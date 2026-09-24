@@ -79,11 +79,11 @@ impl Input {
 
 #[async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "grep"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Search file contents with a Perl-compatible regular expression (powered by ugrep). \
          Searches recursively, honours .gitignore and skips binary files. \
          `output_mode` is `files_with_matches` (default: matching file paths), `content` \

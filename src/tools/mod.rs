@@ -1,8 +1,9 @@
 //! Tool abstraction and registry.
 //!
 //! A tool exposes a name, a description and a JSON schema to the model, and
-//! executes a JSON input into a text result. Adding a tool means implementing
-//! [`Tool`] and registering it in [`ToolRegistry::with_defaults`].
+//! executes a JSON input into a result. Adding a built-in tool means
+//! implementing [`Tool`] and registering it in [`ToolRegistry::with_defaults`];
+//! MCP and skill tools are registered at startup from configuration.
 
 mod bash;
 mod grep;
@@ -27,23 +28,43 @@ use serde_json::{Value, json};
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Anthropic `image` content blocks sent alongside the text.
+    pub images: Vec<Value>,
 }
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self { content: content.into(), is_error: false, images: Vec::new() }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self { content: content.into(), is_error: true, images: Vec::new() }
+    }
+
+    /// The `content` field of the `tool_result` block.
+    pub fn to_result_content(&self) -> Value {
+        if self.images.is_empty() {
+            return Value::String(self.content.clone());
+        }
+        let mut blocks = Vec::with_capacity(self.images.len() + 1);
+        if !self.content.is_empty() {
+            blocks.push(json!({"type": "text", "text": self.content}));
+        }
+        blocks.extend(self.images.iter().cloned());
+        Value::Array(blocks)
     }
 }
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
     fn input_schema(&self) -> Value;
+    /// Whether the API streams this tool's input unbuffered. When true the
+    /// API skips input validation, so `run` must validate strictly.
+    fn eager_input_streaming(&self) -> bool {
+        true
+    }
     async fn run(&self, input: Value) -> ToolOutput;
 }
 
@@ -51,7 +72,7 @@ pub trait Tool: Send + Sync {
 /// across requests, which keeps the prompt-cache prefix stable.
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: BTreeMap<&'static str, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -70,24 +91,33 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.insert(tool.name(), Arc::new(tool));
+        self.tools.insert(tool.name().to_string(), Arc::new(tool));
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tools.keys().map(String::as_str)
     }
 
     /// Tool definitions in the shape the Messages API expects.
     ///
     /// `eager_input_streaming` streams large inputs (e.g. file contents for
     /// `write`) as they are generated. The API then no longer validates the
-    /// input, so every tool deserializes into a strict struct before running.
+    /// input, so built-in tools deserialize into a strict struct before
+    /// running; MCP tools, whose schemas are arbitrary, leave it off so the
+    /// API validates their input.
     pub fn definitions(&self) -> Vec<Value> {
         self.tools
             .values()
             .map(|t| {
-                json!({
+                let mut def = json!({
                     "name": t.name(),
                     "description": t.description(),
                     "input_schema": t.input_schema(),
-                    "eager_input_streaming": true,
-                })
+                });
+                if t.eager_input_streaming() {
+                    def["eager_input_streaming"] = json!(true);
+                }
+                def
             })
             .collect()
     }

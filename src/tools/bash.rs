@@ -24,11 +24,11 @@ struct Input {
 
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "bash"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Run a shell command with `bash -c` and return its stdout, stderr and exit code. \
          Each call runs in a fresh process started in the working directory, so `cd` and \
          environment changes do not persist between calls. Output longer than 30000 bytes \

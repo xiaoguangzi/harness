@@ -26,11 +26,11 @@ struct Input {
 
 #[async_trait]
 impl Tool for WriteTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "write"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Write `content` to a file, replacing it entirely. Creates the file and any missing \
          parent directories if needed. An existing file must be read with the `read` tool \
          first, and the write is refused if it changed since that read. Relative paths \

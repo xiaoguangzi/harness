@@ -28,11 +28,11 @@ struct Input {
 
 #[async_trait]
 impl Tool for ReadTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "read"
     }
 
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read a text file and return its contents with 1-based line numbers. \
          Reads up to 2000 lines by default; use `offset` and `limit` to page through \
          larger files. Lines longer than 2000 characters are truncated. \

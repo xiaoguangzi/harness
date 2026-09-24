@@ -36,6 +36,10 @@ impl Agent {
         self.client.model()
     }
 
+    pub fn tools(&self) -> &ToolRegistry {
+        &self.tools
+    }
+
     /// Runs one user turn to completion. The history only ever grows by
     /// appending, so earlier turns (and their thinking blocks) stay intact.
     pub async fn run_turn(&mut self, prompt: &str, observer: &mut dyn Observer) -> Result<()> {
@@ -103,7 +107,7 @@ impl Agent {
                 results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": t["id"],
-                    "content": out.content,
+                    "content": out.to_result_content(),
                     "is_error": out.is_error,
                 }));
             }
