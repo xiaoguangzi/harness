@@ -40,10 +40,38 @@ impl Agent {
         &self.tools
     }
 
-    /// Runs one user turn to completion. The history only ever grows by
-    /// appending, so earlier turns (and their thinking blocks) stay intact.
-    pub async fn run_turn(&mut self, prompt: &str, observer: &mut dyn Observer) -> Result<()> {
-        self.messages.push(Message::user_text(prompt));
+    /// Runs one user turn to completion. `content` is the user message's
+    /// content blocks (the prompt plus any attachments). The history only
+    /// ever grows by appending, so earlier turns (and their thinking blocks)
+    /// stay intact.
+    pub async fn run_turn(&mut self, content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
+        let turn_start = self.messages.len();
+        self.messages.push(Message { role: "user", content });
+        let result = self.run_loop(observer).await;
+        if result.is_err() {
+            self.repair_after_error(turn_start);
+        }
+        result
+    }
+
+    /// Leaves the history valid after a failed turn. Tool calls that never
+    /// got results are dropped; tool rounds that did run are kept, so the
+    /// model knows about their side effects. A turn that got nowhere is
+    /// removed entirely, so the user can simply retry.
+    fn repair_after_error(&mut self, turn_start: usize) {
+        let unanswered = self
+            .messages
+            .last()
+            .is_some_and(|m| m.role == "assistant" && m.content.iter().any(|b| b["type"] == "tool_use"));
+        if unanswered {
+            self.messages.pop();
+        }
+        if self.messages.len() == turn_start + 1 {
+            self.messages.truncate(turn_start);
+        }
+    }
+
+    async fn run_loop(&mut self, observer: &mut dyn Observer) -> Result<()> {
         let definitions = self.tools.definitions();
 
         for _ in 0..MAX_ITERATIONS {
@@ -56,9 +84,6 @@ impl Agent {
             let stop_reason = response.stop_reason.as_deref().unwrap_or("");
 
             if stop_reason == "refusal" {
-                // Nothing usable to append; drop the prompt so the history
-                // stays a valid alternation of user/assistant turns.
-                self.rollback_turn();
                 let detail = response.stop_details.map(|d| d.to_string()).unwrap_or_default();
                 bail!("the model declined this request {detail}");
             }
@@ -73,7 +98,6 @@ impl Agent {
                 "max_tokens" if !tool_uses.is_empty() => {
                     // A tool_use block cut off by max_tokens may carry partial
                     // input; don't execute it.
-                    self.rollback_turn();
                     bail!("response hit max_tokens while writing a tool call; raise HARNESS_MAX_TOKENS");
                 }
                 "max_tokens" => {
@@ -115,15 +139,5 @@ impl Agent {
         }
 
         bail!("stopped after {MAX_ITERATIONS} iterations without the model finishing")
-    }
-
-    /// Drops everything back to (and including) the last plain user prompt.
-    fn rollback_turn(&mut self) {
-        while let Some(m) = self.messages.pop() {
-            let is_prompt = m.role == "user" && m.content.iter().all(|b| b["type"] == "text");
-            if is_prompt {
-                break;
-            }
-        }
     }
 }

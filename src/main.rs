@@ -1,10 +1,12 @@
 mod agent;
 mod api;
 mod mcp;
+mod mentions;
+mod repl;
 mod skills;
 mod tools;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,7 +15,8 @@ use serde_json::Value;
 use agent::{Agent, Observer};
 use api::{Client, Config};
 use skills::{Skill, SkillTool};
-use tools::ToolRegistry;
+use repl::ReplHelper;
+use tools::{FileTracker, ToolRegistry};
 
 /// Prints agent progress to the terminal.
 struct Terminal;
@@ -62,7 +65,8 @@ fn system_prompt() -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
-    let mut registry = ToolRegistry::with_defaults();
+    let files = FileTracker::default();
+    let mut registry = ToolRegistry::with_defaults(files.clone());
 
     let (skills, warnings) = skills::discover(&skills::default_roots());
     for w in warnings {
@@ -85,42 +89,61 @@ async fn main() -> Result<()> {
     }
 
     let mut agent = Agent::new(Client::new(config)?, registry, system_prompt());
-    let result = run(&mut agent, &skills, &mcp).await;
+    let result = run(&mut agent, &skills, &mcp, &files).await;
     // The agent's tools hold the MCP connections; release them first.
     drop(agent);
     mcp.shutdown().await;
     result
 }
 
-async fn run(agent: &mut Agent, skills: &[Skill], mcp: &mcp::Manager) -> Result<()> {
+async fn run(agent: &mut Agent, skills: &[Skill], mcp: &mcp::Manager, files: &FileTracker) -> Result<()> {
     let mut term = Terminal;
 
     // One-shot mode: `harness "do something"` or `harness /skill args`.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
-        return match parse_input(&args.join(" "), skills) {
-            Input::Prompt(prompt) => agent.run_turn(&prompt, &mut term).await,
+        let line = args.join(" ");
+        return match parse_input(&line, skills) {
+            Input::Prompt(prompt) => submit(agent, &line, &prompt, files, &mut term).await,
             Input::Error(e) => Err(anyhow::anyhow!(e)),
             _ => Err(anyhow::anyhow!("REPL commands are only available interactively")),
         };
     }
 
     println!(
-        "harness ({}) — {} tools, {} skills, {} MCP servers. /help for commands",
+        "harness ({}) — {} tools, {} skills, {} MCP servers. /help for commands, @path to attach files",
         agent.model(),
         agent.tools().names().count(),
         skills.len(),
         mcp.statuses.iter().filter(|s| s.outcome.is_ok()).count(),
     );
-    let stdin = io::stdin();
+
+    let mut commands: Vec<String> =
+        ["/help", "/skills", "/mcp", "/exit"].iter().map(|c| c.to_string()).collect();
+    commands.extend(skills.iter().map(|s| format!("/{}", s.name)));
+    let config = rustyline::Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .auto_add_history(true)
+        .build();
+    let mut editor: rustyline::Editor<ReplHelper, rustyline::history::DefaultHistory> =
+        rustyline::Editor::with_config(config)?;
+    editor.set_helper(Some(ReplHelper::new(commands)));
+    let history = history_path();
+    if let Some(path) = &history {
+        let _ = editor.load_history(path);
+    }
+
     loop {
-        print!("\x1b[1m> \x1b[0m");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            break;
-        }
-        match parse_input(line.trim(), skills) {
+        // Reading a line blocks; let the runtime move other tasks (such as
+        // MCP connections) off this worker meanwhile.
+        let line = match tokio::task::block_in_place(|| editor.readline("> ")) {
+            Ok(line) => line,
+            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(e) => return Err(e.into()),
+        };
+        let line = line.trim();
+        match parse_input(line, skills) {
             Input::Empty => {}
             Input::Exit => break,
             Input::Help => print_help(skills),
@@ -128,13 +151,35 @@ async fn run(agent: &mut Agent, skills: &[Skill], mcp: &mcp::Manager) -> Result<
             Input::ListMcp => print_mcp(mcp),
             Input::Error(e) => eprintln!("\x1b[31m{e}\x1b[0m"),
             Input::Prompt(prompt) => {
-                if let Err(e) = agent.run_turn(&prompt, &mut term).await {
+                if let Err(e) = submit(agent, line, &prompt, files, &mut term).await {
                     eprintln!("\x1b[31merror: {e:#}\x1b[0m");
                 }
             }
         }
     }
+    if let Some(path) = &history {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = editor.save_history(path);
+    }
     Ok(())
+}
+
+fn history_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".harness/history"))
+}
+
+/// Attaches the files `@`-mentioned in `line` and runs the turn.
+async fn submit(agent: &mut Agent, line: &str, prompt: &str, files: &FileTracker, term: &mut Terminal) -> Result<()> {
+    let expanded = mentions::expand(line, files);
+    for a in &expanded.attachments {
+        println!("\x1b[90m  + {}\x1b[0m", a.label);
+    }
+    for w in &expanded.warnings {
+        eprintln!("\x1b[33m  ! {w}\x1b[0m");
+    }
+    agent.run_turn(expanded.into_content(prompt), term).await
 }
 
 #[derive(Debug, PartialEq)]
@@ -175,6 +220,7 @@ fn print_help(skills: &[Skill]) {
     println!("/skills         list available skills");
     println!("/mcp            list MCP servers and their tools");
     println!("/<skill> [args] run a skill");
+    println!("@path           attach a file, directory, image or PDF (Tab completes; @file#L10-20 for lines)");
     println!("/exit           quit");
     if !skills.is_empty() {
         let names: Vec<String> = skills.iter().map(|s| format!("/{}", s.name)).collect();

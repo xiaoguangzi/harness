@@ -21,6 +21,21 @@ cargo run --release -- "list the files"  # one-shot
 | `HARNESS_MAX_TOKENS` | `64000` |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
 
+## Attaching files with `@`
+
+Mention a path with `@` and its contents are attached to your message, so the model sees them without a tool call:
+
+| Mention | Attaches |
+|---|---|
+| `@src/main.rs` | the file, line-numbered (first 2000 lines) |
+| `@src/main.rs#L10-20` / `#L10` | just those lines |
+| `@src/` | a directory listing |
+| `@screenshot.png` (png/jpg/gif/webp) | the image |
+| `@spec.pdf` | the PDF as a document |
+| `@"name with spaces.txt"` | quoted paths |
+
+Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trailing punctuation is ignored. Only existing paths are attached, and an `@` right after an e-mail-style character is left alone, so `me@example.com` stays text. In the REPL, Tab completes paths after `@` and commands after `/`. Attached text files count as read for the `write` tool. The REPL also keeps line-editing history in `~/.harness/history`.
+
 ## REPL commands
 
 | Command | |
@@ -73,6 +88,8 @@ Skills are discovered in `.harness/skills/`, `.claude/skills/`, `~/.harness/skil
 - `src/main.rs` — CLI frontend (REPL / one-shot) and terminal output
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`
 - `src/api.rs` — streaming Messages API client: SSE parsing into content blocks, retries, adaptive thinking, prompt caching, refusal fallbacks
+- `src/mentions.rs` — `@path` parsing and expansion into attachment blocks
+- `src/repl.rs` — rustyline helper: Tab completion of `@paths` and `/commands`
 - `src/mcp.rs` — MCP client: config loading, server connections, `mcp__*` tool adapters
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/write state)

@@ -13,6 +13,7 @@ mod write;
 pub use bash::BashTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
+pub(crate) use read::number_lines;
 pub use write::WriteTool;
 
 use std::collections::{BTreeMap, HashMap};
@@ -80,8 +81,9 @@ impl ToolRegistry {
         Self::default()
     }
 
-    pub fn with_defaults() -> Self {
-        let files = FileTracker::default();
+    /// The built-in tools. `files` is shared with `@file` mentions, so a file
+    /// attached by the user counts as read.
+    pub fn with_defaults(files: FileTracker) -> Self {
         let mut registry = Self::new();
         registry.register(BashTool);
         registry.register(GrepTool);

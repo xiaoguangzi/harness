@@ -80,33 +80,41 @@ impl Tool for ReadTool {
             return ToolOutput::ok(format!("({} is empty)", input.path));
         }
 
-        let offset = input.offset.unwrap_or(1).max(1);
-        let limit = input.limit.unwrap_or(DEFAULT_LIMIT).max(1);
-        let total = text.lines().count();
-        if offset > total {
-            return ToolOutput::error(format!(
-                "offset {offset} is past the end of {} ({total} lines)",
-                input.path
-            ));
+        let offset = input.offset.unwrap_or(1);
+        let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
+        match number_lines(&text, offset, limit) {
+            Ok(out) => ToolOutput::ok(out),
+            Err(e) => ToolOutput::error(format!("{}: {e}", input.path)),
         }
-
-        let mut out = String::new();
-        for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
-            let line = match line.char_indices().nth(MAX_LINE_CHARS) {
-                Some((cut, _)) => format!("{}... [line truncated]", &line[..cut]),
-                None => line.to_string(),
-            };
-            out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
-        }
-        let last = (offset - 1 + limit).min(total);
-        if last < total {
-            out.push_str(&format!(
-                "... [showing lines {offset}-{last} of {total}; use offset={} to continue]\n",
-                last + 1
-            ));
-        }
-        ToolOutput::ok(out)
     }
+}
+
+/// Renders up to `limit` lines starting at 1-based `offset` in `cat -n`
+/// style, noting when more lines remain. Errors if `offset` is past the end.
+pub(crate) fn number_lines(text: &str, offset: usize, limit: usize) -> Result<String, String> {
+    let offset = offset.max(1);
+    let limit = limit.max(1);
+    let total = text.lines().count();
+    if offset > total {
+        return Err(format!("offset {offset} is past the end ({total} lines)"));
+    }
+
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+        let line = match line.char_indices().nth(MAX_LINE_CHARS) {
+            Some((cut, _)) => format!("{}... [line truncated]", &line[..cut]),
+            None => line.to_string(),
+        };
+        out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+    }
+    let last = (offset - 1 + limit).min(total);
+    if last < total {
+        out.push_str(&format!(
+            "... [showing lines {offset}-{last} of {total}; use offset={} to continue]\n",
+            last + 1
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

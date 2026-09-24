@@ -64,10 +64,6 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn user_text(text: impl Into<String>) -> Self {
-        Self { role: "user", content: vec![json!({"type": "text", "text": text.into()})] }
-    }
-
     fn to_json(&self) -> Value {
         json!({"role": self.role, "content": self.content})
     }
