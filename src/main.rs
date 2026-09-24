@@ -4,6 +4,7 @@ mod mcp;
 mod mentions;
 mod repl;
 mod skills;
+mod subagent;
 mod tools;
 
 use std::io::{self, Write};
@@ -15,6 +16,7 @@ use serde_json::Value;
 use agent::{Agent, Observer};
 use api::{Client, Config};
 use skills::{Skill, SkillTool};
+use subagent::{AgentDef, AgentTool, Permission};
 use repl::ReplHelper;
 use tools::{FileTracker, ToolRegistry};
 
@@ -56,7 +58,9 @@ fn system_prompt() -> String {
          commands with `bash`, search file contents with `grep`, read files with `read` \
          and create or overwrite files with `write`. Tools named `mcp__<server>__<tool>` \
          come from connected MCP servers. When a request matches a skill listed in the \
-         `skill` tool, load that skill first and follow it. \
+         `skill` tool, load that skill first and follow it. For open-ended codebase \
+         searches, delegate to the `explore` subagent with the `agent` tool, running \
+         several in parallel for independent questions. \
          The working directory is {cwd}. Work step by step, verify your changes, \
          and finish with a short summary of what you did."
     )
@@ -88,15 +92,38 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut agent = Agent::new(Client::new(config)?, registry, system_prompt());
-    let result = run(&mut agent, &skills, &mcp, &files).await;
+    let client = Client::new(config)?;
+    let (agent_defs, warnings) = subagent::discover(&subagent::default_roots());
+    for w in warnings {
+        eprintln!("\x1b[33magent skipped: {w}\x1b[0m");
+    }
+    let agent_defs = Arc::new(agent_defs);
+    let reporter: subagent::Reporter = Arc::new(|label: &str, tool: &str, input: &Value| {
+        println!("\x1b[90m    ⎿ [{label}] {tool} {}\x1b[0m", preview(&input.to_string(), 120));
+    });
+    // Subagents choose from the tools registered so far, so they never get
+    // the `agent` tool itself.
+    let agent_tool = AgentTool::new(agent_defs.clone(), registry.clone(), client.clone(), reporter);
+    for (agent, tool) in agent_tool.unknown_tools() {
+        eprintln!("\x1b[33magent `{agent}` lists unknown tool `{tool}`\x1b[0m");
+    }
+    registry.register(agent_tool);
+
+    let mut agent = Agent::new(client, registry, system_prompt());
+    let result = run(&mut agent, &skills, &agent_defs, &mcp, &files).await;
     // The agent's tools hold the MCP connections; release them first.
     drop(agent);
     mcp.shutdown().await;
     result
 }
 
-async fn run(agent: &mut Agent, skills: &[Skill], mcp: &mcp::Manager, files: &FileTracker) -> Result<()> {
+async fn run(
+    agent: &mut Agent,
+    skills: &[Skill],
+    agent_defs: &[AgentDef],
+    mcp: &mcp::Manager,
+    files: &FileTracker,
+) -> Result<()> {
     let mut term = Terminal;
 
     // One-shot mode: `harness "do something"` or `harness /skill args`.
@@ -119,7 +146,7 @@ async fn run(agent: &mut Agent, skills: &[Skill], mcp: &mcp::Manager, files: &Fi
     );
 
     let mut commands: Vec<String> =
-        ["/help", "/skills", "/mcp", "/exit"].iter().map(|c| c.to_string()).collect();
+        ["/help", "/skills", "/agents", "/mcp", "/exit"].iter().map(|c| c.to_string()).collect();
     commands.extend(skills.iter().map(|s| format!("/{}", s.name)));
     let config = rustyline::Config::builder()
         .completion_type(rustyline::CompletionType::List)
@@ -149,6 +176,7 @@ async fn run(agent: &mut Agent, skills: &[Skill], mcp: &mcp::Manager, files: &Fi
             Input::Help => print_help(skills),
             Input::ListSkills => print_skills(skills),
             Input::ListMcp => print_mcp(mcp),
+            Input::ListAgents => print_agents(agent_defs),
             Input::Error(e) => eprintln!("\x1b[31m{e}\x1b[0m"),
             Input::Prompt(prompt) => {
                 if let Err(e) = submit(agent, line, &prompt, files, &mut term).await {
@@ -189,6 +217,7 @@ enum Input {
     Help,
     ListSkills,
     ListMcp,
+    ListAgents,
     Prompt(String),
     Error(String),
 }
@@ -205,6 +234,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "help" => Input::Help,
         "skills" => Input::ListSkills,
         "mcp" => Input::ListMcp,
+        "agents" => Input::ListAgents,
         _ => match skills.iter().find(|s| s.name == name) {
             Some(skill) => match skill.load(Some(args)) {
                 Ok(body) => Input::Prompt(format!("The user invoked the `{name}` skill:\n\n{body}")),
@@ -218,6 +248,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
 fn print_help(skills: &[Skill]) {
     println!("/help           show this help");
     println!("/skills         list available skills");
+    println!("/agents         list subagent types and their tools");
     println!("/mcp            list MCP servers and their tools");
     println!("/<skill> [args] run a skill");
     println!("@path           attach a file, directory, image or PDF (Tab completes; @file#L10-20 for lines)");
@@ -234,6 +265,20 @@ fn print_skills(skills: &[Skill]) {
     }
     for s in skills {
         println!("\x1b[1m{}\x1b[0m  {}\n  \x1b[90m{}\x1b[0m", s.name, s.description, s.dir.display());
+    }
+}
+
+fn print_agents(defs: &[AgentDef]) {
+    for d in defs {
+        let access = match d.permission {
+            Permission::ReadOnly => "read-only",
+            Permission::Write => "write",
+        };
+        let tools = d.tools.as_ref().map_or("all permitted".to_string(), |t| t.join(", "));
+        let source = d.path.as_ref().map_or("built-in".to_string(), |p| p.display().to_string());
+        println!("\x1b[1m{}\x1b[0m  [{access}; tools: {tools}]", d.name);
+        println!("  {}", d.description);
+        println!("  \x1b[90m{source}{}\x1b[0m", d.model.as_ref().map_or(String::new(), |m| format!(" · model {m}")));
     }
 }
 

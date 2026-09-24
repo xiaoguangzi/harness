@@ -131,6 +131,10 @@ impl Tool for GrepTool {
         })
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value) -> ToolOutput {
         let input: Input = match parse_input(input) {
             Ok(i) => i,

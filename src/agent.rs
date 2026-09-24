@@ -11,7 +11,7 @@ use crate::tools::{ToolOutput, ToolRegistry};
 const MAX_ITERATIONS: usize = 50;
 
 /// Receives progress events so the frontend decides how to display them.
-pub trait Observer {
+pub trait Observer: Send {
     /// A fragment of assistant text, as it streams in.
     fn on_text_delta(&mut self, text: &str);
     /// The current text block is complete.
@@ -38,6 +38,16 @@ impl Agent {
 
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
+    }
+
+    /// Text of the last assistant message: a subagent's answer.
+    pub fn last_text(&self) -> String {
+        let Some(last) = self.messages.iter().rev().find(|m| m.role == "assistant") else {
+            return String::new();
+        };
+        let texts: Vec<&str> =
+            last.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+        texts.join("\n")
     }
 
     /// Runs one user turn to completion. `content` is the user message's

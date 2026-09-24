@@ -66,6 +66,11 @@ pub trait Tool: Send + Sync {
     fn eager_input_streaming(&self) -> bool {
         true
     }
+    /// Whether the tool never modifies anything. Read-only agents only get
+    /// tools that return true; unknown tools default to false.
+    fn read_only(&self) -> bool {
+        false
+    }
     async fn run(&self, input: Value) -> ToolOutput;
 }
 
@@ -93,7 +98,21 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.insert(tool.name().to_string(), Arc::new(tool));
+        self.register_arc(Arc::new(tool));
+    }
+
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.name().to_string(), tool);
+    }
+
+    #[cfg(test)]
+    pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+        self.tools.get(name)
+    }
+
+    /// Keeps only the tools for which `keep` returns true.
+    pub fn retain(&mut self, mut keep: impl FnMut(&dyn Tool) -> bool) {
+        self.tools.retain(|_, t| keep(t.as_ref()));
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {

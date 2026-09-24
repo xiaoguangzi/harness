@@ -99,7 +99,7 @@ fn parse_skill(text: &str, dir: &Path) -> Result<Skill, String> {
 }
 
 /// Splits `---\n<frontmatter>\n---\n<body>`.
-fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
     let rest = text.strip_prefix("---")?.trim_start_matches(['\r', '\n']);
     let mut offset = 0;
     for line in rest.split_inclusive('\n') {
@@ -114,7 +114,7 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
 /// Reads top-level `key: value` pairs from simple YAML: quoted values,
 /// `>` / `|` block scalars and indented continuation lines are joined
 /// into a single line. Nested structures are ignored.
-fn parse_frontmatter(front: &str) -> BTreeMap<String, String> {
+pub(crate) fn parse_frontmatter(front: &str) -> BTreeMap<String, String> {
     let mut fields = BTreeMap::new();
     let mut current: Option<String> = None;
     for line in front.lines() {
@@ -201,6 +201,10 @@ impl Tool for SkillTool {
             "required": ["name"],
             "additionalProperties": false
         })
+    }
+
+    fn read_only(&self) -> bool {
+        true
     }
 
     async fn run(&self, input: Value) -> ToolOutput {

@@ -19,6 +19,7 @@ cargo run --release -- "list the files"  # one-shot
 |---|---|
 | `HARNESS_MODEL` | `claude-opus-5` |
 | `HARNESS_MAX_TOKENS` | `64000` |
+| `HARNESS_SUBAGENT_MODEL` | the main model |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
 
 ## Attaching files with `@`
@@ -42,6 +43,7 @@ Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trail
 |---|---|
 | `/help` | list commands |
 | `/skills` | list discovered skills |
+| `/agents` | list subagent types, their permission and tools |
 | `/mcp` | list MCP servers, their tools and log files |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
 | `/exit` | quit |
@@ -83,6 +85,29 @@ description: Draft release notes from the git log. Use when asked for a changelo
 
 Skills are discovered in `.harness/skills/`, `.claude/skills/`, `~/.harness/skills/` and `~/.claude/skills/` (earlier wins on name clashes). Only each skill's name and description go to the model up front, listed in the `skill` tool; the body is loaded when the model calls that tool or when you type `/<name>`. Bundled scripts and reference files are used through the normal tools, relative to the skill's base directory, which the loaded skill states.
 
+## Subagents
+
+The main agent can delegate a self-contained task with the `agent` tool. A subagent runs in its own fresh conversation with its own system prompt and tool set, and only its final report comes back, which keeps long searches out of the main context. Several subagents started in one response run in parallel. Their tool calls are shown indented in the terminal.
+
+- **`explore`** (built-in): a codebase search agent whose only tool is `grep`. Use it for "where is X / which files use Y" questions.
+- **Custom agents**: Markdown files in `.harness/agents/` or `.claude/agents/` (project or `~`; the first found wins, and a file named `explore` overrides the built-in):
+
+  ```markdown
+  ---
+  name: reviewer
+  description: Reviews the current diff for bugs. Use after making changes.
+  tools: read, grep          # optional; `mcp__server__*` matches a prefix
+  permission: read-only      # default; `write` allows bash/write and non-read-only MCP tools
+  model: claude-sonnet-5     # optional
+  ---
+  You are a code reviewer...
+  ```
+
+- **Permissions default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further.
+- Subagents cannot start subagents. Their file reads use their own tracker, so they never count as reads for the main agent's `write`.
+- Model: the agent's `model`, else `HARNESS_SUBAGENT_MODEL`, else the main model.
+- `/agents` lists the available types.
+
 ## Layout
 
 - `src/main.rs` — CLI frontend (REPL / one-shot) and terminal output
@@ -90,6 +115,7 @@ Skills are discovered in `.harness/skills/`, `.claude/skills/`, `~/.harness/skil
 - `src/api.rs` — streaming Messages API client: SSE parsing into content blocks, retries, adaptive thinking, prompt caching, refusal fallbacks
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks
 - `src/repl.rs` — rustyline helper: Tab completion of `@paths` and `/commands`
+- `src/subagent.rs` — subagent definitions (built-in `explore`, custom files), permissions, the `agent` tool
 - `src/mcp.rs` — MCP client: config loading, server connections, `mcp__*` tool adapters
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/write state)

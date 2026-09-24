@@ -266,6 +266,7 @@ struct McpTool {
     exposed: String,
     description: String,
     schema: Value,
+    read_only: bool,
 }
 
 #[async_trait]
@@ -284,6 +285,11 @@ impl Tool for McpTool {
 
     fn eager_input_streaming(&self) -> bool {
         false
+    }
+
+    /// Trusts the server's `readOnlyHint`; unannotated tools count as writes.
+    fn read_only(&self) -> bool {
+        self.read_only
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
@@ -333,6 +339,7 @@ impl Manager {
                             exposed: exposed.clone(),
                             description: format!("[MCP server `{}`] {description}", server.name),
                             schema: Value::Object((*t.input_schema).clone()),
+                            read_only: t.annotations.as_ref().and_then(|a| a.read_only_hint).unwrap_or(false),
                         });
                         names.push(exposed);
                     }

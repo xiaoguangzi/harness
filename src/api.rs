@@ -85,6 +85,7 @@ pub struct Response {
     pub invalid_tool_inputs: HashMap<String, String>,
 }
 
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     config: Config,
@@ -104,6 +105,13 @@ impl Client {
         &self.config.model
     }
 
+    /// A client for the same API that uses a different model.
+    pub fn with_model(&self, model: &str) -> Self {
+        let mut client = self.clone();
+        client.config.model = model.to_string();
+        client
+    }
+
     /// Sends a streaming request and assembles the final response, calling
     /// `on_event` as text arrives.
     pub async fn create(
@@ -111,7 +119,7 @@ impl Client {
         system: &str,
         tools: &[Value],
         messages: &[Message],
-        on_event: &mut dyn FnMut(StreamEvent),
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Response> {
         let body = json!({
             "model": self.config.model,
