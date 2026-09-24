@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{Tool, ToolOutput, truncate};
+use super::{Tool, ToolOutput, parse_input, truncate};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -16,6 +16,7 @@ const MAX_OUTPUT_BYTES: usize = 30_000;
 pub struct BashTool;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     command: String,
     timeout_ms: Option<u64>,
@@ -32,7 +33,7 @@ impl Tool for BashTool {
          Each call runs in a fresh process started in the working directory, so `cd` and \
          environment changes do not persist between calls. Output longer than 30000 bytes \
          is truncated. Use this for builds, tests, git, searching (grep, find) and other \
-         shell work; use the `read` tool to view file contents."
+         shell work; use the `read`, `write` and `grep` tools for viewing, writing and searching files."
     }
 
     fn input_schema(&self) -> Value {
@@ -54,9 +55,9 @@ impl Tool for BashTool {
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
-        let input: Input = match serde_json::from_value(input) {
+        let input: Input = match parse_input(input) {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
+            Err(e) => return e,
         };
         let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
@@ -135,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_bad_input() {
-        let out = BashTool.run(json!({"cmd": "ls"})).await;
+        let out = BashTool.run(json!({"command": "ls", "extra": 1})).await;
         assert!(out.is_error);
         assert!(out.content.starts_with("Invalid input"));
     }

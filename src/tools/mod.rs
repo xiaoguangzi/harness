@@ -5,13 +5,19 @@
 //! [`Tool`] and registering it in [`ToolRegistry::with_defaults`].
 
 mod bash;
+mod grep;
 mod read;
+mod write;
 
 pub use bash::BashTool;
+pub use grep::GrepTool;
 pub use read::ReadTool;
+pub use write::WriteTool;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -54,9 +60,12 @@ impl ToolRegistry {
     }
 
     pub fn with_defaults() -> Self {
+        let files = FileTracker::default();
         let mut registry = Self::new();
         registry.register(BashTool);
-        registry.register(ReadTool);
+        registry.register(GrepTool);
+        registry.register(ReadTool::new(files.clone()));
+        registry.register(WriteTool::new(files));
         registry
     }
 
@@ -65,6 +74,10 @@ impl ToolRegistry {
     }
 
     /// Tool definitions in the shape the Messages API expects.
+    ///
+    /// `eager_input_streaming` streams large inputs (e.g. file contents for
+    /// `write`) as they are generated. The API then no longer validates the
+    /// input, so every tool deserializes into a strict struct before running.
     pub fn definitions(&self) -> Vec<Value> {
         self.tools
             .values()
@@ -73,6 +86,7 @@ impl ToolRegistry {
                     "name": t.name(),
                     "description": t.description(),
                     "input_schema": t.input_schema(),
+                    "eager_input_streaming": true,
                 })
             })
             .collect()
@@ -97,4 +111,48 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}\n... [truncated {} bytes]", &s[..end], s.len() - end)
+}
+
+/// Parses tool input into its typed form; unknown fields are rejected by
+/// `#[serde(deny_unknown_fields)]` on each input struct.
+pub(crate) fn parse_input<T: serde::de::DeserializeOwned>(input: Value) -> Result<T, ToolOutput> {
+    serde_json::from_value(input).map_err(|e| ToolOutput::error(format!("Invalid input: {e}")))
+}
+
+/// Remembers which files the model has read, and their modification time at
+/// that point, so `write` refuses to clobber a file the model has not seen
+/// or that changed since it was read.
+#[derive(Clone, Default)]
+pub struct FileTracker(Arc<Mutex<HashMap<PathBuf, Option<SystemTime>>>>);
+
+impl FileTracker {
+    fn key(path: &Path) -> PathBuf {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn mtime(path: &Path) -> Option<SystemTime> {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    pub fn record(&self, path: &Path) {
+        self.0.lock().unwrap().insert(Self::key(path), Self::mtime(path));
+    }
+
+    /// Ok for a new file, or for an existing file read since it last changed.
+    pub fn check_writable(&self, path: &Path) -> Result<(), String> {
+        if !path.exists() {
+            return Ok(());
+        }
+        match self.0.lock().unwrap().get(&Self::key(path)) {
+            None => Err(format!(
+                "{} already exists; read it with the `read` tool before overwriting it",
+                path.display()
+            )),
+            Some(seen) if *seen != Self::mtime(path) => Err(format!(
+                "{} changed since it was last read; read it again before overwriting it",
+                path.display()
+            )),
+            Some(_) => Ok(()),
+        }
+    }
 }

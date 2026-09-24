@@ -2,15 +2,24 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolOutput};
+use super::{FileTracker, Tool, ToolOutput, parse_input};
 
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
 
 /// Reads a text file and returns it with line numbers (`cat -n` style).
-pub struct ReadTool;
+pub struct ReadTool {
+    files: FileTracker,
+}
+
+impl ReadTool {
+    pub fn new(files: FileTracker) -> Self {
+        Self { files }
+    }
+}
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Input {
     path: String,
     offset: Option<usize>,
@@ -53,9 +62,9 @@ impl Tool for ReadTool {
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
-        let input: Input = match serde_json::from_value(input) {
+        let input: Input = match parse_input(input) {
             Ok(i) => i,
-            Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
+            Err(e) => return e,
         };
 
         let bytes = match tokio::fs::read(&input.path).await {
@@ -65,6 +74,7 @@ impl Tool for ReadTool {
         if bytes.contains(&0) {
             return ToolOutput::error(format!("{} looks like a binary file", input.path));
         }
+        self.files.record(input.path.as_ref());
         let text = String::from_utf8_lossy(&bytes);
         if text.is_empty() {
             return ToolOutput::ok(format!("({} is empty)", input.path));
@@ -110,6 +120,10 @@ mod tests {
         f
     }
 
+    fn read_tool() -> ReadTool {
+        ReadTool::new(FileTracker::default())
+    }
+
     fn path(f: &tempfile::NamedTempFile) -> String {
         f.path().to_str().unwrap().to_string()
     }
@@ -117,14 +131,14 @@ mod tests {
     #[tokio::test]
     async fn numbers_lines() {
         let f = file_with(b"a\nb\nc\n");
-        let out = ReadTool.run(json!({"path": path(&f)})).await;
+        let out = read_tool().run(json!({"path": path(&f)})).await;
         assert_eq!(out, ToolOutput::ok("     1\ta\n     2\tb\n     3\tc\n"));
     }
 
     #[tokio::test]
     async fn pages_with_offset_and_limit() {
         let f = file_with(b"a\nb\nc\nd\n");
-        let out = ReadTool.run(json!({"path": path(&f), "offset": 2, "limit": 2})).await;
+        let out = read_tool().run(json!({"path": path(&f), "offset": 2, "limit": 2})).await;
         assert!(!out.is_error);
         assert!(out.content.starts_with("     2\tb\n     3\tc\n"));
         assert!(out.content.contains("use offset=4 to continue"));
@@ -133,21 +147,21 @@ mod tests {
     #[tokio::test]
     async fn offset_past_end_is_error() {
         let f = file_with(b"a\n");
-        let out = ReadTool.run(json!({"path": path(&f), "offset": 5})).await;
+        let out = read_tool().run(json!({"path": path(&f), "offset": 5})).await;
         assert!(out.is_error);
     }
 
     #[tokio::test]
     async fn rejects_binary() {
         let f = file_with(b"\x00\x01\x02");
-        let out = ReadTool.run(json!({"path": path(&f)})).await;
+        let out = read_tool().run(json!({"path": path(&f)})).await;
         assert!(out.is_error);
         assert!(out.content.contains("binary"));
     }
 
     #[tokio::test]
     async fn missing_file_is_error() {
-        let out = ReadTool.run(json!({"path": "/definitely/not/here"})).await;
+        let out = read_tool().run(json!({"path": "/definitely/not/here"})).await;
         assert!(out.is_error);
     }
 }

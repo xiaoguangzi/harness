@@ -5,14 +5,17 @@ use anyhow::{Result, bail};
 use futures::future::join_all;
 use serde_json::{Value, json};
 
-use crate::api::{Client, Message, content_for_history};
-use crate::tools::ToolRegistry;
+use crate::api::{Client, Message, StreamEvent, content_for_history};
+use crate::tools::{ToolOutput, ToolRegistry};
 
 const MAX_ITERATIONS: usize = 50;
 
 /// Receives progress events so the frontend decides how to display them.
 pub trait Observer {
-    fn on_text(&mut self, text: &str);
+    /// A fragment of assistant text, as it streams in.
+    fn on_text_delta(&mut self, text: &str);
+    /// The current text block is complete.
+    fn on_text_end(&mut self);
     fn on_tool_call(&mut self, name: &str, input: &Value);
     fn on_tool_result(&mut self, name: &str, content: &str, is_error: bool);
 }
@@ -40,7 +43,12 @@ impl Agent {
         let definitions = self.tools.definitions();
 
         for _ in 0..MAX_ITERATIONS {
-            let response = self.client.create(&self.system, &definitions, &self.messages).await?;
+            let mut on_event = |event: StreamEvent| match event {
+                StreamEvent::TextDelta(text) => observer.on_text_delta(text),
+                StreamEvent::TextEnd => observer.on_text_end(),
+            };
+            let response =
+                self.client.create(&self.system, &definitions, &self.messages, &mut on_event).await?;
             let stop_reason = response.stop_reason.as_deref().unwrap_or("");
 
             if stop_reason == "refusal" {
@@ -52,11 +60,6 @@ impl Agent {
             }
 
             let content = content_for_history(&response.content);
-            for block in &content {
-                if block["type"] == "text" {
-                    observer.on_text(block["text"].as_str().unwrap_or(""));
-                }
-            }
             let tool_uses: Vec<Value> =
                 content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
             self.messages.push(Message { role: "assistant", content });
@@ -70,7 +73,8 @@ impl Agent {
                     bail!("response hit max_tokens while writing a tool call; raise HARNESS_MAX_TOKENS");
                 }
                 "max_tokens" => {
-                    observer.on_text("\n[stopped: max_tokens reached]");
+                    observer.on_text_delta("[stopped: max_tokens reached]");
+                    observer.on_text_end();
                     return Ok(());
                 }
                 _ => return Ok(()),
@@ -80,9 +84,16 @@ impl Agent {
                 observer.on_tool_call(t["name"].as_str().unwrap_or(""), &t["input"]);
             }
             // Run all tool calls from this response concurrently, then send
-            // every result back in a single user message.
-            let outputs = join_all(tool_uses.iter().map(|t| {
-                self.tools.run(t["name"].as_str().unwrap_or(""), t["input"].clone())
+            // every result back in a single user message. A call whose
+            // streamed input was not valid JSON is not run; the model gets
+            // the raw text back so it can retry.
+            let invalid = &response.invalid_tool_inputs;
+            let outputs = join_all(tool_uses.iter().map(|t| async {
+                let id = t["id"].as_str().unwrap_or("");
+                match invalid.get(id) {
+                    Some(raw) => ToolOutput::error(json!({"INVALID_JSON": raw}).to_string()),
+                    None => self.tools.run(t["name"].as_str().unwrap_or(""), t["input"].clone()).await,
+                }
             }))
             .await;
 

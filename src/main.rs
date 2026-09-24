@@ -15,8 +15,13 @@ use tools::ToolRegistry;
 struct Terminal;
 
 impl Observer for Terminal {
-    fn on_text(&mut self, text: &str) {
-        println!("{text}");
+    fn on_text_delta(&mut self, text: &str) {
+        print!("{text}");
+        let _ = io::stdout().flush();
+    }
+
+    fn on_text_end(&mut self) {
+        println!();
     }
 
     fn on_tool_call(&mut self, name: &str, input: &Value) {
@@ -41,7 +46,8 @@ fn system_prompt() -> String {
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     format!(
         "You are a coding agent running in a terminal harness. You can run shell \
-         commands with the `bash` tool and read files with the `read` tool. \
+         commands with `bash`, search file contents with `grep`, read files with `read` \
+         and create or overwrite files with `write`. \
          The working directory is {cwd}. Work step by step, verify your changes, \
          and finish with a short summary of what you did."
     )
