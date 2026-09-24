@@ -1,213 +1,104 @@
-//! Minimal client for the Anthropic Messages API (`POST /v1/messages`).
+//! Anthropic Messages API backend (`POST /v1/messages`, streaming).
 //!
-//! There is no official Rust SDK, so this speaks raw HTTP and parses the SSE
-//! stream itself. Content blocks are kept as raw JSON so that assistant turns
-//! (including `thinking` blocks) can be echoed back to the API unchanged.
+//! Content blocks pass through as raw JSON, so assistant turns (including
+//! `thinking` blocks) are echoed back to the API unchanged.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use futures::StreamExt;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
+
+use super::config::Target;
+use super::{Message, Response, StreamEvent, ToolDef, http, parse_tool_input, same_source};
 
 const API_VERSION: &str = "2023-06-01";
 /// Server-side refusal fallback, `fallbacks: "default"` form.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
-const MAX_RETRIES: u32 = 3;
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub base_url: String,
-    pub model: String,
-    pub max_tokens: u32,
-    pub auth: Auth,
+pub(super) async fn create(
+    http_client: &reqwest::Client,
+    target: &Target<'_>,
+    system: &str,
+    tools: &[ToolDef],
+    messages: &[Message],
+    on_event: &mut (dyn FnMut(StreamEvent) + Send),
+) -> Result<Response> {
+    let body = build_body(target, system, tools, messages);
+    let mut headers = target.headers();
+    headers.push(("anthropic-version".into(), API_VERSION.into()));
+    if target.fallbacks() {
+        headers.push(("anthropic-beta".into(), FALLBACK_BETA.into()));
+    }
+    let resp = http::post_with_retries(http_client, &target.url("messages"), &headers, &body).await?;
+
+    let mut acc = Accumulator::default();
+    let finished = http::read_sse(resp, |event| acc.apply(&event, on_event)).await?;
+    if !finished {
+        bail!("stream ended before message_stop");
+    }
+    let mut response = acc.finish();
+    response.content = content_for_history(&response.content);
+    Ok(response)
 }
 
-#[derive(Debug, Clone)]
-pub enum Auth {
-    ApiKey(String),
-    Bearer(String),
-}
-
-impl Config {
-    /// Reads `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`),
-    /// `ANTHROPIC_BASE_URL`, `HARNESS_MODEL` and `HARNESS_MAX_TOKENS`.
-    pub fn from_env() -> Result<Self> {
-        let auth = match (std::env::var("ANTHROPIC_API_KEY"), std::env::var("ANTHROPIC_AUTH_TOKEN")) {
-            (Ok(k), _) if !k.is_empty() => Auth::ApiKey(k),
-            (_, Ok(t)) if !t.is_empty() => Auth::Bearer(t),
-            _ => bail!("set ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) to call the API"),
-        };
-        let max_tokens = match std::env::var("HARNESS_MAX_TOKENS") {
-            Ok(v) => v.parse().context("HARNESS_MAX_TOKENS must be an integer")?,
-            // Streaming avoids HTTP timeouts, so give the model room.
-            Err(_) => 64_000,
-        };
-        Ok(Self {
-            base_url: std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| "https://api.anthropic.com".into())
-                .trim_end_matches('/')
-                .to_string(),
-            model: std::env::var("HARNESS_MODEL").unwrap_or_else(|_| "claude-opus-5".into()),
-            max_tokens,
-            auth,
+fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[Message]) -> Value {
+    let spec = target.spec();
+    let eager = target.eager_input_streaming();
+    let tools: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            let mut def = json!({"name": t.name, "description": t.description, "input_schema": t.input_schema});
+            if eager && t.eager_input_streaming {
+                def["eager_input_streaming"] = json!(true);
+            }
+            def
         })
+        .collect();
+    let messages: Vec<Value> = messages
+        .iter()
+        .filter_map(|m| {
+            let content = history_blocks(m, &spec);
+            (!content.is_empty()).then(|| json!({"role": m.role, "content": content}))
+        })
+        .collect();
+
+    let mut body = json!({
+        "model": target.model,
+        "max_tokens": target.max_tokens(),
+        "system": system,
+        "tools": tools,
+        "messages": messages,
+        "thinking": {"type": "adaptive"},
+        "stream": true,
+    });
+    if target.prompt_cache() {
+        // Automatic prompt caching: the growing conversation prefix is
+        // re-read from cache on every loop iteration.
+        body["cache_control"] = json!({"type": "ephemeral"});
     }
+    if target.fallbacks() {
+        // On a safety decline, the API re-runs the request on a fallback
+        // model chosen by refusal category.
+        body["fallbacks"] = json!("default");
+    }
+    target.apply_extra_body(&mut body);
+    body
 }
 
-/// One conversation turn. `content` is a list of raw content blocks.
-#[derive(Debug, Clone)]
-pub struct Message {
-    pub role: &'static str,
-    pub content: Vec<Value>,
-}
-
-impl Message {
-    fn to_json(&self) -> Value {
-        json!({"role": self.role, "content": self.content})
-    }
-}
-
-/// Incremental output surfaced while a response streams in.
-pub enum StreamEvent<'a> {
-    TextDelta(&'a str),
-    TextEnd,
-}
-
-#[derive(Debug, Default)]
-pub struct Response {
-    pub content: Vec<Value>,
-    pub stop_reason: Option<String>,
-    pub stop_details: Option<Value>,
-    /// `tool_use` id -> raw input text, for tool calls whose streamed input
-    /// was not a valid JSON object. Their `input` in `content` is `{}`.
-    pub invalid_tool_inputs: HashMap<String, String>,
-}
-
-#[derive(Clone)]
-pub struct Client {
-    http: reqwest::Client,
-    config: Config,
-}
-
-impl Client {
-    pub fn new(config: Config) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(300))
-            .build()
-            .context("building HTTP client")?;
-        Ok(Self { http, config })
-    }
-
-    pub fn model(&self) -> &str {
-        &self.config.model
-    }
-
-    /// A client for the same API that uses a different model.
-    pub fn with_model(&self, model: &str) -> Self {
-        let mut client = self.clone();
-        client.config.model = model.to_string();
-        client
-    }
-
-    /// Sends a streaming request and assembles the final response, calling
-    /// `on_event` as text arrives.
-    pub async fn create(
-        &self,
-        system: &str,
-        tools: &[Value],
-        messages: &[Message],
-        on_event: &mut (dyn FnMut(StreamEvent) + Send),
-    ) -> Result<Response> {
-        let body = json!({
-            "model": self.config.model,
-            "max_tokens": self.config.max_tokens,
-            "system": system,
-            "tools": tools,
-            "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
-            "thinking": {"type": "adaptive"},
-            // Automatic prompt caching: the growing conversation prefix is
-            // re-read from cache on every loop iteration.
-            "cache_control": {"type": "ephemeral"},
-            // On a safety decline, the API re-runs the request on a fallback
-            // model chosen by refusal category.
-            "fallbacks": "default",
-            "stream": true,
-        });
-
-        let resp = self.send_with_retries(&body).await?;
-        let mut acc = Accumulator::default();
-        // Buffer raw bytes: a chunk boundary can split a multi-byte UTF-8
-        // character, so only decode once a whole event has arrived.
-        let mut buf: Vec<u8> = Vec::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("reading response stream")?;
-            buf.extend(chunk.iter().filter(|&&b| b != b'\r'));
-            // An SSE event ends with a blank line.
-            while let Some(end) = buf.windows(2).position(|w| w == b"\n\n") {
-                let raw: Vec<u8> = buf.drain(..end + 2).collect();
-                let event = String::from_utf8_lossy(&raw);
-                for data in event.lines().filter_map(|l| l.strip_prefix("data:")) {
-                    let data: Value = serde_json::from_str(data.trim())
-                        .with_context(|| format!("parsing stream event: {data}"))?;
-                    if acc.apply(&data, on_event)? {
-                        return Ok(acc.finish());
-                    }
-                }
-            }
-        }
-        bail!("stream ended before message_stop")
-    }
-
-    /// Retries connection failures and retryable statuses; only a successful
-    /// response starts streaming.
-    async fn send_with_retries(&self, body: &Value) -> Result<reqwest::Response> {
-        let url = format!("{}/v1/messages", self.config.base_url);
-        let mut attempt = 0;
-        loop {
-            let mut req = self
-                .http
-                .post(&url)
-                .header("anthropic-version", API_VERSION)
-                .header("anthropic-beta", FALLBACK_BETA)
-                .json(body);
-            req = match &self.config.auth {
-                Auth::ApiKey(k) => req.header("x-api-key", k),
-                Auth::Bearer(t) => req.bearer_auth(t),
-            };
-
-            let result = req.send().await;
-            let retryable = match &result {
-                Ok(resp) => {
-                    let s = resp.status().as_u16();
-                    s == 408 || s == 409 || s == 429 || s >= 500
-                }
-                Err(e) => e.is_connect() || e.is_timeout(),
-            };
-            if retryable && attempt < MAX_RETRIES {
-                attempt += 1;
-                let wait = retry_after(&result).unwrap_or(Duration::from_secs(1 << attempt));
-                tokio::time::sleep(wait).await;
-                continue;
-            }
-
-            let resp = result.context("sending request")?;
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                bail!("API error {status}: {text}");
-            }
-            return Ok(resp);
-        }
-    }
-}
-
-fn retry_after(result: &reqwest::Result<reqwest::Response>) -> Option<Duration> {
-    let secs = result.as_ref().ok()?.headers().get("retry-after")?.to_str().ok()?.parse().ok()?;
-    Some(Duration::from_secs(secs))
+/// A message's blocks as sent to `spec`: OpenAI reasoning items never go to
+/// Anthropic, and thinking blocks only go back to the model that wrote them.
+fn history_blocks(message: &Message, spec: &str) -> Vec<Value> {
+    let own = same_source(message, spec);
+    message
+        .content
+        .iter()
+        .filter(|b| match b["type"].as_str().unwrap_or("") {
+            "openai_reasoning" => false,
+            "thinking" | "redacted_thinking" => own,
+            _ => true,
+        })
+        .cloned()
+        .collect()
 }
 
 /// Folds stream events into complete content blocks.
@@ -220,7 +111,7 @@ struct Accumulator {
 
 impl Accumulator {
     /// Applies one event; returns true on `message_stop`.
-    fn apply(&mut self, event: &Value, on_event: &mut dyn FnMut(StreamEvent)) -> Result<bool> {
+    fn apply(&mut self, event: &Value, on_event: &mut (dyn FnMut(StreamEvent) + Send)) -> Result<bool> {
         let content = &mut self.response.content;
         match event["type"].as_str().unwrap_or("") {
             "content_block_start" => {
@@ -304,21 +195,13 @@ fn append_str(block: &mut Value, field: &str, text: &str) {
     block[field] = Value::String(format!("{current}{text}"));
 }
 
-/// Strictly parses streamed tool input. An empty input means no arguments.
-fn parse_tool_input(raw: &str) -> Option<Value> {
-    if raw.trim().is_empty() {
-        return Some(json!({}));
-    }
-    serde_json::from_str::<Value>(raw).ok().filter(Value::is_object)
-}
-
 /// Prepares response content to be echoed back as the assistant turn.
 ///
 /// After a mid-output refusal fallback, blocks before the last `fallback`
 /// marker belong to the declined attempt: only its `text` blocks may be sent
 /// back. Everything after the marker (and every block when there is no
 /// marker) is kept unchanged.
-pub fn content_for_history(content: &[Value]) -> Vec<Value> {
+fn content_for_history(content: &[Value]) -> Vec<Value> {
     let boundary = content.iter().rposition(|b| b["type"] == "fallback");
     match boundary {
         None => content.to_vec(),
@@ -334,6 +217,51 @@ pub fn content_for_history(content: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::Providers;
+    use crate::llm::config::tests::{file, no_env};
+
+    #[test]
+    fn builds_body_per_provider_and_filters_foreign_blocks() {
+        let p = Providers::from_parts(
+            vec![file(json!({
+                "default_model": "gw/claude-sonnet-4-5",
+                "providers": {"gw": {"protocol": "anthropic", "base_url": "https://gw.example.com", "api_key": "k",
+                    "models": {"claude-sonnet-4-5": {"extra_body": {"thinking": null}}}}}
+            }))],
+            &no_env,
+        )
+        .unwrap();
+        let target = p.target("gw/claude-sonnet-4-5").unwrap();
+        let tools = vec![ToolDef {
+            name: "write".into(),
+            description: "d".into(),
+            input_schema: json!({"type": "object"}),
+            eager_input_streaming: true,
+        }];
+        let thinking = json!({"type": "thinking", "thinking": "", "signature": "s"});
+        let messages = vec![
+            Message::user(vec![json!({"type": "text", "text": "hi"})]),
+            Message {
+                role: "assistant",
+                content: vec![thinking.clone(), json!({"type": "text", "text": "from gpt"}),
+                              json!({"type": "openai_reasoning", "item": {}})],
+                source: Some("other/gpt-5".into()),
+            },
+            Message::user(vec![json!({"type": "text", "text": "again"})]),
+            Message {
+                role: "assistant",
+                content: vec![thinking.clone(), json!({"type": "text", "text": "mine"})],
+                source: Some("gw/claude-sonnet-4-5".into()),
+            },
+        ];
+        let body = build_body(&target, "sys", &tools, &messages);
+        assert!(body.get("fallbacks").is_none(), "gateways don't get fallbacks by default");
+        assert!(body.get("thinking").is_none(), "model extra_body removed thinking");
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(body["tools"][0].get("eager_input_streaming"), None);
+        assert_eq!(body["messages"][1]["content"], json!([{"type": "text", "text": "from gpt"}]));
+        assert_eq!(body["messages"][3]["content"], json!([thinking, {"type": "text", "text": "mine"}]));
+    }
 
     fn run_events(events: &[Value]) -> (Response, String) {
         let mut acc = Accumulator::default();

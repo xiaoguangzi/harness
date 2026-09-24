@@ -12,7 +12,7 @@
 //! description: Reviews the current diff for bugs. Use after making changes.
 //! tools: read, grep, bash        # optional; default: every tool allowed
 //! permission: read-only          # default; `write` allows modifying tools
-//! model: claude-sonnet-5         # optional; default: HARNESS_SUBAGENT_MODEL or the main model
+//! model: relay-b/gpt-5-mini       # optional; default: `subagent_model` or the main model
 //! ---
 //! You are a code reviewer...
 //! ```
@@ -30,7 +30,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::{Agent, Observer};
-use crate::api::Client;
+use crate::llm::Client;
 use crate::skills::{parse_frontmatter, split_frontmatter};
 use crate::tools::{
     FileTracker, ReadTool, Tool, ToolOutput, ToolRegistry, WriteTool, parse_input, truncate,
@@ -176,7 +176,6 @@ pub struct AgentTool {
     /// subagents cannot spawn subagents.
     base: ToolRegistry,
     client: Client,
-    default_model: Option<String>,
     reporter: Reporter,
     description: String,
 }
@@ -198,8 +197,7 @@ impl AgentTool {
             };
             description.push_str(&format!("\n- {} ({access}): {}", d.name, d.description));
         }
-        let default_model = std::env::var("HARNESS_SUBAGENT_MODEL").ok().filter(|m| !m.is_empty());
-        Self { defs, base, client, default_model, reporter, description }
+        Self { defs, base, client, reporter, description }
     }
 
     /// Tool names in `defs` that no available tool matches.
@@ -304,8 +302,16 @@ impl Tool for AgentTool {
         let Some(def) = self.defs.iter().find(|d| d.name == input.agent_type) else {
             return ToolOutput::error(format!("Unknown agent type: {}", input.agent_type));
         };
-        let model = def.model.as_deref().or(self.default_model.as_deref()).unwrap_or(self.client.model());
-        let mut agent = Agent::new(self.client.with_model(model), self.registry_for(def), Self::system_prompt(def));
+        // The agent's own model, else the configured subagent model, else
+        // the caller's.
+        let client = match def.model.as_deref().or(self.client.providers().subagent_model.as_deref()) {
+            Some(spec) => match self.client.switch(spec) {
+                Ok(c) => c,
+                Err(e) => return ToolOutput::error(format!("Agent `{}` has an unusable model: {e:#}", def.name)),
+            },
+            None => self.client.clone(),
+        };
+        let mut agent = Agent::new(client, self.registry_for(def), Self::system_prompt(def));
         let mut observer = SubObserver {
             label: format!("{}: {}", def.name, input.description),
             reporter: self.reporter.clone(),
@@ -329,17 +335,16 @@ impl Tool for AgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{Auth, Config};
+    use crate::llm::Providers;
+    use crate::llm::config::tests::{file, no_env};
     use crate::tools::GrepTool;
 
     fn client() -> Client {
-        Client::new(Config {
-            base_url: "http://127.0.0.1:9".into(),
-            model: "main-model".into(),
-            max_tokens: 1000,
-            auth: Auth::ApiKey("test".into()),
-        })
-        .unwrap()
+        let file = file(json!({
+            "default_model": "gw/main-model",
+            "providers": {"gw": {"protocol": "anthropic", "base_url": "http://127.0.0.1:9", "api_key": "test"}}
+        }));
+        Client::new(Providers::from_parts(vec![file], &no_env).unwrap()).unwrap()
     }
 
     fn agent_tool(defs: Vec<AgentDef>) -> AgentTool {

@@ -1,11 +1,12 @@
 mod agent;
-mod api;
+mod llm;
 mod mcp;
 mod mentions;
 mod repl;
 mod skills;
 mod subagent;
 mod tools;
+mod util;
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use agent::{Agent, Observer};
-use api::{Client, Config};
+use llm::{Client, Providers};
 use skills::{Skill, SkillTool};
 use subagent::{AgentDef, AgentTool, Permission};
 use repl::ReplHelper;
@@ -68,7 +69,7 @@ fn system_prompt() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::from_env()?;
+    let client = Client::new(Providers::load()?)?;
     let files = FileTracker::default();
     let mut registry = ToolRegistry::with_defaults(files.clone());
 
@@ -92,7 +93,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    let client = Client::new(config)?;
     let (agent_defs, warnings) = subagent::discover(&subagent::default_roots());
     for w in warnings {
         eprintln!("\x1b[33magent skipped: {w}\x1b[0m");
@@ -146,7 +146,8 @@ async fn run(
     );
 
     let mut commands: Vec<String> =
-        ["/help", "/skills", "/agents", "/mcp", "/exit"].iter().map(|c| c.to_string()).collect();
+        ["/help", "/model", "/skills", "/agents", "/mcp", "/exit"].iter().map(|c| c.to_string()).collect();
+    commands.extend(agent.client().providers().listed_models().iter().map(|m| format!("/model {m}")));
     commands.extend(skills.iter().map(|s| format!("/{}", s.name)));
     let config = rustyline::Config::builder()
         .completion_type(rustyline::CompletionType::List)
@@ -177,6 +178,14 @@ async fn run(
             Input::ListSkills => print_skills(skills),
             Input::ListMcp => print_mcp(mcp),
             Input::ListAgents => print_agents(agent_defs),
+            Input::Model(None) => print_models(agent),
+            Input::Model(Some(spec)) => match agent.client().switch(&spec) {
+                Ok(client) => {
+                    println!("model: {}", client.spec());
+                    agent.set_client(client);
+                }
+                Err(e) => eprintln!("\x1b[31m{e:#}\x1b[0m"),
+            },
             Input::Error(e) => eprintln!("\x1b[31m{e}\x1b[0m"),
             Input::Prompt(prompt) => {
                 if let Err(e) = submit(agent, line, &prompt, files, &mut term).await {
@@ -218,6 +227,8 @@ enum Input {
     ListSkills,
     ListMcp,
     ListAgents,
+    /// `/model` shows the current model; `/model <spec>` switches.
+    Model(Option<String>),
     Prompt(String),
     Error(String),
 }
@@ -235,6 +246,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "skills" => Input::ListSkills,
         "mcp" => Input::ListMcp,
         "agents" => Input::ListAgents,
+        "model" => Input::Model(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         _ => match skills.iter().find(|s| s.name == name) {
             Some(skill) => match skill.load(Some(args)) {
                 Ok(body) => Input::Prompt(format!("The user invoked the `{name}` skill:\n\n{body}")),
@@ -248,6 +260,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
 fn print_help(skills: &[Skill]) {
     println!("/help           show this help");
     println!("/skills         list available skills");
+    println!("/model [spec]   show the model, or switch to <provider>/<model>");
     println!("/agents         list subagent types and their tools");
     println!("/mcp            list MCP servers and their tools");
     println!("/<skill> [args] run a skill");
@@ -266,6 +279,26 @@ fn print_skills(skills: &[Skill]) {
     for s in skills {
         println!("\x1b[1m{}\x1b[0m  {}\n  \x1b[90m{}\x1b[0m", s.name, s.description, s.dir.display());
     }
+}
+
+fn print_models(agent: &Agent) {
+    let providers = agent.client().providers();
+    println!("current: \x1b[1m{}\x1b[0m", agent.model());
+    if let Some(sub) = &providers.subagent_model {
+        println!("subagents: {sub}");
+    }
+    for name in providers.names() {
+        let protocol = match providers.protocol_of(name) {
+            Some(llm::Protocol::Anthropic) => "anthropic",
+            Some(llm::Protocol::OpenAiResponses) => "openai-responses",
+            None => "?",
+        };
+        println!("provider \x1b[1m{name}\x1b[0m ({protocol})");
+    }
+    for m in providers.listed_models() {
+        println!("  {m}");
+    }
+    println!("\x1b[90mswitch with /model <provider>/<model>; any model name the gateway accepts works\x1b[0m");
 }
 
 fn print_agents(defs: &[AgentDef]) {

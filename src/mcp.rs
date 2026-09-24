@@ -34,6 +34,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tools::{Tool, ToolOutput, ToolRegistry, truncate};
+use crate::util::expand_env;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -113,32 +114,6 @@ pub fn load_config() -> Result<BTreeMap<String, ServerConfig>> {
         servers.extend(parsed.mcp_servers);
     }
     Ok(servers)
-}
-
-/// Expands `${VAR}` and `${VAR:-default}`; unset variables become "".
-fn expand_env(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
-            out.push_str(&rest[start..]);
-            return out;
-        };
-        let expr = &after[..end];
-        let (var, default) = match expr.split_once(":-") {
-            Some((v, d)) => (v, d),
-            None => (expr, ""),
-        };
-        match std::env::var(var) {
-            Ok(v) if !v.is_empty() => out.push_str(&v),
-            _ => out.push_str(default),
-        }
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    out
 }
 
 /// A live connection to one MCP server.
@@ -368,15 +343,6 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn expands_env_vars() {
-        unsafe { std::env::set_var("HARNESS_TEST_TOKEN", "abc") };
-        assert_eq!(expand_env("Bearer ${HARNESS_TEST_TOKEN}"), "Bearer abc");
-        assert_eq!(expand_env("${HARNESS_TEST_UNSET_VAR:-dflt}/x"), "dflt/x");
-        assert_eq!(expand_env("${HARNESS_TEST_UNSET_VAR}"), "");
-        assert_eq!(expand_env("no vars, ${unclosed"), "no vars, ${unclosed");
-    }
 
     #[test]
     fn parses_config_and_infers_transport() {

@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use futures::future::join_all;
 use serde_json::{Value, json};
 
-use crate::api::{Client, Message, StreamEvent, content_for_history};
+use crate::llm::{Client, Message, StreamEvent};
 use crate::tools::{ToolOutput, ToolRegistry};
 
 const MAX_ITERATIONS: usize = 50;
@@ -32,8 +32,18 @@ impl Agent {
         Self { client, tools, system: system.into(), messages: Vec::new() }
     }
 
+    /// The `provider/model` in use.
     pub fn model(&self) -> &str {
-        self.client.model()
+        self.client.spec()
+    }
+
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Switches models; the conversation continues on the new one.
+    pub fn set_client(&mut self, client: Client) {
+        self.client = client;
     }
 
     pub fn tools(&self) -> &ToolRegistry {
@@ -56,7 +66,7 @@ impl Agent {
     /// stay intact.
     pub async fn run_turn(&mut self, content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
         let turn_start = self.messages.len();
-        self.messages.push(Message { role: "user", content });
+        self.messages.push(Message::user(content));
         let result = self.run_loop(observer).await;
         if result.is_err() {
             self.repair_after_error(turn_start);
@@ -98,10 +108,10 @@ impl Agent {
                 bail!("the model declined this request {detail}");
             }
 
-            let content = content_for_history(&response.content);
+            let content = response.content;
             let tool_uses: Vec<Value> =
                 content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
-            self.messages.push(Message { role: "assistant", content });
+            self.messages.push(Message { role: "assistant", content, source: Some(self.client.spec().to_string()) });
 
             match stop_reason {
                 "tool_use" => {}
@@ -145,7 +155,7 @@ impl Agent {
                     "is_error": out.is_error,
                 }));
             }
-            self.messages.push(Message { role: "user", content: results });
+            self.messages.push(Message::user(results));
         }
 
         bail!("stopped after {MAX_ITERATIONS} iterations without the model finishing")

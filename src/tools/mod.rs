@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+
+use crate::llm::ToolDef;
 use serde_json::{Value, json};
 
 /// Result of running a tool, sent back to the model as a `tool_result` block.
@@ -119,26 +121,21 @@ impl ToolRegistry {
         self.tools.keys().map(String::as_str)
     }
 
-    /// Tool definitions in the shape the Messages API expects.
+    /// Tool definitions for the model.
     ///
-    /// `eager_input_streaming` streams large inputs (e.g. file contents for
-    /// `write`) as they are generated. The API then no longer validates the
-    /// input, so built-in tools deserialize into a strict struct before
-    /// running; MCP tools, whose schemas are arbitrary, leave it off so the
-    /// API validates their input.
-    pub fn definitions(&self) -> Vec<Value> {
+    /// `eager_input_streaming` lets an Anthropic API stream large inputs
+    /// (e.g. file contents for `write`) as they are generated. The API then
+    /// no longer validates the input, so built-in tools deserialize into a
+    /// strict struct before running; MCP tools, whose schemas are arbitrary,
+    /// leave it off so the API validates their input.
+    pub fn definitions(&self) -> Vec<ToolDef> {
         self.tools
             .values()
-            .map(|t| {
-                let mut def = json!({
-                    "name": t.name(),
-                    "description": t.description(),
-                    "input_schema": t.input_schema(),
-                });
-                if t.eager_input_streaming() {
-                    def["eager_input_streaming"] = json!(true);
-                }
-                def
+            .map(|t| ToolDef {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
+                eager_input_streaming: t.eager_input_streaming(),
             })
             .collect()
     }
