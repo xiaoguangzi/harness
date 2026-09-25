@@ -10,14 +10,23 @@ A minimal coding-agent harness in Rust. It talks to any mix of LLM gateways that
 
 ## Usage
 
+Install once, then run `harness` from any project directory:
+
+```sh
+cargo install --path .                  # into ~/.cargo/bin; or --root ~/.local for ~/.local/bin
+```
+
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...     # or OPENAI_API_KEY, or configure gateways (below)
-cargo run --release                      # interactive REPL (/exit to quit)
-cargo run --release -- "list the files"  # one-shot
-cargo run --release -- --continue        # resume the latest conversation here (see below)
-cargo run --release -- --web             # web UI at http://localhost:8787 (see below)
-cargo run --release -- --sandbox         # run the model's commands in an OS sandbox (see below)
+harness                                 # interactive REPL (/exit to quit)
+harness "list the files"                # one-shot
+harness --continue                      # resume the latest conversation here (see below)
+harness --web                           # web UI at http://localhost:8787 (see below)
+harness --sandbox                       # run the model's commands in an OS sandbox (see below)
+harness --help                          # all options
 ```
+
+Rerun `cargo install --path .` after pulling changes. While developing, `cargo run --release -- <args>` works the same.
 
 | Variable | Default |
 |---|---|

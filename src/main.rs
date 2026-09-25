@@ -24,9 +24,34 @@ use skills::SkillTool;
 use subagent::AgentTool;
 use tools::{FileTracker, ToolRegistry};
 
+const USAGE: &str = "\
+Usage: harness [OPTIONS] [PROMPT...]
+
+With no PROMPT, starts the interactive REPL; with one, runs it and exits.
+
+Options:
+  -c, --continue      Continue this directory's latest conversation
+  -r, --resume [ID]   Resume a conversation (pick from a list without ID)
+      --web[=ADDR]    Start the web UI instead (default 127.0.0.1:8787)
+      --sandbox       Run the model's commands in an OS sandbox
+      --no-sandbox    Turn the sandbox off even if configured
+  -h, --help          Print this help
+  -V, --version       Print the version
+
+Providers: ~/.harness/providers.json, overridden by ./.harness/providers.json
+";
+
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
+        print!("{USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if matches!(args.first().map(String::as_str), Some("-V" | "--version")) {
+        println!("harness {}", env!("CARGO_PKG_VERSION"));
+        return Ok(ExitCode::SUCCESS);
+    }
     let (sandbox_flag, args) = sandbox::parse_flag(args);
     sandbox::init(sandbox_flag).await?;
     let web_addr = web::parse_flag(&args)?;

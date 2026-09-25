@@ -11,14 +11,23 @@
 
 ## 用法
 
+安装一次，之后即可在任意项目目录运行 `harness`：
+
+```sh
+cargo install --path .                  # 装到 ~/.cargo/bin；或加 --root ~/.local 装到 ~/.local/bin
+```
+
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...     # 或 OPENAI_API_KEY，或按下文配置网关
-cargo run --release                      # 交互式 REPL（/exit 退出）
-cargo run --release -- "list the files"  # 一次性模式
-cargo run --release -- --continue        # 继续当前目录最近的会话（见下文）
-cargo run --release -- --web             # Web UI，地址 http://localhost:8787（见下文）
-cargo run --release -- --sandbox         # 在操作系统沙箱中运行模型的命令（见下文）
+harness                                 # 交互式 REPL（/exit 退出）
+harness "list the files"                # 一次性模式
+harness --continue                      # 继续当前目录最近的会话（见下文）
+harness --web                           # Web UI，地址 http://localhost:8787（见下文）
+harness --sandbox                       # 在操作系统沙箱中运行模型的命令（见下文）
+harness --help                          # 查看全部选项
 ```
+
+拉取更新后重新执行 `cargo install --path .`。开发时用 `cargo run --release -- <参数>` 效果相同。
 
 | 环境变量 | 默认值 |
 |---|---|
