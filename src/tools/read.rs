@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use tokio::io::AsyncBufReadExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -71,26 +72,86 @@ impl Tool for ReadTool {
             Err(e) => return e,
         };
 
-        let bytes = match tokio::fs::read(&input.path).await {
-            Ok(b) => b,
-            Err(e) => return ToolOutput::error(format!("Cannot read {}: {e}", input.path)),
+        let offset = input.offset.unwrap_or(1).max(1);
+        let limit = input.limit.unwrap_or(DEFAULT_LIMIT).max(1);
+        let window = match read_window(&input.path, offset, limit).await {
+            Ok(w) => w,
+            Err(e) => return ToolOutput::error(e),
         };
-        if bytes.contains(&0) {
-            return ToolOutput::error(format!("{} looks like a binary file", input.path));
-        }
         self.files.record(input.path.as_ref());
-        let text = String::from_utf8_lossy(&bytes);
-        if text.is_empty() {
+        if window.total == 0 {
             return ToolOutput::ok(format!("({} is empty)", input.path));
         }
-
-        let offset = input.offset.unwrap_or(1);
-        let limit = input.limit.unwrap_or(DEFAULT_LIMIT);
-        match number_lines(&text, offset, limit) {
+        let lines = window.lines.iter().map(String::as_str);
+        match render(lines, offset, limit, window.total) {
             Ok(out) => ToolOutput::ok(out),
             Err(e) => ToolOutput::error(format!("{}: {e}", input.path)),
         }
     }
+}
+
+/// Lines `offset..offset + limit` of a file, and its line count.
+struct Window {
+    lines: Vec<String>,
+    total: usize,
+}
+
+/// Reads a file in chunks, keeping only the requested lines, and only the
+/// start of a line too long to show, so no file is held in memory whole.
+async fn read_window(path: &str, offset: usize, limit: usize) -> Result<Window, String> {
+    // More than enough bytes for `MAX_LINE_CHARS` characters, so `render`
+    // still marks a cut line as truncated.
+    const MAX_LINE_BYTES: usize = (MAX_LINE_CHARS + 1) * 4;
+    let cannot = |e: std::io::Error| format!("Cannot read {path}: {e}");
+    let file = tokio::fs::File::open(path).await.map_err(cannot)?;
+    let mut reader = tokio::io::BufReader::with_capacity(64 * 1024, file);
+    let wanted = offset - 1..(offset - 1).saturating_add(limit);
+    let mut lines = Vec::new();
+    // The line being read, if it is wanted; its index; the last byte seen.
+    let (mut line, mut index, mut last) = (Vec::new(), 0, None);
+    let take_line = |line: &mut Vec<u8>| {
+        let text = String::from_utf8_lossy(line).into_owned();
+        line.clear();
+        text
+    };
+    loop {
+        let chunk = reader.fill_buf().await.map_err(cannot)?;
+        if chunk.is_empty() {
+            break;
+        }
+        if chunk.contains(&0) {
+            return Err(format!("{path} looks like a binary file"));
+        }
+        let mut pieces = chunk.split(|&b| b == b'\n').peekable();
+        while let Some(piece) = pieces.next() {
+            if wanted.contains(&index) {
+                let room = MAX_LINE_BYTES.saturating_sub(line.len());
+                line.extend_from_slice(&piece[..piece.len().min(room)]);
+            }
+            // The last piece runs on into the next chunk.
+            if pieces.peek().is_none() {
+                break;
+            }
+            if wanted.contains(&index) {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                lines.push(take_line(&mut line));
+            }
+            index += 1;
+        }
+        let n = chunk.len();
+        last = chunk.last().copied();
+        reader.consume(n);
+    }
+    // A last line without a newline counts too.
+    if last.is_some_and(|b| b != b'\n') {
+        if wanted.contains(&index) {
+            lines.push(take_line(&mut line));
+        }
+        index += 1;
+    }
+    Ok(Window { lines, total: index })
 }
 
 /// Renders up to `limit` lines starting at 1-based `offset` in `cat -n`
@@ -98,20 +159,30 @@ impl Tool for ReadTool {
 pub(crate) fn number_lines(text: &str, offset: usize, limit: usize) -> Result<String, String> {
     let offset = offset.max(1);
     let limit = limit.max(1);
-    let total = text.lines().count();
+    render(text.lines().skip(offset - 1).take(limit), offset, limit, text.lines().count())
+}
+
+/// Renders `lines`, which start at 1-based `offset` (at least 1) and are at
+/// most `limit` (at least 1) of the `total`.
+fn render<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    offset: usize,
+    limit: usize,
+    total: usize,
+) -> Result<String, String> {
     if offset > total {
         return Err(format!("offset {offset} is past the end ({total} lines)"));
     }
 
     let mut out = String::new();
-    for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+    for (i, line) in (offset - 1..).zip(lines) {
         let line = match line.char_indices().nth(MAX_LINE_CHARS) {
             Some((cut, _)) => format!("{}... [line truncated]", &line[..cut]),
             None => line.to_string(),
         };
         out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
     }
-    let last = (offset - 1 + limit).min(total);
+    let last = (offset - 1).saturating_add(limit).min(total);
     if last < total {
         out.push_str(&format!(
             "... [showing lines {offset}-{last} of {total}; use offset={} to continue]\n",
@@ -154,6 +225,32 @@ mod tests {
         assert!(!out.is_error);
         assert!(out.content.starts_with("     2\tb\n     3\tc\n"));
         assert!(out.content.contains("use offset=4 to continue"));
+    }
+
+    #[tokio::test]
+    async fn reads_across_chunks() {
+        // A line longer than a read chunk, CRLF endings, no final newline.
+        let long = "x".repeat(200_000);
+        let mut content = format!("{long}\r\nshort\r\n");
+        for i in 3..=100_000 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        content.push_str("tail");
+        let f = file_with(content.as_bytes());
+
+        let out = read_tool().run(json!({"path": path(&f), "limit": 2})).await;
+        let first = format!("     1\t{}... [line truncated]\n     2\tshort\n", "x".repeat(MAX_LINE_CHARS));
+        assert_eq!(out.content, format!("{first}... [showing lines 1-2 of 100001; use offset=3 to continue]\n"));
+
+        let out = read_tool().run(json!({"path": path(&f), "offset": 99_999})).await;
+        assert_eq!(out.content, " 99999\tline 99999\n100000\tline 100000\n100001\ttail\n");
+    }
+
+    #[tokio::test]
+    async fn empty_file() {
+        let f = file_with(b"");
+        let out = read_tool().run(json!({"path": path(&f)})).await;
+        assert_eq!(out.content, format!("({} is empty)", path(&f)));
     }
 
     #[tokio::test]
