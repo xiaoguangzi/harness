@@ -28,7 +28,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL` | 隐式的 `anthropic` provider |
 | `OPENAI_API_KEY`、`OPENAI_BASE_URL` | 隐式的 `openai` provider（Responses API） |
 
-| `HARNESS_WEB_TOKEN` | Web UI token（`--web` 绑定非回环地址时必填，未设置则自动生成） |
+| `HARNESS_WEB_TOKEN` | Web UI token（未设置则启动时自动生成） |
 
 ## Web UI
 
@@ -39,7 +39,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 - **模型配置 (Models)**：当前生效的 provider 和模型，以及 `.harness/providers.json`（或 `$HARNESS_PROVIDERS`）的表单或原始 JSON 编辑器。保存时会先对照其他配置文件和环境进行校验，然后无需重启即生效；空闲任务会切换到新配置。
 - **Agents / Skills / MCP**：发现了哪些内容，以及哪些 MCP 服务器已连接。
 
-即使没有可用的 provider，服务器也会启动，因此可以在浏览器里配置第一个模型。该 API 能执行命令，所以做了防护：绑定回环地址时，请求必须使用回环主机名（防 DNS rebinding），且改变状态的请求需要 `X-Harness` 请求头（防跨站请求）；绑定其他任何地址时还需要 token，启动时会打印带有 token 的 URL（`http://HOST:PORT/#token=...`）。
+即使没有可用的 provider，服务器也会启动，因此可以在浏览器里配置第一个模型。该 API 能执行命令，所以做了防护：每个 API 请求都需要 token，绑定回环地址时也不例外（本机其他用户同样能访问回环端口），启动时会打印带有 token 的 URL（`http://HOST:PORT/#token=...`，浏览器会记住它，之后新开的标签页也能用）；绑定回环地址时，请求还必须使用回环主机名（防 DNS rebinding）；改变状态的请求需要 `X-Harness` 请求头（防跨站请求）。UI 保存的 providers 文件只有其所有者可读。
 
 | 端点 | 说明 |
 |---|---|

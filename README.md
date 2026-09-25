@@ -27,7 +27,7 @@ cargo run --release -- --web             # web UI at http://localhost:8787 (see 
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | implicit `anthropic` provider |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | implicit `openai` provider (Responses API) |
 
-| `HARNESS_WEB_TOKEN` | web UI token (required, and generated if unset, when `--web` binds a non-loopback address) |
+| `HARNESS_WEB_TOKEN` | web UI token (generated at startup if unset) |
 
 ## Web UI
 
@@ -38,7 +38,7 @@ cargo run --release -- --web             # web UI at http://localhost:8787 (see 
 - **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for `.harness/providers.json` (or `$HARNESS_PROVIDERS`). A save is validated against the other config files and the environment first, then applied without a restart; idle tasks move to the new config.
 - **Agents / Skills / MCP**: what was discovered and which MCP servers connected.
 
-The server starts even without a usable provider, so the first model can be configured in the browser. The API can run commands, so it is guarded: on a loopback address, requests must use a loopback host name (no DNS rebinding) and state-changing requests need an `X-Harness` header (no cross-site requests); on any other address a token is also required, and the startup line prints a URL that carries it (`http://HOST:PORT/#token=...`).
+The server starts even without a usable provider, so the first model can be configured in the browser. The API can run commands, so it is guarded: every API request needs a token, even on a loopback address (other users of the machine can reach that too), and the startup line prints a URL that carries it (`http://HOST:PORT/#token=...`; the browser remembers it for later tabs); on a loopback address, requests must also use a loopback host name (no DNS rebinding); and state-changing requests need an `X-Harness` header (no cross-site requests). The providers file the UI saves is readable by its owner only.
 
 | Endpoint | |
 |---|---|

@@ -162,8 +162,8 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 let token = "";
 try {
   const m = location.hash.match(/token=([^&]+)/);
-  if (m) { token = m[1]; sessionStorage.setItem("harness-token", token); history.replaceState(null, "", location.pathname); }
-  else token = sessionStorage.getItem("harness-token") || "";
+  if (m) { token = m[1]; localStorage.setItem("harness-token", token); history.replaceState(null, "", location.pathname); }
+  else token = localStorage.getItem("harness-token") || "";
 } catch (e) {}
 
 async function api(method, path, body) {

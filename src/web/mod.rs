@@ -2,11 +2,12 @@
 //! API behind it) for configuring model gateways, dispatching tasks to the
 //! main agent or a subagent type, and calling tools directly.
 //!
-//! The API can run shell commands, so it is guarded: requests must name a
-//! loopback host unless the server listens on another address, which then
-//! requires a token (`HARNESS_WEB_TOKEN`, or one generated at startup);
-//! state-changing requests must carry an `X-Harness` header, which a
-//! cross-site form or script cannot send without a CORS preflight.
+//! The API can run shell commands, so it is guarded: every API request needs
+//! a token (`HARNESS_WEB_TOKEN`, or one generated at startup), since other
+//! users of the machine can reach a loopback port too; on loopback, requests
+//! must also name a loopback host (no DNS rebinding); state-changing
+//! requests must carry an `X-Harness` header, which a cross-site form or
+//! script cannot send without a CORS preflight.
 
 mod tasks;
 
@@ -83,7 +84,7 @@ struct AppState {
     live: RwLock<Live>,
     tasks: Mutex<BTreeMap<u64, Arc<Task>>>,
     next_id: AtomicU64,
-    token: Option<String>,
+    token: String,
     /// Listening on loopback only: requests must name a loopback host.
     loopback: bool,
 }
@@ -110,10 +111,7 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
         .next()
         .ok_or_else(|| anyhow!("{addr} resolves to no address"))?;
     let loopback = addr.ip().is_loopback();
-    let token = std::env::var("HARNESS_WEB_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .or_else(|| (!loopback).then(random_token));
+    let token = std::env::var("HARNESS_WEB_TOKEN").ok().filter(|t| !t.is_empty()).unwrap_or_else(random_token);
 
     let live = build_live(&setup.tools, &setup.agent_defs, &setup.reporter, setup.providers);
     if let Err(e) = &live.model {
@@ -149,10 +147,7 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
     let shown = if loopback { format!("http://localhost:{}", addr.port()) } else { format!("http://{addr}") };
-    match &state.token {
-        Some(t) => println!("harness web UI: {shown}/#token={t}"),
-        None => println!("harness web UI: {shown}"),
-    }
+    println!("harness web UI: {shown}/#token={}", state.token);
     println!("\x1b[90mCtrl-C to stop\x1b[0m");
     // Open event streams never finish, so stop without waiting for them.
     tokio::select! {
@@ -230,18 +225,16 @@ async fn guard(State(state): State<Shared>, req: Request, next: Next) -> Respons
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
     if req.uri().path().starts_with("/api/") {
-        if let Some(token) = &state.token {
-            let bearer = headers
-                .get(header::AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|h| h.strip_prefix("Bearer "));
-            // EventSource cannot set headers, so the token may come as `?token=`.
-            let query = req.uri().query().unwrap_or("");
-            let from_query = query.split('&').find_map(|kv| kv.strip_prefix("token="));
-            let given = bearer.or(from_query).unwrap_or("");
-            if !constant_time_eq(given.as_bytes(), token.as_bytes()) {
-                return api_error(StatusCode::UNAUTHORIZED, "missing or wrong token").into_response();
-            }
+        let bearer = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
+        // EventSource cannot set headers, so the token may come as `?token=`.
+        let query = req.uri().query().unwrap_or("");
+        let from_query = query.split('&').find_map(|kv| kv.strip_prefix("token="));
+        let given = bearer.or(from_query).unwrap_or("");
+        if !constant_time_eq(given.as_bytes(), state.token.as_bytes()) {
+            return api_error(StatusCode::UNAUTHORIZED, "missing or wrong token; open the URL the server printed at startup").into_response();
         }
         if req.method() != Method::GET && !headers.contains_key("x-harness") {
             return api_error(StatusCode::FORBIDDEN, "missing X-Harness header").into_response();
@@ -356,7 +349,7 @@ async fn save_config(State(state): State<Shared>, Json(req): Json<SaveConfig>) -
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| bad_request(format!("creating {}: {e}", dir.display())))?;
     }
-    std::fs::write(&path, &req.text).map_err(|e| bad_request(format!("writing {}: {e}", path.display())))?;
+    write_private(&path, &req.text).map_err(|e| bad_request(format!("writing {}: {e}", path.display())))?;
 
     let live = build_live(&state.base_tools, &state.agent_defs, &state.reporter, Ok(providers));
     // Idle tasks move to the new providers, keeping their model if it still
@@ -376,6 +369,16 @@ async fn save_config(State(state): State<Shared>, Json(req): Json<SaveConfig>) -
     *state.live.write().unwrap() = live;
     let info = info(State(state)).await.0;
     Ok(Json(json!({"info": info, "running_tasks_kept_old_config": skipped})))
+}
+
+/// Writes a file only its owner can read, as it may hold API keys; an
+/// existing file is narrowed to that too.
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(text.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +635,21 @@ mod tests {
     fn masks_secrets() {
         assert_eq!(mask("short"), "••••");
         assert_eq!(mask("sk-ant-api03-abcdefgh"), "sk-a…efgh");
+    }
+
+    #[test]
+    fn private_config_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        write_private(&path, "{}").unwrap();
+        assert_eq!(mode(&path), 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, "{\"a\": 1}").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\": 1}");
     }
 
     #[test]
