@@ -298,7 +298,12 @@ impl Manager {
     pub async fn start(configs: &BTreeMap<String, ServerConfig>, registry: &mut ToolRegistry) -> Self {
         let connections = futures::future::join_all(configs.iter().map(|(name, cfg)| async move {
             let server = Server::connect(name, cfg).await?;
-            let tools = server.service.list_all_tools().await.map_err(|e| anyhow!("tools/list failed: {e}"))?;
+            // Every page counts: a server that keeps returning cursors must
+            // not hold up startup either.
+            let tools = tokio::time::timeout(CONNECT_TIMEOUT, server.service.list_all_tools())
+                .await
+                .map_err(|_| anyhow!("timed out after {}s listing tools", CONNECT_TIMEOUT.as_secs()))?
+                .map_err(|e| anyhow!("tools/list failed: {e}"))?;
             Ok::<_, anyhow::Error>((server, tools))
         }))
         .await;
