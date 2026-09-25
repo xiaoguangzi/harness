@@ -229,7 +229,7 @@ impl AgentTool {
         registry
     }
 
-    fn system_prompt(def: &AgentDef) -> String {
+    pub fn system_prompt(def: &AgentDef) -> String {
         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
         format!(
             "{}\n\nThe working directory is {cwd}. You were started by another agent, which sees only \

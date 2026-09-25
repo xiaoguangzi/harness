@@ -13,6 +13,7 @@ A minimal coding-agent harness in Rust. It talks to any mix of LLM gateways that
 export ANTHROPIC_API_KEY=sk-ant-...     # or OPENAI_API_KEY, or configure gateways (below)
 cargo run --release                      # interactive REPL (/exit to quit)
 cargo run --release -- "list the files"  # one-shot
+cargo run --release -- --web             # web UI at http://localhost:8787 (see below)
 ```
 
 | Variable | Default |
@@ -23,6 +24,28 @@ cargo run --release -- "list the files"  # one-shot
 | `HARNESS_PROVIDERS` | read only this providers file |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | implicit `anthropic` provider |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | implicit `openai` provider (Responses API) |
+
+| `HARNESS_WEB_TOKEN` | web UI token (required, and generated if unset, when `--web` binds a non-loopback address) |
+
+## Web UI
+
+`harness --web` (or `--web=ADDR`, default `127.0.0.1:8787`) starts a browser UI instead of the REPL:
+
+- **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results (subagent progress shows under its `agent` call). Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands are killed) or delete it. `@path` mentions and `/<skill> args` work as in the REPL.
+- **工具 (Tools)**: every registered tool (built-in, skill, MCP, `agent`) with its description and schema; fill in JSON input and call it directly.
+- **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for `.harness/providers.json` (or `$HARNESS_PROVIDERS`). A save is validated against the other config files and the environment first, then applied without a restart; idle tasks move to the new config.
+- **Agents / Skills / MCP**: what was discovered and which MCP servers connected.
+
+The server starts even without a usable provider, so the first model can be configured in the browser. The API can run commands, so it is guarded: on a loopback address, requests must use a loopback host name (no DNS rebinding) and state-changing requests need an `X-Harness` header (no cross-site requests); on any other address a token is also required, and the startup line prints a URL that carries it (`http://HOST:PORT/#token=...`).
+
+| Endpoint | |
+|---|---|
+| `GET /api/info` | active providers, the editable config file, agents, skills, MCP status |
+| `POST /api/config` `{text}` | validate, save and apply the providers file |
+| `GET /api/tools`, `POST /api/tools/{name}` `{input}` | list / call tools |
+| `GET/POST /api/tasks` `{prompt, agent?, model?, title?}` | list / create tasks |
+| `POST /api/tasks/{id}/messages` `{prompt}`, `/model` `{model}`, `/cancel`; `DELETE /api/tasks/{id}` | drive a task |
+| `GET /api/tasks/{id}/events` | server-sent events: the task's log replayed, then live (resumes via `Last-Event-ID`) |
 
 ## LLM gateways
 
@@ -158,7 +181,8 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 
 ## Layout
 
-- `src/main.rs` — CLI frontend (REPL / one-shot) and terminal output
+- `src/main.rs` — startup, CLI frontend (REPL / one-shot) and terminal output
+- `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`
 - `src/llm/` — LLM gateways
   - `config.rs` — `providers.json`, model spec resolution, per-provider/model settings

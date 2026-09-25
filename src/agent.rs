@@ -25,11 +25,14 @@ pub struct Agent {
     tools: ToolRegistry,
     system: String,
     messages: Vec<Message>,
+    /// History length when the running turn started; still set on the next
+    /// turn only if the previous one was cancelled (its future dropped).
+    turn_start: Option<usize>,
 }
 
 impl Agent {
     pub fn new(client: Client, tools: ToolRegistry, system: impl Into<String>) -> Self {
-        Self { client, tools, system: system.into(), messages: Vec::new() }
+        Self { client, tools, system: system.into(), messages: Vec::new(), turn_start: None }
     }
 
     /// The `provider/model` in use.
@@ -50,6 +53,11 @@ impl Agent {
         &self.tools
     }
 
+    /// Replaces the tool set, e.g. after the providers were reloaded.
+    pub fn set_tools(&mut self, tools: ToolRegistry) {
+        self.tools = tools;
+    }
+
     /// Text of the last assistant message: a subagent's answer.
     pub fn last_text(&self) -> String {
         let Some(last) = self.messages.iter().rev().find(|m| m.role == "assistant") else {
@@ -65,12 +73,17 @@ impl Agent {
     /// ever grows by appending, so earlier turns (and their thinking blocks)
     /// stay intact.
     pub async fn run_turn(&mut self, content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
+        if let Some(cancelled) = self.turn_start.take() {
+            self.repair_after_error(cancelled);
+        }
         let turn_start = self.messages.len();
+        self.turn_start = Some(turn_start);
         self.messages.push(Message::user(content));
         let result = self.run_loop(observer).await;
         if result.is_err() {
             self.repair_after_error(turn_start);
         }
+        self.turn_start = None;
         result
     }
 
