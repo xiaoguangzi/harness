@@ -5,10 +5,12 @@ use anyhow::{Result, bail};
 use futures::future::join_all;
 use serde_json::{Value, json};
 
-use crate::llm::{Client, Message, StreamEvent};
+use crate::llm::{Client, Message, StreamEvent, Usage};
 use crate::tools::{ToolOutput, ToolRegistry};
 
 const MAX_ITERATIONS: usize = 50;
+/// Told to the model about a turn the user cancelled.
+const INTERRUPTED: &str = "[Interrupted by the user]";
 
 /// Receives progress events so the frontend decides how to display them.
 pub trait Observer: Send {
@@ -18,6 +20,8 @@ pub trait Observer: Send {
     fn on_text_end(&mut self);
     fn on_tool_call(&mut self, name: &str, input: &Value);
     fn on_tool_result(&mut self, name: &str, content: &str, is_error: bool);
+    /// Token counts of a finished request.
+    fn on_usage(&mut self, _usage: &Usage) {}
 }
 
 pub struct Agent {
@@ -58,14 +62,21 @@ impl Agent {
         self.tools = tools;
     }
 
-    /// Text of the last assistant message: a subagent's answer.
+    /// Forgets the conversation.
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.turn_start = None;
+    }
+
+    /// Text of the last assistant message: a subagent's answer. Its text
+    /// blocks are one run of text, possibly split mid-sentence.
     pub fn last_text(&self) -> String {
         let Some(last) = self.messages.iter().rev().find(|m| m.role == "assistant") else {
             return String::new();
         };
         let texts: Vec<&str> =
             last.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
-        texts.join("\n")
+        texts.concat()
     }
 
     /// Runs one user turn to completion. `content` is the user message's
@@ -73,8 +84,8 @@ impl Agent {
     /// ever grows by appending, so earlier turns (and their thinking blocks)
     /// stay intact.
     pub async fn run_turn(&mut self, content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
-        if let Some(cancelled) = self.turn_start.take() {
-            self.repair_after_error(cancelled);
+        if self.turn_start.take().is_some() {
+            self.repair_after_interrupt();
         }
         let turn_start = self.messages.len();
         self.turn_start = Some(turn_start);
@@ -104,6 +115,30 @@ impl Agent {
         }
     }
 
+    /// Leaves the history valid after a cancelled turn, keeping what the
+    /// user asked for so the model knows the request was cut short. Tool
+    /// calls that never finished get error results saying so.
+    fn repair_after_interrupt(&mut self) {
+        let Some(last) = self.messages.last_mut() else { return };
+        let note = json!({"type": "text", "text": INTERRUPTED});
+        if last.role == "user" {
+            last.content.push(note);
+            return;
+        }
+        let mut results: Vec<Value> = last
+            .content
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|t| {
+                json!({"type": "tool_result", "tool_use_id": t["id"], "content": INTERRUPTED, "is_error": true})
+            })
+            .collect();
+        if !results.is_empty() {
+            results.push(note);
+            self.messages.push(Message::user(results));
+        }
+    }
+
     async fn run_loop(&mut self, observer: &mut dyn Observer) -> Result<()> {
         let definitions = self.tools.definitions();
 
@@ -114,6 +149,9 @@ impl Agent {
             };
             let response =
                 self.client.create(&self.system, &definitions, &self.messages, &mut on_event).await?;
+            if let Some(usage) = &response.usage {
+                observer.on_usage(usage);
+            }
             let stop_reason = response.stop_reason.as_deref().unwrap_or("");
 
             if stop_reason == "refusal" {
@@ -172,5 +210,53 @@ impl Agent {
         }
 
         bail!("stopped after {MAX_ITERATIONS} iterations without the model finishing")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::Providers;
+    use crate::llm::config::tests::{file, no_env};
+
+    fn agent(messages: Vec<Message>) -> Agent {
+        let file = file(json!({
+            "default_model": "gw/m",
+            "providers": {"gw": {"protocol": "anthropic", "base_url": "http://127.0.0.1:9", "api_key": "k"}}
+        }));
+        let client = Client::new(Providers::from_parts(vec![file], &no_env).unwrap()).unwrap();
+        let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
+        agent.messages = messages;
+        agent
+    }
+
+    fn text(t: &str) -> Value {
+        json!({"type": "text", "text": t})
+    }
+
+    #[test]
+    fn an_interrupted_request_is_kept_with_a_note() {
+        let mut a = agent(vec![Message::user(vec![text("do it")])]);
+        a.repair_after_interrupt();
+        assert_eq!(a.messages.len(), 1);
+        assert_eq!(a.messages[0].content, vec![text("do it"), text(INTERRUPTED)]);
+    }
+
+    #[test]
+    fn interrupted_tool_calls_get_error_results() {
+        let call = json!({"type": "tool_use", "id": "t1", "name": "bash", "input": {}});
+        let mut a = agent(vec![
+            Message::user(vec![text("run it")]),
+            Message { role: "assistant", content: vec![text("ok"), call], source: None },
+        ]);
+        a.repair_after_interrupt();
+        assert_eq!(a.messages.len(), 3);
+        assert_eq!(
+            a.messages[2].content,
+            vec![
+                json!({"type": "tool_result", "tool_use_id": "t1", "content": INTERRUPTED, "is_error": true}),
+                text(INTERRUPTED),
+            ]
+        );
     }
 }

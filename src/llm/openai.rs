@@ -21,7 +21,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use super::config::Target;
-use super::{Message, Response, StreamEvent, ToolDef, http, parse_tool_input, same_source};
+use super::{Message, Response, StreamEvent, ToolDef, Usage, http, parse_tool_input, same_source};
 
 pub(super) async fn create(
     http_client: &reqwest::Client,
@@ -233,6 +233,13 @@ impl Accumulator {
         }
 
         let mut response = Response::default();
+        let usage = &final_response["usage"];
+        if usage.is_object() {
+            response.usage = Some(Usage {
+                input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+                output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+            });
+        }
         let mut has_calls = false;
         for item in &self.items {
             match item["type"].as_str().unwrap_or("") {
@@ -401,9 +408,11 @@ mod tests {
                    "item": {"type": "function_call", "call_id": "c1", "name": "grep", "arguments": "{\"pattern\": \"x\"}"}}),
             json!({"type": "response.output_item.done", "output_index": 3,
                    "item": {"type": "function_call", "call_id": "c2", "name": "write", "arguments": "{\"path\": "}}),
-            json!({"type": "response.completed", "response": {"status": "completed"}}),
+            json!({"type": "response.completed", "response": {"status": "completed",
+                   "usage": {"input_tokens": 120, "output_tokens": 30}}}),
         ]);
         assert_eq!(streamed, "你好|");
+        assert_eq!(resp.usage, Some(Usage { input_tokens: 120, output_tokens: 30 }));
         assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(
             resp.content,

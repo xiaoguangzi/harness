@@ -2,6 +2,17 @@
 
 use serde_json::Value;
 
+/// Held by tests that change the process-wide working directory, and by
+/// tests whose child processes would inherit it.
+#[cfg(test)]
+pub static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`CWD_LOCK`], even if a test panicked while holding it.
+#[cfg(test)]
+pub fn lock_cwd() -> std::sync::MutexGuard<'static, ()> {
+    CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Cuts `s` to at most `max_chars` characters, marking a cut with "…".
 pub fn ellipsize(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {

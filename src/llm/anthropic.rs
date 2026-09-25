@@ -107,6 +107,10 @@ struct Accumulator {
     response: Response,
     /// Block index -> accumulated `input_json_delta` fragments.
     partial_json: HashMap<usize, String>,
+    /// Whether text has streamed since the last `TextEnd`. Consecutive text
+    /// blocks (split by citations, or by gateways that open a block per
+    /// chunk) are one run of text, ended by a tool call or the message end.
+    text_open: bool,
 }
 
 impl Accumulator {
@@ -120,6 +124,10 @@ impl Accumulator {
                     content.resize(index + 1, Value::Null);
                 }
                 content[index] = event["content_block"].clone();
+                let kind = content[index]["type"].as_str().unwrap_or("");
+                if !matches!(kind, "text" | "thinking" | "redacted_thinking") && std::mem::take(&mut self.text_open) {
+                    on_event(StreamEvent::TextEnd);
+                }
             }
             "content_block_delta" => {
                 let index = event["index"].as_u64().unwrap_or(0) as usize;
@@ -131,6 +139,7 @@ impl Accumulator {
                     "text_delta" => {
                         let text = delta["text"].as_str().unwrap_or("");
                         append_str(block, "text", text);
+                        self.text_open = true;
                         on_event(StreamEvent::TextDelta(text));
                     }
                     "thinking_delta" => append_str(block, "thinking", delta["thinking"].as_str().unwrap_or("")),
@@ -152,23 +161,23 @@ impl Accumulator {
                 let Some(block) = content.get_mut(index) else {
                     bail!("stop for unknown content block {index}");
                 };
-                match block["type"].as_str().unwrap_or("") {
-                    "text" => on_event(StreamEvent::TextEnd),
-                    "tool_use" => {
-                        let raw = self.partial_json.remove(&index).unwrap_or_default();
-                        match parse_tool_input(&raw) {
-                            Some(input) => block["input"] = input,
-                            None => {
-                                block["input"] = json!({});
-                                let id = block["id"].as_str().unwrap_or("").to_string();
-                                self.response.invalid_tool_inputs.insert(id, raw);
-                            }
+                if block["type"] == "tool_use" {
+                    let raw = self.partial_json.remove(&index).unwrap_or_default();
+                    match parse_tool_input(&raw) {
+                        Some(input) => block["input"] = input,
+                        None => {
+                            block["input"] = json!({});
+                            let id = block["id"].as_str().unwrap_or("").to_string();
+                            self.response.invalid_tool_inputs.insert(id, raw);
                         }
                     }
-                    _ => {}
                 }
             }
+            // Usage comes at message_start and, cumulatively, at
+            // message_delta; some gateways only fill in the latter.
+            "message_start" => self.apply_usage(&event["message"]["usage"]),
             "message_delta" => {
+                self.apply_usage(&event["usage"]);
                 let delta = &event["delta"];
                 if let Some(reason) = delta["stop_reason"].as_str() {
                     self.response.stop_reason = Some(reason.to_string());
@@ -177,11 +186,33 @@ impl Accumulator {
                     self.response.stop_details = Some(delta["stop_details"].clone());
                 }
             }
-            "message_stop" => return Ok(true),
+            "message_stop" => {
+                if std::mem::take(&mut self.text_open) {
+                    on_event(StreamEvent::TextEnd);
+                }
+                return Ok(true);
+            }
             "error" => bail!("API stream error: {}", event["error"]),
-            _ => {} // message_start, ping, and future event types
+            _ => {} // ping, and future event types
         }
         Ok(false)
+    }
+
+    fn apply_usage(&mut self, usage: &Value) {
+        if !usage.is_object() {
+            return;
+        }
+        let input: Vec<u64> = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+            .iter()
+            .filter_map(|k| usage[k].as_u64())
+            .collect();
+        let total = self.response.usage.get_or_insert_default();
+        if input.iter().sum::<u64>() > 0 {
+            total.input_tokens = input.iter().sum();
+        }
+        if let Some(output) = usage["output_tokens"].as_u64() {
+            total.output_tokens = output;
+        }
     }
 
     fn finish(mut self) -> Response {
@@ -217,6 +248,7 @@ fn content_for_history(content: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::Usage;
     use crate::llm::Providers;
     use crate::llm::config::tests::{file, no_env};
 
@@ -281,7 +313,8 @@ mod tests {
     #[test]
     fn assembles_streamed_blocks() {
         let (resp, streamed) = run_events(&[
-            json!({"type": "message_start", "message": {"content": []}}),
+            json!({"type": "message_start", "message": {"content": [], "usage":
+                {"input_tokens": 10, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 5, "output_tokens": 1}}}),
             json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}),
             json!({"type": "content_block_stop", "index": 0}),
@@ -293,10 +326,11 @@ mod tests {
             json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": "}}),
             json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "\"ls\"}"}}),
             json!({"type": "content_block_stop", "index": 2}),
-            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 42}}),
             json!({"type": "message_stop"}),
         ]);
         assert_eq!(streamed, "Hello|");
+        assert_eq!(resp.usage, Some(Usage { input_tokens: 115, output_tokens: 42 }));
         assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(
             resp.content,
@@ -307,6 +341,32 @@ mod tests {
             ]
         );
         assert!(resp.invalid_tool_inputs.is_empty());
+    }
+
+    #[test]
+    fn text_split_across_blocks_is_one_run() {
+        let empty_thinking = json!({"type": "thinking", "thinking": ""});
+        let (_, streamed) = run_events(&[
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "R"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": empty_thinking}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "ust"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "message_stop"}),
+        ]);
+        assert_eq!(streamed, "Rust|");
+    }
+
+    #[test]
+    fn reads_usage_reported_at_the_end() {
+        let (resp, _) = run_events(&[
+            json!({"type": "message_start", "message": {"content": [], "usage": {"input_tokens": 0, "output_tokens": 0}}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"input_tokens": 816, "output_tokens": 46}}),
+        ]);
+        assert_eq!(resp.usage, Some(Usage { input_tokens: 816, output_tokens: 46 }));
     }
 
     #[test]

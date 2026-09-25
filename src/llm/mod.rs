@@ -68,6 +68,16 @@ pub struct Response {
     /// `tool_use` id -> raw input text, for tool calls whose streamed input
     /// was not a valid JSON object. Their `input` in `content` is `{}`.
     pub invalid_tool_inputs: HashMap<String, String>,
+    /// Token counts, when the gateway reports them.
+    pub usage: Option<Usage>,
+}
+
+/// Token counts of one request.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Usage {
+    /// Every input token, cached or not: the size of the context sent.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// A handle on one model at one provider. Cheap to clone.

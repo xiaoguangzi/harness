@@ -261,8 +261,7 @@ mod tests {
     /// mentions can use relative paths. Tests using it hold a lock because
     /// the working directory is process-wide.
     fn in_temp_dir(f: impl FnOnce(&Path)) {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::util::lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let old = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();

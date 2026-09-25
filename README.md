@@ -107,17 +107,23 @@ Mention a path with `@` and its contents are attached to your message, so the mo
 
 Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trailing punctuation is ignored. Only existing paths are attached, and an `@` right after an e-mail-style character is left alone, so `me@example.com` stays text. In the REPL, Tab completes paths after `@` and commands after `/`. Attached text files count as read for the `write` tool. The REPL also keeps line-editing history in `~/.harness/history`.
 
-## REPL commands
+## REPL
 
-| Command | |
+The assistant's Markdown is rendered as it streams (a line at a time; tables are aligned once complete). Tool calls show as `● bash(cargo test)` with the first lines of their result, subagent calls are listed under their `agent` call, and a spinner shows what is running. Each turn ends with its time, output tokens and context size. When stdout is not a terminal (or `NO_COLOR` is set), text is printed as is, without styling or the summary; in one-shot mode errors go to stderr and the exit code is non-zero.
+
+| Command / key | |
 |---|---|
 | `/help` | list commands |
-| `/skills` | list discovered skills |
 | `/model [spec]` | show providers and models, or switch to `<provider>/<model>` |
+| `/clear` | start a new conversation |
+| `/skills` | list discovered skills |
 | `/agents` | list subagent types, their permission and tools |
 | `/mcp` | list MCP servers, their tools and log files |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
-| `/exit` | quit |
+| `/exit`, Ctrl-D | quit |
+| Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted. At the prompt, press it twice to quit |
+| `\` at line end, Alt+Enter | continue the message on a new line |
+| Tab | complete `@paths` and `/commands` |
 
 ## MCP servers
 
@@ -181,7 +187,8 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 
 ## Layout
 
-- `src/main.rs` — startup, CLI frontend (REPL / one-shot) and terminal output
+- `src/main.rs` — startup: config, tools, skills, MCP servers, agents; then the CLI or web frontend
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), rustyline helper with completion, hints and multi-line input (`repl.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`
 - `src/llm/` — LLM gateways
@@ -190,7 +197,6 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST with retries, SSE reader
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks
-- `src/repl.rs` — rustyline helper: Tab completion of `@paths` and `/commands`
 - `src/subagent.rs` — subagent definitions (built-in `explore`, custom files), permissions, the `agent` tool
 - `src/mcp.rs` — MCP client: config loading, server connections, `mcp__*` tool adapters
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool

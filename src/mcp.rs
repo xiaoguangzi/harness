@@ -134,6 +134,10 @@ impl Server {
                 let log = std::fs::File::create(log_path(name)).context("creating MCP log file")?;
                 let cmd = tokio::process::Command::new(&command).configure(|c| {
                     c.args(&args).envs(&env);
+                    // Its own process group, so Ctrl-C in the terminal (which
+                    // interrupts a turn) doesn't reach the server.
+                    #[cfg(unix)]
+                    c.process_group(0);
                 });
                 let (transport, _) = TokioChildProcess::builder(cmd)
                     .stderr(Stdio::from(log))

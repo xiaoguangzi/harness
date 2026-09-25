@@ -113,15 +113,24 @@ impl Tool for BashTool {
 mod tests {
     use super::*;
 
+    /// Runs the tool in the harness's working directory, which the
+    /// `mentions` tests change for a moment. Each test has its own
+    /// single-threaded runtime, so holding the lock across the await is fine.
+    #[allow(clippy::await_holding_lock)]
+    async fn run(input: Value) -> ToolOutput {
+        let _guard = crate::util::lock_cwd();
+        BashTool.run(input).await
+    }
+
     #[tokio::test]
     async fn captures_stdout() {
-        let out = BashTool.run(json!({"command": "echo hello"})).await;
+        let out = run(json!({"command": "echo hello"})).await;
         assert_eq!(out, ToolOutput::ok("hello\n"));
     }
 
     #[tokio::test]
     async fn nonzero_exit_is_error() {
-        let out = BashTool.run(json!({"command": "echo oops >&2; exit 3"})).await;
+        let out = run(json!({"command": "echo oops >&2; exit 3"})).await;
         assert!(out.is_error);
         assert!(out.content.contains("[stderr]\noops"));
         assert!(out.content.contains("[exit code 3]"));
@@ -129,14 +138,14 @@ mod tests {
 
     #[tokio::test]
     async fn times_out() {
-        let out = BashTool.run(json!({"command": "sleep 5", "timeout_ms": 100})).await;
+        let out = run(json!({"command": "sleep 5", "timeout_ms": 100})).await;
         assert!(out.is_error);
         assert!(out.content.contains("timed out"));
     }
 
     #[tokio::test]
     async fn rejects_bad_input() {
-        let out = BashTool.run(json!({"command": "ls", "extra": 1})).await;
+        let out = run(json!({"command": "ls", "extra": 1})).await;
         assert!(out.is_error);
         assert!(out.content.starts_with("Invalid input"));
     }
