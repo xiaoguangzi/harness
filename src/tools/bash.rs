@@ -9,6 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use super::{Tool, ToolOutput, parse_input, truncate_counting};
+use crate::sandbox;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -16,7 +17,8 @@ const MAX_OUTPUT_BYTES: usize = 30_000;
 /// How long to keep reading output once bash has exited.
 const PIPE_GRACE: Duration = Duration::from_millis(200);
 
-/// Runs a command with `bash -c` in the harness working directory.
+/// Runs a command with `bash -c` in the harness working directory, in the
+/// sandbox when it is on.
 pub struct BashTool;
 
 #[derive(Deserialize)]
@@ -67,14 +69,22 @@ impl Tool for BashTool {
         };
         let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
-        let child = Command::new("bash")
-            .arg("-c")
-            .arg(&input.command)
+        // Its own process group, so its children can be killed with it.
+        let (mut command, _sandboxed) = match sandbox::active() {
+            Some(sandbox) => match sandbox.command("bash", ["-c", &input.command]) {
+                Ok((command, guard)) => (command, Some(guard)),
+                Err(e) => return ToolOutput::error(format!("Failed to spawn bash: {e}")),
+            },
+            None => {
+                let mut command = Command::new("bash");
+                command.arg("-c").arg(&input.command).process_group(0);
+                (command, None)
+            }
+        };
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Its own process group, so its children can be killed with it.
-            .process_group(0)
             .kill_on_drop(true)
             .spawn();
         let mut child = match child {

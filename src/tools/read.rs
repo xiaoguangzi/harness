@@ -72,6 +72,11 @@ impl Tool for ReadTool {
             Err(e) => return e,
         };
 
+        if let Some(sandbox) = crate::sandbox::active()
+            && let Err(e) = sandbox.check_read(input.path.as_ref())
+        {
+            return ToolOutput::error(e);
+        }
         let offset = input.offset.unwrap_or(1).max(1);
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).max(1);
         let window = match read_window(&input.path, offset, limit).await {

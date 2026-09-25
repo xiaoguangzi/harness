@@ -17,6 +17,7 @@ cargo run --release                      # 交互式 REPL（/exit 退出）
 cargo run --release -- "list the files"  # 一次性模式
 cargo run --release -- --continue        # 继续当前目录最近的会话（见下文）
 cargo run --release -- --web             # Web UI，地址 http://localhost:8787（见下文）
+cargo run --release -- --sandbox         # 在操作系统沙箱中运行模型的命令（见下文）
 ```
 
 | 环境变量 | 默认值 |
@@ -28,7 +29,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 | `HARNESS_PROVIDERS` | 只读取这个 providers 文件 |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL` | 隐式的 `anthropic` provider |
 | `OPENAI_API_KEY`、`OPENAI_BASE_URL` | 隐式的 `openai` provider（Responses API） |
-
+| `HARNESS_SANDBOX` | `1` 或 `0`：开启或关闭[沙箱](#沙箱)（`--sandbox` / `--no-sandbox` 参数优先） |
 | `HARNESS_WEB_TOKEN` | Web UI token（未设置则启动时自动生成） |
 
 ## Web UI
@@ -127,6 +128,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 | `/skills` | 列出发现的技能 |
 | `/agents` | 列出子代理类型及其权限和工具 |
 | `/mcp` | 列出 MCP 服务器、其工具和日志文件 |
+| `/sandbox` | 显示沙箱允许的操作（见[沙箱](#沙箱)） |
 | `/<skill> [args]` | 直接运行一个技能（一次性模式同样可用：`harness /greet Bob`） |
 | `/exit`、`exit`、Ctrl-D | 退出（`exit` 或 `quit` 仅在单独占一行时生效） |
 | Ctrl-C | 中断运行中的轮次：运行中的命令被终止，并告知模型请求已被中断。在提示符处连按两次退出 |
@@ -146,6 +148,28 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 | `/resume`、`/resume <id>` | 在 REPL 内做同样的事 |
 
 它们可以与一次性模式组合：`harness -c "now run the tests"` 或 `harness -r <id> "..."`（一次性模式下 `--resume` 需要给出 id）。恢复的会话沿用原来的 id；若上次使用的模型仍在配置中，则切换回该模型；在 REPL 中会重新显示最后几轮。推理块会被保留，因此仍会发回给产生它的模型。`write` 工具的已读记录不会保存：模型在覆盖文件前需要重新读取。Web UI 的任务不会保存。
+
+## 沙箱
+
+`harness --sandbox`（或 `HARNESS_SANDBOX=1`，或在 `~/.harness/sandbox.json` 中写 `"enabled": true`）让模型的 `bash` 命令和 `grep` 搜索在操作系统沙箱里运行：macOS 用系统自带的 Seatbelt（`sandbox-exec`），Linux 用 [bubblewrap](https://github.com/containers/bubblewrap)（`apt install bubblewrap` / `dnf install bubblewrap`；它需要非特权用户命名空间，有些容器里没有）。`--no-sandbox` 或 `HARNESS_SANDBOX=0` 可以单次关闭。沙箱无法启动时，harness 直接退出，不会在没有沙箱的情况下运行。
+
+- **读**：除 `deny_read` 以外都可读。
+- **写**：只能写工作目录、临时目录（`/tmp`、`/var/tmp`、`$TMPDIR`，macOS 上还有每用户的临时和缓存目录）以及 `allow_write`。工作目录中的 `.harness/`、`.claude/`、`.mcp.json`，以及 git 仓库中的 `.git/hooks/` 和 `.git/config` 保持只读，因为它们会让代码之后在沙箱外运行（MCP 服务器、hooks、`core.fsmonitor`）；`.git` 本身不能被重命名或删除。
+- **网络**：只允许回环地址（本地服务和测试可用，DNS 和外连会失败），除非设置 `"network": true`。
+- 命令在没有终端的新会话中运行。Linux 上还有独立的 PID 命名空间，后台任务随命令一起结束；macOS 上无法运行 setuid 程序（`sudo`、`ps`）。
+
+`read` 和 `write` 工具按同样的规则检查。`/sandbox` 显示这些规则，REPL 横幅会显示 `sandboxed`，系统提示词也会告诉模型这些限制，让它报告被拦截的操作，而不是设法绕过。MCP 服务器和 harness 本身不在沙箱中。
+
+```json
+{
+  "enabled": true,
+  "network": false,
+  "allow_write": ["~/.cargo/registry", "~/.npm"],
+  "deny_read": ["~/.ssh", "~/.aws", ".env"]
+}
+```
+
+路径支持 `~/` 和 `${VAR}`，相对路径相对于工作目录。规则重叠时更深的路径优先，所以 `"deny_read": ["~"]` 会隐藏主目录，但其中的工作目录仍可正常使用。配置只从主目录读取，仓库无法关闭沙箱。git 元数据不在工作目录内时（worktree，或工作目录是仓库的子目录），需要把它的路径加入 `allow_write` 才能提交。Linux 上，尚不存在的受保护路径在命令运行期间由一个空的占位替身覆盖，没有命令运行后即删除。
 
 ## MCP 服务器
 
@@ -220,6 +244,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
   - `http.rs` — 带重试的 POST、SSE 读取器
 - `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
 - `src/mentions.rs` — `@路径` 的解析与展开为附件块
+- `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read` 和 `write` 检查的路径规则
 - `src/subagent.rs` — 子代理定义（内置 `explore`、自定义文件）、权限、`agent` 工具
 - `src/mcp.rs` — MCP 客户端：配置加载、服务器连接、`mcp__*` 工具适配器
 - `src/skills.rs` — 技能发现、`SKILL.md` frontmatter 解析、`skill` 工具

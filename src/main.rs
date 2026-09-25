@@ -4,6 +4,7 @@ mod llm;
 mod mcp;
 mod mentions;
 mod prompt;
+mod sandbox;
 mod session;
 mod skills;
 mod subagent;
@@ -26,6 +27,8 @@ use tools::{FileTracker, ToolRegistry};
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let (sandbox_flag, args) = sandbox::parse_flag(args);
+    sandbox::init(sandbox_flag).await?;
     let web_addr = web::parse_flag(&args)?;
     // The web UI can fix a missing or broken providers config, so it starts
     // without one.

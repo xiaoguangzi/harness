@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 use super::{Tool, ToolOutput, parse_input, truncate};
+use crate::sandbox;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_HEAD_LIMIT: usize = 250;
@@ -141,15 +142,25 @@ impl Tool for GrepTool {
             Err(e) => return e,
         };
 
-        let child = Command::new("ugrep")
-            .args(input.ugrep_args())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
-        let child = match child {
-            Ok(c) => c,
+        let command = match sandbox::active() {
+            Some(sandbox) => sandbox.command("ugrep", input.ugrep_args()).map(|(c, guard)| (c, Some(guard))),
+            None => {
+                let mut command = Command::new("ugrep");
+                command.args(input.ugrep_args());
+                Ok((command, None))
+            }
+        };
+        let spawned = command.and_then(|(mut command, guard)| {
+            let child = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            Ok((child, guard))
+        });
+        let (child, _sandboxed) = match spawned {
+            Ok(spawned) => spawned,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return ToolOutput::error(
                     "ugrep is not installed. Install it (e.g. `apt install ugrep` or \
@@ -164,10 +175,15 @@ impl Tool for GrepTool {
             Err(_) => return ToolOutput::error("Search timed out; narrow `path` or `glob`"),
         };
 
-        // ugrep exits 0 on matches, 1 on no matches, 2 on errors.
+        // ugrep exits 0 on matches, 1 on no matches, 2 on errors. Files it
+        // cannot read (such as those the sandbox hides) are skipped quietly
+        // but still make it exit 2.
+        let quiet = output.stderr.is_empty();
         match output.status.code() {
             Some(0) => {}
+            Some(2) if quiet && !output.stdout.is_empty() => {}
             Some(1) => return ToolOutput::ok("No matches found"),
+            Some(2) if quiet => return ToolOutput::ok("No matches found"),
             _ => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return ToolOutput::error(format!("ugrep failed: {}", stderr.trim()));
@@ -240,6 +256,20 @@ mod tests {
         let dir = fixture();
         let out = grep(json!({"pattern": "zzz_nothing", "path": dir.path()})).await;
         assert_eq!(out, ToolOutput::ok("No matches found"));
+    }
+
+    #[tokio::test]
+    async fn skips_unreadable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("c.rs"), "fn main() {}\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = grep(json!({"pattern": "fn main", "path": dir.path()})).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("a.rs"), "{}", out.content);
     }
 
     #[tokio::test]

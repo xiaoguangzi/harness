@@ -16,6 +16,7 @@ cargo run --release                      # interactive REPL (/exit to quit)
 cargo run --release -- "list the files"  # one-shot
 cargo run --release -- --continue        # resume the latest conversation here (see below)
 cargo run --release -- --web             # web UI at http://localhost:8787 (see below)
+cargo run --release -- --sandbox         # run the model's commands in an OS sandbox (see below)
 ```
 
 | Variable | Default |
@@ -27,7 +28,7 @@ cargo run --release -- --web             # web UI at http://localhost:8787 (see 
 | `HARNESS_PROVIDERS` | read only this providers file |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | implicit `anthropic` provider |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | implicit `openai` provider (Responses API) |
-
+| `HARNESS_SANDBOX` | `1` or `0`: turn the [sandbox](#sandbox) on or off (the `--sandbox` / `--no-sandbox` flags win) |
 | `HARNESS_WEB_TOKEN` | web UI token (generated at startup if unset) |
 
 ## Web UI
@@ -126,6 +127,7 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 | `/skills` | list discovered skills |
 | `/agents` | list subagent types, their permission and tools |
 | `/mcp` | list MCP servers, their tools and log files |
+| `/sandbox` | show what the sandbox allows (see [Sandbox](#sandbox)) |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
 | `/exit`, `exit`, Ctrl-D | quit (`exit` or `quit` only when alone on the line) |
 | Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted. At the prompt, press it twice to quit |
@@ -145,6 +147,28 @@ Every REPL and one-shot conversation is saved after each turn to `~/.harness/ses
 | `/resume`, `/resume <id>` | the same from inside the REPL |
 
 They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r <id> "..."` (a one-shot `--resume` needs the id). A resumed conversation continues under its id, on the model it last used if that is still configured, and in the REPL its last turns are shown again. Reasoning blocks are kept, so they are sent back to the model that produced them. The `write` tool's read tracking is not saved: the model reads a file again before overwriting it. Web UI tasks are not saved.
+
+## Sandbox
+
+`harness --sandbox` (or `HARNESS_SANDBOX=1`, or `"enabled": true` in `~/.harness/sandbox.json`) runs the model's `bash` commands and `grep` searches in an OS sandbox: Seatbelt (`sandbox-exec`, built in) on macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux (`apt install bubblewrap` / `dnf install bubblewrap`; it needs unprivileged user namespaces, which some containers lack). `--no-sandbox` or `HARNESS_SANDBOX=0` turns it off for one run. If the sandbox cannot start, the harness exits rather than run without it.
+
+- **Reads**: everything except `deny_read`.
+- **Writes**: only the working directory, the temp directories (`/tmp`, `/var/tmp`, `$TMPDIR`, and on macOS the per-user temp and cache directories) and `allow_write`. In the working directory, `.harness/`, `.claude/`, `.mcp.json` and, in a git repository, `.git/hooks/` and `.git/config` stay read-only, because they make code run outside the sandbox later (MCP servers, hooks, `core.fsmonitor`); `.git` itself cannot be renamed or removed.
+- **Network**: loopback only (local servers and tests work; DNS and outbound connections fail), unless `"network": true`.
+- Commands run in a new session without a terminal. On Linux they also get their own PID namespace, so background jobs end with the command; on macOS, setuid programs (`sudo`, `ps`) cannot run.
+
+The `read` and `write` tools check the same rules. `/sandbox` shows them, the REPL banner says `sandboxed`, and the system prompt tells the model the limits, so it reports a blocked action instead of working around it. MCP servers and the harness itself are not sandboxed.
+
+```json
+{
+  "enabled": true,
+  "network": false,
+  "allow_write": ["~/.cargo/registry", "~/.npm"],
+  "deny_read": ["~/.ssh", "~/.aws", ".env"]
+}
+```
+
+Paths take `~/` and `${VAR}`; relative ones are relative to the working directory. Where rules overlap the deeper path wins, so `"deny_read": ["~"]` hides the home directory while a working directory inside it stays usable. The config is only read from the home directory, so a repository cannot switch the sandbox off. When git's metadata is outside the working directory (a worktree, or a subdirectory of the repository), commits need its path in `allow_write`. On Linux, a protected path that does not exist yet is covered by an empty stand-in while commands run, removed once none is running.
 
 ## MCP servers
 
@@ -219,6 +243,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   - `http.rs` — POST with retries, SSE reader
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks
+- `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read` and `write` check
 - `src/subagent.rs` — subagent definitions (built-in `explore`, custom files), permissions, the `agent` tool
 - `src/mcp.rs` — MCP client: config loading, server connections, `mcp__*` tool adapters
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool

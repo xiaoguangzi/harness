@@ -27,7 +27,7 @@ use menu::Command;
 use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 10] = [
+const BUILTINS: [(&str, &str); 11] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
@@ -37,6 +37,7 @@ const BUILTINS: [(&str, &str); 10] = [
     ("/skills", "list available skills"),
     ("/agents", "list subagent types and their tools"),
     ("/mcp", "list MCP servers and their tools"),
+    ("/sandbox", "show what the sandbox allows commands to do"),
     ("/exit", "quit (or exit, Ctrl-D)"),
 ];
 
@@ -178,6 +179,7 @@ pub async fn run(
             Input::ListTools => print_tools(agent),
             Input::ListMcp => print_mcp(mcp),
             Input::ListAgents => print_agents(agent_defs),
+            Input::Sandbox => print_sandbox(),
             Input::Model(None) => print_models(agent),
             Input::Model(Some(spec)) => match agent.client().switch(&spec) {
                 Ok(client) => {
@@ -335,6 +337,7 @@ enum Input {
     ListTools,
     ListMcp,
     ListAgents,
+    Sandbox,
     /// `/model` shows the current model; `/model <spec>` switches.
     Model(Option<String>),
     /// `/resume` lists saved conversations to pick from; `/resume <id>`
@@ -368,6 +371,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "tools" => Input::ListTools,
         "mcp" => Input::ListMcp,
         "agents" => Input::ListAgents,
+        "sandbox" => Input::Sandbox,
         "model" => Input::Model(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "effort" => match args.trim() {
             "" => Input::Effort(None),
@@ -400,9 +404,10 @@ fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, out: &Outpu
     out.line(out.paint(
         "2",
         &format!(
-            "  {cwd} · {} tools · {} skills · {servers} MCP servers",
+            "  {cwd} · {} tools · {} skills · {servers} MCP servers{}",
             agent.tools().names().count(),
-            skills.len()
+            skills.len(),
+            if crate::sandbox::active().is_some() { " · sandboxed" } else { "" }
         ),
     ));
     out.line(out.paint("2", "  / for commands · @ for files · Ctrl-C to interrupt"));
@@ -443,6 +448,16 @@ fn print_tools(agent: &Agent) {
     for tool in tools {
         let summary = tool.description.split(". ").next().unwrap_or("").trim_end_matches('.');
         println!("  \x1b[1m{:<name_width$}\x1b[0m  \x1b[2m{}\x1b[0m", tool.name, text::fit(summary, room));
+    }
+}
+
+fn print_sandbox() {
+    let Some(sandbox) = crate::sandbox::active() else {
+        println!("the sandbox is off; start with --sandbox, HARNESS_SANDBOX=1 or \"enabled\": true in ~/.harness/sandbox.json");
+        return;
+    };
+    for (label, value) in sandbox.describe() {
+        println!("  \x1b[1m{label:<10}\x1b[0m {value}");
     }
 }
 

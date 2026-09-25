@@ -104,6 +104,9 @@ fn environment() -> String {
     if let Some(shell) = shell {
         lines.push(format!("- User's shell: {shell} (the `bash` tool always runs bash)"));
     }
+    if let Some(sandbox) = crate::sandbox::active() {
+        lines.push(format!("- Sandbox: {}", sandbox.prompt_note()));
+    }
     if let Some(date) = today() {
         lines.push(format!("- Today's date: {date}"));
     }

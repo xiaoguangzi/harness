@@ -64,6 +64,11 @@ impl Tool for WriteTool {
         if path.is_dir() {
             return ToolOutput::error(format!("{} is a directory", input.path));
         }
+        if let Some(sandbox) = crate::sandbox::active()
+            && let Err(e) = sandbox.check_write(path)
+        {
+            return ToolOutput::error(e);
+        }
         if let Err(e) = self.files.check_writable(path) {
             return ToolOutput::error(e);
         }
