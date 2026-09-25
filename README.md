@@ -1,4 +1,5 @@
 # harness
+[English](README.md) | [简体中文](README.zh-CN.md)
 
 A minimal coding-agent harness in Rust. It talks to any mix of LLM gateways that speak the Anthropic Messages protocol or the OpenAI Responses protocol (raw HTTP with streaming).
 
