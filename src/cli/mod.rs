@@ -17,6 +17,7 @@ use crate::agent::Agent;
 use crate::llm;
 use crate::mcp;
 use crate::mentions;
+use crate::session::{self, Recorder, Resume, Store};
 use crate::skills::Skill;
 use crate::subagent::AgentDef;
 use crate::tools::FileTracker;
@@ -26,17 +27,21 @@ use menu::Command;
 use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 9] = [
+const BUILTINS: [(&str, &str); 10] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
     ("/clear", "start a new conversation"),
+    ("/resume", "pick up an earlier conversation from this directory"),
     ("/tools", "list the tools the model can call"),
     ("/skills", "list available skills"),
     ("/agents", "list subagent types and their tools"),
     ("/mcp", "list MCP servers and their tools"),
     ("/exit", "quit (or exit, Ctrl-D)"),
 ];
+
+/// Saved conversations offered by `/resume`.
+const LISTED_SESSIONS: usize = 20;
 
 pub async fn run(
     agent: &mut Agent,
@@ -47,25 +52,49 @@ pub async fn run(
     files: &FileTracker,
     out: Output,
 ) -> Result<ExitCode> {
+    let (resume, args) = session::parse_args(args)?;
     out.spawn_spinner();
     let mut term = Terminal::new(out.clone());
+    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let mut recorder = Store::default_location().map(|store| Recorder::new(store, cwd));
+    let one_shot = !args.is_empty();
+
+    if !one_shot {
+        print_banner(agent, skills, mcp, &out);
+    }
+    if let Some(resume) = resume {
+        let Some(rec) = recorder.as_mut() else { anyhow::bail!("no home directory to find saved sessions in") };
+        let id = match resume {
+            Resume::Id(id) => Some(id),
+            Resume::Latest => match rec.store().list(&rec.meta().cwd).first() {
+                Some(latest) => Some(latest.id.clone()),
+                None => anyhow::bail!("no saved conversation in this directory"),
+            },
+            Resume::Pick if one_shot => anyhow::bail!("--resume needs a session id in one-shot mode"),
+            Resume::Pick => pick_session(rec, &out)?,
+        };
+        if let Some(id) = id {
+            resume_session(agent, rec, &id, &out, !one_shot)?;
+        }
+    }
 
     // One-shot mode: `harness "do something"` or `harness /skill args`.
-    if !args.is_empty() {
+    if one_shot {
         let line = args.join(" ");
         return match parse_input(&line, skills) {
-            // The turn's outcome is already shown.
-            Input::Prompt(prompt) => Ok(match submit(agent, &line, &prompt, files, &out, &mut term).await {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(TurnEnd::Interrupted) => ExitCode::from(130),
-                Err(TurnEnd::Failed(_)) => ExitCode::FAILURE,
-            }),
+            Input::Prompt(prompt) => {
+                // The turn's outcome is already shown.
+                let result = submit(agent, &line, &prompt, files, &out, &mut term, recorder.as_mut()).await;
+                Ok(match result {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(TurnEnd::Interrupted) => ExitCode::from(130),
+                    Err(TurnEnd::Failed(_)) => ExitCode::FAILURE,
+                })
+            }
             Input::Error(e) => Err(anyhow::anyhow!(e)),
             _ => Err(anyhow::anyhow!("REPL commands are only available interactively")),
         };
     }
-
-    print_banner(agent, skills, mcp, &out);
 
     let mut commands: Vec<Command> = BUILTINS.iter().map(|(name, description)| Command::new(*name, *description)).collect();
     commands.extend(skills.iter().map(|s| Command::new(format!("/{}", s.name), &s.description)));
@@ -123,7 +152,27 @@ pub async fn run(
             Input::Help => print_help(skills),
             Input::Clear => {
                 agent.clear();
+                if let Some(rec) = recorder.as_mut() {
+                    rec.restart();
+                }
                 out.line(out.paint("2", "conversation cleared"));
+            }
+            Input::Resume(id) => {
+                let Some(rec) = recorder.as_mut() else {
+                    out.line(out.paint("31", "no home directory to find saved sessions in"));
+                    continue;
+                };
+                let id = match id {
+                    Some(id) => Ok(Some(id)),
+                    None => pick_session(rec, &out),
+                };
+                let resumed = id.and_then(|id| match id {
+                    Some(id) => resume_session(agent, rec, &id, &out, true),
+                    None => Ok(()),
+                });
+                if let Err(e) = resumed {
+                    out.line(out.paint("31", &format!("{e:#}")));
+                }
             }
             Input::ListSkills => print_skills(skills),
             Input::ListTools => print_tools(agent),
@@ -150,7 +199,7 @@ pub async fn run(
             Input::Error(e) => out.line(out.paint("31", &e)),
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
-                let _ = submit(agent, &line, &prompt, files, &out, &mut term).await;
+                let _ = submit(agent, &line, &prompt, files, &out, &mut term, recorder.as_mut()).await;
                 out.line("");
             }
         }
@@ -168,8 +217,77 @@ fn history_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".harness/history"))
 }
 
+/// Lists this directory's saved conversations and asks which one to resume;
+/// `None` when there are none, or the user picked none.
+fn pick_session(rec: &Recorder, out: &Output) -> Result<Option<String>> {
+    let sessions: Vec<session::Meta> =
+        rec.store().list(&rec.meta().cwd).into_iter().filter(|m| m.id != rec.meta().id).take(LISTED_SESSIONS).collect();
+    if sessions.is_empty() {
+        out.line(out.paint("2", "no saved conversations in this directory"));
+        return Ok(None);
+    }
+    let now = session::now();
+    let width = text::terminal_width();
+    for (i, m) in sessions.iter().enumerate() {
+        let when = session::ago(m.updated, now);
+        let info = format!(" · {} messages · {}", m.messages, m.model);
+        let title = if m.title.is_empty() { "(untitled)" } else { m.title.as_str() };
+        let room = width.saturating_sub(4 + 10 + text::width(&info) + 2);
+        out.line(format!(
+            "{} {}  {}{}",
+            out.paint("1", &format!("{:>3}", i + 1)),
+            out.paint("2", &format!("{when:>9}")),
+            text::fit(&text::printable(title), room.max(20)),
+            out.paint("2", &info),
+        ));
+    }
+    let mut editor = rustyline::DefaultEditor::new()?;
+    let answer = match tokio::task::block_in_place(|| editor.readline("resume which? (number, Enter to cancel) ")) {
+        Ok(answer) => answer,
+        Err(ReadlineError::Interrupted | ReadlineError::Eof) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Ok(None);
+    }
+    match answer.parse::<usize>() {
+        Ok(n) if (1..=sessions.len()).contains(&n) => Ok(Some(sessions[n - 1].id.clone())),
+        Ok(_) => anyhow::bail!("pick a number from 1 to {}", sessions.len()),
+        // Anything else is taken as an id.
+        Err(_) => Ok(Some(answer.to_string())),
+    }
+}
+
+/// Loads a saved conversation into the agent, on the model it last used
+/// when that is still configured, and continues recording it. With `show`,
+/// its last turns are shown again.
+fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &Output, show: bool) -> Result<()> {
+    let (meta, messages) = rec.store().load(id)?;
+    agent.restore(messages);
+    let mut notes = Vec::new();
+    if !meta.model.is_empty() && meta.model != agent.model() {
+        match agent.client().switch(&meta.model) {
+            Ok(client) => agent.set_client(client),
+            Err(e) => notes.push(format!("{} is not available ({e:#}); continuing on {}", meta.model, agent.model())),
+        }
+    }
+    rec.resume(meta);
+    if show {
+        output::replay(out, agent.messages());
+        let title = if rec.meta().title.is_empty() { "conversation" } else { rec.meta().title.as_str() };
+        out.line(out.paint("2", &format!("resumed {} · {} · {}", text::printable(title), rec.meta().id, agent.model())));
+        out.line("");
+    }
+    for note in notes {
+        out.line(out.paint("33", &note));
+    }
+    Ok(())
+}
+
 /// Attaches the files `@`-mentioned in `line` and runs the turn until it
-/// ends or Ctrl-C interrupts it. The turn's progress and outcome are shown.
+/// ends or Ctrl-C interrupts it. The turn's progress and outcome are shown,
+/// and the conversation is saved after it.
 async fn submit(
     agent: &mut Agent,
     line: &str,
@@ -177,7 +295,9 @@ async fn submit(
     files: &FileTracker,
     out: &Output,
     term: &mut Terminal,
+    recorder: Option<&mut Recorder>,
 ) -> Result<(), TurnEnd> {
+    let first = agent.messages().is_empty();
     let expanded = mentions::expand(line, files);
     for a in &expanded.attachments {
         out.line(out.paint("2", &format!("  + {}", a.label)));
@@ -193,6 +313,15 @@ async fn submit(
         _ = tokio::signal::ctrl_c() => Err(TurnEnd::Interrupted),
     };
     term.end_turn(&result);
+    if let Some(rec) = recorder {
+        if first {
+            rec.set_title(line);
+        }
+        agent.settle();
+        if let Err(e) = rec.save(agent.messages(), agent.model()) {
+            out.line(out.paint("33", &format!("conversation not saved: {e:#}")));
+        }
+    }
     result
 }
 
@@ -208,6 +337,9 @@ enum Input {
     ListAgents,
     /// `/model` shows the current model; `/model <spec>` switches.
     Model(Option<String>),
+    /// `/resume` lists saved conversations to pick from; `/resume <id>`
+    /// resumes that one.
+    Resume(Option<String>),
     /// `/effort` shows the effort; `/effort <level>` sets it for this
     /// session, and `/effort auto` restores the configured one.
     Effort(Option<Option<llm::Effort>>),
@@ -231,6 +363,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "exit" | "quit" => Input::Exit,
         "help" => Input::Help,
         "clear" => Input::Clear,
+        "resume" => Input::Resume(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "skills" => Input::ListSkills,
         "tools" => Input::ListTools,
         "mcp" => Input::ListMcp,
@@ -388,6 +521,8 @@ mod tests {
         assert_eq!(parse_input("how do I exit vim", &skills), Input::Prompt("how do I exit vim".into()));
         assert_eq!(parse_input("/clear", &skills), Input::Clear);
         assert_eq!(parse_input("/tools", &skills), Input::ListTools);
+        assert_eq!(parse_input("/resume", &skills), Input::Resume(None));
+        assert_eq!(parse_input("/resume 2026 ", &skills), Input::Resume(Some("2026".into())));
         assert_eq!(parse_input("fix it", &skills), Input::Prompt("fix it".into()));
         assert!(matches!(parse_input("/nope", &skills), Input::Error(_)));
         assert_eq!(parse_input("/effort", &skills), Input::Effort(None));

@@ -15,6 +15,7 @@
 export ANTHROPIC_API_KEY=sk-ant-...     # 或 OPENAI_API_KEY，或按下文配置网关
 cargo run --release                      # 交互式 REPL（/exit 退出）
 cargo run --release -- "list the files"  # 一次性模式
+cargo run --release -- --continue        # 继续当前目录最近的会话（见下文）
 cargo run --release -- --web             # Web UI，地址 http://localhost:8787（见下文）
 ```
 
@@ -121,6 +122,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 | `/model [spec]` | 显示 provider 和模型，或切换到 `<provider>/<model>` |
 | `/effort [level]` | 显示推理强度，或设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
 | `/clear` | 开始新会话 |
+| `/resume [id]` | 继续当前目录下之前的会话（见[恢复会话](#恢复会话)） |
 | `/tools` | 列出模型可调用的工具 |
 | `/skills` | 列出发现的技能 |
 | `/agents` | 列出子代理类型及其权限和工具 |
@@ -131,6 +133,19 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 | 行尾 `\`、Alt+Enter | 在新行继续这条消息 |
 | `/` | 在提示符下方打开命令菜单；随输入收窄，↑/↓ 选择，Tab 填入，Enter 运行。`/model ` 之后会列出模型 |
 | `@` | 打开文件菜单（见[用 `@` 附加文件](#用--附加文件)） |
+
+## 恢复会话
+
+REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harness/sessions/<id>.jsonl`（仅所有者可读）：第一行是头部（id、工作目录、第一条提示、模型和时间），之后每行一条消息。`/clear` 会开始一个新文件，旧文件保留。
+
+| | |
+|---|---|
+| `harness -c` / `--continue` | 继续当前目录最近的会话 |
+| `harness -r` / `--resume` | 列出当前目录的会话并选择一个 |
+| `harness -r <id>` / `--resume=<id>` | 继续指定会话；id 的唯一前缀即可 |
+| `/resume`、`/resume <id>` | 在 REPL 内做同样的事 |
+
+它们可以与一次性模式组合：`harness -c "now run the tests"` 或 `harness -r <id> "..."`（一次性模式下 `--resume` 需要给出 id）。恢复的会话沿用原来的 id；若上次使用的模型仍在配置中，则切换回该模型；在 REPL 中会重新显示最后几轮。推理块会被保留，因此仍会发回给产生它的模型。`write` 工具的已读记录不会保存：模型在覆盖文件前需要重新读取。Web UI 的任务不会保存。
 
 ## MCP 服务器
 
@@ -203,6 +218,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
   - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退）
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
   - `http.rs` — 带重试的 POST、SSE 读取器
+- `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
 - `src/mentions.rs` — `@路径` 的解析与展开为附件块
 - `src/subagent.rs` — 子代理定义（内置 `explore`、自定义文件）、权限、`agent` 工具
 - `src/mcp.rs` — MCP 客户端：配置加载、服务器连接、`mcp__*` 工具适配器

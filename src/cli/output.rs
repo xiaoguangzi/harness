@@ -10,8 +10,8 @@ use serde_json::Value;
 use super::diff;
 use super::markdown::Markdown;
 use super::text;
-use crate::agent::Observer;
-use crate::llm::Usage;
+use crate::agent::{INTERRUPTED, Observer};
+use crate::llm::{Message, Usage};
 use crate::tools::ToolOutput;
 
 /// Spinner glyphs, played forward and back.
@@ -24,6 +24,10 @@ const RESULT_LINES: usize = 3;
 /// Reasoning time worth a "Thought for" note.
 const NOTABLE_THINKING: Duration = Duration::from_secs(2);
 const WAITING: &str = "Waiting for the model…";
+/// Turns of a resumed conversation shown again.
+const REPLAYED_TURNS: usize = 10;
+/// Lines of a replayed prompt.
+const PROMPT_LINES: usize = 4;
 
 /// Shared handle on stdout. Output printed while an agent runs goes through
 /// it, so the status lines are cleared first and redrawn after.
@@ -156,6 +160,97 @@ impl Output {
         let mut stdout = io::stdout().lock();
         let _ = write!(stdout, "{s}");
         let _ = stdout.flush();
+    }
+}
+
+/// Shows the end of a resumed conversation the way it looked: prompts,
+/// the assistant's text, and tool calls with the start of their results.
+/// Reasoning and attachments are left out.
+pub fn replay(out: &Output, messages: &[Message]) {
+    // A turn starts at a user message that is not tool results.
+    let starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user" && !m.content.iter().any(|b| b["type"] == "tool_result"))
+        .map(|(i, _)| i)
+        .collect();
+    let first = starts.len().saturating_sub(REPLAYED_TURNS);
+    if first > 0 {
+        out.line(out.paint("2", &format!("… {first} earlier turns")));
+        out.line("");
+    }
+    let width = text::terminal_width();
+    let mut names = std::collections::HashMap::new();
+    // Tool lines were the last shown, so text needs a blank line first.
+    let mut tools = false;
+    for m in &messages[starts.get(first).copied().unwrap_or(messages.len())..] {
+        if m.content.iter().any(|b| b["type"] == "text" && b["text"] == INTERRUPTED) {
+            if std::mem::take(&mut tools) {
+                out.line("");
+            }
+            out.line(out.paint("33", "■ Interrupted"));
+            out.line("");
+        }
+        if m.role == "user" {
+            let prompt = m.content.iter().rev().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).find(|t| *t != INTERRUPTED);
+            if let Some(prompt) = prompt.filter(|_| !m.content.iter().any(|b| b["type"] == "tool_result")) {
+                if std::mem::take(&mut tools) {
+                    out.line("");
+                }
+                let lines: Vec<&str> = prompt.lines().collect();
+                for (i, line) in lines.iter().take(PROMPT_LINES).enumerate() {
+                    let lead = if i == 0 { out.paint("1;35", "❯ ") } else { "  ".to_string() };
+                    out.line(format!("{lead}{}", text::fit(&text::printable(line), width.saturating_sub(3))));
+                }
+                if lines.len() > PROMPT_LINES {
+                    out.line(out.paint("2", &format!("  … +{} lines", lines.len() - PROMPT_LINES)));
+                }
+                out.line("");
+            }
+            for b in m.content.iter().filter(|b| b["type"] == "tool_result") {
+                let name = b["tool_use_id"].as_str().and_then(|id| names.get(id)).map_or("", String::as_str);
+                let is_error = b["is_error"].as_bool().unwrap_or(false);
+                let content = match &b["content"] {
+                    Value::String(s) => s.clone(),
+                    Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                    _ => String::new(),
+                };
+                let color = if is_error { "31" } else { "2" };
+                for (i, line) in result_lines(name, &content, is_error, width.saturating_sub(6)).iter().enumerate() {
+                    let lead = if i == 0 { "  ⎿ " } else { "    " };
+                    out.line(out.paint(color, &text::fit(&format!("{lead}{line}"), width.saturating_sub(2))));
+                }
+            }
+            continue;
+        }
+        for b in &m.content {
+            match b["type"].as_str() {
+                Some("text") => {
+                    if std::mem::take(&mut tools) {
+                        out.line("");
+                    }
+                    let text = b["text"].as_str().unwrap_or("");
+                    if out.styled() {
+                        let mut md = Markdown::new(width);
+                        let mut lines = md.push(text);
+                        lines.extend(md.finish());
+                        out.lines(&lines);
+                    } else {
+                        out.line(text);
+                    }
+                    out.line("");
+                }
+                Some("tool_use") => {
+                    let name = b["name"].as_str().unwrap_or("");
+                    if let Some(id) = b["id"].as_str() {
+                        names.insert(id.to_string(), name.to_string());
+                    }
+                    out.line(format!("{} {}", out.paint("32", "●"), call_label(name, &b["input"], width.saturating_sub(4))));
+                    tools = true;
+                }
+                _ => {}
+            }
+        }
     }
 }
 

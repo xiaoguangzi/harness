@@ -9,7 +9,7 @@ use crate::llm::{Client, Message, StreamEvent, Usage};
 use crate::tools::{ToolOutput, ToolRegistry};
 
 /// Told to the model about a turn the user cancelled.
-const INTERRUPTED: &str = "[Interrupted by the user]";
+pub const INTERRUPTED: &str = "[Interrupted by the user]";
 
 /// Receives progress events so the frontend decides how to display them.
 pub trait Observer: Send {
@@ -77,6 +77,25 @@ impl Agent {
         self.turn_start = None;
     }
 
+    /// The conversation so far.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Replaces the conversation with a saved one.
+    pub fn restore(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+        self.turn_start = None;
+    }
+
+    /// Repairs the history after a cancelled turn now, rather than when the
+    /// next turn starts, e.g. before saving it.
+    pub fn settle(&mut self) {
+        if self.turn_start.take().is_some() {
+            self.repair_after_interrupt();
+        }
+    }
+
     /// Text of the last assistant message: a subagent's answer. Its text
     /// blocks are one run of text, possibly split mid-sentence.
     pub fn last_text(&self) -> String {
@@ -93,9 +112,7 @@ impl Agent {
     /// ever grows by appending, so earlier turns (and their thinking blocks)
     /// stay intact.
     pub async fn run_turn(&mut self, content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
-        if self.turn_start.take().is_some() {
-            self.repair_after_interrupt();
-        }
+        self.settle();
         let turn_start = self.messages.len();
         self.turn_start = Some(turn_start);
         self.messages.push(Message::user(content));

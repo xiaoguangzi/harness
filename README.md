@@ -14,6 +14,7 @@ A minimal coding-agent harness in Rust. It talks to any mix of LLM gateways that
 export ANTHROPIC_API_KEY=sk-ant-...     # or OPENAI_API_KEY, or configure gateways (below)
 cargo run --release                      # interactive REPL (/exit to quit)
 cargo run --release -- "list the files"  # one-shot
+cargo run --release -- --continue        # resume the latest conversation here (see below)
 cargo run --release -- --web             # web UI at http://localhost:8787 (see below)
 ```
 
@@ -120,6 +121,7 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 | `/model [spec]` | show providers and models, or switch to `<provider>/<model>` |
 | `/effort [level]` | show the reasoning effort, or set it: `low`, `medium`, `high`, `xhigh`, `max`, or `auto` for the configured one |
 | `/clear` | start a new conversation |
+| `/resume [id]` | pick up an earlier conversation from this directory (see [Resuming](#resuming-conversations)) |
 | `/tools` | list the tools the model can call |
 | `/skills` | list discovered skills |
 | `/agents` | list subagent types, their permission and tools |
@@ -130,6 +132,19 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 | `\` at line end, Alt+Enter | continue the message on a new line |
 | `/` | open the command menu under the prompt; it narrows as you type, ↑/↓ select, Tab fills in, Enter runs. After `/model ` it lists models |
 | `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |
+
+## Resuming conversations
+
+Every REPL and one-shot conversation is saved after each turn to `~/.harness/sessions/<id>.jsonl` (readable by its owner only): a header line with the id, working directory, first prompt, model and times, then the history, one message per line. `/clear` starts a new file; the old one stays.
+
+| | |
+|---|---|
+| `harness -c` / `--continue` | resume the latest conversation from this directory |
+| `harness -r` / `--resume` | list this directory's conversations and pick one |
+| `harness -r <id>` / `--resume=<id>` | resume that one; a unique prefix of the id is enough |
+| `/resume`, `/resume <id>` | the same from inside the REPL |
+
+They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r <id> "..."` (a one-shot `--resume` needs the id). A resumed conversation continues under its id, on the model it last used if that is still configured, and in the REPL its last turns are shown again. Reasoning blocks are kept, so they are sent back to the model that produced them. The `write` tool's read tracking is not saved: the model reads a file again before overwriting it. Web UI tasks are not saved.
 
 ## MCP servers
 
@@ -202,6 +217,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST with retries, SSE reader
+- `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks
 - `src/subagent.rs` — subagent definitions (built-in `explore`, custom files), permissions, the `agent` tool
 - `src/mcp.rs` — MCP client: config loading, server connections, `mcp__*` tool adapters

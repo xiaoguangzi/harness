@@ -4,6 +4,7 @@ mod llm;
 mod mcp;
 mod mentions;
 mod prompt;
+mod session;
 mod skills;
 mod subagent;
 mod tools;
