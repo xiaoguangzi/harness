@@ -7,6 +7,7 @@
 //! {
 //!   "default_model": "relay-a/claude-opus-5",
 //!   "subagent_model": "relay-b/gpt-5-mini",
+//!   "effort": "xhigh",
 //!   "providers": {
 //!     "relay-a": {
 //!       "protocol": "anthropic",
@@ -28,6 +29,10 @@
 //! `$HARNESS_PROVIDERS` when set. `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`
 //! and `OPENAI_API_KEY` add implicit `anthropic` and `openai` providers when
 //! no provider of that name is configured.
+//!
+//! `effort` (also per model, or `$HARNESS_EFFORT`; default `high`) sets how
+//! hard the model thinks: Anthropic `output_config.effort`, OpenAI
+//! `reasoning.effort`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +45,7 @@ use crate::util::{expand_env, merge_json};
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-5";
 const DEFAULT_MAX_TOKENS: u32 = 64_000;
+const DEFAULT_EFFORT: Effort = Effort::High;
 const OFFICIAL_ANTHROPIC_HOST: &str = "api.anthropic.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -57,6 +63,39 @@ impl Protocol {
             Protocol::Anthropic => "anthropic",
             Protocol::OpenAiResponses => "openai-responses",
         }
+    }
+}
+
+/// Reasoning effort, in Anthropic's levels (Claude Code's `/effort`).
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+impl Effort {
+    pub const ALL: [Effort; 5] = [Effort::Low, Effort::Medium, Effort::High, Effort::XHigh, Effort::Max];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::XHigh => "xhigh",
+            Effort::Max => "max",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == s.trim().to_ascii_lowercase()).ok_or_else(|| {
+            let levels: Vec<&str> = Self::ALL.iter().map(|e| e.as_str()).collect();
+            anyhow!("unknown effort `{s}` (one of {})", levels.join(", "))
+        })
     }
 }
 
@@ -98,6 +137,7 @@ pub struct ProviderConfig {
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub max_tokens: Option<u32>,
+    pub effort: Option<Effort>,
     pub extra_body: Option<Map<String, Value>>,
 }
 
@@ -106,6 +146,7 @@ pub struct ModelConfig {
 pub struct ProvidersFile {
     pub default_model: Option<String>,
     pub subagent_model: Option<String>,
+    pub effort: Option<Effort>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
 }
@@ -118,6 +159,8 @@ pub struct Providers {
     /// Spec for subagents without their own model; `None` means the
     /// caller's model.
     pub subagent_model: Option<String>,
+    /// Effort for models without their own `effort`.
+    pub effort: Effort,
 }
 
 /// Everything needed to send one request: a provider plus a model on it.
@@ -126,6 +169,8 @@ pub struct Target<'a> {
     pub provider: &'a str,
     pub config: &'a ProviderConfig,
     pub model: &'a str,
+    /// The configured effort; a session's `/effort` replaces it.
+    pub effort: Effort,
 }
 
 /// The providers files, lowest precedence first: `$HARNESS_PROVIDERS`
@@ -181,10 +226,15 @@ impl Providers {
         let mut providers = BTreeMap::new();
         let mut default_model = None;
         let mut subagent_model = None;
+        let mut effort = None;
         for file in files {
             providers.extend(file.providers);
             default_model = file.default_model.or(default_model);
             subagent_model = file.subagent_model.or(subagent_model);
+            effort = file.effort.or(effort);
+        }
+        if let Some(level) = env("HARNESS_EFFORT") {
+            effort = Some(Effort::parse(&level).context("HARNESS_EFFORT")?);
         }
         for p in providers.values_mut() {
             p.base_url = expand_env(&p.base_url).trim_end_matches('/').to_string();
@@ -229,7 +279,7 @@ impl Providers {
             );
         }
 
-        let mut this = Self { providers, default_model: String::new(), subagent_model: None };
+        let mut this = Self { providers, default_model: String::new(), subagent_model: None, effort: effort.unwrap_or(DEFAULT_EFFORT) };
         let requested = env("HARNESS_MODEL").or(default_model).or_else(|| this.fallback_default());
         let requested = requested.ok_or_else(|| {
             anyhow!("no default model: set `default_model` in providers.json or HARNESS_MODEL=<provider>/<model>")
@@ -287,7 +337,8 @@ impl Providers {
     pub fn target<'a>(&'a self, spec: &'a str) -> Result<Target<'a>> {
         let (provider, model) = spec.split_once('/').ok_or_else(|| anyhow!("unresolved model spec `{spec}`"))?;
         let config = self.providers.get(provider).ok_or_else(|| anyhow!("unknown provider `{provider}`"))?;
-        Ok(Target { provider, config, model })
+        let effort = config.models.get(model).and_then(|m| m.effort).unwrap_or(self.effort);
+        Ok(Target { provider, config, model, effort })
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -498,6 +549,24 @@ pub(crate) mod tests {
         let unknown: Result<ProvidersFile, _> =
             serde_json::from_value(json!({"providers": {"x": {"protocol": "grpc", "base_url": "u"}}}));
         assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn effort_precedence() {
+        let mut f = two_relays();
+        f.effort = Some(Effort::Medium);
+        f.providers.get_mut("relay-b").unwrap().models.get_mut("gpt-5").unwrap().effort = Some(Effort::Low);
+        let p = Providers::from_parts(vec![f], &no_env).unwrap();
+        assert_eq!(p.target("relay-a/claude-opus-5").unwrap().effort, Effort::Medium);
+        assert_eq!(p.target("relay-b/gpt-5").unwrap().effort, Effort::Low, "the model's own wins");
+
+        let env = |k: &str| (k == "HARNESS_EFFORT").then(|| "max".to_string());
+        let p = Providers::from_parts(vec![two_relays()], &env).unwrap();
+        assert_eq!(p.target("relay-a/m").unwrap().effort, Effort::Max);
+        let bad = |k: &str| (k == "HARNESS_EFFORT").then(|| "huge".to_string());
+        assert!(Providers::from_parts(vec![two_relays()], &bad).is_err());
+        let p = Providers::from_parts(vec![two_relays()], &no_env).unwrap();
+        assert_eq!(p.target("relay-a/m").unwrap().effort, Effort::High, "the default");
     }
 
     #[test]

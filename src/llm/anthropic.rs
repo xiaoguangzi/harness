@@ -69,6 +69,7 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
         "tools": tools,
         "messages": messages,
         "thinking": {"type": "adaptive"},
+        "output_config": {"effort": target.effort.as_str()},
         "stream": true,
     });
     if target.prompt_cache() {
@@ -293,6 +294,11 @@ mod tests {
         assert_eq!(body["tools"][0].get("eager_input_streaming"), None);
         assert_eq!(body["messages"][1]["content"], json!([{"type": "text", "text": "from gpt"}]));
         assert_eq!(body["messages"][3]["content"], json!([thinking, {"type": "text", "text": "mine"}]));
+        assert_eq!(body["output_config"], json!({"effort": "high"}), "the default");
+
+        let target = Target { effort: crate::llm::Effort::XHigh, ..target };
+        let body = build_body(&target, "sys", &tools, &messages);
+        assert_eq!(body["output_config"], json!({"effort": "xhigh"}));
     }
 
     fn run_events(events: &[Value]) -> (Response, String) {

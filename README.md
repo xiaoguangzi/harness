@@ -22,6 +22,7 @@ cargo run --release -- --web             # web UI at http://localhost:8787 (see 
 | `HARNESS_MODEL` | `default_model` from `providers.json`, else `anthropic/claude-opus-5` |
 | `HARNESS_SUBAGENT_MODEL` | `subagent_model` from `providers.json`, else the main model |
 | `HARNESS_MAX_TOKENS` | `64000` (overridden per provider or model) |
+| `HARNESS_EFFORT` | `effort` from `providers.json`, else `high` |
 | `HARNESS_PROVIDERS` | read only this providers file |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | implicit `anthropic` provider |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | implicit `openai` provider (Responses API) |
@@ -82,6 +83,7 @@ Declare gateways in `~/.harness/providers.json` and/or `.harness/providers.json`
 | `api_key` | sent as `x-api-key` (Anthropic) or `Authorization: Bearer` (OpenAI); override with `"auth": "bearer"` / `"x-api-key"` |
 | `headers` | extra request headers |
 | `max_tokens` | output cap (also per model) |
+| `effort` | top level or per model: `low`, `medium`, `high` (default), `xhigh` or `max`. Sent as Anthropic `output_config.effort` or OpenAI `reasoning.effort`; `extra_body` still overrides it, e.g. `{"output_config": null}` for a model that takes no effort |
 | `extra_body` | merged into every request body, also per model; a `null` removes a default key, e.g. `{"thinking": null}` for a model without adaptive thinking, or `{"include": null}` for a gateway that rejects encrypted reasoning |
 | `fallbacks`, `eager_input_streaming` | Anthropic-only API features; default on for `api.anthropic.com`, off for gateways |
 | `prompt_cache` | Anthropic automatic prompt caching; default on |
@@ -89,7 +91,7 @@ Declare gateways in `~/.harness/providers.json` and/or `.harness/providers.json`
 
 `${VAR}` / `${VAR:-default}` expand from the environment in `base_url`, `api_key` and `headers`. A spec without a known provider prefix is a model on the current provider, so gateway model names containing `/` (such as `openai/gpt-5`) also work.
 
-Switch models mid-conversation with `/model <provider>/<model>`; `/model` alone lists providers and models. The history is kept in Anthropic form and converted for OpenAI (`function_call` / `function_call_output`, `input_image`, `input_file`); requests are stateless (`store: false`), with reasoning items replayed from their encrypted content. Model-bound blocks (Anthropic thinking, OpenAI reasoning) are only sent back to the model that produced them. Subagents can use a different gateway through `subagent_model` or an agent's `model`.
+Switch models mid-conversation with `/model <provider>/<model>`; `/model` alone lists providers and models. `/effort <level>` changes the effort for the rest of the session (kept across `/model`), and `/effort auto` goes back to the configured one. The history is kept in Anthropic form and converted for OpenAI (`function_call` / `function_call_output`, `input_image`, `input_file`); requests are stateless (`store: false`), with reasoning items replayed from their encrypted content. Model-bound blocks (Anthropic thinking, OpenAI reasoning) are only sent back to the model that produced them. Subagents can use a different gateway through `subagent_model` or an agent's `model`.
 
 Note: a project-level `.harness/providers.json` (like `.mcp.json`) is trusted as-is, so only run the harness in repositories you trust.
 
@@ -116,6 +118,7 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 |---|---|
 | `/help` | list commands |
 | `/model [spec]` | show providers and models, or switch to `<provider>/<model>` |
+| `/effort [level]` | show the reasoning effort, or set it: `low`, `medium`, `high`, `xhigh`, `max`, or `auto` for the configured one |
 | `/clear` | start a new conversation |
 | `/tools` | list the tools the model can call |
 | `/skills` | list discovered skills |

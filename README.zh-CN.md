@@ -23,6 +23,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 | `HARNESS_MODEL` | `providers.json` 中的 `default_model`，否则 `anthropic/claude-opus-5` |
 | `HARNESS_SUBAGENT_MODEL` | `providers.json` 中的 `subagent_model`，否则与主模型相同 |
 | `HARNESS_MAX_TOKENS` | `64000`（可被 provider 或单个模型覆盖） |
+| `HARNESS_EFFORT` | `providers.json` 中的 `effort`，否则 `high` |
 | `HARNESS_PROVIDERS` | 只读取这个 providers 文件 |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL` | 隐式的 `anthropic` provider |
 | `OPENAI_API_KEY`、`OPENAI_BASE_URL` | 隐式的 `openai` provider（Responses API） |
@@ -83,6 +84,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 | `api_key` | 以 `x-api-key`（Anthropic）或 `Authorization: Bearer`（OpenAI）发送；可用 `"auth": "bearer"` / `"x-api-key"` 覆盖 |
 | `headers` | 额外的请求头 |
 | `max_tokens` | 输出上限（也可按模型设置） |
+| `effort` | 顶层或按模型设置：`low`、`medium`、`high`（默认）、`xhigh` 或 `max`。以 Anthropic 的 `output_config.effort` 或 OpenAI 的 `reasoning.effort` 发送；`extra_body` 仍可覆盖它，例如对不支持 effort 的模型用 `{"output_config": null}` |
 | `extra_body` | 合并进每个请求体，也可按模型设置；`null` 会移除默认键，例如对不支持自适应思考的模型用 `{"thinking": null}`，或对拒绝加密推理的网关用 `{"include": null}` |
 | `fallbacks`、`eager_input_streaming` | 仅 Anthropic 的 API 特性；`api.anthropic.com` 默认开启，网关默认关闭 |
 | `prompt_cache` | Anthropic 自动提示词缓存；默认开启 |
@@ -90,7 +92,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 
 `base_url`、`api_key` 和 `headers` 中的 `${VAR}` / `${VAR:-default}` 会从环境变量展开。没有已知 provider 前缀的 spec 视为当前 provider 上的一个模型，因此包含 `/` 的网关模型名（如 `openai/gpt-5`）同样可用。
 
-会话中途可用 `/model <provider>/<model>` 切换模型；单独输入 `/model` 会列出 provider 和模型。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
+会话中途可用 `/model <provider>/<model>` 切换模型；单独输入 `/model` 会列出 provider 和模型。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
 
 注意：项目级 `.harness/providers.json`（同 `.mcp.json`）会被原样信任，所以请只在可信的仓库中运行 harness。
 
@@ -117,6 +119,7 @@ cargo run --release -- --web             # Web UI，地址 http://localhost:8787
 |---|---|
 | `/help` | 列出命令 |
 | `/model [spec]` | 显示 provider 和模型，或切换到 `<provider>/<model>` |
+| `/effort [level]` | 显示推理强度，或设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
 | `/clear` | 开始新会话 |
 | `/tools` | 列出模型可调用的工具 |
 | `/skills` | 列出发现的技能 |

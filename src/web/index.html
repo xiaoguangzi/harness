@@ -491,7 +491,8 @@ function renderModels() {
     a ? [
       h("div", { class: "grid2" },
         h("div", {}, h("label", {}, "默认模型"), h("div", { class: "mono" }, a.default_model)),
-        h("div", {}, h("label", {}, "子 agent 模型"), h("div", { class: "mono" }, a.subagent_model || "（同主模型）"))),
+        h("div", {}, h("label", {}, "子 agent 模型"), h("div", { class: "mono" }, a.subagent_model || "（同主模型）")),
+        h("div", {}, h("label", {}, "Effort"), h("div", { class: "mono" }, a.effort))),
       h("table", { style: "margin-top:14px" },
         h("tr", {}, h("th", {}, "Provider"), h("th", {}, "协议"), h("th", {}, "Base URL"), h("th", {}, "API Key"), h("th", {}, "模型")),
         a.providers.map(p => h("tr", {}, h("td", { class: "mono" }, p.name), h("td", {}, p.protocol), h("td", { class: "mono" }, p.base_url),
@@ -538,7 +539,10 @@ function cfgForm() {
     h("div", {}, h("label", {}, "default_model（默认模型，provider/model）"),
       h("input", { list: "dl-cfg-models", value: cfg.default_model || "", oninput: e => setOrDelete(cfg, "default_model", e.target.value.trim()) })),
     h("div", {}, h("label", {}, "subagent_model（子 agent 默认模型，可空）"),
-      h("input", { list: "dl-cfg-models", value: cfg.subagent_model || "", oninput: e => setOrDelete(cfg, "subagent_model", e.target.value.trim()) })));
+      h("input", { list: "dl-cfg-models", value: cfg.subagent_model || "", oninput: e => setOrDelete(cfg, "subagent_model", e.target.value.trim()) })),
+    h("div", {}, h("label", {}, "effort（推理强度，默认 high；也可按模型设置）"),
+      h("select", { onchange: e => setOrDelete(cfg, "effort", e.target.value) },
+        ["", "low", "medium", "high", "xhigh", "max"].map(v => h("option", { value: v, selected: (cfg.effort || "") === v }, v || "（默认 high）")))));
 
   const cards = Object.keys(providers).map(name => providerCard(name));
   const add = h("button", { class: "btn", onclick: () => {

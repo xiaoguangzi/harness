@@ -25,9 +25,10 @@ use menu::Command;
 use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 8] = [
+const BUILTINS: [(&str, &str); 9] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
+    ("/effort", "show the reasoning effort, or set it with /effort <level>"),
     ("/clear", "start a new conversation"),
     ("/tools", "list the tools the model can call"),
     ("/skills", "list available skills"),
@@ -70,6 +71,8 @@ pub async fn run(
     commands.extend(
         agent.client().providers().listed_models().iter().map(|m| Command::new(format!("/model {m}"), "switch to this model")),
     );
+    commands.extend(llm::Effort::ALL.iter().map(|e| Command::new(format!("/effort {}", e.as_str()), effort_help(*e))));
+    commands.push(Command::new("/effort auto", "back to the configured effort"));
     let config = rustyline::Config::builder()
         .completion_type(rustyline::CompletionType::List)
         .auto_add_history(true)
@@ -133,6 +136,16 @@ pub async fn run(
                 }
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
+            Input::Effort(None) => {
+                out.line(format!("effort: {}", out.paint("1", agent.client().effort().as_str())));
+                out.line(out.paint("2", "set with /effort low|medium|high|xhigh|max, or /effort auto"));
+            }
+            Input::Effort(Some(level)) => {
+                let mut client = agent.client().clone();
+                client.set_effort(level);
+                out.line(format!("effort: {}", out.paint("1", client.effort().as_str())));
+                agent.set_client(client);
+            }
             Input::Error(e) => out.line(out.paint("31", &e)),
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
@@ -194,6 +207,9 @@ enum Input {
     ListAgents,
     /// `/model` shows the current model; `/model <spec>` switches.
     Model(Option<String>),
+    /// `/effort` shows the effort; `/effort <level>` sets it for this
+    /// session, and `/effort auto` restores the configured one.
+    Effort(Option<Option<llm::Effort>>),
     Prompt(String),
     Error(String),
 }
@@ -219,6 +235,14 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "mcp" => Input::ListMcp,
         "agents" => Input::ListAgents,
         "model" => Input::Model(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
+        "effort" => match args.trim() {
+            "" => Input::Effort(None),
+            "auto" | "default" => Input::Effort(Some(None)),
+            level => match llm::Effort::parse(level) {
+                Ok(e) => Input::Effort(Some(Some(e))),
+                Err(e) => Input::Error(e.to_string()),
+            },
+        },
         _ => match skills.iter().find(|s| s.name == name) {
             Some(skill) => match skill.invocation_prompt(args) {
                 Ok(prompt) => Input::Prompt(prompt),
@@ -237,7 +261,8 @@ fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, out: &Outpu
         _ => cwd,
     };
     let servers = mcp.statuses.iter().filter(|s| s.outcome.is_ok()).count();
-    out.line(format!("{} {}", out.paint("1;35", "✻ harness"), out.paint("1", agent.model())));
+    let effort = out.paint("2", &format!(" · {} effort", agent.client().effort().as_str()));
+    out.line(format!("{} {}{effort}", out.paint("1;35", "✻ harness"), out.paint("1", agent.model())));
     out.line(out.paint(
         "2",
         &format!(
@@ -248,6 +273,16 @@ fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, out: &Outpu
     ));
     out.line(out.paint("2", "  / for commands · @ for files · Ctrl-C to interrupt"));
     out.line("");
+}
+
+fn effort_help(effort: llm::Effort) -> &'static str {
+    match effort {
+        llm::Effort::Low => "fastest and cheapest; simple tasks",
+        llm::Effort::Medium => "balanced speed and depth",
+        llm::Effort::High => "deeper thinking",
+        llm::Effort::XHigh => "deeper still; suits most coding work",
+        llm::Effort::Max => "deepest; when correctness matters most",
+    }
 }
 
 fn print_help(skills: &[Skill]) {
@@ -354,6 +389,10 @@ mod tests {
         assert_eq!(parse_input("/tools", &skills), Input::ListTools);
         assert_eq!(parse_input("fix it", &skills), Input::Prompt("fix it".into()));
         assert!(matches!(parse_input("/nope", &skills), Input::Error(_)));
+        assert_eq!(parse_input("/effort", &skills), Input::Effort(None));
+        assert_eq!(parse_input("/effort XHigh", &skills), Input::Effort(Some(Some(llm::Effort::XHigh))));
+        assert_eq!(parse_input("/effort auto", &skills), Input::Effort(Some(None)));
+        assert!(matches!(parse_input("/effort huge", &skills), Input::Error(_)));
         match parse_input("/greet  Bob ", &skills) {
             Input::Prompt(p) => {
                 assert!(p.starts_with("The user invoked the `greet` skill:"));

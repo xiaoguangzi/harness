@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-pub use config::{Protocol, Providers};
+pub use config::{Effort, Protocol, Providers};
 
 /// One conversation turn. `content` is a list of raw content blocks.
 #[derive(Debug, Clone)]
@@ -86,6 +86,8 @@ pub struct Client {
     http: reqwest::Client,
     providers: Arc<Providers>,
     spec: String,
+    /// Set by `/effort`; replaces the configured effort for every model.
+    effort: Option<Effort>,
 }
 
 impl Client {
@@ -97,7 +99,7 @@ impl Client {
             .build()
             .context("building HTTP client")?;
         let spec = providers.default_model.clone();
-        Ok(Self { http, providers: Arc::new(providers), spec })
+        Ok(Self { http, providers: Arc::new(providers), spec, effort: None })
     }
 
     /// The `provider/model` this client talks to.
@@ -118,6 +120,19 @@ impl Client {
         Ok(Self { spec, ..self.clone() })
     }
 
+    /// The effort requests are sent with.
+    pub fn effort(&self) -> Effort {
+        self.effort
+            .or_else(|| self.providers.target(&self.spec).ok().map(|t| t.effort))
+            .unwrap_or(self.providers.effort)
+    }
+
+    /// Overrides the configured effort, or restores it with `None`. Kept
+    /// across [`Client::switch`].
+    pub fn set_effort(&mut self, effort: Option<Effort>) {
+        self.effort = effort;
+    }
+
     /// Sends a streaming request and assembles the final response, calling
     /// `on_event` as text arrives.
     pub async fn create(
@@ -127,7 +142,8 @@ impl Client {
         messages: &[Message],
         on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Response> {
-        let target = self.providers.target(&self.spec)?;
+        let mut target = self.providers.target(&self.spec)?;
+        target.effort = self.effort.unwrap_or(target.effort);
         match target.config.protocol {
             Protocol::Anthropic => anthropic::create(&self.http, &target, system, tools, messages, on_event).await,
             Protocol::OpenAiResponses => openai::create(&self.http, &target, system, tools, messages, on_event).await,

@@ -67,6 +67,7 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
         // carried as encrypted items.
         "store": false,
         "include": ["reasoning.encrypted_content"],
+        "reasoning": {"effort": target.effort.as_str()},
     });
     target.apply_extra_body(&mut body);
     body
@@ -387,6 +388,15 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["reasoning"], json!({"effort": "high"}));
         assert!(body.get("include").is_none(), "extra_body null removes a default");
+
+        // The configured effort is sent as is; extra_body has the last word.
+        let target = Target { effort: crate::llm::Effort::Low, ..target };
+        let body = build_body(&target, "sys", &tools, &[]);
+        assert_eq!(body["reasoning"], json!({"effort": "high"}), "extra_body wins");
+        let mut bare = p.provider("gw").unwrap().clone();
+        bare.extra_body = None;
+        let target = Target { config: &bare, effort: crate::llm::Effort::Max, ..target };
+        assert_eq!(build_body(&target, "sys", &tools, &[])["reasoning"], json!({"effort": "max"}));
         assert_eq!(
             body["tools"],
             json!([{"type": "function", "name": "grep", "description": "search", "parameters": {"type": "object"}, "strict": false}])
