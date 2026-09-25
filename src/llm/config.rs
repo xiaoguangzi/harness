@@ -118,26 +118,46 @@ pub struct Target<'a> {
     pub model: &'a str,
 }
 
+/// The providers files, lowest precedence first: `$HARNESS_PROVIDERS`
+/// alone, else `~/.harness/providers.json` then `./.harness/providers.json`.
+pub fn config_paths() -> Vec<PathBuf> {
+    match std::env::var_os("HARNESS_PROVIDERS") {
+        Some(p) => vec![PathBuf::from(p)],
+        None => {
+            let mut v = Vec::new();
+            if let Some(home) = std::env::var_os("HOME") {
+                v.push(Path::new(&home).join(".harness/providers.json"));
+            }
+            v.push(PathBuf::from(".harness/providers.json"));
+            v
+        }
+    }
+}
+
+/// The file the web UI edits: the highest-precedence one.
+pub fn editable_path() -> PathBuf {
+    config_paths().pop().expect("at least one providers path")
+}
+
 impl Providers {
     /// Loads the config files and environment described in the module docs.
     pub fn load() -> Result<Self> {
-        let paths: Vec<PathBuf> = match std::env::var_os("HARNESS_PROVIDERS") {
-            Some(p) => vec![PathBuf::from(p)],
-            None => {
-                let mut v = Vec::new();
-                if let Some(home) = std::env::var_os("HOME") {
-                    v.push(Path::new(&home).join(".harness/providers.json"));
-                }
-                v.push(PathBuf::from(".harness/providers.json"));
-                v
-            }
-        };
+        Self::load_with(None)
+    }
+
+    /// Like [`Providers::load`], but with the file at `path` read as `text`
+    /// instead, so an edit can be validated before it is saved.
+    pub fn load_with(replace: Option<(&Path, &str)>) -> Result<Self> {
         let mut files = Vec::new();
-        for path in paths {
-            if !path.exists() {
+        for path in config_paths() {
+            let text = match replace {
+                Some((p, text)) if p == path => text.to_string(),
+                _ if !path.exists() => continue,
+                _ => std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?,
+            };
+            if text.trim().is_empty() {
                 continue;
             }
-            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
             let file: ProvidersFile =
                 serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
             files.push(file);
@@ -267,6 +287,10 @@ impl Providers {
     /// Every `provider/model` listed in the config, for `/model`.
     pub fn listed_models(&self) -> Vec<String> {
         self.providers.iter().flat_map(|(p, c)| c.models.keys().map(move |m| format!("{p}/{m}"))).collect()
+    }
+
+    pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers.get(name)
     }
 
     pub fn protocol_of(&self, provider: &str) -> Option<Protocol> {

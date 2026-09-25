@@ -7,6 +7,7 @@ mod skills;
 mod subagent;
 mod tools;
 mod util;
+mod web;
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -69,7 +70,14 @@ fn system_prompt() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Client::new(Providers::load()?)?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let web_addr = web::parse_flag(&args)?;
+    // The web UI can fix a missing or broken providers config, so it starts
+    // without one.
+    let providers = match Providers::load() {
+        Err(e) if web_addr.is_none() => return Err(e),
+        loaded => loaded,
+    };
     let files = FileTracker::default();
     let mut registry = ToolRegistry::with_defaults(files.clone());
 
@@ -99,8 +107,34 @@ async fn main() -> Result<()> {
     }
     let agent_defs = Arc::new(agent_defs);
     let reporter: subagent::Reporter = Arc::new(|label: &str, tool: &str, input: &Value| {
-        println!("\x1b[90m    ⎿ [{label}] {tool} {}\x1b[0m", preview(&input.to_string(), 120));
+        if !web::forward_subagent(label, tool, input) {
+            println!("\x1b[90m    ⎿ [{label}] {tool} {}\x1b[0m", preview(&input.to_string(), 120));
+        }
     });
+
+    if let Some(addr) = web_addr {
+        let mcp_status = mcp
+            .statuses
+            .iter()
+            .map(|s| match &s.outcome {
+                Ok(tools) => serde_json::json!({"name": s.name, "tools": tools}),
+                Err(e) => serde_json::json!({"name": s.name, "error": e}),
+            })
+            .collect();
+        let setup = web::Setup {
+            providers,
+            tools: registry,
+            skills,
+            agent_defs,
+            mcp: Value::Array(mcp_status),
+            reporter,
+        };
+        let result = web::serve(&addr, setup).await;
+        mcp.shutdown().await;
+        return result;
+    }
+
+    let client = Client::new(providers?)?;
     // Subagents choose from the tools registered so far, so they never get
     // the `agent` tool itself.
     let agent_tool = AgentTool::new(agent_defs.clone(), registry.clone(), client.clone(), reporter);
@@ -110,7 +144,7 @@ async fn main() -> Result<()> {
     registry.register(agent_tool);
 
     let mut agent = Agent::new(client, registry, system_prompt());
-    let result = run(&mut agent, &skills, &agent_defs, &mcp, &files).await;
+    let result = run(&mut agent, args, &skills, &agent_defs, &mcp, &files).await;
     // The agent's tools hold the MCP connections; release them first.
     drop(agent);
     mcp.shutdown().await;
@@ -119,6 +153,7 @@ async fn main() -> Result<()> {
 
 async fn run(
     agent: &mut Agent,
+    args: Vec<String>,
     skills: &[Skill],
     agent_defs: &[AgentDef],
     mcp: &mcp::Manager,
@@ -127,7 +162,6 @@ async fn run(
     let mut term = Terminal;
 
     // One-shot mode: `harness "do something"` or `harness /skill args`.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
         let line = args.join(" ");
         return match parse_input(&line, skills) {

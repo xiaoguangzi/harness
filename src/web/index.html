@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>harness</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --line: #e3e6eb; --text: #1d2330; --muted: #6b7384;
+  --accent: #2f6fed; --accent-soft: #e8effd; --ok: #1f9d55; --warn: #b7791f; --err: #d64545;
+  --code: #f1f3f6; --user: #eef3ff;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161b; --panel: #1b1e25; --line: #2c313b; --text: #e3e6ec; --muted: #8b93a3;
+    --accent: #6b9bff; --accent-soft: #22304d; --ok: #48bb78; --warn: #ecc94b; --err: #fc8181;
+    --code: #232730; --user: #1f2a40;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+header { display: flex; align-items: center; gap: 24px; padding: 0 20px; height: 52px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 16px; margin: 0; letter-spacing: .5px; }
+header .cwd { margin-left: auto; color: var(--muted); font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
+nav { display: flex; gap: 4px; }
+nav button { background: none; border: 0; color: var(--muted); padding: 8px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
+nav button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+main { height: calc(100vh - 52px); }
+.page { display: none; height: 100%; }
+.page.active { display: flex; }
+.side { width: 300px; flex: none; border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+.side .top { padding: 12px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; }
+.list { overflow: auto; flex: 1; }
+.item { padding: 10px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.item:hover { background: var(--bg); }
+.item.active { background: var(--accent-soft); }
+.item .t { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .s { color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; margin-top: 2px; }
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.scroll { flex: 1; overflow: auto; padding: 20px 24px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+.card h2 { font-size: 15px; margin: 0 0 12px; }
+.card h3 { font-size: 14px; margin: 0; }
+label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+input, select, textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; }
+textarea { font-family: var(--mono); font-size: 13px; resize: vertical; }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+button.btn { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; font: inherit; white-space: nowrap; }
+button.btn:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.danger { color: var(--err); }
+button:disabled { opacity: .5; cursor: default; }
+.row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.row > * { flex: 1; min-width: 160px; }
+.row > .btn, .row > .fixed { flex: none; min-width: 0; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+.badge { display: inline-block; white-space: nowrap; flex: none; padding: 1px 8px; border-radius: 10px; font-size: 11.5px; border: 1px solid var(--line); color: var(--muted); }
+.badge.running { color: var(--accent); border-color: var(--accent); }
+.badge.idle { color: var(--ok); border-color: var(--ok); }
+.badge.error { color: var(--err); border-color: var(--err); }
+.badge.cancelled { color: var(--warn); border-color: var(--warn); }
+.badge.ro { color: var(--ok); border-color: var(--ok); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--muted); }
+.dot.running { background: var(--accent); animation: pulse 1s infinite alternate; }
+.dot.idle { background: var(--ok); } .dot.error { background: var(--err); } .dot.cancelled { background: var(--warn); }
+@keyframes pulse { to { opacity: .3; } }
+pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12.5px/1.45 var(--mono); }
+.msg { margin: 0 0 14px; }
+.msg.user { background: var(--user); border-radius: 10px; padding: 10px 14px; white-space: pre-wrap; }
+.msg.assistant { white-space: pre-wrap; padding: 2px 2px; }
+.msg .att { color: var(--muted); font-size: 12px; margin-top: 4px; }
+details.tool { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); margin: 0 0 10px; }
+details.tool > summary { cursor: pointer; padding: 6px 10px; list-style: none; display: flex; gap: 8px; align-items: baseline; }
+details.tool > summary::-webkit-details-marker { display: none; }
+details.tool .name { font: 600 12.5px var(--mono); color: var(--accent); }
+details.tool .args { color: var(--muted); font: 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+details.tool .body { padding: 8px 10px; border-top: 1px solid var(--line); display: grid; gap: 8px; }
+details.tool .body pre { background: var(--code); padding: 8px; border-radius: 6px; max-height: 360px; overflow: auto; }
+details.tool.err .name { color: var(--err); }
+.sub { color: var(--muted); font: 12px var(--mono); padding-left: 10px; border-left: 2px solid var(--line); }
+.note { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.note.err { color: var(--err); white-space: pre-wrap; }
+.composer { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 24px; display: flex; gap: 10px; align-items: flex-end; }
+.composer textarea { font-family: inherit; font-size: 14px; min-height: 44px; max-height: 240px; }
+.taskhead { display: flex; gap: 10px; align-items: center; padding: 12px 24px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+.taskhead .title { font-weight: 600; font-size: 15px; flex: 1; min-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.taskhead input { width: 220px; }
+.empty { color: var(--muted); text-align: center; padding: 60px 20px; }
+.result { margin-top: 14px; }
+.result pre { background: var(--code); padding: 10px; border-radius: 8px; max-height: 60vh; overflow: auto; }
+.result.err pre { outline: 1px solid var(--err); }
+.result img { max-width: 100%; border: 1px solid var(--line); border-radius: 6px; margin-top: 8px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+.provider { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px 14px; margin-bottom: 12px; }
+.provider .head { display: flex; gap: 10px; align-items: center; }
+.tabs2 { display: flex; gap: 6px; margin-bottom: 10px; }
+.tabs2 button.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+#toast { position: fixed; right: 20px; bottom: 20px; background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 480px; white-space: pre-wrap; z-index: 10; }
+#toast.show { opacity: .95; }
+#toast.err { background: var(--err); color: #fff; }
+@media (max-width: 760px) {
+  .page.active { flex-direction: column; }
+  .side { width: 100%; max-height: 35vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  .grid2 { grid-template-columns: 1fr; }
+  header .cwd { display: none; }
+  header { gap: 10px; padding: 0 12px; overflow-x: auto; }
+  nav button { white-space: nowrap; padding: 6px 8px; }
+  .scroll, .composer, .taskhead { padding-left: 16px; padding-right: 16px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>harness</h1>
+  <nav>
+    <button data-page="tasks" class="active">任务</button>
+    <button data-page="tools">工具</button>
+    <button data-page="models">模型配置</button>
+    <button data-page="env">Agents / Skills / MCP</button>
+  </nav>
+  <span class="cwd" id="cwd"></span>
+</header>
+<main>
+  <!-- Tasks -->
+  <section class="page active" id="page-tasks">
+    <div class="side">
+      <div class="top"><button class="btn primary" style="flex:1" id="new-task-btn">＋ 新建任务</button></div>
+      <div class="list" id="task-list"></div>
+    </div>
+    <div class="content" id="task-view"></div>
+  </section>
+
+  <!-- Tools -->
+  <section class="page" id="page-tools">
+    <div class="side">
+      <div class="top"><input id="tool-filter" placeholder="筛选工具…"></div>
+      <div class="list" id="tool-list"></div>
+    </div>
+    <div class="content"><div class="scroll" id="tool-view"><div class="empty">选择左侧的工具，填写 JSON 参数后直接调用</div></div></div>
+  </section>
+
+  <!-- Models -->
+  <section class="page" id="page-models">
+    <div class="content"><div class="scroll" id="models-view"></div></div>
+  </section>
+
+  <!-- Environment -->
+  <section class="page" id="page-env">
+    <div class="content"><div class="scroll" id="env-view"></div></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- helpers
+let token = "";
+try {
+  const m = location.hash.match(/token=([^&]+)/);
+  if (m) { token = m[1]; sessionStorage.setItem("harness-token", token); history.replaceState(null, "", location.pathname); }
+  else token = sessionStorage.getItem("harness-token") || "";
+} catch (e) {}
+
+async function api(method, path, body) {
+  const headers = { "X-Harness": "1" };
+  if (token) headers.Authorization = "Bearer " + token;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const r = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.status + " " + r.statusText);
+  return data;
+}
+
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "class") el.className = v;
+    else if (k === "value") el.value = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) el.append(c instanceof Node ? c : String(c));
+  return el;
+}
+
+let toastTimer;
+function toast(msg, isErr) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.className = "show" + (isErr ? " err" : "");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = "", isErr ? 6000 : 2500);
+}
+
+const STATUS = { running: "运行中", idle: "完成", error: "出错", cancelled: "已取消" };
+const oneLine = (v, n = 160) => { const s = typeof v === "string" ? v : JSON.stringify(v); return s.length > n ? s.slice(0, n) + "…" : s; };
+const pretty = v => typeof v === "string" ? v : JSON.stringify(v, null, 2);
+
+let info = null;
+async function loadInfo() {
+  info = await api("GET", "/api/info");
+  document.getElementById("cwd").textContent = info.cwd;
+  return info;
+}
+function modelOptions() {
+  const a = info && info.config.active;
+  if (!a) return [];
+  const set = new Set([a.default_model, a.subagent_model, ...a.models].filter(Boolean));
+  return [...set];
+}
+function modelDatalist(id) {
+  return h("datalist", { id }, modelOptions().map(m => h("option", { value: m })));
+}
+
+// ---------------------------------------------------------------- navigation
+const pages = { tasks: showTasksPage, tools: showToolsPage, models: showModelsPage, env: showEnvPage };
+document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
+  document.querySelectorAll(".page").forEach(p => p.classList.toggle("active", p.id === "page-" + b.dataset.page));
+  pages[b.dataset.page]();
+}));
+
+// ---------------------------------------------------------------- tasks
+let tasks = [];
+let currentTask = null; // id, or null for the new-task form
+let source = null;
+
+async function refreshTasks() {
+  try { tasks = await api("GET", "/api/tasks"); } catch (e) { return; }
+  const list = document.getElementById("task-list");
+  list.replaceChildren(...(tasks.length ? tasks.map(t => h("div", {
+      class: "item" + (t.id === currentTask ? " active" : ""), onclick: () => openTask(t.id) },
+    h("div", { class: "t" }, t.title),
+    h("div", { class: "s" }, h("span", { class: "dot " + t.status }), STATUS[t.status] || t.status,
+      h("span", {}, "·"), t.agent, h("span", { class: "mono", style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, t.model))
+  )) : [h("div", { class: "empty" }, "还没有任务")]));
+  const cur = tasks.find(t => t.id === currentTask);
+  if (cur) updateTaskHead(cur);
+}
+
+function showTasksPage() {
+  refreshTasks();
+  if (currentTask === null) showNewTask();
+}
+
+function showNewTask() {
+  if (source) { source.close(); source = null; }
+  currentTask = null;
+  refreshTasks();
+  const agents = (info ? info.agents : []);
+  const prompt = h("textarea", { rows: 8, placeholder: "描述要完成的任务。支持 @路径 附加文件，/技能名 调用 skill。Ctrl+Enter 提交", style: "font-family:inherit;font-size:14px" });
+  const agentSel = h("select", {}, h("option", { value: "main" }, "main — 主 agent（全部工具）"),
+    agents.map(a => h("option", { value: a.name }, `${a.name} — ${a.permission}`)));
+  const model = h("input", { list: "dl-new-model", placeholder: "默认: " + (info && info.config.active ? info.config.active.default_model : "未配置") });
+  const title = h("input", { placeholder: "可选，默认取任务首行" });
+  const agentHint = h("div", { class: "note", style: "margin-top:6px" });
+  const syncHint = () => {
+    const a = agents.find(x => x.name === agentSel.value);
+    agentHint.textContent = a ? a.description + (a.tools ? `  [工具: ${a.tools.join(", ")}]` : "") : "主 agent：可使用 bash / read / write / grep / skill / MCP 工具，并可再派发子 agent。";
+    const act = info && info.config.active;
+    model.placeholder = "默认: " + (a ? (a.model || (act && act.subagent_model) || (act && act.default_model)) : (act ? act.default_model : "未配置"));
+  };
+  agentSel.addEventListener("change", syncHint); syncHint();
+  const submit = h("button", { class: "btn primary" }, "派发任务");
+  const go = async () => {
+    submit.disabled = true;
+    try {
+      const t = await api("POST", "/api/tasks", { prompt: prompt.value, agent: agentSel.value, model: model.value, title: title.value });
+      openTask(t.id);
+    } catch (e) { toast(e.message, true); }
+    submit.disabled = false;
+  };
+  submit.addEventListener("click", go);
+  prompt.addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) go(); });
+  const noModel = info && !info.config.active;
+  document.getElementById("task-view").replaceChildren(h("div", { class: "scroll" },
+    noModel ? h("div", { class: "card note err" }, "还没有可用的模型：" + (info.config.error || "") + "\n请先到「模型配置」页添加 provider。") : null,
+    h("div", { class: "card" },
+      h("h2", {}, "新建任务"),
+      h("label", {}, "任务内容"), prompt,
+      h("div", { class: "grid2" },
+        h("div", {}, h("label", {}, "执行者（agent 类型）"), agentSel),
+        h("div", {}, h("label", {}, "模型（provider/model，可留空）"), model, modelDatalist("dl-new-model"))),
+      agentHint,
+      h("label", {}, "标题"), title,
+      h("div", { style: "margin-top:14px;display:flex;justify-content:flex-end" }, submit))));
+  prompt.focus();
+}
+
+let transcript, pending, assistantEl;
+function openTask(id) {
+  if (source) { source.close(); source = null; }
+  currentTask = id;
+  const t = tasks.find(x => x.id === id) || { id, title: "任务 #" + id, status: "", model: "", agent: "" };
+  transcript = h("div", { class: "scroll" });
+  pending = []; assistantEl = null;
+
+  const input = h("textarea", { rows: 2, placeholder: "继续对话… (Ctrl+Enter 发送)" });
+  const send = h("button", { class: "btn primary" }, "发送");
+  const doSend = async () => {
+    if (!input.value.trim()) return;
+    send.disabled = true;
+    try { await api("POST", `/api/tasks/${id}/messages`, { prompt: input.value }); input.value = ""; refreshTasks(); }
+    catch (e) { toast(e.message, true); }
+    send.disabled = false;
+  };
+  send.addEventListener("click", doSend);
+  input.addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) doSend(); });
+
+  const model = h("input", { list: "dl-task-model", id: "task-model", value: t.model, title: "切换本任务的模型" });
+  const head = h("div", { class: "taskhead" },
+    h("span", { class: "title", id: "task-title" }, t.title),
+    h("span", { class: "badge " + t.status, id: "task-status" }, STATUS[t.status] || t.status),
+    h("span", { class: "muted", id: "task-agent" }, t.agent),
+    model, modelDatalist("dl-task-model"),
+    h("button", { class: "btn", onclick: async () => {
+      try { await api("POST", `/api/tasks/${id}/model`, { model: model.value }); toast("已切换模型"); refreshTasks(); }
+      catch (e) { toast(e.message, true); } } }, "切换模型"),
+    h("button", { class: "btn", id: "task-cancel", onclick: async () => {
+      try { await api("POST", `/api/tasks/${id}/cancel`); refreshTasks(); } catch (e) { toast(e.message, true); } } }, "取消"),
+    h("button", { class: "btn danger", onclick: async () => {
+      if (!confirm("删除这个任务？运行中的任务会被取消。")) return;
+      try { await api("DELETE", `/api/tasks/${id}`); showNewTask(); } catch (e) { toast(e.message, true); } } }, "删除"));
+
+  document.getElementById("task-view").replaceChildren(head, transcript, h("div", { class: "composer" }, input, send));
+  updateTaskHead(t);
+  refreshTasks();
+
+  source = new EventSource(`/api/tasks/${id}/events` + (token ? "?token=" + encodeURIComponent(token) : ""));
+  source.onmessage = e => renderEvent(JSON.parse(e.data));
+  source.onerror = () => { if (currentTask !== id && source) source.close(); };
+}
+
+function updateTaskHead(t) {
+  const st = document.getElementById("task-status");
+  if (!st) return;
+  st.className = "badge " + t.status; st.textContent = STATUS[t.status] || t.status;
+  document.getElementById("task-title").textContent = t.title;
+  document.getElementById("task-agent").textContent = t.agent;
+  document.getElementById("task-cancel").disabled = t.status !== "running";
+  const m = document.getElementById("task-model");
+  if (m && document.activeElement !== m) m.value = t.model;
+}
+
+function stickToBottom(fn) {
+  const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 60;
+  fn();
+  if (atBottom) transcript.scrollTop = transcript.scrollHeight;
+}
+
+// Tool calls that will never get a result (the turn failed or was cancelled).
+function abandonPending(label) {
+  for (const p of pending) { const b = p.el.querySelector(".badge"); b.textContent = label; b.className = "badge cancelled"; }
+  pending = [];
+}
+
+function renderEvent(ev) {
+  stickToBottom(() => {
+    switch (ev.type) {
+      case "user":
+        assistantEl = null;
+        transcript.append(h("div", { class: "msg user" }, ev.text,
+          (ev.attachments || []).length ? h("div", { class: "att" }, "附件: " + ev.attachments.join(", ")) : null,
+          (ev.warnings || []).length ? h("div", { class: "att" }, "⚠ " + ev.warnings.join("; ")) : null));
+        break;
+      case "text":
+        if (!assistantEl) { assistantEl = h("div", { class: "msg assistant" }); transcript.append(assistantEl); }
+        assistantEl.append(ev.text);
+        break;
+      case "text_end": assistantEl = null; break;
+      case "tool_call": {
+        assistantEl = null;
+        const body = h("div", { class: "body" }, h("pre", {}, pretty(ev.input)));
+        const d = h("details", { class: "tool" },
+          h("summary", {}, h("span", { class: "name" }, "● " + ev.name), h("span", { class: "args" }, oneLine(ev.input)), h("span", { class: "badge" }, "…")),
+          body);
+        transcript.append(d);
+        pending.push({ name: ev.name, el: d, body });
+        break;
+      }
+      case "subagent": {
+        const p = [...pending].reverse().find(x => x.name === "agent");
+        const line = h("div", { class: "sub" }, `[${ev.label}] ${ev.tool} ${oneLine(ev.input, 120)}`);
+        if (p) { p.body.append(line); p.el.querySelector(".badge").textContent = "运行中"; }
+        else transcript.append(line);
+        break;
+      }
+      case "tool_result": {
+        const i = pending.findIndex(x => x.name === ev.name);
+        const p = i >= 0 ? pending.splice(i, 1)[0] : null;
+        const out = h("pre", {}, ev.content || "(空)");
+        if (p) {
+          p.body.append(out);
+          const b = p.el.querySelector(".badge");
+          b.textContent = ev.is_error ? "错误" : "完成"; b.className = "badge " + (ev.is_error ? "error" : "idle");
+          if (ev.is_error) p.el.classList.add("err");
+        } else transcript.append(out);
+        break;
+      }
+      case "error": transcript.append(h("div", { class: "note err" }, "✖ " + ev.message)); abandonPending("未完成"); break;
+      case "cancelled": transcript.append(h("div", { class: "note" }, "— 已取消 —")); abandonPending("已取消"); break;
+      case "model": transcript.append(h("div", { class: "note" }, "模型切换为 " + ev.model)); break;
+      case "status": {
+        const t = tasks.find(x => x.id === currentTask);
+        if (t) { t.status = ev.status; t.model = ev.model; updateTaskHead(t); }
+        if (ev.status !== "running") refreshTasks();
+        break;
+      }
+    }
+  });
+}
+
+document.getElementById("new-task-btn").addEventListener("click", showNewTask);
+setInterval(() => { if (document.getElementById("page-tasks").classList.contains("active")) refreshTasks(); }, 3000);
+
+// ---------------------------------------------------------------- tools
+let tools = [];
+async function showToolsPage() {
+  try { tools = await api("GET", "/api/tools"); } catch (e) { toast(e.message, true); return; }
+  renderToolList();
+}
+function renderToolList() {
+  const f = document.getElementById("tool-filter").value.toLowerCase();
+  document.getElementById("tool-list").replaceChildren(...tools.filter(t => t.name.toLowerCase().includes(f)).map(t =>
+    h("div", { class: "item", onclick: e => { document.querySelectorAll("#tool-list .item").forEach(x => x.classList.remove("active")); e.currentTarget.classList.add("active"); showTool(t); } },
+      h("div", { class: "t mono" }, t.name),
+      h("div", { class: "s" }, t.read_only ? h("span", { class: "badge ro" }, "只读") : h("span", { class: "badge" }, "可修改"),
+        h("span", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, t.description.split("\n")[0])))));
+}
+document.getElementById("tool-filter").addEventListener("input", renderToolList);
+
+function skeleton(schema) {
+  const out = {};
+  const props = (schema && schema.properties) || {};
+  for (const name of (schema && schema.required) || Object.keys(props).slice(0, 1)) {
+    const p = props[name] || {};
+    const type = Array.isArray(p.type) ? p.type[0] : p.type;
+    out[name] = p.enum ? p.enum[0] : p.default !== undefined ? p.default :
+      ({ string: "", integer: 0, number: 0, boolean: false, array: [], object: {} })[type] ?? null;
+  }
+  return out;
+}
+
+function showTool(t) {
+  const input = h("textarea", { rows: 10 }, JSON.stringify(skeleton(t.schema), null, 2));
+  const result = h("div", {});
+  const run = h("button", { class: "btn primary" }, "调用");
+  run.addEventListener("click", async () => {
+    let parsed;
+    try { parsed = input.value.trim() ? JSON.parse(input.value) : {}; } catch (e) { toast("参数不是合法 JSON: " + e.message, true); return; }
+    run.disabled = true; run.textContent = "调用中…";
+    try {
+      const r = await api("POST", "/api/tools/" + encodeURIComponent(t.name), { input: parsed });
+      result.replaceChildren(h("div", { class: "result" + (r.is_error ? " err" : "") },
+        h("div", { class: "note" }, (r.is_error ? "✖ 出错" : "✔ 完成") + ` · ${r.elapsed_ms} ms`),
+        h("pre", {}, r.content || "(空)"),
+        (r.images || []).map(img => img.source && img.source.data ? h("img", { src: `data:${img.source.media_type};base64,${img.source.data}` }) : null)));
+    } catch (e) { toast(e.message, true); }
+    run.disabled = false; run.textContent = "调用";
+  });
+  input.addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) run.click(); });
+  document.getElementById("tool-view").replaceChildren(h("div", { class: "card" },
+    h("div", { style: "display:flex;gap:10px;align-items:center" }, h("h2", { class: "mono", style: "margin:0" }, t.name),
+      t.read_only ? h("span", { class: "badge ro" }, "只读") : h("span", { class: "badge" }, "可修改")),
+    h("pre", { style: "font-family:inherit;font-size:13px;margin:10px 0" }, t.description),
+    h("details", {}, h("summary", { class: "muted", style: "cursor:pointer" }, "参数 JSON Schema"), h("pre", { style: "background:var(--code);padding:8px;border-radius:6px;margin-top:6px" }, JSON.stringify(t.schema, null, 2))),
+    h("label", {}, "参数 (JSON)，Ctrl+Enter 调用"), input,
+    h("div", { style: "margin-top:10px;display:flex;justify-content:flex-end" }, run),
+    result));
+}
+
+// ---------------------------------------------------------------- models
+let cfg = {};          // the edited providers file
+let cfgMode = "form";  // or "json"
+let cfgText = "";
+
+async function showModelsPage() {
+  try { await loadInfo(); } catch (e) { toast(e.message, true); return; }
+  cfgText = info.config.text || "";
+  try { cfg = cfgText.trim() ? JSON.parse(cfgText) : {}; } catch (e) { cfg = {}; cfgMode = "json"; }
+  renderModels();
+}
+
+function renderModels() {
+  const a = info.config.active;
+  const status = h("div", { class: "card" }, h("h2", {}, "当前生效"),
+    a ? [
+      h("div", { class: "grid2" },
+        h("div", {}, h("label", {}, "默认模型"), h("div", { class: "mono" }, a.default_model)),
+        h("div", {}, h("label", {}, "子 agent 模型"), h("div", { class: "mono" }, a.subagent_model || "（同主模型）"))),
+      h("table", { style: "margin-top:14px" },
+        h("tr", {}, h("th", {}, "Provider"), h("th", {}, "协议"), h("th", {}, "Base URL"), h("th", {}, "API Key"), h("th", {}, "模型")),
+        a.providers.map(p => h("tr", {}, h("td", { class: "mono" }, p.name), h("td", {}, p.protocol), h("td", { class: "mono" }, p.base_url),
+          h("td", { class: "mono" }, p.api_key || "—"), h("td", { class: "mono" }, p.models.join(", ") || "—"))))
+    ] : h("div", { class: "note err" }, "没有可用的模型：" + (info.config.error || "")));
+
+  const save = h("button", { class: "btn primary" }, "保存并生效");
+  save.addEventListener("click", saveConfig);
+  const editor = h("div", { class: "card" },
+    h("div", { style: "display:flex;align-items:center;gap:12px" }, h("h2", { style: "margin:0;flex:1" }, "编辑 providers.json"),
+      h("span", { class: "muted mono" }, info.config.path)),
+    h("p", { class: "note", style: "margin-top:6px" }, "保存前会校验整套配置（含 ~/.harness/providers.json 和环境变量），通过后写入文件并立即生效；空闲任务会切换到新配置。api_key 可写 ${ENV_VAR} 引用环境变量。"),
+    h("div", { class: "tabs2" },
+      h("button", { class: "btn" + (cfgMode === "form" ? " active" : ""), onclick: () => switchCfgMode("form") }, "表单"),
+      h("button", { class: "btn" + (cfgMode === "json" ? " active" : ""), onclick: () => switchCfgMode("json") }, "JSON")),
+    cfgMode === "form" ? cfgForm() : cfgJson(),
+    h("div", { style: "margin-top:14px;display:flex;justify-content:flex-end;gap:10px" },
+      h("button", { class: "btn", onclick: showModelsPage }, "放弃修改"), save));
+  document.getElementById("models-view").replaceChildren(status, editor);
+}
+
+function switchCfgMode(mode) {
+  if (mode === cfgMode) return;
+  if (mode === "form") {
+    try { cfg = cfgText.trim() ? JSON.parse(cfgText) : {}; } catch (e) { toast("JSON 无法解析: " + e.message, true); return; }
+  } else cfgText = JSON.stringify(cfg, null, 2);
+  cfgMode = mode; renderModels();
+}
+
+function cfgJson() {
+  const ta = h("textarea", { rows: 24, oninput: e => cfgText = e.target.value });
+  ta.value = cfgText;
+  return ta;
+}
+
+function setOrDelete(obj, key, value) { if (value === "" || value === undefined || value === null) delete obj[key]; else obj[key] = value; }
+
+function cfgForm() {
+  cfg.providers = cfg.providers || {};
+  const providers = cfg.providers;
+  const allModels = Object.entries(providers).flatMap(([n, p]) => Object.keys(p.models || {}).map(m => n + "/" + m));
+  const dl = h("datalist", { id: "dl-cfg-models" }, allModels.map(m => h("option", { value: m })));
+  const top = h("div", { class: "grid2" },
+    h("div", {}, h("label", {}, "default_model（默认模型，provider/model）"),
+      h("input", { list: "dl-cfg-models", value: cfg.default_model || "", oninput: e => setOrDelete(cfg, "default_model", e.target.value.trim()) })),
+    h("div", {}, h("label", {}, "subagent_model（子 agent 默认模型，可空）"),
+      h("input", { list: "dl-cfg-models", value: cfg.subagent_model || "", oninput: e => setOrDelete(cfg, "subagent_model", e.target.value.trim()) })));
+
+  const cards = Object.keys(providers).map(name => providerCard(name));
+  const add = h("button", { class: "btn", onclick: () => {
+    let n = "provider", i = 1; while (providers[n]) n = "provider" + (++i);
+    providers[n] = { protocol: "anthropic", base_url: "", api_key: "" }; renderModels();
+  } }, "＋ 添加 provider");
+  return h("div", {}, dl, top, h("h3", { style: "margin:18px 0 10px" }, "Providers（网关）"), cards, add);
+}
+
+function jsonField(obj, key, label) {
+  const ta = h("textarea", { rows: 2, placeholder: "{ }" });
+  ta.value = obj[key] ? JSON.stringify(obj[key], null, 2) : "";
+  ta.addEventListener("change", () => {
+    if (!ta.value.trim()) { delete obj[key]; ta.style.borderColor = ""; return; }
+    try { obj[key] = JSON.parse(ta.value); ta.style.borderColor = ""; } catch (e) { ta.style.borderColor = "var(--err)"; toast(label + " 不是合法 JSON", true); }
+  });
+  return h("div", {}, h("label", {}, label), ta);
+}
+
+function providerCard(name) {
+  const p = cfg.providers[name];
+  const rename = e => {
+    const n = e.target.value.trim();
+    if (!n || n === name) return;
+    if (cfg.providers[n]) { toast("已有同名 provider", true); e.target.value = name; return; }
+    // Rebuild to keep the order.
+    cfg.providers = Object.fromEntries(Object.entries(cfg.providers).map(([k, v]) => [k === name ? n : k, v]));
+    for (const key of ["default_model", "subagent_model"])
+      if (cfg[key] && cfg[key].startsWith(name + "/")) cfg[key] = n + cfg[key].slice(name.length);
+    renderModels();
+  };
+  const key = h("input", { type: "password", value: p.api_key || "", placeholder: "${MY_KEY} 或明文 key", oninput: e => setOrDelete(p, "api_key", e.target.value) });
+  const models = h("input", { value: Object.keys(p.models || {}).join(", "), placeholder: "claude-opus-5, claude-sonnet-5", onchange: e => {
+    const names = e.target.value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+    const old = p.models || {};
+    if (names.length) p.models = Object.fromEntries(names.map(m => [m, old[m] || {}])); else delete p.models;
+  } });
+  return h("div", { class: "provider" },
+    h("div", { class: "head" },
+      h("input", { value: name, class: "mono", style: "font-weight:600;max-width:240px", onchange: rename, title: "provider 名称，模型写作 名称/模型" }),
+      h("span", { style: "flex:1" }),
+      h("button", { class: "btn danger", onclick: () => { if (confirm(`删除 provider ${name}？`)) { delete cfg.providers[name]; renderModels(); } } }, "删除")),
+    h("div", { class: "grid2" },
+      h("div", {}, h("label", {}, "protocol"), h("select", { onchange: e => p.protocol = e.target.value },
+        ["anthropic", "openai-responses"].map(v => h("option", { value: v, selected: (p.protocol === v || (v === "openai-responses" && ["openai", "responses"].includes(p.protocol))) }, v)))),
+      h("div", {}, h("label", {}, "base_url"), h("input", { value: p.base_url || "", placeholder: "https://api.anthropic.com", oninput: e => p.base_url = e.target.value.trim() })),
+      h("div", {}, h("label", {}, "api_key"), h("div", { class: "row" }, key,
+        h("button", { class: "btn fixed", onclick: () => key.type = key.type === "password" ? "text" : "password" }, "显示"))),
+      h("div", {}, h("label", {}, "auth（鉴权方式）"), h("select", { onchange: e => setOrDelete(p, "auth", e.target.value) },
+        h("option", { value: "" }, "默认（按协议）"),
+        ["x-api-key", "bearer"].map(v => h("option", { value: v, selected: p.auth === v }, v)))),
+      h("div", {}, h("label", {}, "models（逗号分隔，会出现在模型下拉中）"), models),
+      h("div", {}, h("label", {}, "max_tokens（可空）"), h("input", { type: "number", value: p.max_tokens ?? "", oninput: e => setOrDelete(p, "max_tokens", e.target.value ? Number(e.target.value) : "") }))),
+    h("details", { style: "margin-top:10px" }, h("summary", { class: "muted", style: "cursor:pointer" }, "高级：headers / extra_body"),
+      h("div", { class: "grid2" }, jsonField(p, "headers", "headers（额外请求头）"), jsonField(p, "extra_body", "extra_body（合并进请求体）"))));
+}
+
+async function saveConfig() {
+  const text = cfgMode === "json" ? cfgText : JSON.stringify(cfg, null, 2) + "\n";
+  try {
+    const r = await api("POST", "/api/config", { text });
+    info = r.info;
+    toast("已保存并生效" + (r.running_tasks_kept_old_config ? `（${r.running_tasks_kept_old_config} 个运行中的任务保持旧配置）` : ""));
+    showModelsPage();
+  } catch (e) { toast("保存失败：" + e.message, true); }
+}
+
+// ---------------------------------------------------------------- environment
+async function showEnvPage() {
+  try { await loadInfo(); } catch (e) { toast(e.message, true); return; }
+  document.getElementById("env-view").replaceChildren(
+    h("div", { class: "card" }, h("h2", {}, "子 Agent 类型"),
+      h("p", { class: "note" }, "在「任务」页选择 agent 类型即可把任务直接派发给它；自定义 agent 放在 .harness/agents/ 或 .claude/agents/。"),
+      h("table", {}, h("tr", {}, h("th", {}, "名称"), h("th", {}, "权限"), h("th", {}, "工具"), h("th", {}, "模型"), h("th", {}, "说明")),
+        info.agents.map(a => h("tr", {}, h("td", { class: "mono" }, a.name), h("td", {}, a.permission), h("td", { class: "mono" }, a.tools ? a.tools.join(", ") : "全部允许的"),
+          h("td", { class: "mono" }, a.model || "—"), h("td", {}, a.description, h("div", { class: "muted mono" }, a.source || "内置")))))),
+    h("div", { class: "card" }, h("h2", {}, "Skills"),
+      info.skills.length ? h("table", {}, h("tr", {}, h("th", {}, "名称"), h("th", {}, "说明")),
+        info.skills.map(s => h("tr", {}, h("td", { class: "mono" }, "/" + s.name), h("td", {}, s.description, h("div", { class: "muted mono" }, s.dir)))))
+        : h("p", { class: "note" }, "未发现 skill（.harness/skills、.claude/skills 及 ~ 下同名目录）")),
+    h("div", { class: "card" }, h("h2", {}, "MCP 服务器"),
+      info.mcp.length ? h("table", {}, h("tr", {}, h("th", {}, "服务器"), h("th", {}, "状态 / 工具")),
+        info.mcp.map(m => h("tr", {}, h("td", { class: "mono" }, m.name),
+          h("td", {}, m.error ? h("span", { style: "color:var(--err)" }, m.error) : h("span", { class: "mono" }, m.tools.join(", ") || "(无工具)")))))
+        : h("p", { class: "note" }, "未配置 MCP 服务器（.mcp.json 或 ~/.harness/mcp.json）")));
+}
+
+// ---------------------------------------------------------------- start
+loadInfo().then(showTasksPage).catch(e => toast("无法连接 harness：" + e.message, true));
+</script>
+</body>
+</html>

@@ -117,6 +117,11 @@ impl ToolRegistry {
         self.tools.retain(|_, t| keep(t.as_ref()));
     }
 
+    /// Whether the named tool is marked read-only (false if unknown).
+    pub fn is_read_only(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|t| t.read_only())
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tools.keys().map(String::as_str)
     }
