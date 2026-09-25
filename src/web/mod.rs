@@ -495,11 +495,12 @@ async fn create_task(State(state): State<Shared>, Json(req): Json<NewTask>) -> A
             _ => Ok(client.clone()),
         }
         .map_err(|e| bad_request(format!("{e:#}")))?;
+        let tools = task_tools(&live, def.as_ref(), &files);
         let system = match &def {
-            Some(def) => AgentTool::system_prompt(def),
-            None => crate::system_prompt(),
+            Some(def) => crate::prompt::subagent(def),
+            None => crate::prompt::main(&tools),
         };
-        Agent::new(client, task_tools(&live, def.as_ref(), &files), system)
+        Agent::new(client, tools, system)
     };
     let (content, user) = user_message(&state, prompt, &files)?;
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);

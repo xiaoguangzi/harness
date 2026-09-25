@@ -32,8 +32,10 @@ impl Tool for BashTool {
         "Run a shell command with `bash -c` and return its stdout, stderr and exit code. \
          Each call runs in a fresh process started in the working directory, so `cd` and \
          environment changes do not persist between calls. Output longer than 30000 bytes \
-         is truncated. Use this for builds, tests, git, searching (grep, find) and other \
-         shell work; use the `read`, `write` and `grep` tools for viewing, writing and searching files."
+         is truncated. Use this for builds, tests, git, listing files (ls, find) and other \
+         shell work. Do not use it to read, write or search file contents: no `cat`, `head`, \
+         `tail`, `sed`, `awk`, `echo >`, heredocs, `grep` or `rg` for that. Use the `read` tool \
+         to view files, `write` to create or change them, and the `grep` tool to search."
     }
 
     fn input_schema(&self) -> Value {

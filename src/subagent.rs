@@ -246,15 +246,6 @@ impl AgentTool {
             None => Ok(self.client.clone()),
         }
     }
-
-    pub fn system_prompt(def: &AgentDef) -> String {
-        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
-        format!(
-            "{}\n\nThe working directory is {cwd}. You were started by another agent, which sees only \
-             your final message; the user does not see it directly.",
-            def.prompt
-        )
-    }
 }
 
 #[derive(Deserialize)]
@@ -324,7 +315,7 @@ impl Tool for AgentTool {
             Ok(c) => c,
             Err(e) => return ToolOutput::error(format!("Agent `{}` has an unusable model: {e:#}", def.name)),
         };
-        let mut agent = Agent::new(client, self.registry_for(def), Self::system_prompt(def));
+        let mut agent = Agent::new(client, self.registry_for(def), crate::prompt::subagent(def));
         let mut observer = SubObserver {
             label: format!("{}: {}", def.name, input.description),
             reporter: self.reporter.clone(),

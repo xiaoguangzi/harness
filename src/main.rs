@@ -3,6 +3,7 @@ mod cli;
 mod llm;
 mod mcp;
 mod mentions;
+mod prompt;
 mod skills;
 mod subagent;
 mod tools;
@@ -20,21 +21,6 @@ use llm::{Client, Providers};
 use skills::SkillTool;
 use subagent::AgentTool;
 use tools::{FileTracker, ToolRegistry};
-
-fn system_prompt() -> String {
-    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
-    format!(
-        "You are a coding agent running in a terminal harness. You can run shell \
-         commands with `bash`, search file contents with `grep`, read files with `read` \
-         and create or overwrite files with `write`. Tools named `mcp__<server>__<tool>` \
-         come from connected MCP servers. When a request matches a skill listed in the \
-         `skill` tool, load that skill first and follow it. For open-ended codebase \
-         searches, delegate to the `explore` subagent with the `agent` tool, running \
-         several in parallel for independent questions. \
-         The working directory is {cwd}. Work step by step, verify your changes, \
-         and finish with a short summary of what you did."
-    )
-}
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
@@ -115,7 +101,8 @@ async fn main() -> Result<ExitCode> {
     }
     registry.register(agent_tool);
 
-    let mut agent = Agent::new(client, registry, system_prompt());
+    let system = prompt::main(&registry);
+    let mut agent = Agent::new(client, registry, system);
     let result = cli::run(&mut agent, args, &skills, &agent_defs, &mcp, &files, out).await;
     // The agent's tools hold the MCP connections; release them first.
     drop(agent);
