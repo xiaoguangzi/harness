@@ -130,6 +130,7 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 | `/sandbox` | show what the sandbox allows (see [Sandbox](#sandbox)) |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
 | `/exit`, `exit`, Ctrl-D | quit (`exit` or `quit` only when alone on the line) |
+| Esc | interrupt the running turn, like Ctrl-C |
 | Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted. At the prompt, press it twice to quit |
 | `\` at line end, Alt+Enter | continue the message on a new line |
 | `/` | open the command menu under the prompt; it narrows as you type, ↑/↓ select, Tab fills in, Enter runs. After `/model ` it lists models |

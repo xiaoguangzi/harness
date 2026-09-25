@@ -262,7 +262,7 @@ fn draw(state: &mut State) {
     if status.tokens > 0 {
         hint.push(format!("↓ {} tokens", tokens(status.tokens)));
     }
-    hint.push("ctrl-c to interrupt".to_string());
+    hint.push("esc to interrupt".to_string());
     let hint = format!(" ({})", hint.join(" · "));
     let width = text::terminal_width();
     let label = text::fit(&status.label, width.saturating_sub(text::width(&hint) + 3));

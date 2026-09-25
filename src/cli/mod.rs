@@ -1,6 +1,7 @@
 //! Terminal frontend: the interactive REPL and one-shot mode.
 
 mod diff;
+mod keys;
 mod markdown;
 mod menu;
 mod output;
@@ -288,7 +289,7 @@ fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &Output,
 }
 
 /// Attaches the files `@`-mentioned in `line` and runs the turn until it
-/// ends or Ctrl-C interrupts it. The turn's progress and outcome are shown,
+/// ends or Ctrl-C or Esc interrupts it. The turn's progress and outcome are shown,
 /// and the conversation is saved after it.
 async fn submit(
     agent: &mut Agent,
@@ -308,12 +309,15 @@ async fn submit(
         out.line(out.paint("33", &format!("  ! {w}")));
     }
     term.begin_turn();
+    let mut esc = keys::EscWatch::start();
     // Dropping the turn cancels it: running commands are killed, and the
     // agent repairs its history at the start of the next turn.
     let result = tokio::select! {
         result = agent.run_turn(expanded.into_content(prompt), &mut *term) => result.map_err(TurnEnd::Failed),
         _ = tokio::signal::ctrl_c() => Err(TurnEnd::Interrupted),
+        _ = esc.pressed() => Err(TurnEnd::Interrupted),
     };
+    drop(esc);
     term.end_turn(&result);
     if let Some(rec) = recorder {
         if first {
@@ -410,7 +414,7 @@ fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, out: &Outpu
             if crate::sandbox::active().is_some() { " · sandboxed" } else { "" }
         ),
     ));
-    out.line(out.paint("2", "  / for commands · @ for files · Ctrl-C to interrupt"));
+    out.line(out.paint("2", "  / for commands · @ for files · Esc or Ctrl-C to interrupt"));
     out.line("");
 }
 
@@ -430,6 +434,7 @@ fn print_help(skills: &[Skill]) {
         ("@path", "attach a file, directory, image or PDF; @ opens a file menu (@file#L10-20 for lines)"),
         ("\\ or Alt+Enter", "continue on a new line"),
         ("↑ ↓ Tab Enter", "pick from the menu shown while typing / or @"),
+        ("Esc", "interrupt the running turn"),
         ("Ctrl-C", "interrupt the running turn; twice at the prompt to quit"),
     ];
     for (key, what) in BUILTINS.iter().chain(&keys) {
