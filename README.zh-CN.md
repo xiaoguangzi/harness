@@ -38,7 +38,7 @@ cargo run --release -- --sandbox         # 在操作系统沙箱中运行模型�
 
 - **任务 (Tasks)**：把任务派发给主代理，或直接派发给某个子代理类型（`explore` 或自定义代理），也可指定模型。任务在后台运行，可以多个并发；每个任务都是独立的会话，流式展示文本、工具调用和结果（子代理进度显示在其 `agent` 调用之下）。可以用后续消息继续任务、切换模型、取消任务（运行中的 `bash` 命令会被终止）或删除任务。`@路径` 提及和 `/<skill> args` 与 REPL 中一致。
 - **工具 (Tools)**：列出所有已注册的工具（内置、技能、MCP、`agent`）及其描述和 schema；填入 JSON 输入即可直接调用。
-- **模型配置 (Models)**：当前生效的 provider 和模型，以及 `.harness/providers.json`（或 `$HARNESS_PROVIDERS`）的表单或原始 JSON 编辑器。保存时会先对照其他配置文件和环境进行校验，然后无需重启即生效；空闲任务会切换到新配置。
+- **模型配置 (Models)**：当前生效的 provider 和模型，以及 `~/.harness/providers.json` 的表单或原始 JSON 编辑器，该文件在任何目录下都生效（项目已有 `.harness/providers.json` 时改为编辑它，设置了 `$HARNESS_PROVIDERS` 时编辑该文件）。保存时会先对照其他配置文件和环境进行校验，然后无需重启即生效；空闲任务会切换到新配置。
 - **Agents / Skills / MCP**：发现了哪些内容，以及哪些 MCP 服务器已连接。
 
 即使没有可用的 provider，服务器也会启动，因此可以在浏览器里配置第一个模型。该 API 能执行命令，所以做了防护：每个 API 请求都需要 token，绑定回环地址时也不例外（本机其他用户同样能访问回环端口），启动时会打印带有 token 的 URL（`http://HOST:PORT/#token=...`，浏览器会记住它，之后新开的标签页也能用）；绑定回环地址时，请求还必须使用回环主机名（防 DNS rebinding）；改变状态的请求需要 `X-Harness` 请求头（防跨站请求）。UI 保存的 providers 文件只有其所有者可读。

@@ -189,9 +189,16 @@ pub fn config_paths() -> Vec<PathBuf> {
     }
 }
 
-/// The file the web UI edits: the highest-precedence one.
+/// The file the web UI edits: `$HARNESS_PROVIDERS`, else the project file
+/// if it exists (so edits aren't shadowed by it), else the user file, which
+/// applies in every directory.
 pub fn editable_path() -> PathBuf {
-    config_paths().pop().expect("at least one providers path")
+    let mut paths = config_paths();
+    let last = paths.pop().expect("at least one providers path");
+    match paths.pop() {
+        Some(user) if !last.exists() => user,
+        _ => last,
+    }
 }
 
 impl Providers {
