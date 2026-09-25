@@ -312,6 +312,7 @@ mod tests {
         let mut on_event = |e: StreamEvent| match e {
             StreamEvent::TextDelta(t) => streamed.push_str(t),
             StreamEvent::TextEnd => streamed.push('|'),
+            StreamEvent::PartialUsage(_) => {}
         };
         for e in events {
             if acc.apply(e, &mut on_event).unwrap() {

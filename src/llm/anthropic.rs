@@ -32,8 +32,13 @@ pub(super) async fn create(
     let resp = http::post_with_retries(http_client, &target.url("messages"), &headers, &body).await?;
 
     let mut acc = Accumulator::default();
-    let finished = http::read_sse(resp, |event| acc.apply(&event, on_event)).await?;
-    if !finished {
+    let result = http::read_sse(resp, |event| acc.apply(&event, on_event)).await;
+    if !matches!(result, Ok(true)) {
+        // The request still used tokens: report what message_start told us.
+        if let Some(usage) = acc.response.usage.filter(|u| u.input_tokens > 0) {
+            on_event(StreamEvent::PartialUsage(usage));
+        }
+        result?;
         bail!("stream ended before message_stop");
     }
     let mut response = acc.finish();
@@ -307,6 +312,7 @@ mod tests {
         let mut on_event = |e: StreamEvent| match e {
             StreamEvent::TextDelta(t) => streamed.push_str(t),
             StreamEvent::TextEnd => streamed.push('|'),
+            StreamEvent::PartialUsage(_) => {}
         };
         for e in events {
             if acc.apply(e, &mut on_event).unwrap() {

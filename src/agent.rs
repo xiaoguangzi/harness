@@ -20,7 +20,8 @@ pub trait Observer: Send {
     fn on_text_end(&mut self);
     fn on_tool_call(&mut self, name: &str, input: &Value);
     fn on_tool_result(&mut self, name: &str, content: &str, is_error: bool);
-    /// Token counts of a finished request.
+    /// Token counts of a request: a finished one, or one that failed
+    /// partway (counted as far as its stream got).
     fn on_usage(&mut self, _usage: &Usage) {}
 }
 
@@ -146,6 +147,7 @@ impl Agent {
             let mut on_event = |event: StreamEvent| match event {
                 StreamEvent::TextDelta(text) => observer.on_text_delta(text),
                 StreamEvent::TextEnd => observer.on_text_end(),
+                StreamEvent::PartialUsage(usage) => observer.on_usage(&usage),
             };
             let response =
                 self.client.create(&self.system, &definitions, &self.messages, &mut on_event).await?;

@@ -44,6 +44,9 @@ impl Message {
 pub enum StreamEvent<'a> {
     TextDelta(&'a str),
     TextEnd,
+    /// Token counts of a request that failed partway, as far as the stream
+    /// got; a finished request carries them in [`Response::usage`] instead.
+    PartialUsage(Usage),
 }
 
 /// A tool as offered to the model, independent of protocol.
