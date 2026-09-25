@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{FileTracker, Tool, ToolOutput, parse_input};
+use super::{FileChange, FileTracker, Tool, ToolOutput, parse_input};
 
 /// Creates or overwrites a file with the given contents.
 pub struct WriteTool {
@@ -68,7 +68,11 @@ impl Tool for WriteTool {
             return ToolOutput::error(e);
         }
 
-        let existed = path.exists();
+        // Kept for the diff shown to the user.
+        let before = match tokio::fs::read(path).await {
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(_) => None,
+        };
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {
@@ -80,13 +84,10 @@ impl Tool for WriteTool {
         // The model knows the new contents, so further writes are allowed.
         self.files.record(path);
 
-        let verb = if existed { "Updated" } else { "Created" };
-        ToolOutput::ok(format!(
-            "{verb} {} ({} lines, {} bytes)",
-            input.path,
-            input.content.lines().count(),
-            input.content.len()
-        ))
+        let verb = if before.is_some() { "Updated" } else { "Created" };
+        let summary =
+            format!("{verb} {} ({} lines, {} bytes)", input.path, input.content.lines().count(), input.content.len());
+        ToolOutput::ok(summary).with_change(FileChange { path: input.path, before, after: input.content })
     }
 }
 
@@ -101,7 +102,8 @@ mod tests {
         let path = dir.path().join("a/b/new.txt");
         let tool = WriteTool::new(FileTracker::default());
         let out = tool.run(json!({"path": path, "content": "x\ny\n"})).await;
-        assert_eq!(out, ToolOutput::ok(format!("Created {} (2 lines, 4 bytes)", path.display())));
+        assert_eq!(out.content, format!("Created {} (2 lines, 4 bytes)", path.display()));
+        assert_eq!(out.change.unwrap().before, None);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "x\ny\n");
     }
 

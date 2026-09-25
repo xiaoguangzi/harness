@@ -134,6 +134,11 @@ impl Accumulator {
                 if !matches!(kind, "text" | "thinking" | "redacted_thinking") && std::mem::take(&mut self.text_open) {
                     on_event(StreamEvent::TextEnd);
                 }
+                match kind {
+                    "thinking" | "redacted_thinking" => on_event(StreamEvent::ThinkingDelta("")),
+                    "tool_use" => on_event(StreamEvent::ToolInputStart(content[index]["name"].as_str().unwrap_or(""))),
+                    _ => {}
+                }
             }
             "content_block_delta" => {
                 let index = event["index"].as_u64().unwrap_or(0) as usize;
@@ -148,13 +153,17 @@ impl Accumulator {
                         self.text_open = true;
                         on_event(StreamEvent::TextDelta(text));
                     }
-                    "thinking_delta" => append_str(block, "thinking", delta["thinking"].as_str().unwrap_or("")),
+                    "thinking_delta" => {
+                        let thinking = delta["thinking"].as_str().unwrap_or("");
+                        append_str(block, "thinking", thinking);
+                        on_event(StreamEvent::ThinkingDelta(thinking));
+                    }
                     "signature_delta" => block["signature"] = delta["signature"].clone(),
-                    "input_json_delta" => self
-                        .partial_json
-                        .entry(index)
-                        .or_default()
-                        .push_str(delta["partial_json"].as_str().unwrap_or("")),
+                    "input_json_delta" => {
+                        let json = delta["partial_json"].as_str().unwrap_or("");
+                        self.partial_json.entry(index).or_default().push_str(json);
+                        on_event(StreamEvent::ToolInputDelta(json));
+                    }
                     "citations_delta" => match block["citations"].as_array_mut() {
                         Some(list) => list.push(delta["citation"].clone()),
                         None => block["citations"] = json!([delta["citation"]]),
@@ -312,7 +321,7 @@ mod tests {
         let mut on_event = |e: StreamEvent| match e {
             StreamEvent::TextDelta(t) => streamed.push_str(t),
             StreamEvent::TextEnd => streamed.push('|'),
-            StreamEvent::PartialUsage(_) => {}
+            _ => {}
         };
         for e in events {
             if acc.apply(e, &mut on_event).unwrap() {

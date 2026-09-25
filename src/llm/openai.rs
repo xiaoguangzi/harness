@@ -202,6 +202,20 @@ impl Accumulator {
                     on_event(StreamEvent::TextDelta(delta));
                 }
             }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                on_event(StreamEvent::ThinkingDelta(event["delta"].as_str().unwrap_or("")));
+            }
+            "response.function_call_arguments.delta" => {
+                on_event(StreamEvent::ToolInputDelta(event["delta"].as_str().unwrap_or("")));
+            }
+            "response.output_item.added" => {
+                let item = &event["item"];
+                match item["type"].as_str().unwrap_or("") {
+                    "reasoning" => on_event(StreamEvent::ThinkingDelta("")),
+                    "function_call" => on_event(StreamEvent::ToolInputStart(item["name"].as_str().unwrap_or(""))),
+                    _ => {}
+                }
+            }
             "response.output_item.done" => {
                 let item = event["item"].clone();
                 if item["type"] == "message" && std::mem::take(&mut self.text_open) {
@@ -312,7 +326,7 @@ mod tests {
         let mut on_event = |e: StreamEvent| match e {
             StreamEvent::TextDelta(t) => streamed.push_str(t),
             StreamEvent::TextEnd => streamed.push('|'),
-            StreamEvent::PartialUsage(_) => {}
+            _ => {}
         };
         for e in events {
             if acc.apply(e, &mut on_event).unwrap() {

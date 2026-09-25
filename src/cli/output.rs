@@ -7,17 +7,26 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use super::diff;
 use super::markdown::Markdown;
 use super::text;
 use crate::agent::Observer;
 use crate::llm::Usage;
+use crate::tools::ToolOutput;
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Spinner glyphs, played forward and back.
+const SPINNER: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
+/// Spinner and status label color, and the shimmer that sweeps the label.
+const STATUS_SGR: &str = "38;5;173";
+const SHIMMER_SGR: &str = "1;38;5;216";
 /// Lines of a tool result shown under its call.
 const RESULT_LINES: usize = 3;
+/// Reasoning time worth a "Thought for" note.
+const NOTABLE_THINKING: Duration = Duration::from_secs(2);
+const WAITING: &str = "Waiting for the model…";
 
 /// Shared handle on stdout. Output printed while an agent runs goes through
-/// it, so the spinner line is cleared first and redrawn after.
+/// it, so the status lines are cleared first and redrawn after.
 #[derive(Clone)]
 pub struct Output {
     state: Arc<Mutex<State>>,
@@ -26,16 +35,26 @@ pub struct Output {
 }
 
 struct State {
-    status: Option<(String, Instant)>,
-    /// Whether the spinner is on screen, on an otherwise empty line.
-    drawn: bool,
+    status: Option<Status>,
+    /// Status lines on screen, on otherwise empty lines; the cursor is on
+    /// the last one.
+    drawn: usize,
     frame: usize,
+}
+
+struct Status {
+    label: String,
+    since: Instant,
+    /// Shown dim on a second line: the latest reasoning, say.
+    detail: String,
+    /// Output tokens so far, once any have streamed.
+    tokens: u64,
 }
 
 impl Output {
     pub fn stdout() -> Self {
         let styled = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        Self { state: Arc::new(Mutex::new(State { status: None, drawn: false, frame: 0 })), styled }
+        Self { state: Arc::new(Mutex::new(State { status: None, drawn: 0, frame: 0 })), styled }
     }
 
     pub fn styled(&self) -> bool {
@@ -54,7 +73,7 @@ impl Output {
         }
         let this = self.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(80));
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
             loop {
                 tick.tick().await;
                 let mut state = this.state.lock().unwrap();
@@ -66,16 +85,17 @@ impl Output {
         });
     }
 
-    /// Shows `label` next to the spinner; `None` hides it.
+    /// Shows `label` next to the spinner, keeping the elapsed time and token
+    /// count; `None` hides it.
     pub fn set_status(&self, label: Option<&str>) {
         let mut state = self.state.lock().unwrap();
         match label {
             Some(label) => {
-                let since = match state.status.take() {
-                    Some((_, since)) => since,
-                    None => Instant::now(),
+                let (since, tokens) = match state.status.take() {
+                    Some(s) => (s.since, s.tokens),
+                    None => (Instant::now(), 0),
                 };
-                state.status = Some((label.to_string(), since));
+                state.status = Some(Status { label: label.to_string(), since, detail: String::new(), tokens });
                 if self.styled {
                     draw(&mut state);
                 }
@@ -84,6 +104,20 @@ impl Output {
                 state.status = None;
                 clear(&mut state);
             }
+        }
+    }
+
+    /// Sets the dim line under the status; shown from the next frame on.
+    pub fn set_status_detail(&self, detail: &str) {
+        if let Some(status) = &mut self.state.lock().unwrap().status {
+            status.detail = detail.to_string();
+        }
+    }
+
+    /// Sets the token count next to the status; shown from the next frame on.
+    pub fn set_status_tokens(&self, tokens: u64) {
+        if let Some(status) = &mut self.state.lock().unwrap().status {
+            status.tokens = tokens;
         }
     }
 
@@ -125,24 +159,80 @@ impl Output {
     }
 }
 
+/// Redraws the status: the spinner, label, elapsed time and token count,
+/// and the detail line under them.
 fn draw(state: &mut State) {
-    let Some((label, since)) = &state.status else { return };
-    let secs = since.elapsed().as_secs();
-    let hint = format!(" ({secs}s · ctrl-c to interrupt)");
-    let room = text::terminal_width().saturating_sub(text::width(&hint) + 4);
-    let frame = SPINNER[state.frame % SPINNER.len()];
+    let Some(status) = &state.status else { return };
+    let mut hint = vec![elapsed(status.since.elapsed().as_secs())];
+    if status.tokens > 0 {
+        hint.push(format!("↓ {} tokens", tokens(status.tokens)));
+    }
+    hint.push("ctrl-c to interrupt".to_string());
+    let hint = format!(" ({})", hint.join(" · "));
+    let width = text::terminal_width();
+    let label = text::fit(&status.label, width.saturating_sub(text::width(&hint) + 3));
+    // Forward then back through the glyphs, without repeating the ends.
+    let cycle = 2 * SPINNER.len() - 2;
+    let step = state.frame % cycle;
+    let glyph = SPINNER[if step < SPINNER.len() { step } else { cycle - step }];
+
+    let mut screen = clear_sequence(state.drawn);
+    screen.push_str(&format!("\x1b[{STATUS_SGR}m{glyph}\x1b[0m {}\x1b[2m{hint}\x1b[0m", shimmer(&label, state.frame)));
+    let mut drawn = 1;
+    if !status.detail.is_empty() {
+        let detail = text::fit_tail(&status.detail, width.saturating_sub(5));
+        screen.push_str(&format!("\n\x1b[2m  ⎿ {detail}\x1b[0m"));
+        drawn = 2;
+    }
     let mut stdout = io::stdout().lock();
-    let _ = write!(stdout, "\r\x1b[K\x1b[35m{frame}\x1b[0m {}\x1b[2m{hint}\x1b[0m", text::fit(label, room));
+    let _ = write!(stdout, "{screen}");
     let _ = stdout.flush();
-    state.drawn = true;
+    state.drawn = drawn;
 }
 
 fn clear(state: &mut State) {
-    if std::mem::take(&mut state.drawn) {
+    let drawn = std::mem::take(&mut state.drawn);
+    if drawn > 0 {
         let mut stdout = io::stdout().lock();
-        let _ = write!(stdout, "\r\x1b[K");
+        let _ = write!(stdout, "{}", clear_sequence(drawn));
         let _ = stdout.flush();
     }
+}
+
+/// Erases `lines` status lines, leaving the cursor at the start of the first.
+fn clear_sequence(lines: usize) -> String {
+    let mut s = String::new();
+    for i in 0..lines {
+        if i > 0 {
+            s.push_str("\x1b[1A");
+        }
+        s.push_str("\r\x1b[K");
+    }
+    s
+}
+
+/// Colors `label` with a highlight sweeping across it as `frame` advances.
+fn shimmer(label: &str, frame: usize) -> String {
+    let chars: Vec<char> = label.chars().collect();
+    // The highlight travels a little past both ends before wrapping.
+    let center = (frame % (chars.len() + 8)) as isize - 4;
+    let mut out = String::new();
+    let mut current = "";
+    for (i, c) in chars.iter().enumerate() {
+        let sgr = if (i as isize - center).abs() <= 1 { SHIMMER_SGR } else { STATUS_SGR };
+        if sgr != current {
+            out.push_str(&format!("\x1b[0;{sgr}m"));
+            current = sgr;
+        }
+        out.push(*c);
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
+/// `75` -> `1m 15s`.
+fn elapsed(secs: u64) -> String {
+    if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) }
 }
 
 #[derive(PartialEq)]
@@ -152,11 +242,26 @@ enum Block {
     Tools,
 }
 
+/// What the model is doing, as the status line says.
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    /// A request is out and nothing has streamed back yet.
+    Waiting,
+    Thinking,
+    Responding,
+    /// Streaming a tool call's input.
+    Preparing,
+    Running,
+    /// Between blocks of one response.
+    Working,
+}
+
 /// Shows one agent turn in the terminal.
 pub struct Terminal {
     out: Output,
     markdown: Markdown,
     last: Block,
+    phase: Phase,
     /// Unstyled output only: a text line is open.
     raw_open: bool,
     /// Tool calls in the current batch, and how many results came back.
@@ -167,6 +272,16 @@ pub struct Terminal {
     output_tokens: u64,
     /// Input tokens of the latest request: the context size.
     context_tokens: u64,
+    /// Bytes streamed by the running request, for a token estimate until
+    /// its usage arrives.
+    streamed: usize,
+    /// The end of the reasoning streamed so far, and when it began.
+    thinking: String,
+    thinking_since: Option<Instant>,
+    /// The tool call being streamed, and the start of its input.
+    tool_name: String,
+    tool_input: String,
+    tool_labeled: bool,
 }
 
 impl Terminal {
@@ -175,6 +290,7 @@ impl Terminal {
             markdown: Markdown::new(text::terminal_width()),
             out,
             last: Block::None,
+            phase: Phase::Waiting,
             raw_open: false,
             calls: 0,
             results: 0,
@@ -182,13 +298,19 @@ impl Terminal {
             requests: 0,
             output_tokens: 0,
             context_tokens: 0,
+            streamed: 0,
+            thinking: String::new(),
+            thinking_since: None,
+            tool_name: String::new(),
+            tool_input: String::new(),
+            tool_labeled: false,
         }
     }
 
     pub fn begin_turn(&mut self) {
         let out = self.out.clone();
         *self = Self::new(out);
-        self.out.set_status(Some("Thinking…"));
+        self.enter(Phase::Waiting, WAITING);
     }
 
     /// Flushes pending text and prints how the turn went.
@@ -222,6 +344,32 @@ impl Terminal {
         self.out.line(self.out.paint("2", &format!("✻ {}", stats.join(" · "))));
     }
 
+    /// Switches the status to `phase`, noting how long any reasoning took.
+    fn enter(&mut self, phase: Phase, label: &str) {
+        if self.phase == Phase::Thinking && phase != Phase::Thinking {
+            self.end_thinking();
+        }
+        self.phase = phase;
+        self.out.set_status(Some(label));
+    }
+
+    fn end_thinking(&mut self) {
+        self.thinking.clear();
+        let Some(since) = self.thinking_since.take() else { return };
+        let took = since.elapsed();
+        if took >= NOTABLE_THINKING && self.out.styled() {
+            self.separate(Block::Tools);
+            self.out.line(self.out.paint("2", &format!("∴ Thought for {}", elapsed(took.as_secs()))));
+        }
+    }
+
+    /// Counts streamed output toward the token estimate.
+    fn streamed(&mut self, bytes: usize) {
+        self.streamed += bytes;
+        // About four bytes a token; replaced by the real count at the end.
+        self.out.set_status_tokens(self.output_tokens + (self.streamed / 4) as u64);
+    }
+
     /// Puts a blank line between text and tool calls, and after the prompt.
     fn separate(&mut self, block: Block) {
         if self.last != block {
@@ -249,13 +397,43 @@ pub enum TurnEnd {
 }
 
 impl Observer for Terminal {
+    fn on_request_start(&mut self) {
+        self.streamed = 0;
+        if self.phase != Phase::Waiting {
+            self.enter(Phase::Waiting, WAITING);
+        }
+    }
+
+    fn on_thinking_delta(&mut self, delta: &str) {
+        self.streamed(delta.len());
+        if self.phase != Phase::Thinking {
+            self.enter(Phase::Thinking, "Thinking…");
+            self.thinking_since = Some(Instant::now());
+        }
+        if delta.is_empty() {
+            return;
+        }
+        self.thinking.push_str(delta);
+        // Only the latest line is shown; keep a bounded tail.
+        if self.thinking.len() > 2048 {
+            let mut cut = self.thinking.len() - 1024;
+            while !self.thinking.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.thinking.drain(..cut);
+        }
+        let latest = self.thinking.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        self.out.set_status_detail(&text::printable(latest));
+    }
+
     fn on_text_delta(&mut self, delta: &str) {
+        self.streamed(delta.len());
         if self.last != Block::Text {
             if delta.trim().is_empty() {
                 return;
             }
+            self.enter(Phase::Responding, "Responding…");
             self.separate(Block::Text);
-            self.out.set_status(Some("Responding…"));
         }
         if self.out.styled() {
             let lines = self.markdown.push(delta);
@@ -268,7 +446,29 @@ impl Observer for Terminal {
 
     fn on_text_end(&mut self) {
         self.end_text();
-        self.out.set_status(Some("Thinking…"));
+        self.enter(Phase::Working, "Working…");
+    }
+
+    fn on_tool_input_start(&mut self, name: &str) {
+        self.tool_name = name.to_string();
+        self.tool_input.clear();
+        self.tool_labeled = false;
+        self.enter(Phase::Preparing, &format!("Preparing {name}…"));
+    }
+
+    fn on_tool_input_delta(&mut self, json: &str) {
+        self.streamed(json.len());
+        // Name the call once its main argument is complete. That comes
+        // early, so only the start of the input is kept.
+        if self.tool_labeled || self.tool_input.len() > 4096 {
+            return;
+        }
+        self.tool_input.push_str(json);
+        if let Some(arg) = partial_argument(&self.tool_input) {
+            self.tool_labeled = true;
+            let arg = text::printable(arg.lines().next().unwrap_or(""));
+            self.out.set_status(Some(&format!("Preparing {}({arg})…", self.tool_name)));
+        }
     }
 
     fn on_tool_call(&mut self, name: &str, input: &Value) {
@@ -276,28 +476,39 @@ impl Observer for Terminal {
             (self.calls, self.results) = (0, 0);
         }
         self.calls += 1;
+        let status = if self.calls == 1 { format!("Running {name}…") } else { format!("Running {} tools…", self.calls) };
+        self.enter(Phase::Running, &status);
         self.separate(Block::Tools);
         let width = text::terminal_width();
         self.out.line(format!("{} {}", self.out.paint("32", "●"), call_label(name, input, width.saturating_sub(4))));
-        let status = if self.calls == 1 { format!("Running {name}…") } else { format!("Running {} tools…", self.calls) };
-        self.out.set_status(Some(&status));
     }
 
-    fn on_tool_result(&mut self, name: &str, content: &str, is_error: bool) {
+    fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
         self.results += 1;
         // With several calls in flight, say which one each result is for.
         let prefix = if self.calls > 1 { format!("{name}: ") } else { String::new() };
         let width = text::terminal_width().saturating_sub(6);
-        let lines = result_lines(name, content, is_error, width);
-        let color = if is_error { "31" } else { "2" };
-        let mut shown = Vec::with_capacity(lines.len());
-        for (i, line) in lines.iter().enumerate() {
-            let lead = if i == 0 { format!("  ⎿ {prefix}") } else { "    ".to_string() };
-            shown.push(self.out.paint(color, &text::fit(&format!("{lead}{line}"), width + 4)));
-        }
+        let shown: Vec<String> = match &output.change {
+            Some(change) if !output.is_error => diff::render(change, width, |sgr, s| self.out.paint(sgr, s))
+                .into_iter()
+                .enumerate()
+                .map(|(i, line)| if i == 0 { self.out.paint("2", &format!("  ⎿ {prefix}{line}")) } else { format!("    {line}") })
+                .collect(),
+            _ => {
+                let color = if output.is_error { "31" } else { "2" };
+                result_lines(name, &output.content, output.is_error, width)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| {
+                        let lead = if i == 0 { format!("  ⎿ {prefix}") } else { "    ".to_string() };
+                        self.out.paint(color, &text::fit(&format!("{lead}{line}"), width + 4))
+                    })
+                    .collect()
+            }
+        };
         self.out.lines(&shown);
         if self.results == self.calls {
-            self.out.set_status(Some("Thinking…"));
+            self.enter(Phase::Waiting, WAITING);
         }
     }
 
@@ -305,7 +516,32 @@ impl Observer for Terminal {
         self.requests += 1;
         self.output_tokens += usage.output_tokens;
         self.context_tokens = usage.input_tokens + usage.output_tokens;
+        self.streamed = 0;
+        self.out.set_status_tokens(self.output_tokens);
     }
+}
+
+/// The main argument of a tool call whose JSON input is still streaming
+/// in, once its string value is complete.
+fn partial_argument(json: &str) -> Option<String> {
+    const KEYS: [&str; 7] = ["command", "path", "file_path", "pattern", "description", "url", "query"];
+    KEYS.iter().find_map(|key| {
+        let at = json.find(&format!("\"{key}\""))? + key.len() + 2;
+        let value = json[at..].trim_start().strip_prefix(':')?.trim_start();
+        if !value.starts_with('"') {
+            return None;
+        }
+        let mut escaped = false;
+        for (i, c) in value.char_indices().skip(1) {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => return serde_json::from_str(&value[..=i]).ok(),
+                _ => {}
+            }
+        }
+        None
+    })
 }
 
 /// `12345` -> `12.3k`.
@@ -372,6 +608,21 @@ mod tests {
         assert_eq!(call_label("mcp__x__y", &json!({"id": 3}), 80), "mcp__x__y({\"id\":3})");
         assert_eq!(call_label("ping", &json!({}), 80), "ping");
         assert_eq!(call_label("bash", &json!({"command": "echo hello world"}), 12), "bash(echo …)");
+    }
+
+    #[test]
+    fn finds_the_main_argument_of_a_streaming_call() {
+        assert_eq!(partial_argument(r#"{"path": "src/a.rs", "content": "fn ma"#), Some("src/a.rs".into()));
+        assert_eq!(partial_argument(r#"{"command":"echo \"hi\""#), None);
+        assert_eq!(partial_argument(r#"{"command":"echo \"hi\"","#), Some(r#"echo "hi""#.into()));
+        assert_eq!(partial_argument(r#"{"content": "x", "pa"#), None);
+    }
+
+    #[test]
+    fn draws_the_spinner_status() {
+        assert_eq!(elapsed(75), "1m 15s");
+        assert_eq!(text::strip_ansi(&shimmer("Thinking…", 3)), "Thinking…");
+        assert_eq!(clear_sequence(2), "\r\x1b[K\x1b[1A\r\x1b[K");
     }
 
     #[test]

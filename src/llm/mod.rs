@@ -44,6 +44,13 @@ impl Message {
 pub enum StreamEvent<'a> {
     TextDelta(&'a str),
     TextEnd,
+    /// A fragment of the model's reasoning; empty when a reasoning block
+    /// starts whose text is not shown.
+    ThinkingDelta(&'a str),
+    /// The model started writing a call to the named tool.
+    ToolInputStart(&'a str),
+    /// A fragment of the tool call's JSON input, as it streams in.
+    ToolInputDelta(&'a str),
     /// Token counts of a request that failed partway, as far as the stream
     /// got; a finished request carries them in [`Response::usage`] instead.
     PartialUsage(Usage),

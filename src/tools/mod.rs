@@ -33,15 +33,31 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// Anthropic `image` content blocks sent alongside the text.
     pub images: Vec<Value>,
+    /// A file the tool changed, for the frontend to show as a diff; not
+    /// sent to the model.
+    pub change: Option<Box<FileChange>>,
+}
+
+/// A file's contents before and after a tool changed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileChange {
+    pub path: String,
+    /// `None` for a file the tool created.
+    pub before: Option<String>,
+    pub after: String,
 }
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false, images: Vec::new() }
+        Self { content: content.into(), is_error: false, images: Vec::new(), change: None }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true, images: Vec::new() }
+        Self { content: content.into(), is_error: true, images: Vec::new(), change: None }
+    }
+
+    pub fn with_change(self, change: FileChange) -> Self {
+        Self { change: Some(Box::new(change)), ..self }
     }
 
     /// The `content` field of the `tool_result` block.

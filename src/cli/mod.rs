@@ -1,5 +1,6 @@
 //! Terminal frontend: the interactive REPL and one-shot mode.
 
+mod diff;
 mod markdown;
 mod menu;
 mod output;

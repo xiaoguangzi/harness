@@ -271,7 +271,7 @@ impl Observer for SubObserver {
         self.tool_calls += 1;
         (self.reporter)(&self.label, name, input);
     }
-    fn on_tool_result(&mut self, _name: &str, _content: &str, _is_error: bool) {}
+    fn on_tool_result(&mut self, _name: &str, _output: &ToolOutput) {}
 }
 
 #[async_trait]

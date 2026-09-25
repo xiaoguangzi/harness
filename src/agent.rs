@@ -18,8 +18,17 @@ pub trait Observer: Send {
     fn on_text_delta(&mut self, text: &str);
     /// The current text block is complete.
     fn on_text_end(&mut self);
+    /// A request to the model is about to be sent.
+    fn on_request_start(&mut self) {}
+    /// A fragment of the model's reasoning; empty when reasoning starts
+    /// without visible text.
+    fn on_thinking_delta(&mut self, _text: &str) {}
+    /// The model started writing a call to `name`; its JSON input follows
+    /// in fragments.
+    fn on_tool_input_start(&mut self, _name: &str) {}
+    fn on_tool_input_delta(&mut self, _json: &str) {}
     fn on_tool_call(&mut self, name: &str, input: &Value);
-    fn on_tool_result(&mut self, name: &str, content: &str, is_error: bool);
+    fn on_tool_result(&mut self, name: &str, output: &ToolOutput);
     /// Token counts of a request: a finished one, or one that failed
     /// partway (counted as far as its stream got).
     fn on_usage(&mut self, _usage: &Usage) {}
@@ -144,9 +153,13 @@ impl Agent {
         let definitions = self.tools.definitions();
 
         for _ in 0..MAX_ITERATIONS {
+            observer.on_request_start();
             let mut on_event = |event: StreamEvent| match event {
                 StreamEvent::TextDelta(text) => observer.on_text_delta(text),
                 StreamEvent::TextEnd => observer.on_text_end(),
+                StreamEvent::ThinkingDelta(text) => observer.on_thinking_delta(text),
+                StreamEvent::ToolInputStart(name) => observer.on_tool_input_start(name),
+                StreamEvent::ToolInputDelta(json) => observer.on_tool_input_delta(json),
                 StreamEvent::PartialUsage(usage) => observer.on_usage(&usage),
             };
             let response =
@@ -200,7 +213,7 @@ impl Agent {
 
             let mut results = Vec::with_capacity(outputs.len());
             for (t, out) in tool_uses.iter().zip(outputs) {
-                observer.on_tool_result(t["name"].as_str().unwrap_or(""), &out.content, out.is_error);
+                observer.on_tool_result(t["name"].as_str().unwrap_or(""), &out);
                 results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": t["id"],

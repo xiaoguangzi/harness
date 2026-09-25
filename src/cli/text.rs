@@ -51,6 +51,37 @@ pub fn fit(s: &str, max: usize) -> String {
     out
 }
 
+/// Keeps the end of plain `s`, at most `max` columns, marking a cut with "…".
+pub fn fit_tail(s: &str, max: usize) -> String {
+    if width(s) <= max {
+        return s.to_string();
+    }
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for c in s.chars().rev() {
+        let w = char_width(c);
+        if used + w + 1 > max {
+            break;
+        }
+        kept.push(c);
+        used += w;
+    }
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
+/// `s` on one line, safe to print: style sequences removed, tabs expanded,
+/// and other control characters replaced.
+pub fn printable(s: &str) -> String {
+    strip_ansi(s)
+        .chars()
+        .flat_map(|c| match c {
+            '\t' => vec![' '; 4],
+            c if c.is_control() => vec!['�'],
+            c => vec![c],
+        })
+        .collect()
+}
+
 /// Wraps styled `s` into lines of at most `max` columns, breaking at spaces
 /// where it can. Each line ends with a reset and the next one replays the
 /// styles opened so far, so lines can be printed side by side.
@@ -135,6 +166,13 @@ mod tests {
         assert_eq!(fit("hello", 5), "hello");
         assert_eq!(fit("hello world", 6), "hello…");
         assert_eq!(fit("你好世界", 5), "你好…");
+        assert_eq!(fit_tail("hello world", 6), "…world");
+        assert_eq!(fit_tail("你好世界", 5), "…世界");
+    }
+
+    #[test]
+    fn makes_text_printable() {
+        assert_eq!(printable("\x1b[31mred\x1b[0m\tx\x07"), "red    x�");
     }
 
     #[test]

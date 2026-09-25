@@ -15,7 +15,7 @@ use tokio::task::AbortHandle;
 use crate::agent::{Agent, Observer};
 use crate::llm::Client;
 use crate::subagent::AgentDef;
-use crate::tools::FileTracker;
+use crate::tools::{FileTracker, ToolOutput};
 
 /// Tool results are cut to this many bytes in events; the model still gets
 /// the full result.
@@ -218,8 +218,8 @@ impl Observer for WebObserver<'_> {
         self.task.push(json!({"type": "tool_call", "name": name, "input": input}));
     }
 
-    fn on_tool_result(&mut self, name: &str, content: &str, is_error: bool) {
-        let content = crate::tools::truncate(content, MAX_EVENT_RESULT_BYTES);
-        self.task.push(json!({"type": "tool_result", "name": name, "content": content, "is_error": is_error}));
+    fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
+        let content = crate::tools::truncate(&output.content, MAX_EVENT_RESULT_BYTES);
+        self.task.push(json!({"type": "tool_result", "name": name, "content": content, "is_error": output.is_error}));
     }
 }
