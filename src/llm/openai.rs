@@ -218,16 +218,23 @@ impl Accumulator {
             }
             "response.output_item.done" => {
                 let item = event["item"].clone();
-                if item["type"] == "message" && std::mem::take(&mut self.text_open) {
-                    on_event(StreamEvent::TextEnd);
+                if item["type"] == "message" {
+                    self.end_text(&item, on_event);
                 }
                 self.items.push(item);
             }
             "response.completed" | "response.incomplete" => {
+                let response = event["response"].clone();
                 if std::mem::take(&mut self.text_open) {
                     on_event(StreamEvent::TextEnd);
+                } else if self.items.is_empty() {
+                    // Nothing streamed: show the text of the final output,
+                    // which `finish` falls back to.
+                    for item in response["output"].as_array().into_iter().flatten().filter(|i| i["type"] == "message") {
+                        self.end_text(item, on_event);
+                    }
                 }
-                self.final_response = Some(event["response"].clone());
+                self.final_response = Some(response);
                 return Ok(true);
             }
             "response.failed" => bail!("response failed: {}", event["response"]["error"]),
@@ -235,6 +242,19 @@ impl Accumulator {
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Ends a message's streamed text, or shows its text at once if none
+    /// streamed (some gateways send only whole items).
+    fn end_text(&mut self, message: &Value, on_event: &mut (dyn FnMut(StreamEvent) + Send)) {
+        if !std::mem::take(&mut self.text_open) {
+            let text = message_texts(message).concat();
+            if text.is_empty() {
+                return;
+            }
+            on_event(StreamEvent::TextDelta(&text));
+        }
+        on_event(StreamEvent::TextEnd);
     }
 
     fn finish(mut self) -> Response {
@@ -259,12 +279,7 @@ impl Accumulator {
         for item in &self.items {
             match item["type"].as_str().unwrap_or("") {
                 "message" => {
-                    for part in item["content"].as_array().into_iter().flatten() {
-                        let text = match part["type"].as_str().unwrap_or("") {
-                            "output_text" => part["text"].as_str().unwrap_or("").to_string(),
-                            "refusal" => format!("[refusal] {}", part["refusal"].as_str().unwrap_or("")),
-                            _ => continue,
-                        };
+                    for text in message_texts(item) {
                         response.content.push(json!({"type": "text", "text": text}));
                     }
                 }
@@ -300,6 +315,20 @@ impl Accumulator {
         }
         response
     }
+}
+
+/// The text parts of a `message` output item.
+fn message_texts(message: &Value) -> Vec<String> {
+    message["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| match part["type"].as_str().unwrap_or("") {
+            "output_text" => Some(part["text"].as_str().unwrap_or("").to_string()),
+            "refusal" => Some(format!("[refusal] {}", part["refusal"].as_str().unwrap_or(""))),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -453,7 +482,7 @@ mod tests {
 
     #[test]
     fn maps_incomplete_and_uses_final_output_fallback() {
-        let (resp, _) = run(&[json!({"type": "response.incomplete", "response": {
+        let (resp, streamed) = run(&[json!({"type": "response.incomplete", "response": {
             "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
             "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]},
                        {"type": "reasoning", "id": "rs_x", "summary": []}]
@@ -461,9 +490,27 @@ mod tests {
         assert_eq!(resp.stop_reason.as_deref(), Some("max_tokens"));
         // Reasoning without encrypted content cannot be replayed statelessly.
         assert_eq!(resp.content, vec![json!({"type": "text", "text": "partial"})]);
+        assert_eq!(streamed, "partial|", "text that never streamed is shown at the end");
 
         let (resp, _) = run(&[json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "content_filter"}}})]);
         assert_eq!(resp.stop_reason.as_deref(), Some("refusal"));
+    }
+
+    #[test]
+    fn shows_whole_items_that_did_not_stream() {
+        let message = json!({"type": "message", "content": [{"type": "output_text", "text": "hi"}]});
+        let (_, streamed) = run(&[
+            json!({"type": "response.output_item.done", "item": message}),
+            json!({"type": "response.completed", "response": {"output": [message]}}),
+        ]);
+        assert_eq!(streamed, "hi|", "shown once, from the item");
+
+        // Streamed text is not shown again from the final output.
+        let (_, streamed) = run(&[
+            json!({"type": "response.output_text.delta", "delta": "hi"}),
+            json!({"type": "response.completed", "response": {"output": [message]}}),
+        ]);
+        assert_eq!(streamed, "hi|");
     }
 
     #[test]
