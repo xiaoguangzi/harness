@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use crate::llm::{Client, Message, StreamEvent, Usage};
 use crate::tools::{ToolOutput, ToolRegistry};
 
-const MAX_ITERATIONS: usize = 50;
 /// Told to the model about a turn the user cancelled.
 const INTERRUPTED: &str = "[Interrupted by the user]";
 
@@ -152,7 +151,7 @@ impl Agent {
     async fn run_loop(&mut self, observer: &mut dyn Observer) -> Result<()> {
         let definitions = self.tools.definitions();
 
-        for _ in 0..MAX_ITERATIONS {
+        loop {
             observer.on_request_start();
             let mut on_event = |event: StreamEvent| match event {
                 StreamEvent::TextDelta(text) => observer.on_text_delta(text),
@@ -223,8 +222,6 @@ impl Agent {
             }
             self.messages.push(Message::user(results));
         }
-
-        bail!("stopped after {MAX_ITERATIONS} iterations without the model finishing")
     }
 }
 
