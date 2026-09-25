@@ -13,6 +13,7 @@ use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
 use crate::agent::{Agent, Observer};
+use crate::llm::Client;
 use crate::subagent::AgentDef;
 use crate::tools::FileTracker;
 
@@ -36,8 +37,9 @@ pub fn forward_subagent(label: &str, tool: &str, input: &Value) -> bool {
         .is_ok()
 }
 
-/// An event with its sequence number in the task's log.
-pub type Sequenced = (usize, Value);
+/// A serialized event with its sequence number in the task's log. Events
+/// are serialized once and shared by the log and every subscriber.
+pub type Sequenced = (usize, Arc<str>);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Status {
@@ -68,15 +70,14 @@ struct Meta {
 pub struct Task {
     pub id: u64,
     pub title: String,
-    /// `main`, or the subagent type the task was dispatched to.
-    pub agent_name: String,
+    /// The subagent type the task was dispatched to; `None` for the main agent.
     pub def: Option<AgentDef>,
     /// Files this task's agent has read, for its `write` tool.
     pub files: FileTracker,
     created: u64,
     pub agent: tokio::sync::Mutex<Agent>,
     meta: Mutex<Meta>,
-    log: Mutex<Vec<Value>>,
+    log: Mutex<Vec<Arc<str>>>,
     tx: broadcast::Sender<Sequenced>,
 }
 
@@ -87,7 +88,6 @@ impl Task {
         Self {
             id,
             title,
-            agent_name: def.as_ref().map_or("main".to_string(), |d| d.name.clone()),
             def,
             files,
             created,
@@ -103,7 +103,7 @@ impl Task {
         json!({
             "id": self.id,
             "title": self.title,
-            "agent": self.agent_name,
+            "agent": self.def.as_ref().map_or("main", |d| d.name.as_str()),
             "model": meta.model,
             "status": meta.status.as_str(),
             "turns": meta.turns,
@@ -111,21 +111,24 @@ impl Task {
         })
     }
 
-    pub fn is_running(&self) -> bool {
-        self.meta.lock().unwrap().status == Status::Running
+    /// The task's current model resolved on `client`'s providers, or
+    /// `client` itself if that model no longer resolves.
+    pub fn current_client(&self, client: &Client) -> Client {
+        let model = self.meta.lock().unwrap().model.clone();
+        client.switch(&model).unwrap_or_else(|_| client.clone())
     }
 
-    pub fn model(&self) -> String {
-        self.meta.lock().unwrap().model.clone()
-    }
-
-    pub fn set_model(&self, model: &str) {
-        self.meta.lock().unwrap().model = model.to_string();
+    /// Moves `agent` (this task's, locked) to `client`.
+    pub fn set_client(&self, agent: &mut Agent, client: Client) {
+        let model = client.spec().to_string();
+        agent.set_client(client);
         self.push(json!({"type": "model", "model": model}));
+        self.meta.lock().unwrap().model = model;
     }
 
     /// Appends an event and broadcasts it with its sequence number.
     pub fn push(&self, event: Value) {
+        let event: Arc<str> = event.to_string().into();
         let mut log = self.log.lock().unwrap();
         let seq = log.len();
         log.push(event.clone());

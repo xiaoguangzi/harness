@@ -47,6 +47,14 @@ impl Skill {
         }
         Ok(out)
     }
+
+    /// The prompt for a `/<skill> args` command typed by the user.
+    pub fn invocation_prompt(&self, args: &str) -> Result<String, String> {
+        match self.load(Some(args)) {
+            Ok(body) => Ok(format!("The user invoked the `{}` skill:\n\n{body}", self.name)),
+            Err(e) => Err(format!("cannot load skill {}: {e}", self.name)),
+        }
+    }
 }
 
 /// Default search roots, highest precedence first: project-level

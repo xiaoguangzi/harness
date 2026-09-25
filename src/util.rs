@@ -2,6 +2,14 @@
 
 use serde_json::Value;
 
+/// Cuts `s` to at most `max_chars` characters, marking a cut with "…".
+pub fn ellipsize(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 /// Expands `${VAR}` and `${VAR:-default}`; unset variables become "".
 pub fn expand_env(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

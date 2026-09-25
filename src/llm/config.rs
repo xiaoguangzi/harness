@@ -50,6 +50,16 @@ pub enum Protocol {
     OpenAiResponses,
 }
 
+impl Protocol {
+    /// The name used in config files.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Anthropic => "anthropic",
+            Protocol::OpenAiResponses => "openai-responses",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub enum AuthStyle {
     #[serde(rename = "x-api-key")]

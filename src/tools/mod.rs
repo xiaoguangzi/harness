@@ -107,7 +107,6 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
-    #[cfg(test)]
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
     }
@@ -115,11 +114,6 @@ impl ToolRegistry {
     /// Keeps only the tools for which `keep` returns true.
     pub fn retain(&mut self, mut keep: impl FnMut(&dyn Tool) -> bool) {
         self.tools.retain(|_, t| keep(t.as_ref()));
-    }
-
-    /// Whether the named tool is marked read-only (false if unknown).
-    pub fn is_read_only(&self, name: &str) -> bool {
-        self.tools.get(name).is_some_and(|t| t.read_only())
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {

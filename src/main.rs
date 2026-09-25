@@ -18,7 +18,7 @@ use serde_json::Value;
 use agent::{Agent, Observer};
 use llm::{Client, Providers};
 use skills::{Skill, SkillTool};
-use subagent::{AgentDef, AgentTool, Permission};
+use subagent::{AgentDef, AgentTool};
 use repl::ReplHelper;
 use tools::{FileTracker, ToolRegistry};
 
@@ -46,11 +46,7 @@ impl Observer for Terminal {
 }
 
 fn preview(s: &str, max_chars: usize) -> String {
-    let flat = s.replace('\n', " ⏎ ");
-    match flat.char_indices().nth(max_chars) {
-        Some((i, _)) => format!("{}…", &flat[..i]),
-        None => flat,
-    }
+    util::ellipsize(&s.replace('\n', " ⏎ "), max_chars)
 }
 
 fn system_prompt() -> String {
@@ -282,9 +278,9 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "agents" => Input::ListAgents,
         "model" => Input::Model(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         _ => match skills.iter().find(|s| s.name == name) {
-            Some(skill) => match skill.load(Some(args)) {
-                Ok(body) => Input::Prompt(format!("The user invoked the `{name}` skill:\n\n{body}")),
-                Err(e) => Input::Error(format!("cannot load skill {name}: {e}")),
+            Some(skill) => match skill.invocation_prompt(args) {
+                Ok(prompt) => Input::Prompt(prompt),
+                Err(e) => Input::Error(e),
             },
             None => Input::Error(format!("unknown command /{name} (try /help)")),
         },
@@ -322,11 +318,7 @@ fn print_models(agent: &Agent) {
         println!("subagents: {sub}");
     }
     for name in providers.names() {
-        let protocol = match providers.protocol_of(name) {
-            Some(llm::Protocol::Anthropic) => "anthropic",
-            Some(llm::Protocol::OpenAiResponses) => "openai-responses",
-            None => "?",
-        };
+        let protocol = providers.protocol_of(name).map_or("?", llm::Protocol::as_str);
         println!("provider \x1b[1m{name}\x1b[0m ({protocol})");
     }
     for m in providers.listed_models() {
@@ -337,10 +329,7 @@ fn print_models(agent: &Agent) {
 
 fn print_agents(defs: &[AgentDef]) {
     for d in defs {
-        let access = match d.permission {
-            Permission::ReadOnly => "read-only",
-            Permission::Write => "write",
-        };
+        let access = d.permission.as_str();
         let tools = d.tools.as_ref().map_or("all permitted".to_string(), |t| t.join(", "));
         let source = d.path.as_ref().map_or("built-in".to_string(), |p| p.display().to_string());
         println!("\x1b[1m{}\x1b[0m  [{access}; tools: {tools}]", d.name);

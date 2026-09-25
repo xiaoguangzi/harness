@@ -30,10 +30,10 @@ use serde_json::{Value, json};
 
 use crate::agent::Agent;
 use crate::llm::config::editable_path;
-use crate::llm::{Client, Protocol, Providers};
+use crate::llm::{Client, Providers};
 use crate::mentions;
 use crate::skills::Skill;
-use crate::subagent::{AgentDef, AgentTool, Permission, Reporter};
+use crate::subagent::{AgentDef, AgentTool, Reporter};
 use crate::tools::{FileTracker, ReadTool, ToolRegistry, WriteTool};
 
 pub use tasks::forward_subagent;
@@ -59,11 +59,19 @@ pub struct Setup {
 
 /// The parts that change when the providers are reloaded.
 struct Live {
-    client: Option<Client>,
-    agent_tool: Option<Arc<AgentTool>>,
+    /// The default client and the `agent` tool built on it, or why no
+    /// provider could be loaded.
+    model: Result<(Client, Arc<AgentTool>), String>,
     /// `base_tools` plus the `agent` tool.
     tools: ToolRegistry,
-    error: Option<String>,
+}
+
+impl Live {
+    fn client(&self) -> ApiResult<&Client> {
+        self.model.as_ref().map(|(client, _)| client).map_err(|e| {
+            bad_request(format!("no usable model: {e}; configure one on the Models page"))
+        })
+    }
 }
 
 struct AppState {
@@ -108,7 +116,7 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
         .or_else(|| (!loopback).then(random_token));
 
     let live = build_live(&setup.tools, &setup.agent_defs, &setup.reporter, setup.providers);
-    if let Some(e) = &live.error {
+    if let Err(e) = &live.model {
         eprintln!("\x1b[33mno usable model yet ({e}); configure one in the web UI\x1b[0m");
     }
     let state = Arc::new(AppState {
@@ -158,26 +166,23 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
 }
 
 fn build_live(base: &ToolRegistry, defs: &Arc<Vec<AgentDef>>, reporter: &Reporter, providers: Result<Providers>) -> Live {
-    let client = providers.and_then(Client::new);
     let mut tools = base.clone();
-    match client {
-        Ok(client) => {
-            let agent_tool = Arc::new(AgentTool::new(defs.clone(), base.clone(), client.clone(), reporter.clone()));
-            tools.register_arc(agent_tool.clone());
-            Live { client: Some(client), agent_tool: Some(agent_tool), tools, error: None }
-        }
-        Err(e) => Live { client: None, agent_tool: None, tools, error: Some(format!("{e:#}")) },
-    }
+    let model = providers.and_then(Client::new).map_err(|e| format!("{e:#}")).map(|client| {
+        let agent_tool = Arc::new(AgentTool::new(defs.clone(), base.clone(), client.clone(), reporter.clone()));
+        tools.register_arc(agent_tool.clone());
+        (client, agent_tool)
+    });
+    Live { model, tools }
 }
 
 /// The tool set for a task's agent: a subagent type's own set, or every
 /// tool; `read` and `write` share the task's own file tracker.
 fn task_tools(live: &Live, def: Option<&AgentDef>, files: &FileTracker) -> ToolRegistry {
-    let mut tools = match (def, &live.agent_tool) {
-        (Some(def), Some(agent_tool)) => agent_tool.registry_for(def),
+    let mut tools = match (def, &live.model) {
+        (Some(def), Ok((_, agent_tool))) => agent_tool.registry_for(def),
         _ => live.tools.clone(),
     };
-    let (has_read, has_write) = (tools.names().any(|n| n == "read"), tools.names().any(|n| n == "write"));
+    let (has_read, has_write) = (tools.get("read").is_some(), tools.get("write").is_some());
     if has_read {
         tools.register(ReadTool::new(files.clone()));
     }
@@ -284,10 +289,7 @@ fn providers_json(providers: &Providers) -> Value {
             let p = providers.provider(name)?;
             Some(json!({
                 "name": name,
-                "protocol": match p.protocol {
-                    Protocol::Anthropic => "anthropic",
-                    Protocol::OpenAiResponses => "openai-responses",
-                },
+                "protocol": p.protocol.as_str(),
                 "base_url": p.base_url,
                 "api_key": p.api_key.as_deref().map(mask),
                 "models": p.models.keys().collect::<Vec<_>>(),
@@ -313,7 +315,7 @@ async fn info(State(state): State<Shared>) -> Json<Value> {
             json!({
                 "name": d.name,
                 "description": d.description,
-                "permission": match d.permission { Permission::ReadOnly => "read-only", Permission::Write => "write" },
+                "permission": d.permission.as_str(),
                 "tools": d.tools,
                 "model": d.model,
                 "source": d.path.as_ref().map(|p| p.display().to_string()),
@@ -330,8 +332,8 @@ async fn info(State(state): State<Shared>) -> Json<Value> {
         "config": {
             "path": std::path::absolute(&path).unwrap_or(path).display().to_string(),
             "text": text,
-            "error": live.error,
-            "active": live.client.as_ref().map(|c| providers_json(c.providers())),
+            "error": live.model.as_ref().err(),
+            "active": live.model.as_ref().ok().map(|(c, _)| providers_json(c.providers())),
         },
         "agents": agents,
         "skills": skills,
@@ -348,9 +350,6 @@ struct SaveConfig {
 /// the environment, saves it and switches to the new providers.
 async fn save_config(State(state): State<Shared>, Json(req): Json<SaveConfig>) -> ApiResult<Json<Value>> {
     let path = editable_path();
-    if !req.text.trim().is_empty() {
-        serde_json::from_str::<Value>(&req.text).map_err(|e| bad_request(format!("invalid JSON: {e}")))?;
-    }
     let providers =
         Providers::load_with(Some((&path, &req.text))).map_err(|e| bad_request(format!("{e:#}")))?;
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -363,15 +362,13 @@ async fn save_config(State(state): State<Shared>, Json(req): Json<SaveConfig>) -
     // resolves; running ones keep the old config for this conversation.
     let tasks: Vec<Arc<Task>> = state.tasks.lock().unwrap().values().cloned().collect();
     let mut skipped = 0;
-    if let Some(client) = &live.client {
+    if let Ok((client, _)) = &live.model {
         for task in tasks {
             let Ok(mut agent) = task.agent.try_lock() else {
                 skipped += 1;
                 continue;
             };
-            let client = client.switch(&task.model()).unwrap_or_else(|_| client.clone());
-            task.set_model(client.spec());
-            agent.set_client(client);
+            task.set_client(&mut agent, task.current_client(client));
             agent.set_tools(task_tools(&live, task.def.as_ref(), &task.files));
         }
     }
@@ -390,7 +387,7 @@ async fn list_tools(State(state): State<Shared>) -> Json<Value> {
         .definitions()
         .into_iter()
         .map(|d| {
-            let read_only = live.tools.is_read_only(&d.name);
+            let read_only = live.tools.get(&d.name).is_some_and(|t| t.read_only());
             json!({"name": d.name, "description": d.description, "schema": d.input_schema, "read_only": read_only})
         })
         .collect();
@@ -408,13 +405,11 @@ async fn call_tool(
     Path(name): Path<String>,
     Json(req): Json<CallTool>,
 ) -> ApiResult<Json<Value>> {
-    let tools = state.live.read().unwrap().tools.clone();
-    if !tools.names().any(|n| n == name) {
-        return Err(api_error(StatusCode::NOT_FOUND, format!("unknown tool {name}")));
-    }
+    let tool = state.live.read().unwrap().tools.get(&name).cloned();
+    let tool = tool.ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("unknown tool {name}")))?;
     let input = if req.input.is_null() { json!({}) } else { req.input };
     let started = std::time::Instant::now();
-    let out = tools.run(&name, input).await;
+    let out = tool.run(input).await;
     Ok(Json(json!({
         "content": out.content,
         "is_error": out.is_error,
@@ -437,8 +432,7 @@ fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiResult<
                 .iter()
                 .find(|s| s.name == name)
                 .ok_or_else(|| bad_request(format!("unknown skill /{name}")))?;
-            let body = skill.load(Some(args)).map_err(|e| bad_request(format!("cannot load skill {name}: {e}")))?;
-            format!("The user invoked the `{name}` skill:\n\n{body}")
+            skill.invocation_prompt(args).map_err(bad_request)?
         }
         None => line.to_string(),
     };
@@ -453,11 +447,7 @@ fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiResult<
 }
 
 fn title_for(prompt: &str) -> String {
-    let line = prompt.lines().next().unwrap_or("").trim();
-    match line.char_indices().nth(60) {
-        Some((i, _)) => format!("{}…", &line[..i]),
-        None => line.to_string(),
-    }
+    crate::util::ellipsize(prompt.lines().next().unwrap_or("").trim(), 60)
 }
 
 async fn list_tasks(State(state): State<Shared>) -> Json<Value> {
@@ -497,22 +487,14 @@ async fn create_task(State(state): State<Shared>, Json(req): Json<NewTask>) -> A
     let files = FileTracker::default();
     let agent = {
         let live = state.live.read().unwrap();
-        let client = live.client.clone().ok_or_else(|| {
-            bad_request(format!(
-                "no usable model: {}; configure one on the Models page",
-                live.error.as_deref().unwrap_or("unknown error")
-            ))
-        })?;
-        // As for the `agent` tool: the chosen model, else the agent type's
-        // own, else the configured subagent model, else the default.
-        let spec = req.model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(String::from).or_else(|| {
-            let def = def.as_ref()?;
-            def.model.clone().or_else(|| client.providers().subagent_model.clone())
-        });
-        let client = match spec {
-            Some(spec) => client.switch(&spec).map_err(|e| bad_request(format!("{e:#}")))?,
-            None => client,
-        };
+        let client = live.client()?;
+        // The chosen model, else what the `agent` tool would use.
+        let client = match (req.model.as_deref().map(str::trim).filter(|m| !m.is_empty()), &def, &live.model) {
+            (Some(spec), _, _) => client.switch(spec),
+            (None, Some(def), Ok((_, agent_tool))) => agent_tool.client_for(def),
+            _ => Ok(client.clone()),
+        }
+        .map_err(|e| bad_request(format!("{e:#}")))?;
         let system = match &def {
             Some(def) => AgentTool::system_prompt(def),
             None => crate::system_prompt(),
@@ -543,9 +525,6 @@ async fn send_message(
     if prompt.is_empty() {
         return Err(bad_request("the prompt is empty"));
     }
-    if task.is_running() {
-        return Err(api_error(StatusCode::CONFLICT, "the task is still running; wait for it or cancel it"));
-    }
     let (content, user) = user_message(&state, prompt, &task.files)?;
     task.start_turn(content, user).map_err(|e| api_error(StatusCode::CONFLICT, e))?;
     Ok(Json(task.summary()))
@@ -563,16 +542,13 @@ async fn switch_model(
 ) -> ApiResult<Json<Value>> {
     let task = find_task(&state, id)?;
     let client = {
-        let live = state.live.read().unwrap();
-        let client = live.client.as_ref().ok_or_else(|| bad_request("no usable model configured"))?;
         // Resolve against the task's current provider, as `/model` does.
-        client.switch(&task.model()).unwrap_or_else(|_| client.clone())
+        task.current_client(state.live.read().unwrap().client()?)
     };
     let client = client.switch(&req.model).map_err(|e| bad_request(format!("{e:#}")))?;
     let mut agent =
         task.agent.try_lock().map_err(|_| api_error(StatusCode::CONFLICT, "cannot switch models while running"))?;
-    task.set_model(client.spec());
-    agent.set_client(client);
+    task.set_client(&mut agent, client);
     drop(agent);
     Ok(Json(task.summary()))
 }
@@ -622,7 +598,7 @@ async fn task_events(
     });
     let stream = futures::stream::iter(backlog)
         .chain(live)
-        .map(|(seq, event)| Ok(Event::default().id(seq.to_string()).data(event.to_string())));
+        .map(|(seq, event)| Ok(Event::default().id(seq.to_string()).data(&*event)));
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 

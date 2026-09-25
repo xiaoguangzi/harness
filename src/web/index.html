@@ -243,8 +243,8 @@ async function refreshTasks() {
 }
 
 function showTasksPage() {
-  refreshTasks();
-  if (currentTask === null) showNewTask();
+  if (currentTask === null) showNewTask(); // refreshes the list itself
+  else refreshTasks();
 }
 
 function showNewTask() {

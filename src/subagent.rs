@@ -44,6 +44,15 @@ pub enum Permission {
     Write,
 }
 
+impl Permission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::ReadOnly => "read-only",
+            Permission::Write => "write",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentDef {
     pub name: String,
@@ -229,6 +238,15 @@ impl AgentTool {
         registry
     }
 
+    /// The client for one run: the agent's own model, else the configured
+    /// subagent model, else the caller's.
+    pub fn client_for(&self, def: &AgentDef) -> anyhow::Result<Client> {
+        match def.model.as_deref().or(self.client.providers().subagent_model.as_deref()) {
+            Some(spec) => self.client.switch(spec),
+            None => Ok(self.client.clone()),
+        }
+    }
+
     pub fn system_prompt(def: &AgentDef) -> String {
         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
         format!(
@@ -302,14 +320,9 @@ impl Tool for AgentTool {
         let Some(def) = self.defs.iter().find(|d| d.name == input.agent_type) else {
             return ToolOutput::error(format!("Unknown agent type: {}", input.agent_type));
         };
-        // The agent's own model, else the configured subagent model, else
-        // the caller's.
-        let client = match def.model.as_deref().or(self.client.providers().subagent_model.as_deref()) {
-            Some(spec) => match self.client.switch(spec) {
-                Ok(c) => c,
-                Err(e) => return ToolOutput::error(format!("Agent `{}` has an unusable model: {e:#}", def.name)),
-            },
-            None => self.client.clone(),
+        let client = match self.client_for(def) {
+            Ok(c) => c,
+            Err(e) => return ToolOutput::error(format!("Agent `{}` has an unusable model: {e:#}", def.name)),
         };
         let mut agent = Agent::new(client, self.registry_for(def), Self::system_prompt(def));
         let mut observer = SubObserver {
