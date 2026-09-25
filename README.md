@@ -105,7 +105,7 @@ Mention a path with `@` and its contents are attached to your message, so the mo
 | `@spec.pdf` | the PDF as a document |
 | `@"name with spaces.txt"` | quoted paths |
 
-Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trailing punctuation is ignored. Only existing paths are attached, and an `@` right after an e-mail-style character is left alone, so `me@example.com` stays text. In the REPL, Tab completes paths after `@` and commands after `/`. Attached text files count as read for the `write` tool. The REPL also keeps line-editing history in `~/.harness/history`.
+Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trailing punctuation is ignored. Only existing paths are attached, and an `@` right after an e-mail-style character is left alone, so `me@example.com` stays text. In the REPL, typing `@` opens a file menu under the prompt: it lists the current directory, then searches the project's files (what `git ls-files` lists, or a walk outside git) as you type, best matches first (path prefix, file name, substring, then fuzzy). ↑/↓ select, Tab or Enter fills in the path, and a directory stays open for its entries. Git-ignored entries are hidden unless you type into that directory (`@target/`). Attached text files count as read for the `write` tool. The REPL also keeps line-editing history in `~/.harness/history`.
 
 ## REPL
 
@@ -116,14 +116,16 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 | `/help` | list commands |
 | `/model [spec]` | show providers and models, or switch to `<provider>/<model>` |
 | `/clear` | start a new conversation |
+| `/tools` | list the tools the model can call |
 | `/skills` | list discovered skills |
 | `/agents` | list subagent types, their permission and tools |
 | `/mcp` | list MCP servers, their tools and log files |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
-| `/exit`, Ctrl-D | quit |
+| `/exit`, `exit`, Ctrl-D | quit (`exit` or `quit` only when alone on the line) |
 | Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted. At the prompt, press it twice to quit |
 | `\` at line end, Alt+Enter | continue the message on a new line |
-| Tab | complete `@paths` and `/commands` |
+| `/` | open the command menu under the prompt; it narrows as you type, ↑/↓ select, Tab fills in, Enter runs. After `/model ` it lists models |
+| `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |
 
 ## MCP servers
 
@@ -188,7 +190,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 ## Layout
 
 - `src/main.rs` — startup: config, tools, skills, MCP servers, agents; then the CLI or web frontend
-- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), rustyline helper with completion, hints and multi-line input (`repl.rs`)
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with menu keys, completion and multi-line input (`repl.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`
 - `src/llm/` — LLM gateways

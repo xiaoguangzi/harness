@@ -1,44 +1,146 @@
-//! Line editing for the REPL: history, Tab completion of `@paths` and
-//! `/commands`, a grey hint completing the command being typed, and
-//! multi-line input (a line ending in `\` continues).
+//! Line editing for the REPL: history, a menu under the prompt (commands
+//! while a `/command` is typed, files while an `@path` is), Tab completion,
+//! and multi-line input (a line ending in `\` continues).
+//!
+//! The menu is drawn as a multi-line hint. Up/Down move its selection and
+//! Tab fills it in; Enter runs a command, or fills in a file. A choice is
+//! typed through the completer, which puts the cursor after it.
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::Arc;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::{CmdKind, Highlighter};
-use rustyline::hint::Hinter;
+use rustyline::hint::{Hint, Hinter};
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
-use rustyline::{Context, Helper};
+use rustyline::{
+    Cmd, ConditionalEventHandler, Context, Editor, Event, EventContext, EventHandler, Helper, KeyCode, KeyEvent,
+    Modifiers, RepeatCount,
+};
 
-const MAX_CANDIDATES: usize = 200;
+use super::menu::{Command, Kind, Menu, list_dir, mention_at_end};
+use super::text;
+
+/// The menu, shown below the line being edited.
+pub struct MenuHint(String);
+
+impl Hint for MenuHint {
+    fn display(&self) -> &str {
+        &self.0
+    }
+
+    /// Nothing for the Right arrow to insert: Tab fills in the selection.
+    fn completion(&self) -> Option<&str> {
+        None
+    }
+}
 
 #[derive(Helper)]
 pub struct ReplHelper {
-    /// `/help`, `/exit`, ... plus one entry per skill.
-    commands: Vec<String>,
+    menu: Arc<Menu>,
+    /// Command names, for Tab completion when the menu is not shown.
+    names: Vec<String>,
     styled: bool,
 }
 
 impl ReplHelper {
-    pub fn new(commands: Vec<String>, styled: bool) -> Self {
-        Self { commands, styled }
+    pub fn new(commands: Vec<Command>, styled: bool) -> Self {
+        let names = commands.iter().map(|c| c.name.clone()).collect();
+        Self { menu: Arc::new(Menu::new(commands, ".")), names, styled }
+    }
+
+    /// Binds the keys that drive the menu.
+    pub fn bind_keys<H: Helper, I: rustyline::history::History>(&self, editor: &mut Editor<H, I>) {
+        let keys = [(KeyCode::Up, MenuKey::Up), (KeyCode::Down, MenuKey::Down), (KeyCode::Tab, MenuKey::Tab), (KeyCode::Enter, MenuKey::Enter)];
+        for (code, key) in keys {
+            let handler = MenuKeyHandler { menu: self.menu.clone(), key };
+            editor.bind_sequence(KeyEvent(code, Modifiers::NONE), EventHandler::Conditional(Box::new(handler)));
+        }
+    }
+
+    /// Call before reading a line: files are searched afresh.
+    pub fn new_line(&self) {
+        self.menu.forget_files();
+    }
+
+    /// The command Enter picked from the menu for the last line read.
+    pub fn take_accepted(&self) -> Option<String> {
+        self.menu.take_accepted()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MenuKey {
+    Up,
+    Down,
+    Tab,
+    Enter,
+}
+
+struct MenuKeyHandler {
+    menu: Arc<Menu>,
+    key: MenuKey,
+}
+
+impl ConditionalEventHandler for MenuKeyHandler {
+    /// Acts on the menu while it is shown; otherwise the key does its usual
+    /// thing (history, completion, accepting the line).
+    fn handle(&self, _evt: &Event, _n: RepeatCount, _positive: bool, ctx: &EventContext) -> Option<Cmd> {
+        let line = ctx.line();
+        if !ctx.has_hint() || ctx.pos() < line.len() {
+            return None;
+        }
+        let (kind, items, selected) = self.menu.selection(line)?;
+        let choice = items[selected].text.clone();
+        match (self.key, kind) {
+            // With nothing to choose between, the arrows keep walking
+            // history (which may have recalled a `/command`).
+            (MenuKey::Up | MenuKey::Down, _) if items.len() < 2 => return None,
+            (MenuKey::Up, _) => self.menu.step(line, -1),
+            (MenuKey::Down, _) => self.menu.step(line, 1),
+            (MenuKey::Tab, Kind::Command) => {
+                self.menu.set_pick(0, format!("{choice} "));
+                return Some(Cmd::Complete);
+            }
+            (MenuKey::Enter, Kind::Command) => {
+                if choice != line.trim_end() {
+                    self.menu.set_accepted(choice);
+                }
+                return Some(Cmd::AcceptLine);
+            }
+            // A path typed out in full is sent as is.
+            (MenuKey::Enter, Kind::File { start }) if line[start..] == choice => return None,
+            (MenuKey::Tab | MenuKey::Enter, Kind::File { start }) => {
+                self.menu.set_pick(start, file_text(&choice));
+                return Some(Cmd::Complete);
+            }
+        }
+        Some(Cmd::Repaint)
+    }
+}
+
+/// What choosing `path` types: a directory stays open for its entries, a
+/// file is finished with a space, and a path with spaces is quoted.
+fn file_text(path: &str) -> String {
+    if path.contains(char::is_whitespace) {
+        format!("\"{path}\" ")
+    } else if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path} ")
     }
 }
 
 impl Hinter for ReplHelper {
-    type Hint = String;
+    type Hint = MenuHint;
 
-    /// The rest of the only command that starts with what was typed.
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        if pos < line.len() || !line.starts_with('/') || line.contains(char::is_whitespace) {
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<MenuHint> {
+        if pos < line.len() {
             return None;
         }
-        let mut matches = self.commands.iter().filter(|c| c.starts_with(line) && !c.contains(' '));
-        match (matches.next(), matches.next()) {
-            (Some(only), None) if only.len() > line.len() => Some(only[line.len()..].to_string()),
-            _ => None,
-        }
+        let width = text::terminal_width().saturating_sub(1);
+        self.menu.render(line, width).map(MenuHint)
     }
 }
 
@@ -48,7 +150,10 @@ impl Highlighter for ReplHelper {
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        if self.styled { Cow::Owned(format!("\x1b[2m{hint}\x1b[0m")) } else { Cow::Borrowed(hint) }
+        match self.menu.styled(hint) {
+            Some(styled) if self.styled => Cow::Owned(styled),
+            _ => Cow::Borrowed(hint),
+        }
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
@@ -72,65 +177,33 @@ impl Completer for ReplHelper {
     type Candidate = Pair;
 
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
-        Ok(complete(line, pos, &self.commands, Path::new(".")))
+        // A choice made in the menu is the only candidate, so it is typed.
+        if let Some((start, text)) = self.menu.take_pick() {
+            return Ok((start, vec![Pair { display: text.clone(), replacement: text }]));
+        }
+        Ok(complete(line, pos, &self.names, Path::new(".")))
     }
 }
 
 /// Relative paths are completed against `base`.
 fn complete(line: &str, pos: usize, commands: &[String], base: &Path) -> (usize, Vec<Pair>) {
     let before = &line[..pos];
-    // The word under the cursor starts after the last whitespace, or at the
-    // last `@` that begins a mention (so `看看@src` completes too).
-    let word_start = before
-        .char_indices()
-        .rev()
-        .find(|(_, c)| c.is_whitespace())
-        .map_or(0, |(i, c)| i + c.len_utf8());
-    let word = &before[word_start..];
-
-    if let Some(at) = word.rfind('@') {
-        let prev = word[..at].chars().next_back();
-        if !prev.is_some_and(|c| c.is_ascii_alphanumeric() || "._-+%".contains(c)) {
-            let partial = &word[at + 1..];
-            return (word_start + at + 1, complete_path(partial, base));
-        }
+    if let Some((start, partial)) = mention_at_end(before) {
+        let pairs = list_dir(partial, base)
+            .into_iter()
+            .map(|path| Pair { display: path.rsplit_once('/').map_or(path.clone(), |(_, n)| n.to_string()), replacement: path })
+            .collect();
+        return (start, pairs);
     }
-    if word_start == 0 && word.starts_with('/') {
+    if before.starts_with('/') && !before.contains(char::is_whitespace) {
         let pairs = commands
             .iter()
-            .filter(|c| c.starts_with(word))
+            .filter(|c| c.starts_with(before))
             .map(|c| Pair { display: c.clone(), replacement: format!("{c} ") })
             .collect();
         return (0, pairs);
     }
     (pos, Vec::new())
-}
-
-/// Entries of the directory part of `partial` whose names start with the
-/// rest. Directories get a trailing `/`; hidden entries are only offered
-/// when the typed name starts with `.`.
-fn complete_path(partial: &str, base: &Path) -> Vec<Pair> {
-    let (dir, prefix) = match partial.rfind('/') {
-        Some(i) => (&partial[..=i], &partial[i + 1..]),
-        None => ("", partial),
-    };
-    let Ok(entries) = std::fs::read_dir(base.join(dir)) else {
-        return Vec::new();
-    };
-    let mut pairs: Vec<Pair> = entries
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(prefix) || (name.starts_with('.') && !prefix.starts_with('.')) {
-                return None;
-            }
-            let slash = if e.path().is_dir() { "/" } else { "" };
-            Some(Pair { display: format!("{name}{slash}"), replacement: format!("{dir}{name}{slash}") })
-        })
-        .collect();
-    pairs.sort_by(|a, b| a.display.cmp(&b.display));
-    pairs.truncate(MAX_CANDIDATES);
-    pairs
 }
 
 #[cfg(test)]

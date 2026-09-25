@@ -1,6 +1,7 @@
 //! Terminal frontend: the interactive REPL and one-shot mode.
 
 mod markdown;
+mod menu;
 mod output;
 mod repl;
 mod text;
@@ -20,7 +21,20 @@ use crate::subagent::AgentDef;
 use crate::tools::FileTracker;
 pub use output::Output;
 use output::{Terminal, TurnEnd};
+use menu::Command;
 use repl::ReplHelper;
+
+/// Built-in commands and what they do, as the menu and `/help` show them.
+const BUILTINS: [(&str, &str); 8] = [
+    ("/help", "show commands and keys"),
+    ("/model", "show the model, or switch with /model <provider>/<model>"),
+    ("/clear", "start a new conversation"),
+    ("/tools", "list the tools the model can call"),
+    ("/skills", "list available skills"),
+    ("/agents", "list subagent types and their tools"),
+    ("/mcp", "list MCP servers and their tools"),
+    ("/exit", "quit (or exit, Ctrl-D)"),
+];
 
 pub async fn run(
     agent: &mut Agent,
@@ -51,19 +65,20 @@ pub async fn run(
 
     print_banner(agent, skills, mcp, &out);
 
-    let mut commands: Vec<String> = ["/help", "/model", "/clear", "/skills", "/agents", "/mcp", "/exit"]
-        .iter()
-        .map(|c| c.to_string())
-        .collect();
-    commands.extend(agent.client().providers().listed_models().iter().map(|m| format!("/model {m}")));
-    commands.extend(skills.iter().map(|s| format!("/{}", s.name)));
+    let mut commands: Vec<Command> = BUILTINS.iter().map(|(name, description)| Command::new(*name, *description)).collect();
+    commands.extend(skills.iter().map(|s| Command::new(format!("/{}", s.name), &s.description)));
+    commands.extend(
+        agent.client().providers().listed_models().iter().map(|m| Command::new(format!("/model {m}"), "switch to this model")),
+    );
     let config = rustyline::Config::builder()
         .completion_type(rustyline::CompletionType::List)
         .auto_add_history(true)
         .build();
     let mut editor: rustyline::Editor<ReplHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(config)?;
-    editor.set_helper(Some(ReplHelper::new(commands, out.styled())));
+    let helper = ReplHelper::new(commands, out.styled());
+    helper.bind_keys(&mut editor);
+    editor.set_helper(Some(helper));
     // Alt+Enter inserts a newline, like a trailing `\`.
     editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::ALT), Cmd::Newline);
     let history = history_path();
@@ -75,6 +90,9 @@ pub async fn run(
     loop {
         // Reading a line blocks; let the runtime move other tasks (such as
         // MCP connections) off this worker meanwhile.
+        if let Some(helper) = editor.helper() {
+            helper.new_line();
+        }
         let line = match tokio::task::block_in_place(|| editor.readline("❯ ")) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) if !interrupted => {
@@ -86,7 +104,15 @@ pub async fn run(
             Err(e) => return Err(e.into()),
         };
         interrupted = false;
-        let line = repl::join_continuations(line.trim());
+        let mut line = repl::join_continuations(line.trim());
+        if let Some(command) = editor.helper().and_then(ReplHelper::take_accepted) {
+            // Enter ran the command selected in the menu; show it in place
+            // of the prefix that was typed.
+            if out.styled() {
+                print!("\x1b[1A\r\x1b[K{}{command}\n", out.paint("1;35", "❯ "));
+            }
+            line = command;
+        }
         match parse_input(&line, skills) {
             Input::Empty => {}
             Input::Exit => break,
@@ -96,6 +122,7 @@ pub async fn run(
                 out.line(out.paint("2", "conversation cleared"));
             }
             Input::ListSkills => print_skills(skills),
+            Input::ListTools => print_tools(agent),
             Input::ListMcp => print_mcp(mcp),
             Input::ListAgents => print_agents(agent_defs),
             Input::Model(None) => print_models(agent),
@@ -162,6 +189,7 @@ enum Input {
     Help,
     Clear,
     ListSkills,
+    ListTools,
     ListMcp,
     ListAgents,
     /// `/model` shows the current model; `/model <spec>` switches.
@@ -174,7 +202,12 @@ enum Input {
 /// instructions directly into the prompt, saving the model a tool call.
 fn parse_input(line: &str, skills: &[Skill]) -> Input {
     let Some(command) = line.strip_prefix('/') else {
-        return if line.is_empty() { Input::Empty } else { Input::Prompt(line.to_string()) };
+        return match line {
+            "" => Input::Empty,
+            // A bare `exit` or `quit` alone on the line quits too.
+            "exit" | "quit" => Input::Exit,
+            _ => Input::Prompt(line.to_string()),
+        };
     };
     let (name, args) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
     match name {
@@ -182,6 +215,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "help" => Input::Help,
         "clear" => Input::Clear,
         "skills" => Input::ListSkills,
+        "tools" => Input::ListTools,
         "mcp" => Input::ListMcp,
         "agents" => Input::ListAgents,
         "model" => Input::Model(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
@@ -212,30 +246,34 @@ fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, out: &Outpu
             skills.len()
         ),
     ));
-    out.line(out.paint("2", "  /help for commands · @path attaches a file · \\ or Alt+Enter for a new line · Ctrl-C interrupts"));
+    out.line(out.paint("2", "  / for commands · @ for files · Ctrl-C to interrupt"));
     out.line("");
 }
 
 fn print_help(skills: &[Skill]) {
-    let rows = [
-        ("/help", "show this help"),
-        ("/model [spec]", "show the model, or switch to <provider>/<model>"),
-        ("/clear", "start a new conversation"),
-        ("/skills", "list available skills"),
-        ("/agents", "list subagent types and their tools"),
-        ("/mcp", "list MCP servers and their tools"),
+    let keys = [
         ("/<skill> [args]", "run a skill"),
-        ("/exit", "quit (or Ctrl-D)"),
-        ("@path", "attach a file, directory, image or PDF (Tab completes; @file#L10-20 for lines)"),
+        ("@path", "attach a file, directory, image or PDF; @ opens a file menu (@file#L10-20 for lines)"),
         ("\\ or Alt+Enter", "continue on a new line"),
-        ("Ctrl-C", "interrupt the running turn"),
+        ("↑ ↓ Tab Enter", "pick from the menu shown while typing / or @"),
+        ("Ctrl-C", "interrupt the running turn; twice at the prompt to quit"),
     ];
-    for (key, what) in rows {
+    for (key, what) in BUILTINS.iter().chain(&keys) {
         println!("  \x1b[1m{key:<16}\x1b[0m {what}");
     }
     if !skills.is_empty() {
         let names: Vec<String> = skills.iter().map(|s| format!("/{}", s.name)).collect();
         println!("  \x1b[2mskills: {}\x1b[0m", names.join(" "));
+    }
+}
+
+fn print_tools(agent: &Agent) {
+    let tools = agent.tools().definitions();
+    let name_width = tools.iter().map(|t| t.name.len()).max().unwrap_or(0);
+    let room = text::terminal_width().saturating_sub(name_width + 5);
+    for tool in tools {
+        let summary = tool.description.split(". ").next().unwrap_or("").trim_end_matches('.');
+        println!("  \x1b[1m{:<name_width$}\x1b[0m  \x1b[2m{}\x1b[0m", tool.name, text::fit(summary, room));
     }
 }
 
@@ -308,7 +346,12 @@ mod tests {
 
         assert_eq!(parse_input("", &skills), Input::Empty);
         assert_eq!(parse_input("/exit", &skills), Input::Exit);
+        assert_eq!(parse_input("exit", &skills), Input::Exit);
+        assert_eq!(parse_input("quit", &skills), Input::Exit);
+        assert_eq!(parse_input("exit now", &skills), Input::Prompt("exit now".into()));
+        assert_eq!(parse_input("how do I exit vim", &skills), Input::Prompt("how do I exit vim".into()));
         assert_eq!(parse_input("/clear", &skills), Input::Clear);
+        assert_eq!(parse_input("/tools", &skills), Input::ListTools);
         assert_eq!(parse_input("fix it", &skills), Input::Prompt("fix it".into()));
         assert!(matches!(parse_input("/nope", &skills), Input::Error(_)));
         match parse_input("/greet  Bob ", &skills) {
