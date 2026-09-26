@@ -1,11 +1,15 @@
 //! The agent loop: send the conversation, run any requested tools, send the
 //! results back, and repeat until the model ends its turn.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Result, bail};
 use futures::future::join_all;
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 use crate::llm::{Client, Message, StreamEvent, Usage};
+use crate::subagent::Subagents;
 use crate::tools::{ToolOutput, ToolRegistry};
 
 /// Told to the model about a turn the user cancelled.
@@ -33,6 +37,80 @@ pub trait Observer: Send {
     fn on_usage(&mut self, _usage: &Usage) {}
 }
 
+/// Messages for the model that arrive from elsewhere while it works or
+/// waits: a background subagent's report for the main agent, a follow-up
+/// for a subagent. The loop hands over what has arrived with its next
+/// request; a frontend starts a turn for them when the agent is idle.
+#[derive(Default)]
+pub struct Inbox {
+    queue: Mutex<Queue>,
+    arrived: Notify,
+    /// Called after each push that wants a turn.
+    on_wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+#[derive(Default)]
+struct Queue {
+    blocks: Vec<Value>,
+    /// Whether something queued should start a turn of its own, rather
+    /// than wait for the next one.
+    wake: bool,
+}
+
+impl Inbox {
+    /// Queues `text` for the model. With `wake`, an idle agent should run a
+    /// turn for it; otherwise it goes along with the next one.
+    pub fn push(&self, text: String, wake: bool) {
+        {
+            let mut queue = self.queue.lock().unwrap();
+            queue.blocks.push(json!({"type": "text", "text": text}));
+            queue.wake |= wake;
+        }
+        if wake {
+            self.arrived.notify_waiters();
+            let hook = self.on_wake.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// Whether something waiting wants a turn.
+    pub fn wants_turn(&self) -> bool {
+        self.queue.lock().unwrap().wake
+    }
+
+    pub fn clear(&self) {
+        self.take();
+    }
+
+    /// Takes everything waiting.
+    pub fn take(&self) -> Vec<Value> {
+        let mut queue = self.queue.lock().unwrap();
+        queue.wake = false;
+        std::mem::take(&mut queue.blocks)
+    }
+
+    /// Sets what to call when something arrives that wants a turn, such
+    /// as starting one in a frontend.
+    pub fn on_wake(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_wake.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Resolves once something waiting wants a turn.
+    pub async fn wanted(&self) {
+        loop {
+            let arrived = self.arrived.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+            if self.wants_turn() {
+                return;
+            }
+            arrived.await;
+        }
+    }
+}
+
 pub struct Agent {
     client: Client,
     tools: ToolRegistry,
@@ -41,11 +119,17 @@ pub struct Agent {
     /// History length when the running turn started; still set on the next
     /// turn only if the previous one was cancelled (its future dropped).
     turn_start: Option<usize>,
+    inbox: Arc<Inbox>,
+    /// Subagents this conversation started, kept for follow-ups. Their
+    /// background reports arrive in `inbox`.
+    subagents: Arc<Subagents>,
 }
 
 impl Agent {
     pub fn new(client: Client, tools: ToolRegistry, system: impl Into<String>) -> Self {
-        Self { client, tools, system: system.into(), messages: Vec::new(), turn_start: None }
+        let inbox = Arc::new(Inbox::default());
+        let subagents = Arc::new(Subagents::new(inbox.clone()));
+        Self { client, tools, system: system.into(), messages: Vec::new(), turn_start: None, inbox, subagents }
     }
 
     /// The `provider/model` in use.
@@ -71,8 +155,18 @@ impl Agent {
         self.tools = tools;
     }
 
-    /// Forgets the conversation.
+    pub fn inbox(&self) -> &Arc<Inbox> {
+        &self.inbox
+    }
+
+    pub fn subagents(&self) -> &Arc<Subagents> {
+        &self.subagents
+    }
+
+    /// Forgets the conversation, stopping its subagents.
     pub fn clear(&mut self) {
+        self.subagents.reset();
+        self.inbox.clear();
         self.messages.clear();
         self.turn_start = None;
     }
@@ -82,10 +176,11 @@ impl Agent {
         &self.messages
     }
 
-    /// Replaces the conversation with a saved one.
+    /// Replaces the conversation with a saved one. Subagents it mentions
+    /// are gone; the current ones are stopped.
     pub fn restore(&mut self, messages: Vec<Message>) {
+        self.clear();
         self.messages = messages;
-        self.turn_start = None;
     }
 
     /// Repairs the history after a cancelled turn now, rather than when the
@@ -96,10 +191,12 @@ impl Agent {
         }
     }
 
-    /// Text of the last assistant message: a subagent's answer. Its text
-    /// blocks are one run of text, possibly split mid-sentence.
-    pub fn last_text(&self) -> String {
-        let Some(last) = self.messages.iter().rev().find(|m| m.role == "assistant") else {
+    /// Text of the last assistant message from index `since` on: a
+    /// subagent's answer. Its text blocks are one run of text, possibly
+    /// split mid-sentence.
+    pub fn last_text(&self, since: usize) -> String {
+        let written = self.messages.get(since..).unwrap_or_default();
+        let Some(last) = written.iter().rev().find(|m| m.role == "assistant") else {
             return String::new();
         };
         let texts: Vec<&str> =
@@ -108,17 +205,29 @@ impl Agent {
     }
 
     /// Runs one user turn to completion. `content` is the user message's
-    /// content blocks (the prompt plus any attachments). The history only
-    /// ever grows by appending, so earlier turns (and their thinking blocks)
-    /// stay intact.
+    /// content blocks (the prompt plus any attachments); what waits in the
+    /// inbox goes first. Empty `content` runs a turn for the inbox alone,
+    /// and does nothing if that is empty too. The history only ever grows
+    /// by appending, so earlier turns (and their thinking blocks) stay
+    /// intact.
     pub async fn run_turn(&mut self, content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
         self.settle();
+        let arrived = self.inbox.take();
+        if content.is_empty() && arrived.is_empty() {
+            return Ok(());
+        }
         let turn_start = self.messages.len();
         self.turn_start = Some(turn_start);
-        self.messages.push(Message::user(content));
-        let result = self.run_loop(observer).await;
+        self.messages.push(Message::user(arrived.iter().cloned().chain(content).collect()));
+        let (subagents, client) = (self.subagents.clone(), self.client.clone());
+        let result = crate::subagent::scope(subagents, client, self.run_loop(observer)).await;
         if result.is_err() {
             self.repair_after_error(turn_start);
+            // A turn that got nowhere is removed, but what had arrived for
+            // the model stays: it can't be sent again.
+            if self.messages.len() == turn_start && !arrived.is_empty() {
+                self.messages.push(Message::user(arrived));
+            }
         }
         self.turn_start = None;
         result
@@ -169,6 +278,14 @@ impl Agent {
         let definitions = self.tools.definitions();
 
         loop {
+            // What arrived meanwhile goes after the prompt or the tool results.
+            let arrived = self.inbox.take();
+            if !arrived.is_empty() {
+                match self.messages.last_mut() {
+                    Some(last) if last.role == "user" => last.content.extend(arrived),
+                    _ => self.messages.push(Message::user(arrived)),
+                }
+            }
             observer.on_request_start();
             let mut on_event = |event: StreamEvent| match event {
                 StreamEvent::TextDelta(text) => observer.on_text_delta(text),
@@ -207,6 +324,9 @@ impl Agent {
                     observer.on_text_end();
                     return Ok(());
                 }
+                // Something arrived while the model was answering: it
+                // carries on with that rather than end the turn.
+                _ if self.inbox.wants_turn() => continue,
                 _ => return Ok(()),
             }
 

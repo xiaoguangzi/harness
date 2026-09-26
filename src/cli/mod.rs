@@ -8,11 +8,14 @@ mod output;
 mod repl;
 mod text;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Result;
 use rustyline::error::ReadlineError;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
+use serde_json::Value;
 
 use crate::agent::Agent;
 use crate::llm;
@@ -25,10 +28,10 @@ use crate::tools::FileTracker;
 pub use output::Output;
 use output::{Terminal, TurnEnd};
 use menu::Command;
-use repl::ReplHelper;
+use repl::{ReplHelper, Wake};
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 11] = [
+const BUILTINS: [(&str, &str); 13] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
@@ -37,6 +40,8 @@ const BUILTINS: [(&str, &str); 11] = [
     ("/tools", "list the tools the model can call"),
     ("/skills", "list available skills"),
     ("/agents", "list subagent types and their tools"),
+    ("/tasks", "list the subagents this conversation started"),
+    ("/stop", "stop running subagents, or one with /stop <id>"),
     ("/mcp", "list MCP servers and their tools"),
     ("/sandbox", "show what the sandbox allows commands to do"),
     ("/exit", "quit (or exit, Ctrl-D)"),
@@ -86,7 +91,22 @@ pub async fn run(
         return match parse_input(&line, skills) {
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
-                let result = submit(agent, &line, &prompt, files, &out, &mut term, recorder.as_mut()).await;
+                let mut result = submit(agent, &line, &prompt, files, &out, &mut term, recorder.as_mut()).await;
+                // Answer background subagents' reports as they come in, and
+                // exit once none is left running.
+                while result.is_ok() {
+                    if !agent.inbox().wants_turn() {
+                        let running = agent.subagents().running_in_background();
+                        if running == 0 {
+                            break;
+                        }
+                        if !wait_for_reports(agent, running, &out).await {
+                            result = Err(TurnEnd::Interrupted);
+                            break;
+                        }
+                    }
+                    result = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut()).await;
+                }
                 Ok(match result {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(TurnEnd::Interrupted) => ExitCode::from(130),
@@ -111,7 +131,18 @@ pub async fn run(
         .build();
     let mut editor: rustyline::Editor<ReplHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(config)?;
-    let helper = ReplHelper::new(commands, out.styled());
+    // A background subagent's report may come in while the prompt waits.
+    // The editor handles SIGINT only when both ends are a terminal.
+    let wake = (std::io::stdin().is_terminal() && out.styled()).then(|| {
+        let wake = Arc::new(Wake::new(agent.inbox()));
+        let poke = wake.clone();
+        agent.inbox().on_wake(move || poke.poke());
+        wake
+    });
+    // A wake that lands just after the editor returns meets Tokio's SIGINT
+    // handler, installed from here on, instead of ending the process.
+    let _sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    let helper = ReplHelper::new(commands, out.styled(), wake.clone());
     helper.bind_keys(&mut editor);
     editor.set_helper(Some(helper));
     // Alt+Enter inserts a newline, like a trailing `\`.
@@ -123,16 +154,41 @@ pub async fn run(
 
     let mut interrupted = false;
     loop {
+        // A background subagent reported back: the model answers first.
+        if agent.inbox().wants_turn() {
+            let _ = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut()).await;
+            out.line("");
+            continue;
+        }
         // Reading a line blocks; let the runtime move other tasks (such as
         // MCP connections) off this worker meanwhile.
         if let Some(helper) = editor.helper() {
             helper.new_line();
         }
-        let line = match tokio::task::block_in_place(|| editor.readline("❯ ")) {
+        out.hold(true);
+        let read = tokio::task::block_in_place(|| editor.readline("❯ "));
+        let woken = wake.as_ref().is_some_and(|w| w.finish_reading()) && matches!(read, Err(ReadlineError::Interrupted));
+        if woken {
+            // Interrupted for a subagent's report: take the prompt back.
+            print!("\x1b[1A\r\x1b[K");
+        }
+        // What subagents printed meanwhile.
+        out.hold(false);
+        let line = match read {
             Ok(line) => line,
+            Err(ReadlineError::Interrupted) if woken => {
+                interrupted = false;
+                continue;
+            }
             Err(ReadlineError::Interrupted) if !interrupted => {
                 interrupted = true;
-                out.line(out.paint("2", "(press Ctrl-C again or Ctrl-D to exit)"));
+                let running = agent.subagents().running_in_background();
+                let note = match running {
+                    0 => String::new(),
+                    1 => "; a subagent is still running".to_string(),
+                    n => format!("; {n} subagents are still running"),
+                };
+                out.line(out.paint("2", &format!("(press Ctrl-C again or Ctrl-D to exit{note})")));
                 continue;
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
@@ -180,6 +236,16 @@ pub async fn run(
             Input::ListTools => print_tools(agent),
             Input::ListMcp => print_mcp(mcp),
             Input::ListAgents => print_agents(agent_defs),
+            Input::Tasks => print_tasks(&agent.subagents().list()),
+            Input::Stop(None) => {
+                let stopped = agent.subagents().stop_all();
+                out.line(out.paint("2", &format!("stopped {stopped} subagent{}", if stopped == 1 { "" } else { "s" })));
+            }
+            Input::Stop(Some(id)) => match agent.subagents().stop(&id, true) {
+                Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
+                Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
+                Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+            },
             Input::Sandbox => print_sandbox(),
             Input::Model(None) => print_models(agent),
             Input::Model(Some(spec)) => match agent.client().switch(&spec) {
@@ -288,9 +354,7 @@ fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &Output,
     Ok(())
 }
 
-/// Attaches the files `@`-mentioned in `line` and runs the turn until it
-/// ends or Ctrl-C or Esc interrupts it. The turn's progress and outcome are shown,
-/// and the conversation is saved after it.
+/// Attaches the files `@`-mentioned in `line` and runs the turn.
 async fn submit(
     agent: &mut Agent,
     line: &str,
@@ -308,20 +372,35 @@ async fn submit(
     for w in &expanded.warnings {
         out.line(out.paint("33", &format!("  ! {w}")));
     }
+    run_shown(agent, expanded.into_content(prompt), first.then_some(line), out, term, recorder).await
+}
+
+/// Runs a turn until it ends or Ctrl-C or Esc interrupts it; empty `content`
+/// runs one for what waits in the agent's inbox. The turn's progress and
+/// outcome are shown, and the conversation is saved after it, titled
+/// `title` if it is new.
+async fn run_shown(
+    agent: &mut Agent,
+    content: Vec<Value>,
+    title: Option<&str>,
+    out: &Output,
+    term: &mut Terminal,
+    recorder: Option<&mut Recorder>,
+) -> Result<(), TurnEnd> {
     term.begin_turn();
     let mut esc = keys::EscWatch::start();
     // Dropping the turn cancels it: running commands are killed, and the
     // agent repairs its history at the start of the next turn.
     let result = tokio::select! {
-        result = agent.run_turn(expanded.into_content(prompt), &mut *term) => result.map_err(TurnEnd::Failed),
+        result = agent.run_turn(content, &mut *term) => result.map_err(TurnEnd::Failed),
         _ = tokio::signal::ctrl_c() => Err(TurnEnd::Interrupted),
         _ = esc.pressed() => Err(TurnEnd::Interrupted),
     };
     drop(esc);
     term.end_turn(&result);
     if let Some(rec) = recorder {
-        if first {
-            rec.set_title(line);
+        if let Some(title) = title {
+            rec.set_title(title);
         }
         agent.settle();
         if let Err(e) = rec.save(agent.messages(), agent.model()) {
@@ -329,6 +408,22 @@ async fn submit(
         }
     }
     result
+}
+
+/// Shows that `running` background subagents are still at work until one
+/// reports back; false if the user interrupted the wait.
+async fn wait_for_reports(agent: &Agent, running: usize, out: &Output) -> bool {
+    let plural = if running == 1 { "" } else { "s" };
+    out.set_status(Some(&format!("Waiting for {running} background subagent{plural}…")));
+    let mut esc = keys::EscWatch::start();
+    let reported = tokio::select! {
+        _ = agent.inbox().wanted() => true,
+        _ = tokio::signal::ctrl_c() => false,
+        _ = esc.pressed() => false,
+    };
+    drop(esc);
+    out.set_status(None);
+    reported
 }
 
 #[derive(Debug, PartialEq)]
@@ -341,6 +436,10 @@ enum Input {
     ListTools,
     ListMcp,
     ListAgents,
+    /// `/tasks` lists this conversation's subagents.
+    Tasks,
+    /// `/stop` stops every running subagent; `/stop <id>` that one.
+    Stop(Option<String>),
     Sandbox,
     /// `/model` shows the current model; `/model <spec>` switches.
     Model(Option<String>),
@@ -375,6 +474,8 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "tools" => Input::ListTools,
         "mcp" => Input::ListMcp,
         "agents" => Input::ListAgents,
+        "tasks" => Input::Tasks,
+        "stop" => Input::Stop(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "sandbox" => Input::Sandbox,
         "model" => Input::Model(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "effort" => match args.trim() {
@@ -503,6 +604,37 @@ fn print_agents(defs: &[AgentDef]) {
     }
 }
 
+fn print_tasks(subagents: &[Value]) {
+    if subagents.is_empty() {
+        println!("no subagents in this conversation");
+        return;
+    }
+    for s in subagents {
+        let status = s["status"].as_str().unwrap_or("");
+        let color = match status {
+            "running" => "36",
+            "completed" => "32",
+            "failed" => "31",
+            _ => "33",
+        };
+        let mut info = vec![
+            s["model"].as_str().unwrap_or("").to_string(),
+            format!("{} tool calls", s["tool_calls"]),
+            output::elapsed(s["seconds"].as_u64().unwrap_or(0)),
+        ];
+        if s["background"] == true {
+            info.push("background".into());
+        }
+        println!(
+            "  \x1b[1m{}\x1b[0m  \x1b[{color}m{status:<9}\x1b[0m  {}  \x1b[2m{}\x1b[0m",
+            s["id"].as_str().unwrap_or(""),
+            text::printable(s["label"].as_str().unwrap_or("")),
+            info.join(" · ")
+        );
+    }
+    println!("\x1b[90mstop one with /stop <id>, or every running one with /stop\x1b[0m");
+}
+
 fn print_mcp(mcp: &mcp::Manager) {
     if mcp.statuses.is_empty() {
         println!("no MCP servers configured (.mcp.json, ~/.harness/mcp.json or HARNESS_MCP_CONFIG)");
@@ -541,6 +673,9 @@ mod tests {
         assert_eq!(parse_input("how do I exit vim", &skills), Input::Prompt("how do I exit vim".into()));
         assert_eq!(parse_input("/clear", &skills), Input::Clear);
         assert_eq!(parse_input("/tools", &skills), Input::ListTools);
+        assert_eq!(parse_input("/tasks", &skills), Input::Tasks);
+        assert_eq!(parse_input("/stop", &skills), Input::Stop(None));
+        assert_eq!(parse_input("/stop a3f9c2", &skills), Input::Stop(Some("a3f9c2".into())));
         assert_eq!(parse_input("/resume", &skills), Input::Resume(None));
         assert_eq!(parse_input("/resume 2026 ", &skills), Input::Resume(Some("2026".into())));
         assert_eq!(parse_input("fix it", &skills), Input::Prompt("fix it".into()));

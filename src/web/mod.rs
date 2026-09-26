@@ -34,10 +34,9 @@ use crate::llm::config::editable_path;
 use crate::llm::{Client, Providers};
 use crate::mentions;
 use crate::skills::Skill;
-use crate::subagent::{AgentDef, AgentTool, Reporter};
+use crate::subagent::{AgentDef, AgentTool, MessageAgentTool, Reporter, StopAgentTool};
 use crate::tools::{FileTracker, ReadTool, ToolRegistry, WriteTool};
 
-pub use tasks::forward_subagent;
 use tasks::Task;
 
 const INDEX_HTML: &str = include_str!("index.html");
@@ -142,6 +141,8 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
         .route("/api/tasks/{id}/model", post(switch_model))
         .route("/api/tasks/{id}/cancel", post(cancel_task))
         .route("/api/tasks/{id}/events", get(task_events))
+        .route("/api/tasks/{id}/subagents", get(list_subagents))
+        .route("/api/tasks/{id}/subagents/{agent_id}/stop", post(stop_subagent))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state.clone());
 
@@ -165,6 +166,8 @@ fn build_live(base: &ToolRegistry, defs: &Arc<Vec<AgentDef>>, reporter: &Reporte
     let model = providers.and_then(Client::new).map_err(|e| format!("{e:#}")).map(|client| {
         let agent_tool = Arc::new(AgentTool::new(defs.clone(), base.clone(), client.clone(), reporter.clone()));
         tools.register_arc(agent_tool.clone());
+        tools.register(MessageAgentTool);
+        tools.register(StopAgentTool);
         (client, agent_tool)
     });
     Live { model, tools }
@@ -463,6 +466,19 @@ async fn get_task(State(state): State<Shared>, Path(id): Path<u64>) -> ApiResult
     Ok(Json(find_task(&state, id)?.summary()))
 }
 
+async fn list_subagents(State(state): State<Shared>, Path(id): Path<u64>) -> ApiResult<Json<Value>> {
+    Ok(Json(Value::Array(find_task(&state, id)?.subagents.list())))
+}
+
+async fn stop_subagent(
+    State(state): State<Shared>,
+    Path((id, agent_id)): Path<(u64, String)>,
+) -> ApiResult<Json<Value>> {
+    let task = find_task(&state, id)?;
+    let stopped = task.subagents.stop(&agent_id, true).map_err(|e| api_error(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok(Json(json!({"stopped": stopped})))
+}
+
 #[derive(Deserialize)]
 struct NewTask {
     prompt: String,
@@ -509,7 +525,7 @@ async fn create_task(State(state): State<Shared>, Json(req): Json<NewTask>) -> A
     let (content, user) = user_message(&state, prompt, &files)?;
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let title = req.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| title_for(prompt));
-    let task = Arc::new(Task::new(id, title, def, files, agent));
+    let task = Task::new(id, title, def, files, agent);
     state.tasks.lock().unwrap().insert(id, task.clone());
     task.start_turn(content, user).map_err(bad_request)?;
     Ok(Json(task.summary()))
@@ -569,6 +585,9 @@ async fn cancel_task(State(state): State<Shared>, Path(id): Path<u64>) -> ApiRes
 async fn delete_task(State(state): State<Shared>, Path(id): Path<u64>) -> ApiResult<Json<Value>> {
     let task = state.tasks.lock().unwrap().remove(&id).ok_or_else(|| api_error(StatusCode::NOT_FOUND, "no such task"))?;
     task.cancel();
+    // Open event streams may keep the task alive for a while; its subagents
+    // stop now.
+    task.subagents.reset();
     Ok(Json(json!({"deleted": id})))
 }
 

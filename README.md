@@ -44,7 +44,7 @@ Rerun `cargo install --path .` after pulling changes. While developing, `cargo r
 
 `harness --web` (or `--web=ADDR`, default `127.0.0.1:8787`) starts a browser UI instead of the REPL:
 
-- **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results (subagent progress shows under its `agent` call). Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands are killed) or delete it. `@path` mentions and `/<skill> args` work as in the REPL.
+- **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore`, `general-purpose` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results. Each subagent gets a card with its tool calls, status, report and a Stop button, and a background subagent's report starts a turn by itself when the task is idle. Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands and foreground subagents are stopped; background subagents carry on) or delete it (which stops its subagents too). `@path` mentions and `/<skill> args` work as in the REPL.
 - **工具 (Tools)**: every registered tool (built-in, skill, MCP, `agent`) with its description and schema; fill in JSON input and call it directly.
 - **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for `~/.harness/providers.json`, which applies in every directory (`.harness/providers.json` instead when the project has one, or `$HARNESS_PROVIDERS`). A save is validated against the other config files and the environment first, then applied without a restart; idle tasks move to the new config.
 - **Agents / Skills / MCP**: what was discovered and which MCP servers connected.
@@ -58,6 +58,7 @@ The server starts even without a usable provider, so the first model can be conf
 | `GET /api/tools`, `POST /api/tools/{name}` `{input}` | list / call tools |
 | `GET/POST /api/tasks` `{prompt, agent?, model?, title?}` | list / create tasks |
 | `POST /api/tasks/{id}/messages` `{prompt}`, `/model` `{model}`, `/cancel`; `DELETE /api/tasks/{id}` | drive a task |
+| `GET /api/tasks/{id}/subagents`, `POST /api/tasks/{id}/subagents/{agent_id}/stop` | list / stop the task's subagents |
 | `GET /api/tasks/{id}/events` | server-sent events: the task's log replayed, then live (resumes via `Last-Event-ID`) |
 
 ## LLM gateways
@@ -123,7 +124,7 @@ Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trail
 
 ## REPL
 
-The assistant's Markdown is rendered as it streams (a line at a time; tables are aligned once complete). Tool calls show as `● bash(cargo test)` with the first lines of their result, subagent calls are listed under their `agent` call, and a spinner shows what is running. Each turn ends with its time, output tokens and context size. When stdout is not a terminal (or `NO_COLOR` is set), text is printed as is, without styling or the summary; in one-shot mode errors go to stderr and the exit code is non-zero.
+The assistant's Markdown is rendered as it streams (a line at a time; tables are aligned once complete). Tool calls show as `● bash(cargo test)` with the first lines of their result, a foreground subagent's calls are listed under its `agent` call, a background subagent gets a line when it ends, and a spinner shows what is running. Each turn ends with its time, output tokens and context size. When stdout is not a terminal (or `NO_COLOR` is set), text is printed as is, without styling or the summary; in one-shot mode errors go to stderr and the exit code is non-zero.
 
 | Command / key | |
 |---|---|
@@ -135,6 +136,8 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 | `/tools` | list the tools the model can call |
 | `/skills` | list discovered skills |
 | `/agents` | list subagent types, their permission and tools |
+| `/tasks` | list the subagents this conversation started: id, status, model, tool calls, time |
+| `/stop [id]` | stop a running subagent, or all of them (see [Subagents](#subagents)) |
 | `/mcp` | list MCP servers, their tools and log files |
 | `/sandbox` | show what the sandbox allows (see [Sandbox](#sandbox)) |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
@@ -219,10 +222,11 @@ Skills are discovered in `.harness/skills/`, `.claude/skills/`, `~/.harness/skil
 
 ## Subagents
 
-The main agent can delegate a self-contained task with the `agent` tool. A subagent runs in its own fresh conversation with its own system prompt and tool set, and only its final report comes back, which keeps long searches out of the main context. Several subagents started in one response run in parallel. Their tool calls are shown indented in the terminal.
+The main agent can delegate a self-contained task with the `agent` tool. A subagent runs in its own fresh conversation with its own system prompt and tool set, and only its final report comes back, which keeps long searches out of the main context. Several subagents started in one response run in parallel.
 
 - **`explore`** (built-in): a codebase search agent whose only tool is `grep`. Use it for "where is X / which files use Y" questions.
-- **Custom agents**: Markdown files in `.harness/agents/` or `.claude/agents/` (project or `~`; the first found wins, and a file named `explore` overrides the built-in):
+- **`general-purpose`** (built-in): a coding agent with the main agent's tools (`bash`, `write`, MCP tools and the rest, under the same sandbox) for multi-step research or a well-scoped change. Subagents share the working directory, so the main agent is told to give each one that changes files its own files.
+- **Custom agents**: Markdown files in `.harness/agents/` or `.claude/agents/` (project or `~`; the first found wins, and a file named like a built-in overrides it):
 
   ```markdown
   ---
@@ -235,17 +239,25 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   You are a code reviewer...
   ```
 
-- **Permissions default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further.
+- **Custom agents default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further.
 - Subagents cannot start subagents. Their file reads use their own tracker, so they never count as reads for the main agent's `write`.
-- Model: the agent's `model`, else `subagent_model` / `HARNESS_SUBAGENT_MODEL`, else the main model; any `<provider>/<model>`.
+- Model: the agent's `model`, else `subagent_model` / `HARNESS_SUBAGENT_MODEL`, else the model the conversation is on now (after any `/model` or `/effort`); any `<provider>/<model>`.
 - `/agents` lists the available types.
+
+### Background subagents and follow-ups
+
+- **Foreground** (the default): the `agent` call waits for the report. Interrupting the turn stops the subagent.
+- **Background** (`run_in_background: true`): the call returns at once with the subagent's `agent_id`, and the main agent carries on. When the subagent is done, its report goes to the main agent with its next request: during a turn, after the tool calls running then (or, if the model was writing its answer, it carries on instead of ending the turn); after the turn, in a turn of its own. The REPL starts that turn while the prompt is empty. Anything you have typed is kept, and the report goes along with your message instead. One-shot mode waits for background subagents before it exits, and a web task starts the turn when it is idle. Background subagents keep running when you interrupt the turn.
+- **Follow-ups**: every subagent keeps its conversation. `message_agent` runs a finished or stopped one again on a new message, with its context intact (waiting for its report, or in the background). A running one gets the message at its next step. `stop_agent` stops one; changes it made remain.
+- `/tasks` lists this conversation's subagents; `/stop <id>` stops one and `/stop` every running one. The main agent hears about subagents you stopped with your next message. In the web UI each subagent's card has a Stop button.
+- At most 8 subagents of a conversation run at once, and the 32 most recent are kept for follow-ups. They live in memory only: `/clear`, `/resume`, deleting a web task or quitting stops and forgets them.
 
 ## Layout
 
 - `src/main.rs` — startup: config, tools, skills, MCP servers, agents; then the CLI or web frontend
-- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with menu keys, completion and multi-line input (`repl.rs`)
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with menu keys, completion, multi-line input and waking the prompt for a subagent's report (`repl.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
-- `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`
+- `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
 - `src/llm/` — LLM gateways
   - `config.rs` — `providers.json`, model spec resolution, per-provider/model settings
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
@@ -254,7 +266,8 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks
 - `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read` and `write` check
-- `src/subagent.rs` — subagent definitions (built-in `explore`, custom files), permissions, the `agent` tool
+- `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
+- `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox
 - `src/mcp.rs` — MCP client: config loading, server connections, `mcp__*` tool adapters
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/write state)

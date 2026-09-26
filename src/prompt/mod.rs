@@ -42,8 +42,17 @@ const GUIDANCE: &[(&str, &str)] = &[
         "agent",
         "hand a task to a subagent with its own context, which returns only its report. Use it for \
          open-ended searches that would take many calls, launching several at once for independent \
-         questions; do a lookup that takes one or two calls yourself.",
+         questions; do a lookup that takes one or two calls yourself. With `run_in_background` you keep \
+         working and the report arrives by itself in a later message, even after your turn ends: don't \
+         poll or wait for it, and don't guess what it will say. Give subagents that change files \
+         separate files to work on.",
     ),
+    (
+        "message_agent",
+        "send a subagent from earlier in this conversation a follow-up, a correction or more work; it \
+         keeps its context, so prefer this to starting a new one on the same ground.",
+    ),
+    ("stop_agent", "stop a subagent whose work is no longer needed."),
 ];
 
 /// The main agent's system prompt, for the tools in `tools`.

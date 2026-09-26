@@ -90,13 +90,11 @@ async fn main() -> Result<ExitCode> {
     }
     let agent_defs = Arc::new(agent_defs);
     let out = cli::Output::stdout();
+    // Web tasks show their subagents' progress themselves; this is for the
+    // terminal, and for subagents started from the web UI's tool page.
     let reporter: subagent::Reporter = {
         let out = out.clone();
-        Arc::new(move |label: &str, tool: &str, input: &Value| {
-            if !web::forward_subagent(label, tool, input) {
-                out.subagent_call(label, tool, input);
-            }
-        })
+        Arc::new(move |event: &Value| out.subagent_event(event))
     };
 
     if let Some(addr) = web_addr {
@@ -129,6 +127,8 @@ async fn main() -> Result<ExitCode> {
         eprintln!("\x1b[33magent `{agent}` lists unknown tool `{tool}`\x1b[0m");
     }
     registry.register(agent_tool);
+    registry.register(subagent::MessageAgentTool);
+    registry.register(subagent::StopAgentTool);
 
     let system = prompt::main(&registry);
     let mut agent = Agent::new(client, registry, system);

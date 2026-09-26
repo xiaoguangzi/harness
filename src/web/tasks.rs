@@ -5,37 +5,21 @@
 //! appended to the log and broadcast to live subscribers, so a browser can
 //! replay a task from any point and then follow it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
-use crate::agent::{Agent, Observer};
+use crate::agent::{Agent, Inbox, Observer};
 use crate::llm::Client;
-use crate::subagent::AgentDef;
+use crate::subagent::{AgentDef, Subagents};
 use crate::tools::{FileTracker, ToolOutput};
 
 /// Tool results are cut to this many bytes in events; the model still gets
 /// the full result.
 const MAX_EVENT_RESULT_BYTES: usize = 20_000;
-
-tokio::task_local! {
-    /// The task whose turn is running on this tokio task, so subagent
-    /// progress (reported through a process-wide callback) reaches it.
-    static CURRENT: Arc<Task>;
-}
-
-/// Appends a subagent's tool call to the running task's log. False when no
-/// web task is running here (the CLI, or a tool called directly).
-pub fn forward_subagent(label: &str, tool: &str, input: &Value) -> bool {
-    CURRENT
-        .try_with(|task| {
-            task.push(json!({"type": "subagent", "label": label, "tool": tool, "input": input}));
-        })
-        .is_ok()
-}
 
 /// A serialized event with its sequence number in the task's log. Events
 /// are serialized once and shared by the log and every subscriber.
@@ -76,26 +60,47 @@ pub struct Task {
     pub files: FileTracker,
     created: u64,
     pub agent: tokio::sync::Mutex<Agent>,
+    /// The agent's subagents and inbox, reachable while a turn holds the agent.
+    pub subagents: Arc<Subagents>,
+    inbox: Arc<Inbox>,
     meta: Mutex<Meta>,
     log: Mutex<Vec<Arc<str>>>,
     tx: broadcast::Sender<Sequenced>,
 }
 
 impl Task {
-    pub fn new(id: u64, title: String, def: Option<AgentDef>, files: FileTracker, agent: Agent) -> Self {
+    /// A task for `agent`. Its subagents' progress goes to the task's log,
+    /// and a background subagent's report starts a turn when none runs.
+    pub fn new(id: u64, title: String, def: Option<AgentDef>, files: FileTracker, agent: Agent) -> Arc<Self> {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let meta = Meta { status: Status::Idle, model: agent.model().to_string(), turns: 0, handle: None };
-        Self {
-            id,
-            title,
-            def,
-            files,
-            created,
-            agent: tokio::sync::Mutex::new(agent),
-            meta: Mutex::new(meta),
-            log: Mutex::new(Vec::new()),
-            tx: broadcast::channel(1024).0,
-        }
+        Arc::new_cyclic(|task: &Weak<Task>| {
+            let events = task.clone();
+            agent.subagents().set_reporter(Arc::new(move |event: &Value| {
+                if let Some(task) = events.upgrade() {
+                    task.push(event.clone());
+                }
+            }));
+            let wake = task.clone();
+            agent.inbox().on_wake(move || {
+                if let Some(task) = wake.upgrade() {
+                    task.wake();
+                }
+            });
+            Self {
+                id,
+                title,
+                def,
+                files,
+                created,
+                subagents: agent.subagents().clone(),
+                inbox: agent.inbox().clone(),
+                agent: tokio::sync::Mutex::new(agent),
+                meta: Mutex::new(meta),
+                log: Mutex::new(Vec::new()),
+                tx: broadcast::channel(1024).0,
+            }
+        })
     }
 
     pub fn summary(&self) -> Value {
@@ -165,11 +170,22 @@ impl Task {
             let result = agent.run_turn(content, &mut WebObserver { task: &task }).await;
             drop(agent);
             task.finish(result);
+            // Reports that arrived as the turn ended get a turn of their own.
+            task.wake();
         };
         // Holding `meta` until the handle is stored keeps `finish` (which
         // takes the same lock) from running first.
-        meta.handle = Some(tokio::spawn(CURRENT.scope(self.clone(), run)).abort_handle());
+        meta.handle = Some(tokio::spawn(run).abort_handle());
         Ok(())
+    }
+
+    /// Starts a turn for what waits in the agent's inbox, such as a
+    /// background subagent's report, unless a turn is running: that one
+    /// takes it along.
+    fn wake(self: &Arc<Self>) {
+        if self.inbox.wants_turn() {
+            let _ = self.start_turn(Vec::new(), json!({"type": "wake"}));
+        }
     }
 
     fn finish(&self, result: anyhow::Result<()>) {
@@ -189,7 +205,8 @@ impl Task {
     }
 
     /// Stops the running turn. Dropping its future kills running `bash`
-    /// commands; the agent repairs its history before the next turn.
+    /// commands and foreground subagents; the agent repairs its history
+    /// before the next turn. Background subagents carry on.
     pub fn cancel(&self) -> bool {
         let mut meta = self.meta.lock().unwrap();
         let Some(handle) = meta.handle.take() else { return false };
@@ -221,5 +238,37 @@ impl Observer for WebObserver<'_> {
     fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
         let content = crate::tools::truncate(&output.content, MAX_EVENT_RESULT_BYTES);
         self.task.push(json!({"type": "tool_result", "name": name, "content": content, "is_error": output.is_error}));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::Providers;
+    use crate::llm::config::tests::{file, no_env};
+    use crate::tools::ToolRegistry;
+
+    #[tokio::test]
+    async fn a_report_for_an_idle_task_starts_a_turn() {
+        // A gateway that refuses every request, so the turn ends at once.
+        let app = axum::Router::new().route("/v1/messages", axum::routing::post(|| async { (axum::http::StatusCode::BAD_REQUEST, "no") }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = file(json!({"default_model": "mock/main", "providers": {
+            "mock": {"protocol": "anthropic", "base_url": url, "api_key": "test"}
+        }}));
+        let client = Client::new(Providers::from_parts(vec![config], &no_env).unwrap()).unwrap();
+        let task = Task::new(1, "test".into(), None, FileTracker::default(), Agent::new(client, ToolRegistry::new(), "sys"));
+        let (_, mut events) = task.subscribe(0);
+        task.inbox.push("<subagent-notification>…</subagent-notification>".into(), true);
+        let mut seen = Vec::new();
+        while !seen.iter().any(|e: &String| e.contains(r#""type":"error""#)) {
+            let (_, event) = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
+            seen.push(event.to_string());
+        }
+        assert!(seen[0].contains(r#""type":"wake""#), "{seen:?}");
+        let agent = task.agent.lock().await;
+        assert!(agent.messages()[0].content[0]["text"].as_str().unwrap().contains("subagent-notification"), "the report is kept");
     }
 }

@@ -8,7 +8,8 @@
 
 use std::borrow::Cow;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -21,6 +22,66 @@ use rustyline::{
 
 use super::menu::{Command, Kind, Menu, list_dir, mention_at_end};
 use super::text;
+use crate::agent::Inbox;
+
+/// Lets a background subagent's report start a turn while the prompt waits
+/// for input. The line editor can't be told to stop reading, so this sends
+/// its thread a SIGINT: the editor's handler cuts the read short and it
+/// returns as for Ctrl-C. Only while it shows an empty line, so nothing
+/// typed is lost.
+pub struct Wake {
+    inbox: Weak<Inbox>,
+    /// Set from the editor's first redraw on, when its SIGINT handler is in
+    /// place.
+    reading: AtomicBool,
+    /// The thread reading, as a `pthread_t`.
+    reader: AtomicUsize,
+    empty: AtomicBool,
+    raised: AtomicBool,
+}
+
+impl Wake {
+    pub fn new(inbox: &Arc<Inbox>) -> Self {
+        Self {
+            inbox: Arc::downgrade(inbox),
+            reading: AtomicBool::new(false),
+            reader: AtomicUsize::new(0),
+            empty: AtomicBool::new(false),
+            raised: AtomicBool::new(false),
+        }
+    }
+
+    /// Interrupts the line editor if it shows an empty line and something
+    /// in the inbox wants a turn.
+    pub fn poke(&self) {
+        let wanted = self.inbox.upgrade().is_some_and(|inbox| inbox.wants_turn());
+        if wanted
+            && self.reading.load(Ordering::SeqCst)
+            && self.empty.load(Ordering::SeqCst)
+            && !self.raised.swap(true, Ordering::SeqCst)
+        {
+            // SAFETY: only sends a signal to a thread of this process, one
+            // that is still running (the REPL's).
+            unsafe { libc::pthread_kill(self.reader.load(Ordering::SeqCst) as libc::pthread_t, libc::SIGINT) };
+        }
+    }
+
+    /// Called on each redraw of the line being edited, on its thread.
+    fn edited(&self, line: &str) {
+        self.empty.store(line.is_empty(), Ordering::SeqCst);
+        self.reader.store(unsafe { libc::pthread_self() } as usize, Ordering::SeqCst);
+        self.reading.store(true, Ordering::SeqCst);
+        if line.is_empty() {
+            self.poke();
+        }
+    }
+
+    /// Called when the line editor returns: whether this interrupted it.
+    pub fn finish_reading(&self) -> bool {
+        self.reading.store(false, Ordering::SeqCst);
+        self.raised.swap(false, Ordering::SeqCst)
+    }
+}
 
 /// The menu, shown below the line being edited.
 pub struct MenuHint(String);
@@ -42,12 +103,13 @@ pub struct ReplHelper {
     /// Command names, for Tab completion when the menu is not shown.
     names: Vec<String>,
     styled: bool,
+    wake: Option<Arc<Wake>>,
 }
 
 impl ReplHelper {
-    pub fn new(commands: Vec<Command>, styled: bool) -> Self {
+    pub fn new(commands: Vec<Command>, styled: bool, wake: Option<Arc<Wake>>) -> Self {
         let names = commands.iter().map(|c| c.name.clone()).collect();
-        Self { menu: Arc::new(Menu::new(commands, ".")), names, styled }
+        Self { menu: Arc::new(Menu::new(commands, ".")), names, styled, wake }
     }
 
     /// Binds the keys that drive the menu.
@@ -136,6 +198,10 @@ impl Hinter for ReplHelper {
     type Hint = MenuHint;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<MenuHint> {
+        // Called on every redraw, so it also tells `wake` what is typed.
+        if let Some(wake) = &self.wake {
+            wake.edited(line);
+        }
         if pos < line.len() {
             return None;
         }

@@ -1,10 +1,17 @@
 //! Subagents: the main agent delegates a self-contained task to a fresh
 //! agent with its own conversation, system prompt and tool set, and gets
-//! back only the final answer. This keeps long searches out of the main
-//! context, and several subagents can run in parallel.
+//! back only its report. This keeps long searches out of the main context,
+//! and several subagents can run in parallel.
 //!
-//! The built-in `explore` agent only has the `grep` tool. Custom agents are
-//! Markdown files in `.harness/agents/` or `.claude/agents/` (project or `~`):
+//! A subagent runs in the foreground (the `agent` call waits for its report)
+//! or in the background (the call returns at once, and the report arrives in
+//! the parent's inbox when it is done; see [`runtime`]). Either way its
+//! conversation is kept, so `message_agent` can send it follow-ups, and
+//! `stop_agent` stops it.
+//!
+//! The built-in `explore` agent only has the `grep` tool; `general-purpose`
+//! has every tool but these three. Custom agents are Markdown files in
+//! `.harness/agents/` or `.claude/agents/` (project or `~`):
 //!
 //! ```markdown
 //! ---
@@ -17,9 +24,11 @@
 //! You are a code reviewer...
 //! ```
 //!
-//! Permissions default to read-only: such an agent only gets tools marked
+//! Custom agents default to read-only: such an agent only gets tools marked
 //! read-only (`read`, `grep`, `skill`, MCP tools with `readOnlyHint`), so no
 //! `bash` or `write` unless it declares `permission: write`.
+
+pub mod runtime;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,14 +38,17 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::agent::{Agent, Observer};
+use crate::agent::Agent;
 use crate::llm::Client;
 use crate::skills::{parse_frontmatter, split_frontmatter};
-use crate::tools::{
-    FileTracker, ReadTool, Tool, ToolOutput, ToolRegistry, WriteTool, parse_input, truncate,
-};
+use crate::tools::{FileTracker, ReadTool, Tool, ToolOutput, ToolRegistry, WriteTool, parse_input};
+pub use runtime::{Subagents, scope};
 
 const MAX_RESULT_BYTES: usize = 50_000;
+
+/// The tools that start and steer subagents. Subagents never get them, so
+/// they cannot start subagents of their own.
+pub const TOOLS: [&str; 3] = ["agent", "message_agent", "stop_agent"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Permission {
@@ -107,6 +119,30 @@ pub fn explore() -> AgentDef {
     }
 }
 
+/// A coding agent with every tool the main agent has, bar the subagent tools.
+pub fn general_purpose() -> AgentDef {
+    AgentDef {
+        name: "general-purpose".into(),
+        description: "General-purpose agent for multi-step work: researching a question that needs \
+                      reading files and running commands, or making a well-scoped change and testing \
+                      it. It has the same tools as you. When several change files at once, give each \
+                      its own files."
+            .into(),
+        prompt: "You are a subagent: another agent delegated a task to you. Complete it with your tools. \
+                 Read the code you change, keep unrelated work intact, and check your changes with \
+                 relevant tests or builds. Other agents may be working in the same directory: change \
+                 only the files your task is about, and never revert changes you did not make. Do not \
+                 commit, push or publish anything unless the task says to.\n\n\
+                 Your final message is the only thing the caller sees. Make it a concise report: what \
+                 you found or did, the files you changed, how you verified it, and anything left open."
+            .into(),
+        permission: Permission::Write,
+        tools: None,
+        model: None,
+        path: None,
+    }
+}
+
 /// Default search roots, highest precedence first.
 pub fn default_roots() -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from(".harness/agents"), PathBuf::from(".claude/agents")];
@@ -138,8 +174,9 @@ pub fn discover(roots: &[PathBuf]) -> (Vec<AgentDef>, Vec<String>) {
             }
         }
     }
-    let builtin = explore();
-    defs.entry(builtin.name.clone()).or_insert(builtin);
+    for builtin in [explore(), general_purpose()] {
+        defs.entry(builtin.name.clone()).or_insert(builtin);
+    }
     (defs.into_values().collect(), warnings)
 }
 
@@ -175,16 +212,18 @@ fn parse_def(text: &str, file: &Path) -> Result<AgentDef, String> {
     Ok(AgentDef { name, description, prompt, permission, tools, model, path })
 }
 
-/// Called for each tool call a subagent makes: `(agent label, tool, input)`.
-pub type Reporter = Arc<dyn Fn(&str, &str, &Value) + Send + Sync>;
+/// Receives subagent progress as JSON events: a tool call (`subagent`) or a
+/// change of status (`subagent_status`). The web UI logs them as they are.
+pub type Reporter = Arc<dyn Fn(&Value) + Send + Sync>;
 
 /// The `agent` tool.
 pub struct AgentTool {
     defs: Arc<Vec<AgentDef>>,
-    /// Tools subagents are chosen from. Must not contain this tool, so
-    /// subagents cannot spawn subagents.
+    /// Tools subagents are chosen from. Must not contain the subagent
+    /// tools, so subagents cannot spawn subagents.
     base: ToolRegistry,
     client: Client,
+    /// Where progress goes unless the conversation set its own place.
     reporter: Reporter,
     description: String,
 }
@@ -196,8 +235,13 @@ impl AgentTool {
              final report. Use it to keep long searches and file reading out of this conversation. \
              The subagent cannot see this conversation, so `prompt` must be self-contained: state the \
              goal, what you already know, and what the report should contain. For independent \
-             questions, launch several subagents in parallel in one response. The report comes back \
-             to you, not the user; relay what matters.\n\nAvailable agents:",
+             questions, launch several subagents in parallel in one response.\n\n\
+             By default the call waits for the report. With `run_in_background: true` it returns at \
+             once and you keep working; the report arrives by itself in a later message when the \
+             subagent is done, even after your turn has ended. Do not poll or wait for it, and never \
+             guess what it will find. Every subagent gets an `agent_id`: `message_agent` continues \
+             it with its context intact, `stop_agent` stops it. The report comes to you, not the \
+             user; relay what matters.\n\nAvailable agents:",
         );
         for d in defs.iter() {
             let access = match d.permission {
@@ -224,8 +268,8 @@ impl AgentTool {
         unknown
     }
 
-    /// Builds the tool set for one run. File tools get a fresh tracker, so
-    /// a subagent's reads never count as reads by the main agent.
+    /// Builds the tool set for one subagent. File tools get a fresh tracker,
+    /// so a subagent's reads never count as reads by the main agent.
     pub fn registry_for(&self, def: &AgentDef) -> ToolRegistry {
         let files = FileTracker::default();
         let mut registry = self.base.clone();
@@ -234,17 +278,22 @@ impl AgentTool {
         if def.permission == Permission::ReadOnly {
             registry.retain(|t| t.read_only());
         }
-        registry.retain(|t| t.name() != "agent" && def.allows(t.name()));
+        registry.retain(|t| !TOOLS.contains(&t.name()) && def.allows(t.name()));
         registry
     }
 
-    /// The client for one run: the agent's own model, else the configured
+    /// The client for a subagent: the agent's own model, else the configured
     /// subagent model, else the caller's.
     pub fn client_for(&self, def: &AgentDef) -> anyhow::Result<Client> {
-        match def.model.as_deref().or(self.client.providers().subagent_model.as_deref()) {
-            Some(spec) => self.client.switch(spec),
-            None => Ok(self.client.clone()),
-        }
+        client_from(def, &self.client)
+    }
+}
+
+/// The client for `def` when the caller's model is `parent`.
+fn client_from(def: &AgentDef, parent: &Client) -> anyhow::Result<Client> {
+    match def.model.as_deref().or(parent.providers().subagent_model.as_deref()) {
+        Some(spec) => parent.switch(spec),
+        None => Ok(parent.clone()),
     }
 }
 
@@ -254,24 +303,8 @@ struct Input {
     agent_type: String,
     description: String,
     prompt: String,
-}
-
-/// Forwards a subagent's tool calls to the reporter; its text is read from
-/// the finished conversation instead of being streamed.
-struct SubObserver {
-    label: String,
-    reporter: Reporter,
-    tool_calls: usize,
-}
-
-impl Observer for SubObserver {
-    fn on_text_delta(&mut self, _text: &str) {}
-    fn on_text_end(&mut self) {}
-    fn on_tool_call(&mut self, name: &str, input: &Value) {
-        self.tool_calls += 1;
-        (self.reporter)(&self.label, name, input);
-    }
-    fn on_tool_result(&mut self, _name: &str, _output: &ToolOutput) {}
+    #[serde(default)]
+    run_in_background: bool,
 }
 
 #[async_trait]
@@ -291,7 +324,11 @@ impl Tool for AgentTool {
             "properties": {
                 "agent_type": {"type": "string", "enum": names, "description": "Which agent to run."},
                 "description": {"type": "string", "description": "A 3-6 word summary of the task, shown to the user."},
-                "prompt": {"type": "string", "description": "The complete, self-contained task for the subagent."}
+                "prompt": {"type": "string", "description": "The complete, self-contained task for the subagent."},
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Return at once instead of waiting; the report arrives in a later message."
+                }
             },
             "required": ["agent_type", "description", "prompt"],
             "additionalProperties": false
@@ -311,30 +348,148 @@ impl Tool for AgentTool {
         let Some(def) = self.defs.iter().find(|d| d.name == input.agent_type) else {
             return ToolOutput::error(format!("Unknown agent type: {}", input.agent_type));
         };
-        let client = match self.client_for(def) {
+        // Outside a conversation (the web UI's tool page) a subagent can
+        // only run in the foreground, on the tool's own model.
+        let (subagents, parent) = match runtime::current() {
+            Some((subagents, client)) => (subagents, client),
+            None if input.run_in_background => {
+                return ToolOutput::error("run_in_background needs a conversation to report back to");
+            }
+            None => (Arc::new(Subagents::new(Arc::default())), self.client.clone()),
+        };
+        let client = match client_from(def, &parent) {
             Ok(c) => c,
             Err(e) => return ToolOutput::error(format!("Agent `{}` has an unusable model: {e:#}", def.name)),
         };
-        let mut agent = Agent::new(client, self.registry_for(def), crate::prompt::subagent(def));
-        let mut observer = SubObserver {
-            label: format!("{}: {}", def.name, input.description),
-            reporter: self.reporter.clone(),
-            tool_calls: 0,
+        let agent = Agent::new(client, self.registry_for(def), crate::prompt::subagent(def));
+        let background = input.run_in_background;
+        let run = match subagents.spawn(agent, &def.name, &input.description, input.prompt, background, &self.reporter) {
+            Ok(run) => run,
+            Err(e) => return ToolOutput::error(format!("{e:#}")),
         };
+        if !background {
+            return run.report().await;
+        }
+        ToolOutput::ok(format!(
+            "Started {} agent {} in the background. Its report will arrive in a later message when it \
+             finishes; do not poll, sleep or wait for it. Carry on with other work, or end your turn if \
+             there is nothing else to do.",
+            def.name, run.child.id
+        ))
+    }
+}
 
-        let result = agent.run_turn(vec![json!({"type": "text", "text": input.prompt})], &mut observer).await;
-        let report = truncate(agent.last_text().trim(), MAX_RESULT_BYTES);
-        match result {
-            Ok(()) if report.is_empty() => ToolOutput::error("The subagent finished without a report"),
-            Ok(()) => ToolOutput::ok(report),
-            Err(e) => ToolOutput::error(format!(
-                "The subagent failed after {} tool calls: {e:#}{}",
-                observer.tool_calls,
-                if report.is_empty() { String::new() } else { format!("\n\nLast output:\n{report}") }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageInput {
+    agent_id: String,
+    message: String,
+    #[serde(default)]
+    run_in_background: bool,
+}
+
+/// The `message_agent` tool: continues a subagent of this conversation.
+pub struct MessageAgentTool;
+
+#[async_trait]
+impl Tool for MessageAgentTool {
+    fn name(&self) -> &str {
+        "message_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Send a message to a subagent you started in this conversation, by its agent_id. It keeps its \
+         context, so this is the way to ask a follow-up, correct its course or give it more work. A \
+         finished or stopped subagent runs again on the message: the call waits for its new report, or \
+         with run_in_background returns at once and the report arrives in a later message. A running \
+         one reads the message at its next step, and reports as it would have anyway."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "The subagent's agent_id."},
+                "message": {"type": "string", "description": "What to tell it; it sees nothing else of this conversation."},
+                "run_in_background": {"type": "boolean", "description": "Don't wait for its report (when it runs again)."}
+            },
+            "required": ["agent_id", "message"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn run(&self, input: Value) -> ToolOutput {
+        let input: MessageInput = match parse_input(input) {
+            Ok(i) => i,
+            Err(e) => return e,
+        };
+        let Some((subagents, _)) = runtime::current() else {
+            return ToolOutput::error("message_agent only works within a conversation");
+        };
+        let id = &input.agent_id;
+        match subagents.send(id, input.message, input.run_in_background) {
+            Err(e) => ToolOutput::error(format!("{e:#}")),
+            Ok(runtime::Sent::Queued) => {
+                ToolOutput::ok(format!("Subagent {id} is running; it will read the message at its next step."))
+            }
+            Ok(runtime::Sent::Started(_)) if input.run_in_background => ToolOutput::ok(format!(
+                "Subagent {id} is working on the message in the background; its report will arrive in a \
+                 later message."
             )),
+            Ok(runtime::Sent::Started(run)) => run.report().await,
         }
     }
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopInput {
+    agent_id: String,
+}
+
+/// The `stop_agent` tool.
+pub struct StopAgentTool;
+
+#[async_trait]
+impl Tool for StopAgentTool {
+    fn name(&self) -> &str {
+        "stop_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Stop a running subagent of this conversation, by its agent_id, when its work is no longer \
+         needed or it is going the wrong way. Changes it already made remain. Its context is kept: \
+         message_agent continues it."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"agent_id": {"type": "string", "description": "The subagent's agent_id."}},
+            "required": ["agent_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn run(&self, input: Value) -> ToolOutput {
+        let input: StopInput = match parse_input(input) {
+            Ok(i) => i,
+            Err(e) => return e,
+        };
+        let Some((subagents, _)) = runtime::current() else {
+            return ToolOutput::error("stop_agent only works within a conversation");
+        };
+        let id = &input.agent_id;
+        match subagents.stop(id, false) {
+            Ok(true) => ToolOutput::ok(format!("Stopped subagent {id}. message_agent can continue it.")),
+            Ok(false) => ToolOutput::ok(format!("Subagent {id} was not running.")),
+            Err(e) => ToolOutput::error(format!("{e:#}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -353,7 +508,7 @@ mod tests {
 
     fn agent_tool(defs: Vec<AgentDef>) -> AgentTool {
         let base = ToolRegistry::with_defaults(FileTracker::default());
-        AgentTool::new(Arc::new(defs), base, client(), Arc::new(|_: &str, _: &str, _: &Value| {}))
+        AgentTool::new(Arc::new(defs), base, client(), Arc::new(|_: &Value| {}))
     }
 
     fn names(r: &ToolRegistry) -> Vec<&str> {
@@ -395,7 +550,7 @@ mod tests {
         let mut base = ToolRegistry::new();
         base.register(ReadTool::new(files.clone()));
         base.register(GrepTool);
-        let tool = AgentTool::new(Arc::new(vec![explore()]), base, client(), Arc::new(|_: &str, _: &str, _: &Value| {}));
+        let tool = AgentTool::new(Arc::new(vec![explore()]), base, client(), Arc::new(|_: &Value| {}));
         let registry = tool.registry_for(&AgentDef { tools: None, ..explore() });
         let read = registry.get("read").unwrap().clone();
 
@@ -422,7 +577,7 @@ mod tests {
 
         let (defs, warnings) = discover(&[dir.path().into()]);
         let by_name: BTreeMap<&str, &AgentDef> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
-        assert_eq!(by_name.keys().copied().collect::<Vec<_>>(), vec!["explore", "fixer", "reviewer"]);
+        assert_eq!(by_name.keys().copied().collect::<Vec<_>>(), vec!["explore", "fixer", "general-purpose", "reviewer"]);
         assert_eq!(by_name["explore"].description, "custom explore", "files override built-ins");
         let reviewer = by_name["reviewer"];
         assert_eq!(reviewer.permission, Permission::ReadOnly);

@@ -44,6 +44,9 @@ struct State {
     /// the last one.
     drawn: usize,
     frame: usize,
+    /// Lines printed while the line editor reads, shown once it is done:
+    /// printing then would tear up the line being edited.
+    held: Option<Vec<String>>,
 }
 
 struct Status {
@@ -58,7 +61,22 @@ struct Status {
 impl Output {
     pub fn stdout() -> Self {
         let styled = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        Self { state: Arc::new(Mutex::new(State { status: None, drawn: 0, frame: 0 })), styled }
+        let state = State { status: None, drawn: 0, frame: 0, held: None };
+        Self { state: Arc::new(Mutex::new(state)), styled }
+    }
+
+    /// Holds back output while the line editor reads (`true`), and prints
+    /// what was held once it is done (`false`).
+    pub fn hold(&self, hold: bool) {
+        let held = {
+            let mut state = self.state.lock().unwrap();
+            if hold {
+                state.held.get_or_insert_with(Vec::new);
+                return;
+            }
+            state.held.take().unwrap_or_default()
+        };
+        self.lines(&held);
     }
 
     pub fn styled(&self) -> bool {
@@ -131,6 +149,10 @@ impl Output {
             return;
         }
         let mut state = self.state.lock().unwrap();
+        if let Some(held) = &mut state.held {
+            held.extend(lines.iter().map(|l| l.as_ref().to_string()));
+            return;
+        }
         clear(&mut state);
         let mut stdout = io::stdout().lock();
         for line in lines {
@@ -147,11 +169,39 @@ impl Output {
         self.lines(&[line]);
     }
 
-    /// Shows a subagent's tool call, indented under its `agent` call.
-    pub fn subagent_call(&self, label: &str, tool: &str, input: &Value) {
-        let prefix = format!("    ◦ {} › ", text::fit(label, 32));
-        let room = text::terminal_width().saturating_sub(text::width(&prefix) + 1);
-        self.line(self.paint("2", &format!("{prefix}{}", call_label(tool, input, room))));
+    /// Shows a subagent's progress: a foreground one's tool calls, indented
+    /// under its `agent` call, and how a background one ended. A background
+    /// one's tool calls are left out, as they would interleave with
+    /// whatever the main agent is doing.
+    pub fn subagent_event(&self, event: &Value) {
+        let label = event["label"].as_str().unwrap_or("");
+        let background = event["background"].as_bool().unwrap_or(false);
+        match event["type"].as_str() {
+            Some("subagent") if !background => {
+                let prefix = format!("    ◦ {} › ", text::fit(label, 32));
+                let room = text::terminal_width().saturating_sub(text::width(&prefix) + 1);
+                let call = call_label(event["tool"].as_str().unwrap_or(""), &event["input"], room);
+                self.line(self.paint("2", &format!("{prefix}{call}")));
+            }
+            Some("subagent_status") if background => {
+                let status = event["status"].as_str().unwrap_or("");
+                let color = match status {
+                    "completed" => "32",
+                    "failed" => "31",
+                    "stopped" => "33",
+                    _ => return,
+                };
+                let detail = format!(
+                    " · {} · {} tool calls · {}",
+                    event["id"].as_str().unwrap_or(""),
+                    event["tool_calls"].as_u64().unwrap_or(0),
+                    elapsed(event["seconds"].as_u64().unwrap_or(0)),
+                );
+                let prefix = format!("  ◦ {} › ", text::fit(label, 48));
+                self.line(format!("{}{}{}", self.paint("2", &prefix), self.paint(color, status), self.paint("2", &detail)));
+            }
+            _ => {}
+        }
     }
 
     /// Prints text as is, without a newline; only when not styled, where
@@ -326,7 +376,7 @@ fn shimmer(label: &str, frame: usize) -> String {
 }
 
 /// `75` -> `1m 15s`.
-fn elapsed(secs: u64) -> String {
+pub(super) fn elapsed(secs: u64) -> String {
     if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) }
 }
 
@@ -647,8 +697,10 @@ fn tokens(n: u64) -> String {
 /// A one-line view of a tool call: `bash(cargo test)`, `grep(foo · src)`.
 fn call_label(name: &str, input: &Value, max: usize) -> String {
     // The fields that say the most about a call, most telling first.
-    const KEYS: [&str; 10] =
-        ["agent_type", "description", "command", "pattern", "path", "file_path", "glob", "url", "query", "name"];
+    const KEYS: [&str; 12] = [
+        "agent_type", "description", "agent_id", "message", "command", "pattern", "path", "file_path", "glob", "url",
+        "query", "name",
+    ];
     let obj = input.as_object();
     let mut parts: Vec<String> = KEYS
         .iter()
