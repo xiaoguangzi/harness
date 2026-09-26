@@ -2,6 +2,7 @@
 //! results back, and repeat until the model ends its turn.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use futures::future::join_all;
@@ -35,6 +36,10 @@ pub trait Observer: Send {
     /// Token counts of a request: a finished one, or one that failed
     /// partway (counted as far as its stream got).
     fn on_usage(&mut self, _usage: &Usage) {}
+    /// The response broke off and is requested again after `wait`: what
+    /// streamed since the last `on_request_start` is void, and output
+    /// starts over. `attempt` counts from 1 to `llm::MAX_RETRIES`.
+    fn on_retry(&mut self, _error: &anyhow::Error, _attempt: u32, _wait: Duration) {}
 }
 
 /// Messages for the model that arrive from elsewhere while it works or
@@ -294,6 +299,7 @@ impl Agent {
                 StreamEvent::ToolInputStart(name) => observer.on_tool_input_start(name),
                 StreamEvent::ToolInputDelta(json) => observer.on_tool_input_delta(json),
                 StreamEvent::PartialUsage(usage) => observer.on_usage(&usage),
+                StreamEvent::Retry { error, attempt, wait } => observer.on_retry(error, attempt, wait),
             };
             let response =
                 self.client.create(&self.system, &definitions, &self.messages, &mut on_event).await?;

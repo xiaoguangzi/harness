@@ -564,6 +564,8 @@ function renderEvent(ev) {
         }
         break;
       }
+      case "retry": assistantEl = null;
+        transcript.append(h("div", { class: "note" }, `↻ 回复中断（${ev.message}），${ev.wait}s 后重新请求（${ev.attempt}/${ev.max}）`)); break;
       case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台子 agent 有了结果，继续")); break;
       case "tool_result": {
         const i = pending.findIndex(x => x.name === ev.name);

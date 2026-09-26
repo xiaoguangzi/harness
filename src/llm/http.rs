@@ -1,13 +1,43 @@
 //! HTTP plumbing shared by the protocol backends: POST with retries, and
 //! an SSE reader.
 
-use std::time::Duration;
+use std::fmt;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use serde_json::Value;
 
-const MAX_RETRIES: u32 = 3;
+pub const MAX_RETRIES: u32 = 3;
+
+/// Marks an error after which the same request is worth sending again: the
+/// connection broke while the response streamed in, or the API reported a
+/// passing failure mid-stream. Its text is the error message (or the
+/// context), so messages read as before.
+#[derive(Debug)]
+pub struct Transient(pub String);
+
+impl fmt::Display for Transient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Whether `error` is marked [`Transient`].
+pub fn is_transient(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Transient>().is_some()
+}
+
+/// An error the API reported in the stream; `kind` is its error type or
+/// code. Overload and server errors are transient.
+pub fn stream_error(message: String, kind: &str) -> anyhow::Error {
+    match kind {
+        "overloaded_error" | "api_error" | "server_error" | "rate_limit_error" | "rate_limit_exceeded" => {
+            anyhow::Error::msg(Transient(message))
+        }
+        _ => anyhow::Error::msg(message),
+    }
+}
 
 /// POSTs `body` as JSON, retrying connection failures and retryable
 /// statuses (408, 409, 429, 5xx). Only a successful response is returned.
@@ -29,7 +59,8 @@ pub async fn post_with_retries(
                 let s = resp.status().as_u16();
                 s == 408 || s == 409 || s == 429 || s >= 500
             }
-            Err(e) => e.is_connect() || e.is_timeout(),
+            // Includes HTTP/2 streams reset before the response arrived.
+            Err(e) => e.is_connect() || e.is_timeout() || e.is_request(),
         };
         if retryable && attempt < MAX_RETRIES {
             attempt += 1;
@@ -54,15 +85,18 @@ fn retry_after(result: &reqwest::Result<reqwest::Response>) -> Option<Duration> 
 }
 
 /// Feeds each SSE `data:` payload, parsed as JSON, to `on_data` until it
-/// returns true (returns Ok(true)) or the stream ends (Ok(false)).
-/// Non-JSON payloads such as `[DONE]` are skipped.
-pub async fn read_sse(resp: reqwest::Response, mut on_data: impl FnMut(Value) -> Result<bool>) -> Result<bool> {
+/// returns true. Non-JSON payloads such as `[DONE]` are skipped. A stream
+/// that breaks off, or ends before `on_data` is done, is a [`Transient`]
+/// error saying how far it got; `last` names the event that should end it.
+pub async fn read_sse(resp: reqwest::Response, last: &str, mut on_data: impl FnMut(Value) -> Result<bool>) -> Result<()> {
     // Buffer raw bytes: a chunk boundary can split a multi-byte UTF-8
     // character, so only decode once a whole event has arrived.
     let mut buf: Vec<u8> = Vec::new();
+    let mut progress = Progress::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading response stream")?;
+        let chunk = chunk.with_context(|| Transient(format!("reading response stream {progress}")))?;
+        progress.last_data = Instant::now();
         buf.extend(chunk.iter().filter(|&&b| b != b'\r'));
         // An SSE event ends with a blank line.
         while let Some(end) = buf.windows(2).position(|w| w == b"\n\n") {
@@ -75,11 +109,50 @@ pub async fn read_sse(resp: reqwest::Response, mut on_data: impl FnMut(Value) ->
                 }
                 let value: Value =
                     serde_json::from_str(data).with_context(|| format!("parsing stream event: {data}"))?;
+                progress.saw(&value);
                 if on_data(value)? {
-                    return Ok(true);
+                    return Ok(());
                 }
             }
         }
     }
-    Ok(false)
+    Err(anyhow::Error::msg(Transient(format!("stream ended before {last} {progress}"))))
+}
+
+/// How far a response stream got, for errors: whether it broke off after a
+/// long silence (an idle timeout on the way) or while data was flowing.
+struct Progress {
+    start: Instant,
+    last_data: Instant,
+    events: usize,
+    /// The latest event's type, with its delta's type if it has one.
+    last_event: String,
+}
+
+impl Progress {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self { start: now, last_data: now, events: 0, last_event: String::new() }
+    }
+
+    fn saw(&mut self, event: &Value) {
+        self.events += 1;
+        self.last_event.clear();
+        self.last_event.push_str(event["type"].as_str().unwrap_or("?"));
+        if let Some(delta) = event["delta"]["type"].as_str() {
+            self.last_event.push('/');
+            self.last_event.push_str(delta);
+        }
+    }
+}
+
+impl fmt::Display for Progress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (total, idle) = (self.start.elapsed().as_secs_f64(), self.last_data.elapsed().as_secs_f64());
+        write!(f, "after {total:.1}s, {idle:.1}s since the last data ({} events", self.events)?;
+        if self.events > 0 {
+            write!(f, ", the last {}", self.last_event)?;
+        }
+        f.write_str(")")
+    }
 }

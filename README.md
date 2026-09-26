@@ -293,7 +293,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   - `config.rs` — providers from the settings and environment, model spec resolution, per-provider/model settings
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
-  - `http.rs` — POST with retries, SSE reader
+  - `http.rs` — POST with retries, SSE reader; marks the stream failures (a dropped connection, an overload) after which `llm::Client` requests the response again
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks; pasted images' blocks
 - `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read` and `write` check

@@ -6,14 +6,14 @@
 //! replay a task from any point and then follow it.
 
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
 use crate::agent::{Agent, Inbox, Observer};
-use crate::llm::Client;
+use crate::llm::{Client, MAX_RETRIES};
 use crate::subagent::{AgentDef, Subagents};
 use crate::tools::{FileTracker, ToolOutput};
 
@@ -238,6 +238,16 @@ impl Observer for WebObserver<'_> {
     fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
         let content = crate::tools::truncate(&output.content, MAX_EVENT_RESULT_BYTES);
         self.task.push(json!({"type": "tool_result", "name": name, "content": content, "is_error": output.is_error}));
+    }
+
+    fn on_retry(&mut self, error: &anyhow::Error, attempt: u32, wait: Duration) {
+        self.task.push(json!({
+            "type": "retry",
+            "message": crate::llm::retry_reason(error),
+            "attempt": attempt,
+            "max": MAX_RETRIES,
+            "wait": wait.as_secs(),
+        }));
     }
 }
 

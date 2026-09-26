@@ -17,7 +17,7 @@
 //! carries `encrypted_content` is kept as an `openai_reasoning` block so it
 //! can be replayed to the same model on the next request.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::config::Target;
@@ -35,10 +35,7 @@ pub(super) async fn create(
     let resp = http::post_with_retries(http_client, &target.url("responses"), &target.headers(), &body).await?;
 
     let mut acc = Accumulator::default();
-    let finished = http::read_sse(resp, |event| acc.apply(&event, on_event)).await?;
-    if !finished {
-        bail!("stream ended before response.completed");
-    }
+    http::read_sse(resp, "response.completed", |event| acc.apply(&event, on_event)).await?;
     Ok(acc.finish())
 }
 
@@ -237,8 +234,16 @@ impl Accumulator {
                 self.final_response = Some(response);
                 return Ok(true);
             }
-            "response.failed" => bail!("response failed: {}", event["response"]["error"]),
-            "error" => bail!("API stream error: {}", event.get("error").unwrap_or(event)),
+            "response.failed" => {
+                let error = &event["response"]["error"];
+                let kind = error["code"].as_str().unwrap_or("");
+                return Err(http::stream_error(format!("response failed: {error}"), kind));
+            }
+            "error" => {
+                let error = event.get("error").unwrap_or(event);
+                let kind = ["type", "code"].iter().find_map(|k| error[k].as_str().filter(|&s| s != "error"));
+                return Err(http::stream_error(format!("API stream error: {error}"), kind.unwrap_or("")));
+            }
             _ => {}
         }
         Ok(false)

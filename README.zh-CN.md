@@ -294,7 +294,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
   - `config.rs` — 由配置和环境变量得到 provider、模型 spec 解析、按 provider/模型的设置
   - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退）
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
-  - `http.rs` — 带重试的 POST、SSE 读取器
+  - `http.rs` — 带重试的 POST、SSE 读取器；标记哪些流式失败（连接断开、过载）之后 `llm::Client` 会重新请求回复
 - `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
 - `src/mentions.rs` — `@路径` 的解析与展开为附件块；粘贴图片的附件块
 - `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read` 和 `write` 检查的路径规则

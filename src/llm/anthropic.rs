@@ -32,14 +32,13 @@ pub(super) async fn create(
     let resp = http::post_with_retries(http_client, &target.url("messages"), &headers, &body).await?;
 
     let mut acc = Accumulator::default();
-    let result = http::read_sse(resp, |event| acc.apply(&event, on_event)).await;
-    if !matches!(result, Ok(true)) {
+    let result = http::read_sse(resp, "message_stop", |event| acc.apply(&event, on_event)).await;
+    if result.is_err() {
         // The request still used tokens: report what message_start told us.
         if let Some(usage) = acc.response.usage.filter(|u| u.input_tokens > 0) {
             on_event(StreamEvent::PartialUsage(usage));
         }
         result?;
-        bail!("stream ended before message_stop");
     }
     let mut response = acc.finish();
     response.content = content_for_history(&response.content);
@@ -207,7 +206,11 @@ impl Accumulator {
                 }
                 return Ok(true);
             }
-            "error" => bail!("API stream error: {}", event["error"]),
+            "error" => {
+                let error = &event["error"];
+                let kind = error["type"].as_str().unwrap_or("");
+                return Err(http::stream_error(format!("API stream error: {error}"), kind));
+            }
             _ => {} // ping, and future event types
         }
         Ok(false)
