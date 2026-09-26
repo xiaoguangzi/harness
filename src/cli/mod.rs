@@ -188,7 +188,7 @@ pub async fn run(
                         helper.new_line(last, carried);
                         helper.prompt()
                     }
-                    None => (input::PROMPT.to_string(), input::PROMPT.to_string()),
+                    None => input::PROMPT.to_string(),
                 };
                 // Reading a line blocks; let the runtime move other tasks
                 // (such as MCP connections) off this worker meanwhile.
@@ -204,7 +204,7 @@ pub async fn run(
                         Err(ReadlineError::Eof) => Some(""),
                         Err(_) => None,
                     };
-                    print!("\x1b[{}A\r\x1b[J", helper.rows_used(&prompt.0, shown));
+                    print!("\x1b[{}A\r\x1b[J", helper.rows_used(&prompt, shown));
                     let _ = std::io::stdout().flush();
                 }
                 // What subagents printed meanwhile.

@@ -123,14 +123,11 @@ impl ReplHelper {
         Self { menu, pasted: Arc::default(), names, styled, wake, shown: Mutex::default() }
     }
 
-    /// The prompt: on a terminal, the input box's top rule and `❯`.
-    pub fn prompt(&self) -> (String, String) {
-        if !self.styled {
-            return (input::PROMPT.to_string(), input::PROMPT.to_string());
-        }
-        let rule = input::rule(text::terminal_width());
-        let styled = format!("\x1b[2m{rule}\x1b[0m\n\x1b[{}m❯\x1b[0m ", input::PROMPT_SGR);
-        (format!("{rule}\n{}", input::PROMPT), styled)
+    /// The prompt. On a terminal, it starts with a row for the input box's
+    /// top rule, which the highlighter draws at the terminal's width as it
+    /// is when the line is redrawn, so the rule follows a resized window.
+    pub fn prompt(&self) -> String {
+        if self.styled { format!("\n{}", input::PROMPT) } else { input::PROMPT.to_string() }
     }
 
     /// Rows from the top of `prompt` to where the cursor is once the line
@@ -358,6 +355,16 @@ impl Hinter for ReplHelper {
 }
 
 impl Highlighter for ReplHelper {
+    /// The editor lays the prompt out as given; the rule drawn into its
+    /// first row fits that row whatever its length.
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, default: bool) -> Cow<'b, str> {
+        if !self.styled || !default || prompt != self.prompt() {
+            return Cow::Borrowed(prompt);
+        }
+        let rule = input::rule(text::terminal_width());
+        Cow::Owned(format!("\x1b[2m{rule}\x1b[0m\n\x1b[{}m❯\x1b[0m ", input::PROMPT_SGR))
+    }
+
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
         if !self.styled {
             return Cow::Borrowed(hint);
