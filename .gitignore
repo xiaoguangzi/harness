@@ -2,3 +2,6 @@
 
 # Local model gateway config; holds API keys
 /.harness/providers.json
+
+# Local Claude Code instructions
+/CLAUDE.md
