@@ -2,6 +2,7 @@
 
 mod clipboard;
 mod diff;
+mod input;
 mod keys;
 mod markdown;
 mod menu;
@@ -9,7 +10,7 @@ mod output;
 mod repl;
 mod text;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use rustyline::error::ReadlineError;
 use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 use serde_json::Value;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, Inbox};
 use crate::llm;
 use crate::mcp;
 use crate::mentions;
@@ -26,7 +27,9 @@ use crate::session::{self, Recorder, Resume, Store};
 use crate::skills::Skill;
 use crate::subagent::AgentDef;
 use crate::tools::FileTracker;
-use clipboard::Image;
+use clipboard::{Clip, Image};
+use input::{Queued, Typing};
+use keys::{Key, KeyWatch};
 pub use output::Output;
 use output::{Terminal, TurnEnd};
 use menu::Command;
@@ -94,7 +97,7 @@ pub async fn run(
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
                 let attached = attachments(&line, &[], files);
-                let mut result = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut()).await;
+                let mut result = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut(), None).await;
                 // Answer background subagents' reports as they come in, and
                 // exit once none is left running.
                 while result.is_ok() {
@@ -108,7 +111,7 @@ pub async fn run(
                             break;
                         }
                     }
-                    result = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut()).await;
+                    result = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut(), None).await;
                 }
                 Ok(match result {
                     Ok(()) => ExitCode::SUCCESS,
@@ -145,7 +148,11 @@ pub async fn run(
     // A wake that lands just after the editor returns meets Tokio's SIGINT
     // handler, installed from here on, instead of ending the process.
     let _sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
-    let helper = ReplHelper::new(commands, out.styled(), wake.clone());
+    // On a terminal, the prompt is drawn as an input box, which stays under
+    // the output while a turn runs; what is typed there carries over to the
+    // prompt after it.
+    let boxed = std::io::stdin().is_terminal() && out.styled();
+    let helper = ReplHelper::new(commands, boxed, wake.clone());
     helper.bind_keys(&mut editor);
     editor.set_helper(Some(helper));
     // Alt+Enter inserts a newline, like a trailing `\`.
@@ -155,59 +162,89 @@ pub async fn run(
         let _ = editor.load_history(path);
     }
 
+    let mut typing = Typing::default();
     let mut interrupted = false;
     loop {
-        // A background subagent reported back: the model answers first.
+        // A background subagent reported back, or a message sent from the
+        // input box is still on its way: the model answers first.
         if agent.inbox().wants_turn() {
-            let _ = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut()).await;
+            let input = boxed.then_some(TurnInput { typing: &mut typing, files });
+            let _ = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut(), input).await;
+            remember_sent(&mut editor, &mut typing);
             out.line("");
             continue;
         }
-        // Reading a line blocks; let the runtime move other tasks (such as
-        // MCP connections) off this worker meanwhile.
-        if let Some(helper) = editor.helper() {
-            helper.new_line(mentions::last_pasted_image(agent.messages()));
-        }
-        out.hold(true);
-        let read = tokio::task::block_in_place(|| editor.readline("❯ "));
-        let woken = wake.as_ref().is_some_and(|w| w.finish_reading()) && matches!(read, Err(ReadlineError::Interrupted));
-        if woken {
-            // Interrupted for a subagent's report: take the prompt back.
-            print!("\x1b[1A\r\x1b[K");
-        }
-        // What subagents printed meanwhile.
-        out.hold(false);
-        let line = match read {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted) if woken => {
-                interrupted = false;
-                continue;
+        let (line, images) = match typing.next_command() {
+            // Sent from the input box while a turn ran.
+            Some(command) => {
+                out.lines(&prompt_lines(&out, &command));
+                (command, Vec::new())
             }
-            Err(ReadlineError::Interrupted) if !interrupted => {
-                interrupted = true;
-                let running = agent.subagents().running_in_background();
-                let note = match running {
-                    0 => String::new(),
-                    1 => "; a subagent is still running".to_string(),
-                    n => format!("; {n} subagents are still running"),
+            None => {
+                let (before, after, carried) = typing.draft.take();
+                let prompt = match editor.helper() {
+                    Some(helper) => {
+                        let last = mentions::last_pasted_image(agent.messages()).max(typing.draft.last_image());
+                        helper.new_line(last, carried);
+                        helper.prompt()
+                    }
+                    None => (input::PROMPT.to_string(), input::PROMPT.to_string()),
                 };
-                out.line(out.paint("2", &format!("(press Ctrl-C again or Ctrl-D to exit{note})")));
-                continue;
+                // Reading a line blocks; let the runtime move other tasks
+                // (such as MCP connections) off this worker meanwhile.
+                out.hold(true);
+                let read = tokio::task::block_in_place(|| editor.readline_with_initial(&prompt, (&before, &after)));
+                let woken =
+                    wake.as_ref().is_some_and(|w| w.finish_reading()) && matches!(read, Err(ReadlineError::Interrupted));
+                // Take the input box off the screen; a line sent shows as
+                // a plain prompt instead.
+                if boxed && let Some(helper) = editor.helper() {
+                    let shown = match &read {
+                        Ok(line) => Some(line.as_str()),
+                        Err(ReadlineError::Eof) => Some(""),
+                        Err(_) => None,
+                    };
+                    print!("\x1b[{}A\r\x1b[J", helper.rows_used(&prompt.0, shown));
+                    let _ = std::io::stdout().flush();
+                }
+                // What subagents printed meanwhile.
+                out.hold(false);
+                let line = match read {
+                    Ok(line) => line,
+                    // Interrupted for a subagent's report.
+                    Err(ReadlineError::Interrupted) if woken => {
+                        interrupted = false;
+                        continue;
+                    }
+                    Err(ReadlineError::Interrupted) if !interrupted => {
+                        interrupted = true;
+                        let running = agent.subagents().running_in_background();
+                        let note = match running {
+                            0 => String::new(),
+                            1 => "; a subagent is still running".to_string(),
+                            n => format!("; {n} subagents are still running"),
+                        };
+                        out.line(out.paint("2", &format!("(press Ctrl-C again or Ctrl-D to exit{note})")));
+                        continue;
+                    }
+                    Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+                    Err(e) => return Err(e.into()),
+                };
+                interrupted = false;
+                let Some(helper) = editor.helper() else { continue };
+                typing.draft.note_image(helper.last_image());
+                let mut line = repl::join_continuations(line.trim());
+                // Enter ran the command selected in the menu, rather than
+                // the prefix typed.
+                if let Some(command) = helper.take_accepted() {
+                    line = command;
+                }
+                if boxed && !line.is_empty() {
+                    out.lines(&prompt_lines(&out, &line));
+                }
+                (line, helper.take_images())
             }
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
-            Err(e) => return Err(e.into()),
         };
-        interrupted = false;
-        let images = editor.helper().map(ReplHelper::take_images).unwrap_or_default();
-        let mut line = repl::join_continuations(line.trim());
-        if let Some(command) = editor.helper().and_then(ReplHelper::take_accepted) {
-            // Enter ran the command selected in the menu; show it in place
-            // of the prefix that was typed.
-            if out.styled() {
-                print!("\x1b[1A\r\x1b[K{}{command}\n", out.paint("1;35", "❯ "));
-            }
-            line = command;
-        }
         match parse_input(&line, skills) {
             Input::Empty => {}
             Input::Exit => break,
@@ -273,7 +310,9 @@ pub async fn run(
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
                 let attached = attachments(&line, &images, files);
-                let _ = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut()).await;
+                let input = boxed.then_some(TurnInput { typing: &mut typing, files });
+                let _ = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut(), input).await;
+                remember_sent(&mut editor, &mut typing);
                 out.line("");
             }
         }
@@ -369,7 +408,21 @@ fn attachments(line: &str, images: &[(usize, Image)], files: &FileTracker) -> me
     expanded
 }
 
+/// `text` the way the conversation shows a prompt: behind `❯`, with the
+/// lines after the first indented.
+fn prompt_lines(out: &Output, text: &str) -> Vec<String> {
+    let lead = out.paint(input::PROMPT_SGR, input::PROMPT);
+    text.lines().enumerate().map(|(i, line)| format!("{}{line}", if i == 0 { &lead } else { "  " })).collect()
+}
+
+/// Lines saying what is attached to a prompt, and what could not be.
+fn attachment_lines(out: &Output, expanded: &mentions::Expanded) -> Vec<String> {
+    let attached = expanded.attachments.iter().map(|a| out.paint("2", &format!("  + {}", a.label)));
+    attached.chain(expanded.warnings.iter().map(|w| out.paint("33", &format!("  ! {w}")))).collect()
+}
+
 /// Shows what is attached to `line` and runs the turn.
+#[allow(clippy::too_many_arguments)]
 async fn submit(
     agent: &mut Agent,
     line: &str,
@@ -378,21 +431,25 @@ async fn submit(
     out: &Output,
     term: &mut Terminal,
     recorder: Option<&mut Recorder>,
+    input: Option<TurnInput<'_>>,
 ) -> Result<(), TurnEnd> {
     let first = agent.messages().is_empty();
-    for a in &expanded.attachments {
-        out.line(out.paint("2", &format!("  + {}", a.label)));
-    }
-    for w in &expanded.warnings {
-        out.line(out.paint("33", &format!("  ! {w}")));
-    }
-    run_shown(agent, expanded.into_content(prompt), first.then_some(line), out, term, recorder).await
+    out.lines(&attachment_lines(out, &expanded));
+    run_shown(agent, expanded.into_content(prompt), first.then_some(line), out, term, recorder, input).await
+}
+
+/// The input box under a running turn, and what sending from it needs.
+struct TurnInput<'a> {
+    typing: &'a mut Typing,
+    files: &'a FileTracker,
 }
 
 /// Runs a turn until it ends or Ctrl-C or Esc interrupts it; empty `content`
 /// runs one for what waits in the agent's inbox. The turn's progress and
 /// outcome are shown, and the conversation is saved after it, titled
-/// `title` if it is new.
+/// `title` if it is new. With `input`, the input box stays under the
+/// output meanwhile; if the turn is cut short, the messages sent from it
+/// that the model never got go back into it.
 async fn run_shown(
     agent: &mut Agent,
     content: Vec<Value>,
@@ -400,17 +457,44 @@ async fn run_shown(
     out: &Output,
     term: &mut Terminal,
     recorder: Option<&mut Recorder>,
+    mut input: Option<TurnInput<'_>>,
 ) -> Result<(), TurnEnd> {
     term.begin_turn();
-    let mut esc = keys::EscWatch::start();
+    let inbox = agent.inbox().clone();
+    let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+    let mut keys = match input.as_mut() {
+        Some(input) => {
+            out.open_input(std::mem::take(input.typing), inbox.clone());
+            let out = out.clone();
+            KeyWatch::with_keys(move |key| type_key(&out, key, &tx))
+        }
+        None => KeyWatch::start(),
+    };
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     // Dropping the turn cancels it: running commands are killed, and the
     // agent repairs its history at the start of the next turn.
-    let result = tokio::select! {
-        result = agent.run_turn(content, &mut *term) => result.map_err(TurnEnd::Failed),
-        _ = tokio::signal::ctrl_c() => Err(TurnEnd::Interrupted),
-        _ = esc.pressed() => Err(TurnEnd::Interrupted),
+    let mut turn = Box::pin(agent.run_turn(content, &mut *term));
+    let result = loop {
+        tokio::select! {
+            result = &mut turn => break result.map_err(TurnEnd::Failed),
+            _ = &mut ctrl_c => break Err(TurnEnd::Interrupted),
+            _ = keys.pressed() => break Err(TurnEnd::Interrupted),
+            Some((text, images)) = sent.recv() => {
+                if let Some(input) = &input {
+                    send(out, &inbox, input.files, text, images);
+                }
+            }
+        }
     };
-    drop(esc);
+    drop(turn);
+    drop(keys);
+    if let Some(input) = input {
+        *input.typing = out.close_input();
+        if result.is_err() {
+            input.typing.recall(&inbox);
+        }
+    }
     term.end_turn(&result);
     if let Some(rec) = recorder {
         if let Some(title) = title {
@@ -424,12 +508,63 @@ async fn run_shown(
     result
 }
 
+/// Types `key` into the input box. Enter hands what it holds to `tx`.
+fn type_key(out: &Output, key: Key, tx: &tokio::sync::mpsc::UnboundedSender<(String, Vec<(usize, Image)>)>) {
+    match key {
+        Key::Enter => {
+            if let Some(Some(message)) = out.edit_input(|typing| typing.draft.submit()) {
+                let _ = tx.send(message);
+            }
+        }
+        Key::PasteImage => match clipboard::read() {
+            Ok(Some(Clip::Image(image))) => {
+                out.edit_input(|typing| typing.draft.paste_image(image));
+            }
+            Ok(Some(Clip::Files(paths))) => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                out.edit_input(|typing| typing.draft.paste(&repl::file_mentions(&paths, &cwd)));
+            }
+            Ok(None) | Err(_) => {}
+        },
+        key => {
+            out.edit_input(|typing| typing.draft.edit(key));
+        }
+    }
+}
+
+/// Sends a line typed into the input box while a turn runs. A message goes
+/// to the model with its next request (or makes it carry on rather than
+/// end the turn); a command waits for the turn to end. Until then it is
+/// listed above the box.
+fn send(out: &Output, inbox: &Inbox, files: &FileTracker, text: String, images: Vec<(usize, Image)>) {
+    let queued = if text.starts_with('/') || matches!(text.as_str(), "exit" | "quit") {
+        Queued { text, images, id: None, shown: Vec::new() }
+    } else {
+        let expanded = attachments(&text, &images, files);
+        let mut shown = prompt_lines(out, &text);
+        shown.extend(attachment_lines(out, &expanded));
+        let id = inbox.push_content(expanded.into_content(&text), true);
+        Queued { text, images, id: Some(id), shown }
+    };
+    out.edit_input(|typing| {
+        typing.sent.push(queued.text.clone());
+        typing.queued.push(queued);
+    });
+}
+
+/// Adds the lines sent from the input box to the line editor's history.
+fn remember_sent(editor: &mut rustyline::Editor<ReplHelper, rustyline::history::DefaultHistory>, typing: &mut Typing) {
+    for line in typing.sent.drain(..) {
+        let _ = editor.add_history_entry(line);
+    }
+}
+
 /// Shows that `running` background subagents are still at work until one
 /// reports back; false if the user interrupted the wait.
 async fn wait_for_reports(agent: &Agent, running: usize, out: &Output) -> bool {
     let plural = if running == 1 { "" } else { "s" };
     out.set_status(Some(&format!("Waiting for {running} background subagent{plural}…")));
-    let mut esc = keys::EscWatch::start();
+    let mut esc = KeyWatch::start();
     let reported = tokio::select! {
         _ = agent.inbox().wanted() => true,
         _ = tokio::signal::ctrl_c() => false,

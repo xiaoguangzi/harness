@@ -153,6 +153,8 @@ On macOS the clipboard is read through `osascript` (any image type an app puts t
 
 The assistant's Markdown is rendered as it streams (a line at a time; tables are aligned once complete). Tool calls show as `● bash(cargo test)` with the first lines of their result, a foreground subagent's calls are listed under its `agent` call, a background subagent gets a line when it ends, and a spinner shows what is running. Each turn ends with its time, output tokens and context size. When stdout is not a terminal (or `NO_COLOR` is set), text is printed as is, without styling or the summary; in one-shot mode errors go to stderr and the exit code is non-zero.
 
+The prompt is an input box between two rules that stays at the bottom, under the output and the spinner, while a turn runs too. What you type while the model works goes into it: press Enter and the message is listed above the box until the model gets it with its next request (after the tool calls running then; if the model was writing its answer, it carries on instead of ending the turn), and then it shows in the conversation. `@path` mentions and Ctrl+V work there too; the menus and history only at the prompt. A `/command` sent while a turn runs waits for the turn to end. If you interrupt the turn, messages the model has not got yet go back into the box, and anything left in the box is still there at the prompt after the turn.
+
 | Command / key | |
 |---|---|
 | `/help` | list commands |
@@ -286,7 +288,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 
 - `src/main.rs` — startup: settings, tools, skills, MCP servers, agents; then the CLI or web frontend
 - `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section
-- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with menu keys, completion, multi-line input, pasting with Ctrl+V and waking the prompt for a subagent's report (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner, input box and turn display (`output.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with the input box's rules, menu keys, completion, multi-line input, pasting with Ctrl+V and waking the prompt for a subagent's report (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
 - `src/llm/` — LLM gateways

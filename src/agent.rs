@@ -44,8 +44,9 @@ pub trait Observer: Send {
 
 /// Messages for the model that arrive from elsewhere while it works or
 /// waits: a background subagent's report for the main agent, a follow-up
-/// for a subagent. The loop hands over what has arrived with its next
-/// request; a frontend starts a turn for them when the agent is idle.
+/// for a subagent, a message the user typed while a turn ran. The loop
+/// hands over what has arrived with its next request; a frontend starts a
+/// turn for them when the agent is idle.
 #[derive(Default)]
 pub struct Inbox {
     queue: Mutex<Queue>,
@@ -56,9 +57,15 @@ pub struct Inbox {
 
 #[derive(Default)]
 struct Queue {
+    entries: Vec<Entry>,
+    next_id: u64,
+}
+
+struct Entry {
+    id: u64,
     blocks: Vec<Value>,
-    /// Whether something queued should start a turn of its own, rather
-    /// than wait for the next one.
+    /// Whether it should start a turn of its own, rather than wait for the
+    /// next one.
     wake: bool,
 }
 
@@ -66,11 +73,19 @@ impl Inbox {
     /// Queues `text` for the model. With `wake`, an idle agent should run a
     /// turn for it; otherwise it goes along with the next one.
     pub fn push(&self, text: String, wake: bool) {
-        {
+        self.push_content(vec![json!({"type": "text", "text": text})], wake);
+    }
+
+    /// Queues content blocks for the model, like [`Inbox::push`]; returns
+    /// an id to follow them by.
+    pub fn push_content(&self, blocks: Vec<Value>, wake: bool) -> u64 {
+        let id = {
             let mut queue = self.queue.lock().unwrap();
-            queue.blocks.push(json!({"type": "text", "text": text}));
-            queue.wake |= wake;
-        }
+            let id = queue.next_id;
+            queue.next_id += 1;
+            queue.entries.push(Entry { id, blocks, wake });
+            id
+        };
         if wake {
             self.arrived.notify_waiters();
             let hook = self.on_wake.lock().unwrap().clone();
@@ -78,11 +93,25 @@ impl Inbox {
                 hook();
             }
         }
+        id
     }
 
     /// Whether something waiting wants a turn.
     pub fn wants_turn(&self) -> bool {
-        self.queue.lock().unwrap().wake
+        self.queue.lock().unwrap().entries.iter().any(|e| e.wake)
+    }
+
+    /// Whether what was pushed as `id` still waits, not yet taken.
+    pub fn waiting(&self, id: u64) -> bool {
+        self.queue.lock().unwrap().entries.iter().any(|e| e.id == id)
+    }
+
+    /// Takes back what was pushed as `id`, if it still waits.
+    pub fn withdraw(&self, id: u64) -> bool {
+        let mut queue = self.queue.lock().unwrap();
+        let before = queue.entries.len();
+        queue.entries.retain(|e| e.id != id);
+        queue.entries.len() < before
     }
 
     pub fn clear(&self) {
@@ -91,9 +120,8 @@ impl Inbox {
 
     /// Takes everything waiting.
     pub fn take(&self) -> Vec<Value> {
-        let mut queue = self.queue.lock().unwrap();
-        queue.wake = false;
-        std::mem::take(&mut queue.blocks)
+        let entries = std::mem::take(&mut self.queue.lock().unwrap().entries);
+        entries.into_iter().flat_map(|e| e.blocks).collect()
     }
 
     /// Sets what to call when something arrives that wants a turn, such

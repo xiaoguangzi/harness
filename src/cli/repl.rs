@@ -3,9 +3,11 @@
 //! multi-line input (a line ending in `\` continues) and pasting images with
 //! Ctrl+V.
 //!
-//! The menu is drawn as a multi-line hint. Up/Down move its selection and
-//! Tab fills it in; Enter runs a command, or fills in a file. A choice is
-//! typed through the completer, which puts the cursor after it.
+//! On a terminal the line is drawn in the input box: the prompt carries the
+//! rule above it, and the hint the rule below. The menu is drawn as more of
+//! the hint. Up/Down move its selection and Tab fills it in; Enter runs a
+//! command, or fills in a file. A choice is typed through the completer,
+//! which puts the cursor after it.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -22,6 +24,7 @@ use rustyline::{
 };
 
 use super::clipboard::{self, Clip, Image};
+use super::input;
 use super::menu::{Command, Kind, Menu, list_dir, mention_at_end};
 use super::text;
 use crate::agent::Inbox;
@@ -106,14 +109,47 @@ pub struct ReplHelper {
     pasted: Arc<Mutex<Pasted>>,
     /// Command names, for Tab completion when the menu is not shown.
     names: Vec<String>,
+    /// Whether the line is drawn in the input box, with styles.
     styled: bool,
     wake: Option<Arc<Wake>>,
+    /// The line and hint last drawn.
+    shown: Mutex<(String, String)>,
 }
 
 impl ReplHelper {
     pub fn new(commands: Vec<Command>, styled: bool, wake: Option<Arc<Wake>>) -> Self {
         let names = commands.iter().map(|c| c.name.clone()).collect();
-        Self { menu: Arc::new(Menu::new(commands, ".")), pasted: Arc::default(), names, styled, wake }
+        let menu = Arc::new(Menu::new(commands, "."));
+        Self { menu, pasted: Arc::default(), names, styled, wake, shown: Mutex::default() }
+    }
+
+    /// The prompt: on a terminal, the input box's top rule and `❯`.
+    pub fn prompt(&self) -> (String, String) {
+        if !self.styled {
+            return (input::PROMPT.to_string(), input::PROMPT.to_string());
+        }
+        let rule = input::rule(text::terminal_width());
+        let styled = format!("\x1b[2m{rule}\x1b[0m\n\x1b[{}m❯\x1b[0m ", input::PROMPT_SGR);
+        (format!("{rule}\n{}", input::PROMPT), styled)
+    }
+
+    /// Rows from the top of `prompt` to where the cursor is once the line
+    /// editor returns, with `line` accepted (hint gone) or cut short
+    /// (`None`; hint left on screen). They are laid out the way the editor
+    /// does, at the terminal's width.
+    pub fn rows_used(&self, prompt: &str, line: Option<&str>) -> usize {
+        let shown = self.shown.lock().unwrap();
+        let (line, hint) = match line {
+            Some(line) => (line, ""),
+            None => (shown.0.as_str(), shown.1.as_str()),
+        };
+        rows(&format!("{prompt}{line}{hint}"), text::terminal_width())
+    }
+
+    /// The images pasted into the line being edited are numbered after
+    /// this.
+    pub fn last_image(&self) -> usize {
+        self.pasted.lock().unwrap().last
     }
 
     /// Binds the keys that drive the menu, and Ctrl+V.
@@ -129,10 +165,11 @@ impl ReplHelper {
 
     /// Call before reading a line: files are searched afresh, and images
     /// pasted into it are numbered after `last_image`, the conversation's
-    /// last.
-    pub fn new_line(&self, last_image: usize) {
+    /// last. `images` were pasted into the text it starts with.
+    pub fn new_line(&self, last_image: usize, images: Vec<(usize, Image)>) {
         self.menu.forget_files();
-        *self.pasted.lock().unwrap() = Pasted { last: last_image, ..Pasted::default() };
+        let last = images.iter().map(|(n, _)| *n).fold(last_image, usize::max);
+        *self.pasted.lock().unwrap() = Pasted { images, last, notice: None };
     }
 
     /// The images pasted into the last line read, by number.
@@ -241,7 +278,7 @@ impl ConditionalEventHandler for PasteHandler {
 }
 
 /// `@` mentions of `paths`, relative to `cwd` when inside it.
-fn file_mentions(paths: &[PathBuf], cwd: &Path) -> String {
+pub(super) fn file_mentions(paths: &[PathBuf], cwd: &Path) -> String {
     let mentions: Vec<String> = paths
         .iter()
         .map(|path| {
@@ -258,7 +295,7 @@ fn file_mentions(paths: &[PathBuf], cwd: &Path) -> String {
 
 /// `text` to insert at byte `pos` of `line`, set off from the words around
 /// it by spaces.
-fn spaced(line: &str, pos: usize, text: &str) -> String {
+pub(super) fn spaced(line: &str, pos: usize, text: &str) -> String {
     let before = line[..pos].chars().next_back().is_some_and(|c| !c.is_whitespace());
     let after = !line[pos..].starts_with(char::is_whitespace);
     format!("{}{text}{}", if before { " " } else { "" }, if after { " " } else { "" })
@@ -276,18 +313,13 @@ fn file_text(path: &str) -> String {
     }
 }
 
-impl Hinter for ReplHelper {
-    type Hint = MenuHint;
-
-    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<MenuHint> {
-        // Called on every redraw, so it also tells `wake` what is typed.
-        if let Some(wake) = &self.wake {
-            wake.edited(line);
-        }
+impl ReplHelper {
+    /// What shows under the line: why Ctrl+V pasted nothing, or the menu.
+    fn below(&self, line: &str, pos: usize) -> Option<String> {
         {
             let mut pasted = self.pasted.lock().unwrap();
             match &pasted.notice {
-                Some((shown_for, hint)) if shown_for == line => return Some(MenuHint(hint.clone())),
+                Some((shown_for, hint)) if shown_for == line => return Some(hint.clone()),
                 Some(_) => pasted.notice = None,
                 None => {}
             }
@@ -296,24 +328,53 @@ impl Hinter for ReplHelper {
             return None;
         }
         let width = text::terminal_width().saturating_sub(1);
-        self.menu.render(line, width).map(MenuHint)
+        self.menu.render(line, width)
+    }
+}
+
+impl Hinter for ReplHelper {
+    type Hint = MenuHint;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<MenuHint> {
+        // Called on every redraw, so it also tells `wake` what is typed.
+        if let Some(wake) = &self.wake {
+            wake.edited(line);
+        }
+        let below = self.below(line, pos);
+        // The input box's bottom rule comes first, on a row of its own. A
+        // line that fills its last row leaves the cursor there, waiting to
+        // wrap: the editor counts a newline for that, and the rule's own
+        // newline would be one too many.
+        let hint = if self.styled {
+            let width = text::terminal_width();
+            let full = fills_last_row(&format!("{}{line}", input::PROMPT), width);
+            Some(format!("{}{}{}", if full { "" } else { "\n" }, input::rule(width), below.unwrap_or_default()))
+        } else {
+            below
+        };
+        *self.shown.lock().unwrap() = (line.to_string(), hint.clone().unwrap_or_default());
+        hint.map(MenuHint)
     }
 }
 
 impl Highlighter for ReplHelper {
-    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, default: bool) -> Cow<'b, str> {
-        if self.styled && default { Cow::Owned(format!("\x1b[1;35m{prompt}\x1b[0m")) } else { Cow::Borrowed(prompt) }
-    }
-
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
         if !self.styled {
             return Cow::Borrowed(hint);
         }
-        if let Some(styled) = self.menu.styled(hint) {
-            return Cow::Owned(styled);
-        }
-        let notice = self.pasted.lock().unwrap().notice.as_ref().is_some_and(|(_, shown)| shown == hint);
-        if notice { Cow::Owned(format!("\x1b[33m{hint}\x1b[0m")) } else { Cow::Borrowed(hint) }
+        // The rule, then what `below` gave.
+        let body = hint.strip_prefix('\n').unwrap_or(hint);
+        let (rule, below) = body.split_at(body.find('\n').unwrap_or(body.len()));
+        let below = if below.is_empty() {
+            String::new()
+        } else if let Some(styled) = self.menu.styled(below) {
+            styled
+        } else if self.pasted.lock().unwrap().notice.as_ref().is_some_and(|(_, shown)| shown == below) {
+            format!("\x1b[33m{below}\x1b[0m")
+        } else {
+            below.to_string()
+        };
+        Cow::Owned(format!("\n\x1b[2m{rule}\x1b[0m{below}"))
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
@@ -326,6 +387,39 @@ impl Validator for ReplHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
         Ok(if ctx.input().ends_with('\\') { ValidationResult::Incomplete } else { ValidationResult::Valid(None) })
     }
+}
+
+/// Rows `shown` takes when the line editor draws it at `cols` columns, from
+/// its first row to the one under its end.
+fn rows(shown: &str, cols: usize) -> usize {
+    let (row, col) = layout(shown, cols);
+    // A full last row puts the end at the start of the next.
+    row + usize::from(col == cols) + 1
+}
+
+/// Whether `shown` ends exactly at the end of a row.
+fn fills_last_row(shown: &str, cols: usize) -> bool {
+    layout(shown, cols).1 == cols
+}
+
+/// The row and column where `shown` ends at `cols` columns, by the line
+/// editor's own layout rules.
+fn layout(shown: &str, cols: usize) -> (usize, usize) {
+    let (mut row, mut col) = (0, 0);
+    for c in shown.chars() {
+        if c == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let w = if c == '\t' { 8 - col % 8 } else { text::char_width(c) };
+        col += w;
+        if col > cols {
+            row += 1;
+            col = w;
+        }
+    }
+    (row, col)
 }
 
 /// Joins continued lines: `a\` + newline + `b` -> `a` + newline + `b`.
@@ -402,6 +496,18 @@ mod tests {
 
         let (_, pairs) = complete("mail me@sr", 10, &[]);
         assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn counts_rows_the_way_the_editor_lays_them_out() {
+        assert_eq!(rows("───\n❯ hi", 10), 2);
+        assert_eq!(rows("───\n❯ hi\n───", 10), 3);
+        // 8 columns fill a row exactly; the end moves to the next.
+        assert_eq!(rows("❯ 看看看", 8), 2);
+        assert_eq!(rows("❯ 看看看看", 8), 2);
+        assert_eq!(rows("❯ ab\ncd", 8), 2);
+        assert!(fills_last_row("❯ 看看看", 8));
+        assert!(!fills_last_row("❯ 看看看\n", 8));
     }
 
     #[test]

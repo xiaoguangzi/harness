@@ -1,5 +1,6 @@
-//! Terminal output: a status spinner, and the observer that shows an agent
-//! turn as it runs (Markdown text, tool calls and results, token counts).
+//! Terminal output: a status spinner with the input box under it, and the
+//! observer that shows an agent turn as it runs (Markdown text, tool calls
+//! and results, token counts).
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
@@ -8,9 +9,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::diff;
+use super::input::{self, Queued, Typing};
 use super::markdown::Markdown;
 use super::text;
-use crate::agent::{INTERRUPTED, Observer};
+use crate::agent::{INTERRUPTED, Inbox, Observer};
 use crate::llm::{MAX_RETRIES, Message, Usage, retry_reason};
 use crate::tools::ToolOutput;
 
@@ -28,9 +30,13 @@ const WAITING: &str = "Waiting for the model…";
 const REPLAYED_TURNS: usize = 10;
 /// Lines of a replayed prompt.
 const PROMPT_LINES: usize = 4;
+/// Wrap a redraw, so terminals that support it show it all at once.
+const SYNC_START: &str = "\x1b[?2026h\x1b[?25l";
+const SYNC_END: &str = "\x1b[?25h\x1b[?2026l";
 
 /// Shared handle on stdout. Output printed while an agent runs goes through
-/// it, so the status lines are cleared first and redrawn after.
+/// it, so the status lines and input box are cleared first and redrawn
+/// after.
 #[derive(Clone)]
 pub struct Output {
     state: Arc<Mutex<State>>,
@@ -40,9 +46,12 @@ pub struct Output {
 
 struct State {
     status: Option<Status>,
-    /// Status lines on screen, on otherwise empty lines; the cursor is on
-    /// the last one.
-    drawn: usize,
+    /// The input box, while a turn runs in the REPL.
+    input: Option<InputBox>,
+    /// Whether the status or input box is on screen, on the last rows; the
+    /// cursor is on `cursor_row` of them.
+    drawn: bool,
+    cursor_row: usize,
     frame: usize,
     /// Lines printed while the line editor reads, shown once it is done:
     /// printing then would tear up the line being edited.
@@ -58,11 +67,55 @@ struct Status {
     tokens: u64,
 }
 
+struct InputBox {
+    typing: Typing,
+    /// Where the messages sent from it go.
+    inbox: Arc<Inbox>,
+}
+
 impl Output {
     pub fn stdout() -> Self {
         let styled = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        let state = State { status: None, drawn: 0, frame: 0, held: None };
+        let state = State { status: None, input: None, drawn: false, cursor_row: 0, frame: 0, held: None };
         Self { state: Arc::new(Mutex::new(state)), styled }
+    }
+
+    /// Shows the input box under the status, holding `typing`, until
+    /// [`Output::close_input`]. Messages sent from it go to `inbox`.
+    pub fn open_input(&self, typing: Typing, inbox: Arc<Inbox>) {
+        let mut state = self.state.lock().unwrap();
+        state.input = Some(InputBox { typing, inbox });
+        self.show(&mut state, "");
+    }
+
+    /// Removes the input box; what it held.
+    pub fn close_input(&self) -> Typing {
+        let mut state = self.state.lock().unwrap();
+        let typing = state.input.take().map(|b| b.typing).unwrap_or_default();
+        self.show(&mut state, "");
+        typing
+    }
+
+    /// Changes what the input box holds, and redraws it; `None` if it isn't
+    /// shown.
+    pub fn edit_input<R>(&self, edit: impl FnOnce(&mut Typing) -> R) -> Option<R> {
+        let mut state = self.state.lock().unwrap();
+        let input = state.input.as_mut()?;
+        let result = edit(&mut input.typing);
+        self.show(&mut state, "");
+        Some(result)
+    }
+
+    /// Takes the queued messages the model has now been handed out of the
+    /// input box.
+    pub fn take_delivered(&self) -> Vec<Queued> {
+        let mut state = self.state.lock().unwrap();
+        let Some(input) = state.input.as_mut() else { return Vec::new() };
+        let delivered = input.typing.take_delivered(&input.inbox);
+        if !delivered.is_empty() {
+            self.show(&mut state, "");
+        }
+        delivered
     }
 
     /// Holds back output while the line editor reads (`true`), and prints
@@ -101,7 +154,7 @@ impl Output {
                 let mut state = this.state.lock().unwrap();
                 if state.status.is_some() {
                     state.frame += 1;
-                    draw(&mut state);
+                    this.show(&mut state, "");
                 }
             }
         });
@@ -118,15 +171,10 @@ impl Output {
                     None => (Instant::now(), 0),
                 };
                 state.status = Some(Status { label: label.to_string(), since, detail: String::new(), tokens });
-                if self.styled {
-                    draw(&mut state);
-                }
             }
-            None => {
-                state.status = None;
-                clear(&mut state);
-            }
+            None => state.status = None,
         }
+        self.show(&mut state, "");
     }
 
     /// Sets the dim line under the status; shown from the next frame on.
@@ -153,16 +201,50 @@ impl Output {
             held.extend(lines.iter().map(|l| l.as_ref().to_string()));
             return;
         }
-        clear(&mut state);
-        let mut stdout = io::stdout().lock();
+        let mut printed = String::new();
         for line in lines {
-            let _ = writeln!(stdout, "{}", line.as_ref());
+            printed.push_str(line.as_ref());
+            printed.push('\n');
         }
+        self.show(&mut state, &printed);
+    }
+
+    /// Prints `printed` above the status and input box, and redraws them,
+    /// in one write.
+    fn show(&self, state: &mut State, printed: &str) {
+        let redraw = self.styled && (state.status.is_some() || state.input.is_some());
+        if printed.is_empty() && !redraw && !state.drawn {
+            return;
+        }
+        let mut screen = String::new();
+        if self.styled {
+            screen.push_str(SYNC_START);
+        }
+        if std::mem::take(&mut state.drawn) {
+            screen.push_str(&clear_sequence(state.cursor_row));
+        }
+        screen.push_str(printed);
+        if redraw {
+            let (rows, cursor) = render(state, |sgr, s| self.paint(sgr, s));
+            let last = rows.len() - 1;
+            screen.push_str(&rows.join("\n"));
+            let (row, col) = cursor.unwrap_or((last, text::width(&rows[last])));
+            if row < last {
+                screen.push_str(&format!("\x1b[{}A", last - row));
+            }
+            screen.push('\r');
+            if col > 0 {
+                screen.push_str(&format!("\x1b[{col}C"));
+            }
+            state.drawn = true;
+            state.cursor_row = row;
+        }
+        if self.styled {
+            screen.push_str(SYNC_END);
+        }
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(screen.as_bytes());
         let _ = stdout.flush();
-        drop(stdout);
-        if self.styled && state.status.is_some() {
-            draw(&mut state);
-        }
     }
 
     pub fn line(&self, line: impl AsRef<str>) {
@@ -304,56 +386,48 @@ pub fn replay(out: &Output, messages: &[Message]) {
     }
 }
 
-/// Redraws the status: the spinner, label, elapsed time and token count,
-/// and the detail line under them.
-fn draw(state: &mut State) {
-    let Some(status) = &state.status else { return };
-    let mut hint = vec![elapsed(status.since.elapsed().as_secs())];
-    if status.tokens > 0 {
-        hint.push(format!("↓ {} tokens", tokens(status.tokens)));
-    }
-    hint.push("esc to interrupt".to_string());
-    let hint = format!(" ({})", hint.join(" · "));
+/// The rows under the output: the status (spinner, label, elapsed time and
+/// token count, and the detail line under them), then the input box. The
+/// input box also says where the cursor goes: (row, column).
+fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, Option<(usize, usize)>) {
     let width = text::terminal_width();
-    let label = text::fit(&status.label, width.saturating_sub(text::width(&hint) + 3));
-    // Forward then back through the glyphs, without repeating the ends.
-    let cycle = 2 * SPINNER.len() - 2;
-    let step = state.frame % cycle;
-    let glyph = SPINNER[if step < SPINNER.len() { step } else { cycle - step }];
-
-    let mut screen = clear_sequence(state.drawn);
-    screen.push_str(&format!("\x1b[{STATUS_SGR}m{glyph}\x1b[0m {}\x1b[2m{hint}\x1b[0m", shimmer(&label, state.frame)));
-    let mut drawn = 1;
-    if !status.detail.is_empty() {
-        let detail = text::fit_tail(&status.detail, width.saturating_sub(5));
-        screen.push_str(&format!("\n\x1b[2m  ⎿ {detail}\x1b[0m"));
-        drawn = 2;
-    }
-    let mut stdout = io::stdout().lock();
-    let _ = write!(stdout, "{screen}");
-    let _ = stdout.flush();
-    state.drawn = drawn;
-}
-
-fn clear(state: &mut State) {
-    let drawn = std::mem::take(&mut state.drawn);
-    if drawn > 0 {
-        let mut stdout = io::stdout().lock();
-        let _ = write!(stdout, "{}", clear_sequence(drawn));
-        let _ = stdout.flush();
-    }
-}
-
-/// Erases `lines` status lines, leaving the cursor at the start of the first.
-fn clear_sequence(lines: usize) -> String {
-    let mut s = String::new();
-    for i in 0..lines {
-        if i > 0 {
-            s.push_str("\x1b[1A");
+    let mut rows = Vec::new();
+    if let Some(status) = &state.status {
+        let mut hint = vec![elapsed(status.since.elapsed().as_secs())];
+        if status.tokens > 0 {
+            hint.push(format!("↓ {} tokens", tokens(status.tokens)));
         }
-        s.push_str("\r\x1b[K");
+        hint.push("esc to interrupt".to_string());
+        let hint = format!(" ({})", hint.join(" · "));
+        let label = text::fit(&status.label, width.saturating_sub(text::width(&hint) + 3));
+        // Forward then back through the glyphs, without repeating the ends.
+        let cycle = 2 * SPINNER.len() - 2;
+        let step = state.frame % cycle;
+        let glyph = SPINNER[if step < SPINNER.len() { step } else { cycle - step }];
+        rows.push(format!("\x1b[{STATUS_SGR}m{glyph}\x1b[0m {}\x1b[2m{hint}\x1b[0m", shimmer(&label, state.frame)));
+        if !status.detail.is_empty() {
+            let detail = text::fit_tail(&status.detail, width.saturating_sub(5));
+            rows.push(format!("\x1b[2m  ⎿ {detail}\x1b[0m"));
+        }
     }
-    s
+    let Some(input) = &state.input else { return (rows, None) };
+    if !rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows.extend(input.typing.queued_rows(width, &paint));
+    let rule = paint("2", &input::rule(width));
+    rows.push(rule.clone());
+    let (draft, (row, col)) = input.typing.draft.render(width, &paint);
+    let cursor = (rows.len() + row, col);
+    rows.extend(draft);
+    rows.push(rule);
+    (rows, Some(cursor))
+}
+
+/// Erases the rows under the output, from `cursor_row` of them, leaving the
+/// cursor at the start of the first.
+fn clear_sequence(cursor_row: usize) -> String {
+    if cursor_row == 0 { "\r\x1b[J".to_string() } else { format!("\r\x1b[{cursor_row}A\x1b[J") }
 }
 
 /// Colors `label` with a highlight sweeping across it as `frame` advances.
@@ -385,6 +459,8 @@ enum Block {
     None,
     Text,
     Tools,
+    /// A message the user sent while the turn ran.
+    Prompt,
 }
 
 /// What the model is doing, as the status line says.
@@ -544,6 +620,14 @@ pub enum TurnEnd {
 impl Observer for Terminal {
     fn on_request_start(&mut self) {
         self.streamed = 0;
+        // Messages sent from the input box go with this request.
+        for queued in self.out.take_delivered() {
+            if self.last != Block::None {
+                self.out.line("");
+            }
+            self.out.lines(&queued.shown);
+            self.last = Block::Prompt;
+        }
         if self.phase != Phase::Waiting {
             self.enter(Phase::Waiting, WAITING);
         }
@@ -784,7 +868,7 @@ mod tests {
     fn draws_the_spinner_status() {
         assert_eq!(elapsed(75), "1m 15s");
         assert_eq!(text::strip_ansi(&shimmer("Thinking…", 3)), "Thinking…");
-        assert_eq!(clear_sequence(2), "\r\x1b[K\x1b[1A\r\x1b[K");
+        assert_eq!(clear_sequence(2), "\r\x1b[2A\x1b[J");
     }
 
     #[test]

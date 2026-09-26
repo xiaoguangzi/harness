@@ -18,7 +18,7 @@ fn tokens(s: &str) -> impl Iterator<Item = (&str, bool)> {
     })
 }
 
-fn char_width(c: char) -> usize {
+pub fn char_width(c: char) -> usize {
     c.width().unwrap_or(0)
 }
 
