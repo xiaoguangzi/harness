@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use crate::agent::Agent;
 use crate::llm::Client;
 use crate::skills::{parse_frontmatter, split_frontmatter};
-use crate::tools::{FileTracker, ReadTool, Tool, ToolOutput, ToolRegistry, WriteTool, parse_input};
+use crate::tools::{FileTracker, Tool, ToolOutput, ToolRegistry, parse_input};
 pub use runtime::{Subagents, scope};
 
 const MAX_RESULT_BYTES: usize = 50_000;
@@ -271,10 +271,8 @@ impl AgentTool {
     /// Builds the tool set for one subagent. File tools get a fresh tracker,
     /// so a subagent's reads never count as reads by the main agent.
     pub fn registry_for(&self, def: &AgentDef) -> ToolRegistry {
-        let files = FileTracker::default();
         let mut registry = self.base.clone();
-        registry.register(ReadTool::new(files.clone()));
-        registry.register(WriteTool::new(files));
+        registry.track_files(&FileTracker::default());
         if def.permission == Permission::ReadOnly {
             registry.retain(|t| t.read_only());
         }
@@ -496,7 +494,7 @@ mod tests {
     use super::*;
     use crate::llm::Providers;
     use crate::llm::config::tests::{file, no_env};
-    use crate::tools::GrepTool;
+    use crate::tools::{GrepTool, ReadTool};
 
     fn client() -> Client {
         let file = file(json!({

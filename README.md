@@ -141,7 +141,7 @@ Mention a path with `@` and its contents are attached to your message, so the mo
 | `@spec.pdf` | the PDF as a document |
 | `@"name with spaces.txt"` | quoted paths |
 
-Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trailing punctuation is ignored. Only existing paths are attached, and an `@` right after an e-mail-style character is left alone, so `me@example.com` stays text. In the REPL, typing `@` opens a file menu under the prompt: it lists the current directory, then searches the project's files (what `git ls-files` lists, or a walk outside git) as you type, best matches first (path prefix, file name, substring, then fuzzy). ↑/↓ select, Tab or Enter fills in the path, and a directory stays open for its entries. Git-ignored entries are hidden unless you type into that directory (`@target/`). Attached text files count as read for the `write` tool. The REPL also keeps line-editing history in `~/.harness/history`.
+Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trailing punctuation is ignored. Only existing paths are attached, and an `@` right after an e-mail-style character is left alone, so `me@example.com` stays text. In the REPL, typing `@` opens a file menu under the prompt: it lists the current directory, then searches the project's files (what `git ls-files` lists, or a walk outside git) as you type, best matches first (path prefix, file name, substring, then fuzzy). ↑/↓ select, Tab or Enter fills in the path, and a directory stays open for its entries. Git-ignored entries are hidden unless you type into that directory (`@target/`). Attached text files count as read for the `edit` and `write` tools. The REPL also keeps line-editing history in `~/.harness/history`.
 
 ### Pasting images
 
@@ -187,7 +187,7 @@ Every REPL and one-shot conversation is saved after each turn to `~/.harness/ses
 | `harness -r <id>` / `--resume=<id>` | resume that one; a unique prefix of the id is enough |
 | `/resume`, `/resume <id>` | the same from inside the REPL |
 
-They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r <id> "..."` (a one-shot `--resume` needs the id). A resumed conversation continues under its id, on the model it last used if that is still configured, and in the REPL its last turns are shown again. Reasoning blocks are kept, so they are sent back to the model that produced them. The `write` tool's read tracking is not saved: the model reads a file again before overwriting it. Web UI tasks are not saved.
+They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r <id> "..."` (a one-shot `--resume` needs the id). A resumed conversation continues under its id, on the model it last used if that is still configured, and in the REPL its last turns are shown again. Reasoning blocks are kept, so they are sent back to the model that produced them. The read tracking of `edit` and `write` is not saved: the model reads a file again before changing it. Web UI tasks are not saved.
 
 ## Sandbox
 
@@ -198,7 +198,7 @@ They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r
 - **Network**: loopback only (local servers and tests work; DNS and outbound connections fail), unless `"network": true`.
 - Commands run in a new session without a terminal. On Linux they also get their own PID namespace, so background jobs end with the command; on macOS, setuid programs (`sudo`, `ps`) cannot run.
 
-The `read` and `write` tools check the same rules. `/sandbox` shows them, the REPL banner says `sandboxed`, and the system prompt tells the model the limits, so it reports a blocked action instead of working around it. MCP servers and the harness itself are not sandboxed.
+The `read`, `edit` and `write` tools check the same rules. `/sandbox` shows them, the REPL banner says `sandboxed`, and the system prompt tells the model the limits, so it reports a blocked action instead of working around it. MCP servers and the harness itself are not sandboxed.
 
 ```json
 {
@@ -255,7 +255,7 @@ Skills are discovered in `.harness/skills/`, `.claude/skills/`, `~/.harness/skil
 The main agent can delegate a self-contained task with the `agent` tool. A subagent runs in its own fresh conversation with its own system prompt and tool set, and only its final report comes back, which keeps long searches out of the main context. Several subagents started in one response run in parallel.
 
 - **`explore`** (built-in): a codebase search agent whose only tool is `grep`. Use it for "where is X / which files use Y" questions.
-- **`general-purpose`** (built-in): a coding agent with the main agent's tools (`bash`, `write`, MCP tools and the rest, under the same sandbox) for multi-step research or a well-scoped change. Subagents share the working directory, so the main agent is told to give each one that changes files its own files.
+- **`general-purpose`** (built-in): a coding agent with the main agent's tools (`bash`, `edit`, `write`, MCP tools and the rest, under the same sandbox) for multi-step research or a well-scoped change. Subagents share the working directory, so the main agent is told to give each one that changes files its own files.
 - **Custom agents**: Markdown files in `.harness/agents/` or `.claude/agents/` (project or `~`; the first found wins, and a file named like a built-in overrides it):
 
   ```markdown
@@ -263,14 +263,14 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   name: reviewer
   description: Reviews the current diff for bugs. Use after making changes.
   tools: read, grep          # optional; `mcp__server__*` matches a prefix
-  permission: read-only      # default; `write` allows bash/write and non-read-only MCP tools
+  permission: read-only      # default; `write` allows bash/edit/write and non-read-only MCP tools
   model: claude-sonnet-5     # optional
   ---
   You are a code reviewer...
   ```
 
 - **Custom agents default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further.
-- Subagents cannot start subagents. Their file reads use their own tracker, so they never count as reads for the main agent's `write`.
+- Subagents cannot start subagents. Their file reads use their own tracker, so they never count as reads for the main agent's `edit` and `write`.
 - Model: the agent's `model`, else `subagent_model` / `HARNESS_SUBAGENT_MODEL`, else the model the conversation is on now (after any `/model` or `/effort`); any `<provider>/<model>`.
 - `/agents` lists the available types.
 
@@ -296,14 +296,15 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   - `http.rs` — POST with retries, SSE reader; marks the stream failures (a dropped connection, an overload) after which `llm::Client` requests the response again
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks; pasted images' blocks
-- `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read` and `write` check
+- `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read`, `edit` and `write` check
 - `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
 - `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox
 - `src/mcp.rs` — MCP client: server configs, connections, `mcp__*` tool adapters
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool
-- `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/write state)
-  - `bash.rs` — run a command via `bash -c` (timeout, output truncation)
+- `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/edit/write state)
+  - `bash.rs` — run a command via `bash -c` (timeout, output truncation); refuses commands that change files themselves (inline Python/Node/Perl scripts that write files, `sed -i`, heredocs or `echo` into a file), which go through `edit` / `write`
   - `read.rs` — read a text file with line numbers (`offset` / `limit` paging)
+  - `edit.rs` — replace an exact, unique string in a file (or every occurrence with `replace_all`), so a change costs as much as the change; the same read-first rule as `write`, and edits to one file from one response apply in order
   - `write.rs` — create or overwrite a file; an existing file must have been read first and be unchanged since
   - `grep.rs` — regex search via ugrep (PCRE, honours `.gitignore`, `files_with_matches` / `content` / `count` modes)
 

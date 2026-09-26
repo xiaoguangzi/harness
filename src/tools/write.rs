@@ -31,10 +31,11 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write `content` to a file, replacing it entirely. Creates the file and any missing \
-         parent directories if needed. An existing file must be read with the `read` tool \
-         first, and the write is refused if it changed since that read. Relative paths \
-         resolve against the working directory."
+        "Write `content` to a file, replacing it entirely. Use it to create a file, or to \
+         rewrite one completely; to change part of a file use `edit`. Creates any missing \
+         parent directories. An existing file must be read with the `read` tool first, and \
+         the write is refused if it changed since that read. Relative paths resolve against \
+         the working directory."
     }
 
     fn input_schema(&self) -> Value {
@@ -69,6 +70,7 @@ impl Tool for WriteTool {
         {
             return ToolOutput::error(e);
         }
+        let _changing = self.files.changing().await;
         if let Err(e) = self.files.check_writable(path) {
             return ToolOutput::error(e);
         }

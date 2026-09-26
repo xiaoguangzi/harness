@@ -21,17 +21,28 @@ const GUIDANCE: &[(&str, &str)] = &[
          through large files with `offset` and `limit`.",
     ),
     (
+        "edit",
+        "change part of an existing file by replacing an exact, unique piece of it. This is how \
+         to change files: keep `old_string` to the lines that change plus a little context, and \
+         make several small edits rather than one that repeats most of the file. The file must \
+         have been read (or attached) first.",
+    ),
+    (
         "write",
-        "create a file or replace one entirely. There is no partial-edit tool: to change a file, \
-         read it, then write back the complete new contents, keeping everything you did not mean \
-         to change. An existing file must have been read (or attached) first.",
+        "create a new file, or replace one you are rewriting from scratch. Not for changes to \
+         part of a file, which is what `edit` is for. An existing file must have been read (or \
+         attached) first.",
     ),
     ("grep", "search file contents by regular expression. Use it instead of running grep or rg through `bash`."),
     (
         "bash",
         "builds, tests, git, listing files and other shell work. Every call is a fresh process, so \
-         `cd` does not persist: use absolute paths or `cd dir && command`. Do not use it to read, \
-         write or search files when the tools above can.",
+         `cd` does not persist: use absolute paths or `cd dir && command`. Do not use it to read or \
+         search files when the tools above can, and never to create or change files: no Python, \
+         Node or Perl scripts, `sed -i`, heredocs or `>` redirection into files. Those changes go \
+         through `edit` and `write`, which check that you read the file and show the user the \
+         change; commands that edit files themselves are refused. Running the project's own build \
+         steps, formatters and code generators is fine.",
     ),
     (
         "skill",
@@ -148,7 +159,7 @@ mod tests {
     fn fills_the_template() {
         let prompt = main(&ToolRegistry::with_defaults(FileTracker::default()));
         assert!(!prompt.contains("{{"), "{prompt}");
-        for tool in ["read", "write", "grep", "bash"] {
+        for tool in ["read", "edit", "write", "grep", "bash"] {
             assert!(prompt.contains(&format!("- `{tool}`: ")), "missing {tool}");
         }
         assert!(!prompt.contains("`skill`:") && !prompt.contains("`agent`:"));

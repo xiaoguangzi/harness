@@ -35,7 +35,7 @@ use crate::mentions;
 use crate::settings::{self, Settings};
 use crate::skills::Skill;
 use crate::subagent::{AgentDef, AgentTool, MessageAgentTool, Reporter, StopAgentTool};
-use crate::tools::{FileTracker, ReadTool, ToolRegistry, WriteTool};
+use crate::tools::{FileTracker, ToolRegistry};
 
 use tasks::Task;
 
@@ -174,19 +174,13 @@ fn build_live(base: &ToolRegistry, defs: &Arc<Vec<AgentDef>>, reporter: &Reporte
 }
 
 /// The tool set for a task's agent: a subagent type's own set, or every
-/// tool; `read` and `write` share the task's own file tracker.
+/// tool; the file tools share the task's own file tracker.
 fn task_tools(live: &Live, def: Option<&AgentDef>, files: &FileTracker) -> ToolRegistry {
     let mut tools = match (def, &live.model) {
         (Some(def), Ok((_, agent_tool))) => agent_tool.registry_for(def),
         _ => live.tools.clone(),
     };
-    let (has_read, has_write) = (tools.get("read").is_some(), tools.get("write").is_some());
-    if has_read {
-        tools.register(ReadTool::new(files.clone()));
-    }
-    if has_write {
-        tools.register(WriteTool::new(files.clone()));
-    }
+    tools.track_files(files);
     tools
 }
 

@@ -16,7 +16,7 @@ The user can attach files with `@path` (or `@path#L10-20` for a range). Each one
 - a directory as a `<directory path="...">` listing;
 - an image or PDF as an image or document block.
 
-An attached file counts as already read. Do not read it again unless you need lines outside the attached range or it may have changed since; you can `write` it directly.
+An attached file counts as already read. Do not read it again unless you need lines outside the attached range or it may have changed since; you can `edit` it directly.
 
 # How to work
 

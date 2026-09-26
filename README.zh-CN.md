@@ -142,7 +142,7 @@ harness --help                          # 查看全部选项
 | `@spec.pdf` | PDF 作为文档 |
 | `@"name with spaces.txt"` | 带引号的路径 |
 
-提及可以出现在句中且无需空格（`看看@src/main.rs的代码`）；尾部标点会被忽略。只有真实存在的路径才会被附加，紧跟在电子邮件风格字符之后的 `@` 会被原样保留，因此 `me@example.com` 仍是普通文本。在 REPL 中，输入 `@` 会在提示符下方打开文件菜单：先列出当前目录，然后随输入搜索项目文件（git 仓库中是 `git ls-files` 的输出，仓库外则遍历目录），最佳匹配优先（路径前缀、文件名、子串，然后模糊匹配）。↑/↓ 选择，Tab 或 Enter 填入路径，目录会保持打开以列出其中条目。被 git 忽略的条目默认隐藏，除非你输入到该目录里（`@target/`）。附加的文本文件会计入已读，满足 `write` 工具的要求。REPL 还会在 `~/.harness/history` 中保存行编辑历史。
+提及可以出现在句中且无需空格（`看看@src/main.rs的代码`）；尾部标点会被忽略。只有真实存在的路径才会被附加，紧跟在电子邮件风格字符之后的 `@` 会被原样保留，因此 `me@example.com` 仍是普通文本。在 REPL 中，输入 `@` 会在提示符下方打开文件菜单：先列出当前目录，然后随输入搜索项目文件（git 仓库中是 `git ls-files` 的输出，仓库外则遍历目录），最佳匹配优先（路径前缀、文件名、子串，然后模糊匹配）。↑/↓ 选择，Tab 或 Enter 填入路径，目录会保持打开以列出其中条目。被 git 忽略的条目默认隐藏，除非你输入到该目录里（`@target/`）。附加的文本文件会计入已读，满足 `edit` 和 `write` 工具的要求。REPL 还会在 `~/.harness/history` 中保存行编辑历史。
 
 ### 粘贴图片
 
@@ -188,7 +188,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 | `harness -r <id>` / `--resume=<id>` | 继续指定会话；id 的唯一前缀即可 |
 | `/resume`、`/resume <id>` | 在 REPL 内做同样的事 |
 
-它们可以与一次性模式组合：`harness -c "now run the tests"` 或 `harness -r <id> "..."`（一次性模式下 `--resume` 需要给出 id）。恢复的会话沿用原来的 id；若上次使用的模型仍在配置中，则切换回该模型；在 REPL 中会重新显示最后几轮。推理块会被保留，因此仍会发回给产生它的模型。`write` 工具的已读记录不会保存：模型在覆盖文件前需要重新读取。Web UI 的任务不会保存。
+它们可以与一次性模式组合：`harness -c "now run the tests"` 或 `harness -r <id> "..."`（一次性模式下 `--resume` 需要给出 id）。恢复的会话沿用原来的 id；若上次使用的模型仍在配置中，则切换回该模型；在 REPL 中会重新显示最后几轮。推理块会被保留，因此仍会发回给产生它的模型。`edit` 和 `write` 的已读记录不会保存：模型在修改文件前需要重新读取。Web UI 的任务不会保存。
 
 ## 沙箱
 
@@ -199,7 +199,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 - **网络**：只允许回环地址（本地服务和测试可用，DNS 和外连会失败），除非设置 `"network": true`。
 - 命令在没有终端的新会话中运行。Linux 上还有独立的 PID 命名空间，后台任务随命令一起结束；macOS 上无法运行 setuid 程序（`sudo`、`ps`）。
 
-`read` 和 `write` 工具按同样的规则检查。`/sandbox` 显示这些规则，REPL 横幅会显示 `sandboxed`，系统提示词也会告诉模型这些限制，让它报告被拦截的操作，而不是设法绕过。MCP 服务器和 harness 本身不在沙箱中。
+`read`、`edit` 和 `write` 工具按同样的规则检查。`/sandbox` 显示这些规则，REPL 横幅会显示 `sandboxed`，系统提示词也会告诉模型这些限制，让它报告被拦截的操作，而不是设法绕过。MCP 服务器和 harness 本身不在沙箱中。
 
 ```json
 {
@@ -256,7 +256,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 主代理可以用 `agent` 工具委派一个自包含的任务。子代理在自己的全新会话中运行，有自己的系统提示和工具集，只有最终报告会返回，从而把漫长的搜索挡在主上下文之外。同一次响应中启动的多个子代理并行运行。
 
 - **`explore`**（内置）：只有 `grep` 工具的代码库搜索代理。用于“X 在哪里 / 哪些文件用了 Y”这类问题。
-- **`general-purpose`**（内置）：拥有主代理全部工具（`bash`、`write`、MCP 工具等，受同一沙箱约束）的编码代理，用于多步调研或范围明确的修改。子代理共享工作目录，因此主代理会被要求给每个修改文件的子代理分配各自的文件。
+- **`general-purpose`**（内置）：拥有主代理全部工具（`bash`、`edit`、`write`、MCP 工具等，受同一沙箱约束）的编码代理，用于多步调研或范围明确的修改。子代理共享工作目录，因此主代理会被要求给每个修改文件的子代理分配各自的文件。
 - **自定义代理**：`.harness/agents/` 或 `.claude/agents/`（项目或 `~`）中的 Markdown 文件（先找到的优先，与内置代理同名的文件会覆盖内置项）：
 
   ```markdown
@@ -264,14 +264,14 @@ description: Draft release notes from the git log. Use when asked for a changelo
   name: reviewer
   description: Reviews the current diff for bugs. Use after making changes.
   tools: read, grep          # 可选；`mcp__server__*` 匹配前缀
-  permission: read-only      # 默认；`write` 允许 bash/write 和非只读的 MCP 工具
+  permission: read-only      # 默认；`write` 允许 bash/edit/write 和非只读的 MCP 工具
   model: claude-sonnet-5     # 可选
   ---
   You are a code reviewer...
   ```
 
 - **自定义代理默认只读**：只读代理只会获得标记为只读的工具（`read`、`grep`、`skill`，以及服务器设置了 `readOnlyHint` 的 MCP 工具），即使它的 `tools` 列表写了其他工具也不行。`tools` 用于进一步收窄。
-- 子代理不能再启动子代理。它们的文件读取使用自己的追踪器，因此不会计入主代理 `write` 所需的已读记录。
+- 子代理不能再启动子代理。它们的文件读取使用自己的追踪器，因此不会计入主代理 `edit` 和 `write` 所需的已读记录。
 - 模型：代理的 `model`，否则 `subagent_model` / `HARNESS_SUBAGENT_MODEL`，否则会话当前使用的模型（包括 `/model`、`/effort` 切换之后）；任意 `<provider>/<model>`。
 - `/agents` 列出可用类型。
 
@@ -297,14 +297,15 @@ description: Draft release notes from the git log. Use when asked for a changelo
   - `http.rs` — 带重试的 POST、SSE 读取器；标记哪些流式失败（连接断开、过载）之后 `llm::Client` 会重新请求回复
 - `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
 - `src/mentions.rs` — `@路径` 的解析与展开为附件块；粘贴图片的附件块
-- `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read` 和 `write` 检查的路径规则
+- `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read`、`edit` 和 `write` 检查的路径规则
 - `src/subagent.rs` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具
 - `src/subagent/runtime.rs` — 一个会话的子代理：前台与后台运行、后续追问、停止、向主代理收件箱报告
 - `src/mcp.rs` — MCP 客户端：服务器配置、连接、`mcp__*` 工具适配器
 - `src/skills.rs` — 技能发现、`SKILL.md` frontmatter 解析、`skill` 工具
-- `src/tools/` — `Tool` trait、注册表和 `FileTracker`（共享的读/写状态）
-  - `bash.rs` — 通过 `bash -c` 运行命令（超时、输出截断）
+- `src/tools/` — `Tool` trait、注册表和 `FileTracker`（共享的读/改/写状态）
+  - `bash.rs` — 通过 `bash -c` 运行命令（超时、输出截断）；拒绝自行修改文件的命令（写文件的内联 Python/Node/Perl 脚本、`sed -i`、写入文件的 heredoc 或 `echo`），这些修改应走 `edit` / `write`
   - `read.rs` — 读取文本文件并带行号（`offset` / `limit` 分页）
+  - `edit.rs` — 把文件中一段精确且唯一的文本替换掉（`replace_all` 则替换全部出现），修改的开销只取决于改动本身；与 `write` 相同的先读规则，同一次回复中对同一文件的多个修改按顺序生效
   - `write.rs` — 创建或覆盖文件；已存在的文件必须先被读取且此后未被修改
   - `grep.rs` — 通过 ugrep 的正则搜索（PCRE，遵循 `.gitignore`，`files_with_matches` / `content` / `count` 模式）
 

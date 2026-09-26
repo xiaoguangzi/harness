@@ -6,11 +6,13 @@
 //! MCP and skill tools are registered at startup from configuration.
 
 mod bash;
+mod edit;
 mod grep;
 mod read;
 mod write;
 
 pub use bash::BashTool;
+pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub(crate) use read::number_lines;
@@ -111,8 +113,23 @@ impl ToolRegistry {
         registry.register(BashTool);
         registry.register(GrepTool);
         registry.register(ReadTool::new(files.clone()));
+        registry.register(EditTool::new(files.clone()));
         registry.register(WriteTool::new(files));
         registry
+    }
+
+    /// Gives the file tools present (`read`, `edit`, `write`) the tracker
+    /// `files`, e.g. a subagent's own.
+    pub fn track_files(&mut self, files: &FileTracker) {
+        if self.get("read").is_some() {
+            self.register(ReadTool::new(files.clone()));
+        }
+        if self.get("edit").is_some() {
+            self.register(EditTool::new(files.clone()));
+        }
+        if self.get("write").is_some() {
+            self.register(WriteTool::new(files.clone()));
+        }
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
@@ -190,10 +207,15 @@ pub(crate) fn parse_input<T: serde::de::DeserializeOwned>(input: Value) -> Resul
 }
 
 /// Remembers which files the model has read, and their modification time at
-/// that point, so `write` refuses to clobber a file the model has not seen
-/// or that changed since it was read.
+/// that point, so `edit` and `write` refuse to change a file the model has
+/// not seen or that changed since it was read.
 #[derive(Clone, Default)]
-pub struct FileTracker(Arc<Mutex<HashMap<PathBuf, Option<SystemTime>>>>);
+pub struct FileTracker {
+    seen: Arc<Mutex<HashMap<PathBuf, Option<SystemTime>>>>,
+    /// Held while a tool checks, changes and records a file, so calls from
+    /// one response that change the same file apply one after another.
+    changing: Arc<tokio::sync::Mutex<()>>,
+}
 
 impl FileTracker {
     fn key(path: &Path) -> PathBuf {
@@ -205,7 +227,13 @@ impl FileTracker {
     }
 
     pub fn record(&self, path: &Path) {
-        self.0.lock().unwrap().insert(Self::key(path), Self::mtime(path));
+        self.seen.lock().unwrap().insert(Self::key(path), Self::mtime(path));
+    }
+
+    /// Waits for any other change through this tracker to finish; hold the
+    /// guard from checking the file until recording the change.
+    pub async fn changing(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.changing.lock().await
     }
 
     /// Ok for a new file, or for an existing file read since it last changed.
@@ -213,13 +241,13 @@ impl FileTracker {
         if !path.exists() {
             return Ok(());
         }
-        match self.0.lock().unwrap().get(&Self::key(path)) {
+        match self.seen.lock().unwrap().get(&Self::key(path)) {
             None => Err(format!(
-                "{} already exists; read it with the `read` tool before overwriting it",
+                "{} already exists; read it with the `read` tool before changing it",
                 path.display()
             )),
             Some(seen) if *seen != Self::mtime(path) => Err(format!(
-                "{} changed since it was last read; read it again before overwriting it",
+                "{} changed since it was last read; read it again before changing it",
                 path.display()
             )),
             Some(_) => Ok(()),
