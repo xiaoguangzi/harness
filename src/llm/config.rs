@@ -1,11 +1,11 @@
 //! Provider (gateway) configuration.
 //!
-//! `providers.json` declares the gateways to talk to and which protocol each
-//! speaks. Models are addressed as `<provider>/<model>`:
+//! The settings file (`settings.rs`) declares the gateways to talk to and
+//! which protocol each speaks. Models are addressed as `<provider>/<model>`:
 //!
 //! ```json
 //! {
-//!   "default_model": "relay-a/claude-opus-5",
+//!   "model": "relay-a/claude-opus-5",
 //!   "subagent_model": "relay-b/gpt-5-mini",
 //!   "effort": "xhigh",
 //!   "providers": {
@@ -24,23 +24,21 @@
 //! }
 //! ```
 //!
-//! Files: `~/.harness/providers.json`, then `./.harness/providers.json`
-//! (later files override earlier ones by provider name), or only
-//! `$HARNESS_PROVIDERS` when set. `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`
-//! and `OPENAI_API_KEY` add implicit `anthropic` and `openai` providers when
-//! no provider of that name is configured.
+//! `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` and `OPENAI_API_KEY` add
+//! implicit `anthropic` and `openai` providers when no provider of that name
+//! is configured.
 //!
 //! `effort` (also per model, or `$HARNESS_EFFORT`; default `high`) sets how
 //! hard the model thinks: Anthropic `output_config.effort`, OpenAI
 //! `reasoning.effort`.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::settings::Settings;
 use crate::util::{expand_env, merge_json};
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-5";
@@ -141,16 +139,6 @@ pub struct ModelConfig {
     pub extra_body: Option<Map<String, Value>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProvidersFile {
-    pub default_model: Option<String>,
-    pub subagent_model: Option<String>,
-    pub effort: Option<Effort>,
-    #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
-}
-
 #[derive(Debug, Clone)]
 pub struct Providers {
     providers: BTreeMap<String, ProviderConfig>,
@@ -161,6 +149,8 @@ pub struct Providers {
     pub subagent_model: Option<String>,
     /// Effort for models without their own `effort`.
     pub effort: Effort,
+    /// `max_tokens` for providers and models without their own.
+    max_tokens: Option<u32>,
 }
 
 /// Everything needed to send one request: a provider plus a model on it.
@@ -171,77 +161,27 @@ pub struct Target<'a> {
     pub model: &'a str,
     /// The configured effort; a session's `/effort` replaces it.
     pub effort: Effort,
-}
-
-/// The providers files, lowest precedence first: `$HARNESS_PROVIDERS`
-/// alone, else `~/.harness/providers.json` then `./.harness/providers.json`.
-pub fn config_paths() -> Vec<PathBuf> {
-    match std::env::var_os("HARNESS_PROVIDERS") {
-        Some(p) => vec![PathBuf::from(p)],
-        None => {
-            let mut v = Vec::new();
-            if let Some(home) = std::env::var_os("HOME") {
-                v.push(Path::new(&home).join(".harness/providers.json"));
-            }
-            v.push(PathBuf::from(".harness/providers.json"));
-            v
-        }
-    }
-}
-
-/// The file the web UI edits: `$HARNESS_PROVIDERS`, else the project file
-/// if it exists (so edits aren't shadowed by it), else the user file, which
-/// applies in every directory.
-pub fn editable_path() -> PathBuf {
-    let mut paths = config_paths();
-    let last = paths.pop().expect("at least one providers path");
-    match paths.pop() {
-        Some(user) if !last.exists() => user,
-        _ => last,
-    }
+    /// The top-level `max_tokens`, for providers and models without one.
+    pub(super) default_max_tokens: Option<u32>,
 }
 
 impl Providers {
-    /// Loads the config files and environment described in the module docs.
-    pub fn load() -> Result<Self> {
-        Self::load_with(None)
+    /// The providers in `settings`, with the environment described in the
+    /// module docs.
+    pub fn from_settings(settings: &Settings) -> Result<Self> {
+        Self::from_parts(settings, &|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
     }
 
-    /// Like [`Providers::load`], but with the file at `path` read as `text`
-    /// instead, so an edit can be validated before it is saved.
-    pub fn load_with(replace: Option<(&Path, &str)>) -> Result<Self> {
-        let mut files = Vec::new();
-        for path in config_paths() {
-            let text = match replace {
-                Some((p, text)) if p == path => text.to_string(),
-                _ if !path.exists() => continue,
-                _ => std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?,
-            };
-            if text.trim().is_empty() {
-                continue;
-            }
-            let file: ProvidersFile =
-                serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-            files.push(file);
-        }
-        Self::from_parts(files, &|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
-    }
-
-    /// Builds the provider set from parsed files (lowest precedence first)
-    /// and an environment lookup.
-    pub fn from_parts(files: Vec<ProvidersFile>, env: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
-        let mut providers = BTreeMap::new();
-        let mut default_model = None;
-        let mut subagent_model = None;
-        let mut effort = None;
-        for file in files {
-            providers.extend(file.providers);
-            default_model = file.default_model.or(default_model);
-            subagent_model = file.subagent_model.or(subagent_model);
-            effort = file.effort.or(effort);
-        }
+    /// Builds the provider set from settings and an environment lookup.
+    pub fn from_parts(settings: &Settings, env: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
+        let mut providers = settings.providers.clone();
+        let mut effort = settings.effort;
+        let mut max_tokens = settings.max_tokens;
         if let Some(level) = env("HARNESS_EFFORT") {
             effort = Some(Effort::parse(&level).context("HARNESS_EFFORT")?);
+        }
+        if let Some(n) = env("HARNESS_MAX_TOKENS") {
+            max_tokens = Some(n.trim().parse().context("HARNESS_MAX_TOKENS")?);
         }
         for p in providers.values_mut() {
             p.base_url = expand_env(&p.base_url).trim_end_matches('/').to_string();
@@ -282,14 +222,20 @@ impl Providers {
         if providers.is_empty() {
             bail!(
                 "no LLM provider configured: set ANTHROPIC_API_KEY (or OPENAI_API_KEY), or declare \
-                 gateways in ~/.harness/providers.json or .harness/providers.json"
+                 gateways under `providers` in ~/.harness/settings.json"
             );
         }
 
-        let mut this = Self { providers, default_model: String::new(), subagent_model: None, effort: effort.unwrap_or(DEFAULT_EFFORT) };
-        let requested = env("HARNESS_MODEL").or(default_model).or_else(|| this.fallback_default());
+        let mut this = Self {
+            providers,
+            default_model: String::new(),
+            subagent_model: None,
+            effort: effort.unwrap_or(DEFAULT_EFFORT),
+            max_tokens,
+        };
+        let requested = env("HARNESS_MODEL").or(settings.model.clone()).or_else(|| this.fallback_default());
         let requested = requested.ok_or_else(|| {
-            anyhow!("no default model: set `default_model` in providers.json or HARNESS_MODEL=<provider>/<model>")
+            anyhow!("no default model: set `model` in settings.json or HARNESS_MODEL=<provider>/<model>")
         })?;
         // A bare model name (e.g. HARNESS_MODEL=claude-opus-5) goes to the
         // sole provider, or to `anthropic` when there are several.
@@ -298,7 +244,7 @@ impl Providers {
             _ => this.providers.contains_key("anthropic").then(|| "anthropic".to_string()),
         };
         this.default_model = this.resolve_spec(&requested, bare_provider.as_deref())?;
-        if let Some(spec) = env("HARNESS_SUBAGENT_MODEL").or(subagent_model) {
+        if let Some(spec) = env("HARNESS_SUBAGENT_MODEL").or(settings.subagent_model.clone()) {
             this.subagent_model = Some(this.resolve_spec(&spec, None)?);
         }
         Ok(this)
@@ -345,7 +291,7 @@ impl Providers {
         let (provider, model) = spec.split_once('/').ok_or_else(|| anyhow!("unresolved model spec `{spec}`"))?;
         let config = self.providers.get(provider).ok_or_else(|| anyhow!("unknown provider `{provider}`"))?;
         let effort = config.models.get(model).and_then(|m| m.effort).unwrap_or(self.effort);
-        Ok(Target { provider, config, model, effort })
+        Ok(Target { provider, config, model, effort, default_max_tokens: self.max_tokens })
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -402,7 +348,7 @@ impl Target<'_> {
         self.model_config()
             .and_then(|m| m.max_tokens)
             .or(self.config.max_tokens)
-            .or_else(|| std::env::var("HARNESS_MAX_TOKENS").ok().and_then(|v| v.parse().ok()))
+            .or(self.default_max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS)
     }
 
@@ -461,13 +407,13 @@ pub(crate) mod tests {
         None
     }
 
-    pub(crate) fn file(v: Value) -> ProvidersFile {
+    pub(crate) fn file(v: Value) -> Settings {
         serde_json::from_value(v).unwrap()
     }
 
-    fn two_relays() -> ProvidersFile {
+    fn two_relays() -> Settings {
         file(json!({
-            "default_model": "relay-a/claude-opus-5",
+            "model": "relay-a/claude-opus-5",
             "providers": {
                 "relay-a": {"protocol": "anthropic", "base_url": "https://a.example.com/", "api_key": "ka"},
                 "relay-b": {
@@ -482,7 +428,7 @@ pub(crate) mod tests {
 
     #[test]
     fn resolves_specs() {
-        let p = Providers::from_parts(vec![two_relays()], &no_env).unwrap();
+        let p = Providers::from_parts(&two_relays(), &no_env).unwrap();
         assert_eq!(p.default_model, "relay-a/claude-opus-5");
         assert_eq!(p.resolve_spec("relay-b/gpt-5", None).unwrap(), "relay-b/gpt-5");
         // No known provider prefix: a model on the default provider, even
@@ -495,7 +441,7 @@ pub(crate) mod tests {
 
     #[test]
     fn target_settings() {
-        let p = Providers::from_parts(vec![two_relays()], &no_env).unwrap();
+        let p = Providers::from_parts(&two_relays(), &no_env).unwrap();
         let a = p.target("relay-a/claude-opus-5").unwrap();
         assert_eq!(a.url("messages"), "https://a.example.com/v1/messages");
         assert_eq!(a.headers(), vec![("x-api-key".to_string(), "ka".to_string())]);
@@ -512,6 +458,15 @@ pub(crate) mod tests {
         b.apply_extra_body(&mut body);
         assert_eq!(body, json!({"model": "gpt-5", "reasoning": {"effort": "high"}}));
         assert_eq!(p.target("relay-b/other").unwrap().max_tokens(), 8000);
+        assert_eq!(p.target("relay-a/m").unwrap().max_tokens(), DEFAULT_MAX_TOKENS);
+
+        let mut s = two_relays();
+        s.max_tokens = Some(2000);
+        let p = Providers::from_parts(&s, &no_env).unwrap();
+        assert_eq!(p.target("relay-a/m").unwrap().max_tokens(), 2000, "the top-level default");
+        assert_eq!(p.target("relay-b/other").unwrap().max_tokens(), 8000, "the provider's own wins");
+        let env = |k: &str| (k == "HARNESS_MAX_TOKENS").then(|| "3000".to_string());
+        assert_eq!(Providers::from_parts(&s, &env).unwrap().target("relay-a/m").unwrap().max_tokens(), 3000);
     }
 
     #[test]
@@ -521,7 +476,7 @@ pub(crate) mod tests {
             "OPENAI_API_KEY" => Some("sk-oai".to_string()),
             _ => None,
         };
-        let p = Providers::from_parts(vec![], &env).unwrap();
+        let p = Providers::from_parts(&Settings::default(), &env).unwrap();
         assert_eq!(p.names(), vec!["anthropic", "openai"]);
         assert_eq!(p.default_model, "anthropic/claude-opus-5");
         let a = p.target(&p.default_model).unwrap();
@@ -536,7 +491,7 @@ pub(crate) mod tests {
             "HARNESS_MODEL" => Some("claude-sonnet-5".to_string()),
             _ => None,
         };
-        assert_eq!(Providers::from_parts(vec![], &env).unwrap().default_model, "anthropic/claude-sonnet-5");
+        assert_eq!(Providers::from_parts(&Settings::default(), &env).unwrap().default_model, "anthropic/claude-sonnet-5");
     }
 
     #[test]
@@ -546,14 +501,14 @@ pub(crate) mod tests {
             "HARNESS_SUBAGENT_MODEL" => Some("claude-haiku-4-5".to_string()),
             _ => None,
         };
-        let p = Providers::from_parts(vec![two_relays()], &env).unwrap();
+        let p = Providers::from_parts(&two_relays(), &env).unwrap();
         assert_eq!(p.default_model, "relay-b/gpt-5");
         assert_eq!(p.subagent_model.as_deref(), Some("relay-b/claude-haiku-4-5"));
 
-        assert!(Providers::from_parts(vec![], &no_env).is_err(), "nothing configured");
+        assert!(Providers::from_parts(&Settings::default(), &no_env).is_err(), "nothing configured");
         let bad = file(json!({"providers": {"x": {"protocol": "anthropic", "base_url": "u"}}}));
-        assert!(Providers::from_parts(vec![bad], &no_env).is_err(), "no default model");
-        let unknown: Result<ProvidersFile, _> =
+        assert!(Providers::from_parts(&bad, &no_env).is_err(), "no default model");
+        let unknown: Result<Settings, _> =
             serde_json::from_value(json!({"providers": {"x": {"protocol": "grpc", "base_url": "u"}}}));
         assert!(unknown.is_err());
     }
@@ -563,28 +518,16 @@ pub(crate) mod tests {
         let mut f = two_relays();
         f.effort = Some(Effort::Medium);
         f.providers.get_mut("relay-b").unwrap().models.get_mut("gpt-5").unwrap().effort = Some(Effort::Low);
-        let p = Providers::from_parts(vec![f], &no_env).unwrap();
+        let p = Providers::from_parts(&f, &no_env).unwrap();
         assert_eq!(p.target("relay-a/claude-opus-5").unwrap().effort, Effort::Medium);
         assert_eq!(p.target("relay-b/gpt-5").unwrap().effort, Effort::Low, "the model's own wins");
 
         let env = |k: &str| (k == "HARNESS_EFFORT").then(|| "max".to_string());
-        let p = Providers::from_parts(vec![two_relays()], &env).unwrap();
+        let p = Providers::from_parts(&two_relays(), &env).unwrap();
         assert_eq!(p.target("relay-a/m").unwrap().effort, Effort::Max);
         let bad = |k: &str| (k == "HARNESS_EFFORT").then(|| "huge".to_string());
-        assert!(Providers::from_parts(vec![two_relays()], &bad).is_err());
-        let p = Providers::from_parts(vec![two_relays()], &no_env).unwrap();
+        assert!(Providers::from_parts(&two_relays(), &bad).is_err());
+        let p = Providers::from_parts(&two_relays(), &no_env).unwrap();
         assert_eq!(p.target("relay-a/m").unwrap().effort, Effort::High, "the default");
-    }
-
-    #[test]
-    fn later_files_override_earlier() {
-        let user = two_relays();
-        let project = file(json!({
-            "default_model": "relay-b/gpt-5",
-            "providers": {"relay-a": {"protocol": "anthropic", "base_url": "https://a2.example.com"}}
-        }));
-        let p = Providers::from_parts(vec![user, project], &no_env).unwrap();
-        assert_eq!(p.default_model, "relay-b/gpt-5");
-        assert_eq!(p.target("relay-a/m").unwrap().url("messages"), "https://a2.example.com/v1/messages");
     }
 }

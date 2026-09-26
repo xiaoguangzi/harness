@@ -31,15 +31,37 @@ harness --help                          # 查看全部选项
 
 | 环境变量 | 默认值 |
 |---|---|
-| `HARNESS_MODEL` | `providers.json` 中的 `default_model`，否则 `anthropic/claude-opus-5` |
-| `HARNESS_SUBAGENT_MODEL` | `providers.json` 中的 `subagent_model`，否则与主模型相同 |
-| `HARNESS_MAX_TOKENS` | `64000`（可被 provider 或单个模型覆盖） |
-| `HARNESS_EFFORT` | `providers.json` 中的 `effort`，否则 `high` |
-| `HARNESS_PROVIDERS` | 只读取这个 providers 文件 |
+| `HARNESS_SETTINGS` | 读取这个[配置](#配置)文件，代替 `~/.harness/settings.json`（`--settings FILE` 优先） |
+| `HARNESS_MODEL` | 配置中的 `model`，否则 `anthropic/claude-opus-5` |
+| `HARNESS_SUBAGENT_MODEL` | 配置中的 `subagent_model`，否则与主模型相同 |
+| `HARNESS_MAX_TOKENS` | 配置中的 `max_tokens`，否则 `64000`（可被 provider 或单个模型覆盖） |
+| `HARNESS_EFFORT` | 配置中的 `effort`，否则 `high` |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL` | 隐式的 `anthropic` provider |
 | `OPENAI_API_KEY`、`OPENAI_BASE_URL` | 隐式的 `openai` provider（Responses API） |
 | `HARNESS_SANDBOX` | `1` 或 `0`：开启或关闭[沙箱](#沙箱)（`--sandbox` / `--no-sandbox` 参数优先） |
 | `HARNESS_WEB_TOKEN` | Web UI token（未设置则启动时自动生成） |
+
+## 配置
+
+所有配置都在一个文件里：`~/.harness/settings.json`（或 `--settings FILE` / `$HARNESS_SETTINGS`）：
+
+```json
+{
+  "model": "relay-a/claude-opus-5",
+  "effort": "high",
+  "providers": { "relay-a": { "protocol": "anthropic", "base_url": "https://relay-a.example.com", "api_key": "${RELAY_A_KEY}" } },
+  "mcpServers": { "exa": { "url": "https://mcp.exa.ai/mcp" } },
+  "sandbox": { "enabled": true }
+}
+```
+
+| 键 | 说明 |
+|---|---|
+| `model`、`subagent_model`、`effort`、`max_tokens`、`providers` | 模型和 [LLM 网关](#llm-网关) |
+| `mcpServers` | [MCP 服务器](#mcp-服务器) |
+| `sandbox` | [沙箱](#沙箱) |
+
+所有键都可省略，未知的键会报错。项目目录中的配置一概不读（包括项目的 `.mcp.json`）：否则仓库可以把带着你 API key 的请求发到它自己的服务器、启动 MCP 命令或放宽沙箱。项目中的 `.harness/agents`、`.harness/skills` 及 `.claude/` 下的同名目录仍会读取，因为它们只增加提示词。旧版本读取 `~/.harness/providers.json`、`mcp.json` 和 `sandbox.json`；这些文件存在时 harness 会给出警告，其内容应移到上面对应的键下（`default_model` 改名为 `model`）。
 
 ## Web UI
 
@@ -47,15 +69,15 @@ harness --help                          # 查看全部选项
 
 - **任务 (Tasks)**：把任务派发给主代理，或直接派发给某个子代理类型（`explore`、`general-purpose` 或自定义代理），也可指定模型。任务在后台运行，可以多个并发；每个任务都是独立的会话，流式展示文本、工具调用和结果。每个子代理有一张卡片，显示它的工具调用、状态、报告和停止按钮；任务空闲时，后台子代理的报告会自动开始新的一轮。可以用后续消息继续任务、切换模型、取消任务（运行中的 `bash` 命令和前台子代理会停止，后台子代理继续运行）或删除任务（其子代理也会停止）。`@路径` 提及和 `/<skill> args` 与 REPL 中一致。
 - **工具 (Tools)**：列出所有已注册的工具（内置、技能、MCP、`agent`）及其描述和 schema；填入 JSON 输入即可直接调用。
-- **模型配置 (Models)**：当前生效的 provider 和模型，以及 `~/.harness/providers.json` 的表单或原始 JSON 编辑器，该文件在任何目录下都生效（项目已有 `.harness/providers.json` 时改为编辑它，设置了 `$HARNESS_PROVIDERS` 时编辑该文件）。保存时会先对照其他配置文件和环境进行校验，然后无需重启即生效；空闲任务会切换到新配置。
+- **模型配置 (Models)**：当前生效的 provider 和模型，以及配置文件的表单或原始 JSON 编辑器。保存时会先结合环境变量校验，模型配置随即无需重启生效，空闲任务会切换过去（`mcpServers` 和 `sandbox` 的修改在下次启动时生效）。
 - **Agents / Skills / MCP**：发现了哪些内容，以及哪些 MCP 服务器已连接。
 
-即使没有可用的 provider，服务器也会启动，因此可以在浏览器里配置第一个模型。该 API 能执行命令，所以做了防护：每个 API 请求都需要 token，绑定回环地址时也不例外（本机其他用户同样能访问回环端口），启动时会打印带有 token 的 URL（`http://HOST:PORT/#token=...`，浏览器会记住它，之后新开的标签页也能用）；绑定回环地址时，请求还必须使用回环主机名（防 DNS rebinding）；改变状态的请求需要 `X-Harness` 请求头（防跨站请求）。UI 保存的 providers 文件只有其所有者可读。
+即使没有可用的 provider，服务器也会启动，因此可以在浏览器里配置第一个模型。该 API 能执行命令，所以做了防护：每个 API 请求都需要 token，绑定回环地址时也不例外（本机其他用户同样能访问回环端口），启动时会打印带有 token 的 URL（`http://HOST:PORT/#token=...`，浏览器会记住它，之后新开的标签页也能用）；绑定回环地址时，请求还必须使用回环主机名（防 DNS rebinding）；改变状态的请求需要 `X-Harness` 请求头（防跨站请求）。UI 保存的配置文件只有其所有者可读。
 
 | 端点 | 说明 |
 |---|---|
-| `GET /api/info` | 生效的 provider、可编辑的配置文件、agents、skills、MCP 状态 |
-| `POST /api/config` `{text}` | 校验、保存并应用 providers 文件 |
+| `GET /api/info` | 生效的 provider、配置文件、agents、skills、MCP 状态 |
+| `POST /api/config` `{text}` | 校验、保存并应用配置文件 |
 | `GET /api/tools`、`POST /api/tools/{name}` `{input}` | 列出 / 调用工具 |
 | `GET/POST /api/tasks` `{prompt, agent?, model?, title?}` | 列出 / 创建任务 |
 | `POST /api/tasks/{id}/messages` `{prompt}`、`/model` `{model}`、`/cancel`；`DELETE /api/tasks/{id}` | 驱动任务 |
@@ -64,11 +86,11 @@ harness --help                          # 查看全部选项
 
 ## LLM 网关
 
-在 `~/.harness/providers.json` 和/或 `.harness/providers.json` 中声明网关（按 provider 名，项目文件优先）。每个网关只说一种协议；模型以 `<provider>/<model>` 寻址。
+在[配置](#配置)的 `providers` 下声明网关。每个网关只说一种协议；模型以 `<provider>/<model>` 寻址。
 
 ```json
 {
-  "default_model": "relay-a/claude-opus-5",
+  "model": "relay-a/claude-opus-5",
   "subagent_model": "relay-b/gpt-5-mini",
   "providers": {
     "relay-a": {
@@ -95,7 +117,7 @@ harness --help                          # 查看全部选项
 | `protocol` | `anthropic`（`POST {base_url}/v1/messages`）或 `openai-responses`（`POST {base_url}/v1/responses`）；`base_url` 中已有的 `/v1` 不会重复拼接 |
 | `api_key` | 以 `x-api-key`（Anthropic）或 `Authorization: Bearer`（OpenAI）发送；可用 `"auth": "bearer"` / `"x-api-key"` 覆盖 |
 | `headers` | 额外的请求头 |
-| `max_tokens` | 输出上限（也可按模型设置） |
+| `max_tokens` | 输出上限：顶层、按 provider 或按模型设置 |
 | `effort` | 顶层或按模型设置：`low`、`medium`、`high`（默认）、`xhigh` 或 `max`。以 Anthropic 的 `output_config.effort` 或 OpenAI 的 `reasoning.effort` 发送；`extra_body` 仍可覆盖它，例如对不支持 effort 的模型用 `{"output_config": null}` |
 | `extra_body` | 合并进每个请求体，也可按模型设置；`null` 会移除默认键，例如对不支持自适应思考的模型用 `{"thinking": null}`，或对拒绝加密推理的网关用 `{"include": null}` |
 | `fallbacks`、`eager_input_streaming` | 仅 Anthropic 的 API 特性；`api.anthropic.com` 默认开启，网关默认关闭 |
@@ -105,8 +127,6 @@ harness --help                          # 查看全部选项
 `base_url`、`api_key` 和 `headers` 中的 `${VAR}` / `${VAR:-default}` 会从环境变量展开。没有已知 provider 前缀的 spec 视为当前 provider 上的一个模型，因此包含 `/` 的网关模型名（如 `openai/gpt-5`）同样可用。
 
 会话中途可用 `/model <provider>/<model>` 切换模型；单独输入 `/model` 会列出 provider 和模型。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
-
-注意：项目级 `.harness/providers.json`（同 `.mcp.json`）会被原样信任，所以请只在可信的仓库中运行 harness。
 
 ## 用 `@` 附加文件
 
@@ -164,7 +184,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 
 ## 沙箱
 
-`harness --sandbox`（或 `HARNESS_SANDBOX=1`，或在 `~/.harness/sandbox.json` 中写 `"enabled": true`）让模型的 `bash` 命令和 `grep` 搜索在操作系统沙箱里运行：macOS 用系统自带的 Seatbelt（`sandbox-exec`），Linux 用 [bubblewrap](https://github.com/containers/bubblewrap)（`apt install bubblewrap` / `dnf install bubblewrap`；它需要非特权用户命名空间，有些容器里没有）。`--no-sandbox` 或 `HARNESS_SANDBOX=0` 可以单次关闭。沙箱无法启动时，harness 直接退出，不会在没有沙箱的情况下运行。
+`harness --sandbox`（或 `HARNESS_SANDBOX=1`，或在配置的 `sandbox` 部分写 `"enabled": true`）让模型的 `bash` 命令和 `grep` 搜索在操作系统沙箱里运行：macOS 用系统自带的 Seatbelt（`sandbox-exec`），Linux 用 [bubblewrap](https://github.com/containers/bubblewrap)（`apt install bubblewrap` / `dnf install bubblewrap`；它需要非特权用户命名空间，有些容器里没有）。`--no-sandbox` 或 `HARNESS_SANDBOX=0` 可以单次关闭。沙箱无法启动时，harness 直接退出，不会在没有沙箱的情况下运行。
 
 - **读**：除 `deny_read` 以外都可读。
 - **写**：只能写工作目录、临时目录（`/tmp`、`/var/tmp`、`$TMPDIR`，macOS 上还有每用户的临时和缓存目录）以及 `allow_write`。工作目录中的 `.harness/`、`.claude/`、`.mcp.json`，以及 git 仓库中的 `.git/hooks/` 和 `.git/config` 保持只读，因为它们会让代码之后在沙箱外运行（MCP 服务器、hooks、`core.fsmonitor`）；`.git` 本身不能被重命名或删除。
@@ -175,18 +195,20 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 
 ```json
 {
-  "enabled": true,
-  "network": false,
-  "allow_write": ["~/.cargo/registry", "~/.npm"],
-  "deny_read": ["~/.ssh", "~/.aws", ".env"]
+  "sandbox": {
+    "enabled": true,
+    "network": false,
+    "allow_write": ["~/.cargo/registry", "~/.npm"],
+    "deny_read": ["~/.ssh", "~/.aws", ".env"]
+  }
 }
 ```
 
-路径支持 `~/` 和 `${VAR}`，相对路径相对于工作目录。规则重叠时更深的路径优先，所以 `"deny_read": ["~"]` 会隐藏主目录，但其中的工作目录仍可正常使用。配置只从主目录读取，仓库无法关闭沙箱。git 元数据不在工作目录内时（worktree，或工作目录是仓库的子目录），需要把它的路径加入 `allow_write` 才能提交。Linux 上，尚不存在的受保护路径在命令运行期间由一个空的占位替身覆盖，没有命令运行后即删除。
+路径支持 `~/` 和 `${VAR}`，相对路径相对于工作目录。规则重叠时更深的路径优先，所以 `"deny_read": ["~"]` 会隐藏主目录，但其中的工作目录仍可正常使用。配置只来自你自己的配置文件，仓库无法关闭沙箱。git 元数据不在工作目录内时（worktree，或工作目录是仓库的子目录），需要把它的路径加入 `allow_write` 才能提交。Linux 上，尚不存在的受保护路径在命令运行期间由一个空的占位替身覆盖，没有命令运行后即删除。
 
 ## MCP 服务器
 
-在 `.mcp.json`（项目）和/或 `~/.harness/mcp.json`（用户）中声明服务器，结构与 Claude Code 相同；名称冲突时项目文件优先。`HARNESS_MCP_CONFIG=path` 则只使用这一个文件。
+在[配置](#配置)的 `mcpServers` 下声明服务器，结构与 Claude Code 的 `.mcp.json` 相同。项目的 `.mcp.json` 不会被读取；需要的服务器请复制到你的配置里。
 
 ```json
 {
@@ -256,11 +278,12 @@ description: Draft release notes from the git log. Use when asked for a changelo
 ## 目录结构
 
 - `src/main.rs` — 启动：配置、工具、技能、MCP 服务器、代理；然后进入 CLI 或 web 前端
+- `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分
 - `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、旋转指示器与轮次显示（`output.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、带菜单按键、补全、多行输入以及为子代理报告唤醒提示符的 rustyline 辅助（`repl.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
 - `src/llm/` — LLM 网关
-  - `config.rs` — `providers.json`、模型 spec 解析、按 provider/模型的设置
+  - `config.rs` — 由配置和环境变量得到 provider、模型 spec 解析、按 provider/模型的设置
   - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退）
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
   - `http.rs` — 带重试的 POST、SSE 读取器
@@ -269,7 +292,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 - `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read` 和 `write` 检查的路径规则
 - `src/subagent.rs` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具
 - `src/subagent/runtime.rs` — 一个会话的子代理：前台与后台运行、后续追问、停止、向主代理收件箱报告
-- `src/mcp.rs` — MCP 客户端：配置加载、服务器连接、`mcp__*` 工具适配器
+- `src/mcp.rs` — MCP 客户端：服务器配置、连接、`mcp__*` 工具适配器
 - `src/skills.rs` — 技能发现、`SKILL.md` frontmatter 解析、`skill` 工具
 - `src/tools/` — `Tool` trait、注册表和 `FileTracker`（共享的读/写状态）
   - `bash.rs` — 通过 `bash -c` 运行命令（超时、输出截断）

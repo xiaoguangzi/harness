@@ -30,15 +30,37 @@ Rerun `cargo install --path .` after pulling changes. While developing, `cargo r
 
 | Variable | Default |
 |---|---|
-| `HARNESS_MODEL` | `default_model` from `providers.json`, else `anthropic/claude-opus-5` |
-| `HARNESS_SUBAGENT_MODEL` | `subagent_model` from `providers.json`, else the main model |
-| `HARNESS_MAX_TOKENS` | `64000` (overridden per provider or model) |
-| `HARNESS_EFFORT` | `effort` from `providers.json`, else `high` |
-| `HARNESS_PROVIDERS` | read only this providers file |
+| `HARNESS_SETTINGS` | read this [settings](#settings) file instead of `~/.harness/settings.json` (`--settings FILE` wins) |
+| `HARNESS_MODEL` | `model` from the settings, else `anthropic/claude-opus-5` |
+| `HARNESS_SUBAGENT_MODEL` | `subagent_model` from the settings, else the main model |
+| `HARNESS_MAX_TOKENS` | `max_tokens` from the settings, else `64000` (overridden per provider or model) |
+| `HARNESS_EFFORT` | `effort` from the settings, else `high` |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | implicit `anthropic` provider |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | implicit `openai` provider (Responses API) |
 | `HARNESS_SANDBOX` | `1` or `0`: turn the [sandbox](#sandbox) on or off (the `--sandbox` / `--no-sandbox` flags win) |
 | `HARNESS_WEB_TOKEN` | web UI token (generated at startup if unset) |
+
+## Settings
+
+All configuration lives in one file, `~/.harness/settings.json` (or `--settings FILE` / `$HARNESS_SETTINGS`):
+
+```json
+{
+  "model": "relay-a/claude-opus-5",
+  "effort": "high",
+  "providers": { "relay-a": { "protocol": "anthropic", "base_url": "https://relay-a.example.com", "api_key": "${RELAY_A_KEY}" } },
+  "mcpServers": { "exa": { "url": "https://mcp.exa.ai/mcp" } },
+  "sandbox": { "enabled": true }
+}
+```
+
+| Key | |
+|---|---|
+| `model`, `subagent_model`, `effort`, `max_tokens`, `providers` | models and [LLM gateways](#llm-gateways) |
+| `mcpServers` | [MCP servers](#mcp-servers) |
+| `sandbox` | the [sandbox](#sandbox) |
+
+Every key is optional, and unknown keys are an error. Nothing is read from the project directory (a project's `.mcp.json` included): a repository could otherwise send requests carrying your API keys to its own server, start MCP commands or loosen the sandbox. The project's `.harness/agents`, `.harness/skills` and their `.claude/` counterparts are still read, as they only add prompts. Older versions read `~/.harness/providers.json`, `mcp.json` and `sandbox.json`; the harness warns while they exist, and their contents go under the keys above (`default_model` is now `model`).
 
 ## Web UI
 
@@ -46,15 +68,15 @@ Rerun `cargo install --path .` after pulling changes. While developing, `cargo r
 
 - **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore`, `general-purpose` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results. Each subagent gets a card with its tool calls, status, report and a Stop button, and a background subagent's report starts a turn by itself when the task is idle. Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands and foreground subagents are stopped; background subagents carry on) or delete it (which stops its subagents too). `@path` mentions and `/<skill> args` work as in the REPL.
 - **工具 (Tools)**: every registered tool (built-in, skill, MCP, `agent`) with its description and schema; fill in JSON input and call it directly.
-- **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for `~/.harness/providers.json`, which applies in every directory (`.harness/providers.json` instead when the project has one, or `$HARNESS_PROVIDERS`). A save is validated against the other config files and the environment first, then applied without a restart; idle tasks move to the new config.
+- **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for the settings file. A save is validated with the environment first; the model setup then applies without a restart, and idle tasks move to it (`mcpServers` and `sandbox` changes apply on the next start).
 - **Agents / Skills / MCP**: what was discovered and which MCP servers connected.
 
-The server starts even without a usable provider, so the first model can be configured in the browser. The API can run commands, so it is guarded: every API request needs a token, even on a loopback address (other users of the machine can reach that too), and the startup line prints a URL that carries it (`http://HOST:PORT/#token=...`; the browser remembers it for later tabs); on a loopback address, requests must also use a loopback host name (no DNS rebinding); and state-changing requests need an `X-Harness` header (no cross-site requests). The providers file the UI saves is readable by its owner only.
+The server starts even without a usable provider, so the first model can be configured in the browser. The API can run commands, so it is guarded: every API request needs a token, even on a loopback address (other users of the machine can reach that too), and the startup line prints a URL that carries it (`http://HOST:PORT/#token=...`; the browser remembers it for later tabs); on a loopback address, requests must also use a loopback host name (no DNS rebinding); and state-changing requests need an `X-Harness` header (no cross-site requests). The settings file the UI saves is readable by its owner only.
 
 | Endpoint | |
 |---|---|
-| `GET /api/info` | active providers, the editable config file, agents, skills, MCP status |
-| `POST /api/config` `{text}` | validate, save and apply the providers file |
+| `GET /api/info` | active providers, the settings file, agents, skills, MCP status |
+| `POST /api/config` `{text}` | validate, save and apply the settings file |
 | `GET /api/tools`, `POST /api/tools/{name}` `{input}` | list / call tools |
 | `GET/POST /api/tasks` `{prompt, agent?, model?, title?}` | list / create tasks |
 | `POST /api/tasks/{id}/messages` `{prompt}`, `/model` `{model}`, `/cancel`; `DELETE /api/tasks/{id}` | drive a task |
@@ -63,11 +85,11 @@ The server starts even without a usable provider, so the first model can be conf
 
 ## LLM gateways
 
-Declare gateways in `~/.harness/providers.json` and/or `.harness/providers.json` (the project file wins per provider name). Each one speaks one protocol; models are addressed as `<provider>/<model>`.
+Declare gateways under `providers` in the [settings](#settings). Each one speaks one protocol; models are addressed as `<provider>/<model>`.
 
 ```json
 {
-  "default_model": "relay-a/claude-opus-5",
+  "model": "relay-a/claude-opus-5",
   "subagent_model": "relay-b/gpt-5-mini",
   "providers": {
     "relay-a": {
@@ -94,7 +116,7 @@ Declare gateways in `~/.harness/providers.json` and/or `.harness/providers.json`
 | `protocol` | `anthropic` (`POST {base_url}/v1/messages`) or `openai-responses` (`POST {base_url}/v1/responses`); a `/v1` already in `base_url` is not doubled |
 | `api_key` | sent as `x-api-key` (Anthropic) or `Authorization: Bearer` (OpenAI); override with `"auth": "bearer"` / `"x-api-key"` |
 | `headers` | extra request headers |
-| `max_tokens` | output cap (also per model) |
+| `max_tokens` | output cap: top level, per provider or per model |
 | `effort` | top level or per model: `low`, `medium`, `high` (default), `xhigh` or `max`. Sent as Anthropic `output_config.effort` or OpenAI `reasoning.effort`; `extra_body` still overrides it, e.g. `{"output_config": null}` for a model that takes no effort |
 | `extra_body` | merged into every request body, also per model; a `null` removes a default key, e.g. `{"thinking": null}` for a model without adaptive thinking, or `{"include": null}` for a gateway that rejects encrypted reasoning |
 | `fallbacks`, `eager_input_streaming` | Anthropic-only API features; default on for `api.anthropic.com`, off for gateways |
@@ -104,8 +126,6 @@ Declare gateways in `~/.harness/providers.json` and/or `.harness/providers.json`
 `${VAR}` / `${VAR:-default}` expand from the environment in `base_url`, `api_key` and `headers`. A spec without a known provider prefix is a model on the current provider, so gateway model names containing `/` (such as `openai/gpt-5`) also work.
 
 Switch models mid-conversation with `/model <provider>/<model>`; `/model` alone lists providers and models. `/effort <level>` changes the effort for the rest of the session (kept across `/model`), and `/effort auto` goes back to the configured one. The history is kept in Anthropic form and converted for OpenAI (`function_call` / `function_call_output`, `input_image`, `input_file`); requests are stateless (`store: false`), with reasoning items replayed from their encrypted content. Model-bound blocks (Anthropic thinking, OpenAI reasoning) are only sent back to the model that produced them. Subagents can use a different gateway through `subagent_model` or an agent's `model`.
-
-Note: a project-level `.harness/providers.json` (like `.mcp.json`) is trusted as-is, so only run the harness in repositories you trust.
 
 ## Attaching files with `@`
 
@@ -163,7 +183,7 @@ They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r
 
 ## Sandbox
 
-`harness --sandbox` (or `HARNESS_SANDBOX=1`, or `"enabled": true` in `~/.harness/sandbox.json`) runs the model's `bash` commands and `grep` searches in an OS sandbox: Seatbelt (`sandbox-exec`, built in) on macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux (`apt install bubblewrap` / `dnf install bubblewrap`; it needs unprivileged user namespaces, which some containers lack). `--no-sandbox` or `HARNESS_SANDBOX=0` turns it off for one run. If the sandbox cannot start, the harness exits rather than run without it.
+`harness --sandbox` (or `HARNESS_SANDBOX=1`, or `"enabled": true` in the settings' `sandbox` section) runs the model's `bash` commands and `grep` searches in an OS sandbox: Seatbelt (`sandbox-exec`, built in) on macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux (`apt install bubblewrap` / `dnf install bubblewrap`; it needs unprivileged user namespaces, which some containers lack). `--no-sandbox` or `HARNESS_SANDBOX=0` turns it off for one run. If the sandbox cannot start, the harness exits rather than run without it.
 
 - **Reads**: everything except `deny_read`.
 - **Writes**: only the working directory, the temp directories (`/tmp`, `/var/tmp`, `$TMPDIR`, and on macOS the per-user temp and cache directories) and `allow_write`. In the working directory, `.harness/`, `.claude/`, `.mcp.json` and, in a git repository, `.git/hooks/` and `.git/config` stay read-only, because they make code run outside the sandbox later (MCP servers, hooks, `core.fsmonitor`); `.git` itself cannot be renamed or removed.
@@ -174,18 +194,20 @@ The `read` and `write` tools check the same rules. `/sandbox` shows them, the RE
 
 ```json
 {
-  "enabled": true,
-  "network": false,
-  "allow_write": ["~/.cargo/registry", "~/.npm"],
-  "deny_read": ["~/.ssh", "~/.aws", ".env"]
+  "sandbox": {
+    "enabled": true,
+    "network": false,
+    "allow_write": ["~/.cargo/registry", "~/.npm"],
+    "deny_read": ["~/.ssh", "~/.aws", ".env"]
+  }
 }
 ```
 
-Paths take `~/` and `${VAR}`; relative ones are relative to the working directory. Where rules overlap the deeper path wins, so `"deny_read": ["~"]` hides the home directory while a working directory inside it stays usable. The config is only read from the home directory, so a repository cannot switch the sandbox off. When git's metadata is outside the working directory (a worktree, or a subdirectory of the repository), commits need its path in `allow_write`. On Linux, a protected path that does not exist yet is covered by an empty stand-in while commands run, removed once none is running.
+Paths take `~/` and `${VAR}`; relative ones are relative to the working directory. Where rules overlap the deeper path wins, so `"deny_read": ["~"]` hides the home directory while a working directory inside it stays usable. The config comes only from your settings file, so a repository cannot switch the sandbox off. When git's metadata is outside the working directory (a worktree, or a subdirectory of the repository), commits need its path in `allow_write`. On Linux, a protected path that does not exist yet is covered by an empty stand-in while commands run, removed once none is running.
 
 ## MCP servers
 
-Declare servers in `.mcp.json` (project) and/or `~/.harness/mcp.json` (user), using the same shape as Claude Code; the project file wins on name clashes. `HARNESS_MCP_CONFIG=path` uses that single file instead.
+Declare servers under `mcpServers` in the [settings](#settings), in the same shape as Claude Code's `.mcp.json`. A project's `.mcp.json` is not read; copy the servers you want into your settings.
 
 ```json
 {
@@ -254,12 +276,13 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 
 ## Layout
 
-- `src/main.rs` — startup: config, tools, skills, MCP servers, agents; then the CLI or web frontend
+- `src/main.rs` — startup: settings, tools, skills, MCP servers, agents; then the CLI or web frontend
+- `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section
 - `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with menu keys, completion, multi-line input and waking the prompt for a subagent's report (`repl.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
 - `src/llm/` — LLM gateways
-  - `config.rs` — `providers.json`, model spec resolution, per-provider/model settings
+  - `config.rs` — providers from the settings and environment, model spec resolution, per-provider/model settings
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST with retries, SSE reader
@@ -268,7 +291,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 - `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read` and `write` check
 - `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
 - `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox
-- `src/mcp.rs` — MCP client: config loading, server connections, `mcp__*` tool adapters
+- `src/mcp.rs` — MCP client: server configs, connections, `mcp__*` tool adapters
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/write state)
   - `bash.rs` — run a command via `bash -c` (timeout, output truncation)

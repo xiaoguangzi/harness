@@ -82,10 +82,10 @@ impl Mock {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let config = file(json!({"default_model": "mock/main", "providers": {
+        let config = file(json!({"model": "mock/main", "providers": {
             "mock": {"protocol": "anthropic", "base_url": url, "api_key": "fixture-only"}
         }}));
-        let client = Client::new(Providers::from_parts(vec![config], &no_env).unwrap()).unwrap();
+        let client = Client::new(Providers::from_parts(&config, &no_env).unwrap()).unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self { client, requests, server }
     }

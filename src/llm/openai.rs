@@ -339,11 +339,11 @@ mod tests {
 
     fn providers() -> Providers {
         Providers::from_parts(
-            vec![file(json!({
-                "default_model": "gw/gpt-5",
+            &file(json!({
+                "model": "gw/gpt-5",
                 "providers": {"gw": {"protocol": "openai-responses", "base_url": "https://gw.example.com/v1", "api_key": "k",
                     "extra_body": {"include": null, "reasoning": {"effort": "high"}}}}
-            }))],
+            })),
             &no_env,
         )
         .unwrap()

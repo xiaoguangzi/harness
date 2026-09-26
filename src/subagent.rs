@@ -500,10 +500,10 @@ mod tests {
 
     fn client() -> Client {
         let file = file(json!({
-            "default_model": "gw/main-model",
+            "model": "gw/main-model",
             "providers": {"gw": {"protocol": "anthropic", "base_url": "http://127.0.0.1:9", "api_key": "test"}}
         }));
-        Client::new(Providers::from_parts(vec![file], &no_env).unwrap()).unwrap()
+        Client::new(Providers::from_parts(&file, &no_env).unwrap()).unwrap()
     }
 
     fn agent_tool(defs: Vec<AgentDef>) -> AgentTool {

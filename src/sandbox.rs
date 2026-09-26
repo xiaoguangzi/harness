@@ -1,7 +1,7 @@
 //! OS sandbox for the commands the model runs.
 //!
 //! When enabled (`--sandbox`, `HARNESS_SANDBOX=1` or `"enabled": true` in
-//! `~/.harness/sandbox.json`), `bash` commands and `grep` searches run in
+//! the settings file's `sandbox` section), `bash` commands and `grep` searches run in
 //! Seatbelt (`sandbox-exec`) on macOS or bubblewrap (`bwrap`) on Linux:
 //!
 //! - everything is readable except the `deny_read` paths;
@@ -11,7 +11,8 @@
 //! - the network is limited to loopback unless `network` is true.
 //!
 //! The `read` and `write` tools check the same rules themselves. The config
-//! is only read from the home directory, so a repository cannot loosen it.
+//! comes only from the user's settings file (`settings.rs`), so a repository
+//! cannot loosen it.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -40,8 +41,8 @@ const SEATBELT_LOOPBACK: &str = r#"(deny network*)
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct Config {
-    enabled: Option<bool>,
+pub struct Config {
+    pub enabled: Option<bool>,
     #[serde(default)]
     network: bool,
     #[serde(default)]
@@ -133,7 +134,7 @@ pub fn parse_flag(args: Vec<String>) -> (Option<bool>, Vec<String>) {
 
 /// Turns the sandbox on if the flag, else `HARNESS_SANDBOX`, else the
 /// config says so, and checks that it works here.
-pub async fn init(flag: Option<bool>) -> Result<Option<&'static Sandbox>> {
+pub async fn init(flag: Option<bool>, config: &Config) -> Result<Option<&'static Sandbox>> {
     let env = std::env::var("HARNESS_SANDBOX").ok().filter(|v| !v.is_empty());
     let from_env = match env.as_deref() {
         None => None,
@@ -145,25 +146,13 @@ pub async fn init(flag: Option<bool>) -> Result<Option<&'static Sandbox>> {
         return Ok(None);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let config = match &home {
-        Some(home) => load_config(&home.join(".harness/sandbox.json"))?,
-        None => Config::default(),
-    };
     if !flag.or(from_env).or(config.enabled).unwrap_or(false) {
         return Ok(None);
     }
     let cwd = std::env::current_dir().context("finding the working directory")?;
-    let sandbox = Sandbox::new(Backend::native()?, &cwd, home.as_deref(), &config);
+    let sandbox = Sandbox::new(Backend::native()?, &cwd, home.as_deref(), config);
     sandbox.probe().await?;
     Ok(Some(ACTIVE.get_or_init(|| sandbox)))
-}
-
-fn load_config(path: &Path) -> Result<Config> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
 }
 
 impl Sandbox {
@@ -417,7 +406,7 @@ impl Sandbox {
             "`bash` and `grep` run in an OS sandbox, and `read` and `write` follow the same rules ({}). \
              When something fails because of it (\"Operation not permitted\", \"Read-only file system\", \
              a network error), tell the user instead of working around it; they can loosen it in \
-             ~/.harness/sandbox.json.",
+             the `sandbox` section of ~/.harness/settings.json.",
             items.join("; ")
         )
     }
@@ -607,7 +596,7 @@ mod tests {
         let s = sandbox(Backend::Seatbelt, &cwd, "{}");
         assert_eq!(s.check_write(&cwd.join("src/main.rs")), Ok(()));
         assert_eq!(s.check_write(&cwd.join(".git/objects/ab")), Ok(()));
-        for path in [".harness/sandbox.json", ".mcp.json", ".claude/settings.json", ".git/hooks/pre-commit", ".git/config"] {
+        for path in [".harness/settings.json", ".mcp.json", ".claude/settings.json", ".git/hooks/pre-commit", ".git/config"] {
             let err = s.check_write(&cwd.join(path)).unwrap_err();
             assert!(err.contains("read-only"), "{path}: {err}");
         }

@@ -559,7 +559,7 @@ fn print_tools(agent: &Agent) {
 
 fn print_sandbox() {
     let Some(sandbox) = crate::sandbox::active() else {
-        println!("the sandbox is off; start with --sandbox, HARNESS_SANDBOX=1 or \"enabled\": true in ~/.harness/sandbox.json");
+        println!("the sandbox is off; start with --sandbox, HARNESS_SANDBOX=1 or \"sandbox\": {{\"enabled\": true}} in ~/.harness/settings.json");
         return;
     };
     for (label, value) in sandbox.describe() {
@@ -637,7 +637,7 @@ fn print_tasks(subagents: &[Value]) {
 
 fn print_mcp(mcp: &mcp::Manager) {
     if mcp.statuses.is_empty() {
-        println!("no MCP servers configured (.mcp.json, ~/.harness/mcp.json or HARNESS_MCP_CONFIG)");
+        println!("no MCP servers configured (`mcpServers` in ~/.harness/settings.json)");
     }
     for status in &mcp.statuses {
         match &status.outcome {

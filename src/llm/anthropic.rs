@@ -270,11 +270,11 @@ mod tests {
     #[test]
     fn builds_body_per_provider_and_filters_foreign_blocks() {
         let p = Providers::from_parts(
-            vec![file(json!({
-                "default_model": "gw/claude-sonnet-4-5",
+            &file(json!({
+                "model": "gw/claude-sonnet-4-5",
                 "providers": {"gw": {"protocol": "anthropic", "base_url": "https://gw.example.com", "api_key": "k",
                     "models": {"claude-sonnet-4-5": {"extra_body": {"thinking": null}}}}}
-            }))],
+            })),
             &no_env,
         )
         .unwrap();

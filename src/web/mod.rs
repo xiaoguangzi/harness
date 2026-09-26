@@ -30,9 +30,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::Agent;
-use crate::llm::config::editable_path;
 use crate::llm::{Client, Providers};
 use crate::mentions;
+use crate::settings::{self, Settings};
 use crate::skills::Skill;
 use crate::subagent::{AgentDef, AgentTool, MessageAgentTool, Reporter, StopAgentTool};
 use crate::tools::{FileTracker, ReadTool, ToolRegistry, WriteTool};
@@ -302,8 +302,8 @@ fn providers_json(providers: &Providers) -> Value {
 }
 
 async fn info(State(state): State<Shared>) -> Json<Value> {
-    let path = editable_path();
-    let text = std::fs::read_to_string(&path).ok();
+    let path = settings::path();
+    let text = path.and_then(|p| std::fs::read_to_string(p).ok());
     let live = state.live.read().unwrap();
     let agents: Vec<Value> = state
         .agent_defs
@@ -327,7 +327,7 @@ async fn info(State(state): State<Shared>) -> Json<Value> {
     Json(json!({
         "cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
         "config": {
-            "path": std::path::absolute(&path).unwrap_or(path).display().to_string(),
+            "path": path.map(|p| std::path::absolute(p).unwrap_or(p.into()).display().to_string()),
             "text": text,
             "error": live.model.as_ref().err(),
             "active": live.model.as_ref().ok().map(|(c, _)| providers_json(c.providers())),
@@ -343,16 +343,18 @@ struct SaveConfig {
     text: String,
 }
 
-/// Validates the edited providers file against the other config files and
-/// the environment, saves it and switches to the new providers.
+/// Validates the edited settings file with the environment, saves it and
+/// switches to the new providers. MCP servers and the sandbox are set up at
+/// startup, so changes to those apply on the next start.
 async fn save_config(State(state): State<Shared>, Json(req): Json<SaveConfig>) -> ApiResult<Json<Value>> {
-    let path = editable_path();
-    let providers =
-        Providers::load_with(Some((&path, &req.text))).map_err(|e| bad_request(format!("{e:#}")))?;
+    let path = settings::path().ok_or_else(|| bad_request("no settings file: HOME is not set"))?;
+    let providers = Settings::parse(&req.text)
+        .and_then(|s| Providers::from_settings(&s))
+        .map_err(|e| bad_request(format!("{e:#}")))?;
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| bad_request(format!("creating {}: {e}", dir.display())))?;
     }
-    write_private(&path, &req.text).map_err(|e| bad_request(format!("writing {}: {e}", path.display())))?;
+    write_private(path, &req.text).map_err(|e| bad_request(format!("writing {}: {e}", path.display())))?;
 
     let live = build_live(&state.base_tools, &state.agent_defs, &state.reporter, Ok(providers));
     // Idle tasks move to the new providers, keeping their model if it still
@@ -660,7 +662,7 @@ mod tests {
     fn private_config_file() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("providers.json");
+        let path = dir.path().join("settings.json");
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         write_private(&path, "{}").unwrap();
         assert_eq!(mode(&path), 0o600);

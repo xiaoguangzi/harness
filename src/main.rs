@@ -6,6 +6,7 @@ mod mentions;
 mod prompt;
 mod sandbox;
 mod session;
+mod settings;
 mod skills;
 mod subagent;
 mod tools;
@@ -20,6 +21,7 @@ use serde_json::Value;
 
 use agent::Agent;
 use llm::{Client, Providers};
+use settings::Settings;
 use skills::SkillTool;
 use subagent::AgentTool;
 use tools::{FileTracker, ToolRegistry};
@@ -35,10 +37,11 @@ Options:
       --web[=ADDR]    Start the web UI instead (default 127.0.0.1:8787)
       --sandbox       Run the model's commands in an OS sandbox
       --no-sandbox    Turn the sandbox off even if configured
+      --settings FILE Read settings from FILE instead
   -h, --help          Print this help
   -V, --version       Print the version
 
-Providers: ~/.harness/providers.json, overridden by ./.harness/providers.json
+Settings: ~/.harness/settings.json (or $HARNESS_SETTINGS)
 ";
 
 #[tokio::main]
@@ -52,12 +55,18 @@ async fn main() -> Result<ExitCode> {
         println!("harness {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
+    let (settings_path, args) = settings::parse_flag(args)?;
+    settings::set_path(settings_path);
+    let settings = Settings::load()?;
+    for file in settings::legacy_files() {
+        eprintln!("\x1b[33m{} is no longer read; move its settings into ~/.harness/settings.json\x1b[0m", file.display());
+    }
     let (sandbox_flag, args) = sandbox::parse_flag(args);
-    sandbox::init(sandbox_flag).await?;
+    sandbox::init(sandbox_flag, &settings.sandbox).await?;
     let web_addr = web::parse_flag(&args)?;
-    // The web UI can fix a missing or broken providers config, so it starts
+    // The web UI can fix a missing or broken provider setup, so it starts
     // without one.
-    let providers = match Providers::load() {
+    let providers = match Providers::from_settings(&settings) {
         Err(e) if web_addr.is_none() => return Err(e),
         loaded => loaded,
     };
@@ -73,11 +82,7 @@ async fn main() -> Result<ExitCode> {
         registry.register(SkillTool::new(skills.clone()));
     }
 
-    let mcp_configs = mcp::load_config().unwrap_or_else(|e| {
-        eprintln!("\x1b[33mMCP config ignored: {e:#}\x1b[0m");
-        Default::default()
-    });
-    let mcp = mcp::Manager::start(&mcp_configs, &mut registry).await;
+    let mcp = mcp::Manager::start(&settings.mcp_servers, &mut registry).await;
     for status in &mcp.statuses {
         if let Err(e) = &status.outcome {
             eprintln!("\x1b[33mMCP server `{}` failed: {e}\x1b[0m", status.name);

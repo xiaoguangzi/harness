@@ -370,10 +370,10 @@ mod tests {
 
     fn agent(messages: Vec<Message>) -> Agent {
         let file = file(json!({
-            "default_model": "gw/m",
+            "model": "gw/m",
             "providers": {"gw": {"protocol": "anthropic", "base_url": "http://127.0.0.1:9", "api_key": "k"}}
         }));
-        let client = Client::new(Providers::from_parts(vec![file], &no_env).unwrap()).unwrap();
+        let client = Client::new(Providers::from_parts(&file, &no_env).unwrap()).unwrap();
         let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
         agent.messages = messages;
         agent

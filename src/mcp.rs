@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) client support.
 //!
-//! Servers are declared in a JSON file using the same `mcpServers` shape as
-//! Claude Code's `.mcp.json`:
+//! Servers are declared under `mcpServers` in the settings file
+//! (`settings.rs`), in the same shape as Claude Code's `.mcp.json`:
 //!
 //! ```json
 //! {
@@ -18,7 +18,7 @@
 //! environment.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,12 +41,6 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_OUTPUT_BYTES: usize = 100_000;
 /// Anthropic tool names must match `^[a-zA-Z0-9_-]{1,64}$`.
 const MAX_TOOL_NAME: usize = 64;
-
-#[derive(Debug, Deserialize, Default)]
-struct ConfigFile {
-    #[serde(rename = "mcpServers", default)]
-    mcp_servers: BTreeMap<String, ServerConfig>,
-}
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -86,34 +80,6 @@ impl ServerConfig {
             other => bail!("unsupported MCP transport type `{other}` (use `stdio` or `http`)"),
         }
     }
-}
-
-/// Loads server configs. `HARNESS_MCP_CONFIG` names a single file;
-/// otherwise `~/.harness/mcp.json` and then `./.mcp.json` are merged, with
-/// the project file winning on name clashes.
-pub fn load_config() -> Result<BTreeMap<String, ServerConfig>> {
-    let files: Vec<PathBuf> = match std::env::var_os("HARNESS_MCP_CONFIG") {
-        Some(p) => vec![PathBuf::from(p)],
-        None => {
-            let mut v = Vec::new();
-            if let Some(home) = std::env::var_os("HOME") {
-                v.push(Path::new(&home).join(".harness/mcp.json"));
-            }
-            v.push(PathBuf::from(".mcp.json"));
-            v
-        }
-    };
-    let mut servers = BTreeMap::new();
-    for file in files {
-        if !file.exists() {
-            continue;
-        }
-        let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
-        let parsed: ConfigFile =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
-        servers.extend(parsed.mcp_servers);
-    }
-    Ok(servers)
 }
 
 /// A live connection to one MCP server.
@@ -355,7 +321,7 @@ mod tests {
 
     #[test]
     fn parses_config_and_infers_transport() {
-        let parsed: ConfigFile = serde_json::from_value(json!({"mcpServers": {
+        let parsed: crate::settings::Settings = serde_json::from_value(json!({"mcpServers": {
             "local": {"command": "srv", "args": ["--x"], "env": {"K": "V"}},
             "remote": {"url": "https://example.com/mcp", "headers": {"X-Key": "k"}}
         }}))

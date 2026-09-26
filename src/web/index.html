@@ -650,7 +650,7 @@ function showTool(t) {
 }
 
 // ---------------------------------------------------------------- models
-let cfg = {};          // the edited providers file
+let cfg = {};          // the edited settings file
 let cfgMode = "form";  // or "json"
 let cfgText = "";
 
@@ -678,9 +678,9 @@ function renderModels() {
   const save = h("button", { class: "btn primary" }, "保存并生效");
   save.addEventListener("click", saveConfig);
   const editor = h("div", { class: "card" },
-    h("div", { style: "display:flex;align-items:center;gap:12px" }, h("h2", { style: "margin:0;flex:1" }, "编辑 providers.json"),
+    h("div", { style: "display:flex;align-items:center;gap:12px" }, h("h2", { style: "margin:0;flex:1" }, "编辑 settings.json"),
       h("span", { class: "muted mono" }, info.config.path)),
-    h("p", { class: "note", style: "margin-top:6px" }, "保存前会校验整套配置（含 ~/.harness/providers.json 和环境变量），通过后写入文件并立即生效；空闲任务会切换到新配置。api_key 可写 ${ENV_VAR} 引用环境变量。"),
+    h("p", { class: "note", style: "margin-top:6px" }, "保存前会结合环境变量校验配置，通过后写入文件，模型配置立即生效，空闲任务会切换到新配置；mcpServers 和 sandbox 的修改重启后生效。api_key 可写 ${ENV_VAR} 引用环境变量。"),
     h("div", { class: "tabs2" },
       h("button", { class: "btn" + (cfgMode === "form" ? " active" : ""), onclick: () => switchCfgMode("form") }, "表单"),
       h("button", { class: "btn" + (cfgMode === "json" ? " active" : ""), onclick: () => switchCfgMode("json") }, "JSON")),
@@ -712,8 +712,8 @@ function cfgForm() {
   const allModels = Object.entries(providers).flatMap(([n, p]) => Object.keys(p.models || {}).map(m => n + "/" + m));
   const dl = h("datalist", { id: "dl-cfg-models" }, allModels.map(m => h("option", { value: m })));
   const top = h("div", { class: "grid2" },
-    h("div", {}, h("label", {}, "default_model（默认模型，provider/model）"),
-      h("input", { list: "dl-cfg-models", value: cfg.default_model || "", oninput: e => setOrDelete(cfg, "default_model", e.target.value.trim()) })),
+    h("div", {}, h("label", {}, "model（默认模型，provider/model）"),
+      h("input", { list: "dl-cfg-models", value: cfg.model || "", oninput: e => setOrDelete(cfg, "model", e.target.value.trim()) })),
     h("div", {}, h("label", {}, "subagent_model（子 agent 默认模型，可空）"),
       h("input", { list: "dl-cfg-models", value: cfg.subagent_model || "", oninput: e => setOrDelete(cfg, "subagent_model", e.target.value.trim()) })),
     h("div", {}, h("label", {}, "effort（推理强度，默认 high；也可按模型设置）"),
@@ -746,7 +746,7 @@ function providerCard(name) {
     if (cfg.providers[n]) { toast("已有同名 provider", true); e.target.value = name; return; }
     // Rebuild to keep the order.
     cfg.providers = Object.fromEntries(Object.entries(cfg.providers).map(([k, v]) => [k === name ? n : k, v]));
-    for (const key of ["default_model", "subagent_model"])
+    for (const key of ["model", "subagent_model"])
       if (cfg[key] && cfg[key].startsWith(name + "/")) cfg[key] = n + cfg[key].slice(name.length);
     renderModels();
   };
@@ -803,7 +803,7 @@ async function showEnvPage() {
       info.mcp.length ? h("table", {}, h("tr", {}, h("th", {}, "服务器"), h("th", {}, "状态 / 工具")),
         info.mcp.map(m => h("tr", {}, h("td", { class: "mono" }, m.name),
           h("td", {}, m.error ? h("span", { style: "color:var(--err)" }, m.error) : h("span", { class: "mono" }, m.tools.join(", ") || "(无工具)")))))
-        : h("p", { class: "note" }, "未配置 MCP 服务器（.mcp.json 或 ~/.harness/mcp.json）")));
+        : h("p", { class: "note" }, "未配置 MCP 服务器（~/.harness/settings.json 的 mcpServers）")));
 }
 
 // ---------------------------------------------------------------- start
