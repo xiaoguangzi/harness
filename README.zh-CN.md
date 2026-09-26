@@ -8,6 +8,7 @@
 
 - Rust 1.88+
 - `PATH` 上需要有 [ugrep](https://github.com/Genivia/ugrep)，供 `grep` 工具使用（`apt install ugrep` / `brew install ugrep`）
+- Linux 上[粘贴图片](#粘贴图片)需要 `wl-paste`（[wl-clipboard](https://github.com/bugaevc/wl-clipboard)，Wayland）或 `xclip`（X11）；macOS 无需额外安装
 
 ## 用法
 
@@ -143,6 +144,12 @@ harness --help                          # 查看全部选项
 
 提及可以出现在句中且无需空格（`看看@src/main.rs的代码`）；尾部标点会被忽略。只有真实存在的路径才会被附加，紧跟在电子邮件风格字符之后的 `@` 会被原样保留，因此 `me@example.com` 仍是普通文本。在 REPL 中，输入 `@` 会在提示符下方打开文件菜单：先列出当前目录，然后随输入搜索项目文件（git 仓库中是 `git ls-files` 的输出，仓库外则遍历目录），最佳匹配优先（路径前缀、文件名、子串，然后模糊匹配）。↑/↓ 选择，Tab 或 Enter 填入路径，目录会保持打开以列出其中条目。被 git 忽略的条目默认隐藏，除非你输入到该目录里（`@target/`）。附加的文本文件会计入已读，满足 `write` 工具的要求。REPL 还会在 `~/.harness/history` 中保存行编辑历史。
 
+### 粘贴图片
+
+在 REPL 中，Ctrl+V 粘贴剪贴板里的图片，例如截图。macOS 上同样是 Ctrl+V，因为 Cmd+V 归终端所有，而终端只会粘贴文本。图片在提示符中显示为 `[Image #1]`，只要这个占位符还在消息里，图片就会随消息发送，删掉占位符即不发送该图片。编号在整个会话中延续，因此之后的消息可以回头引用 `[Image #1]`。在 Finder 或文件管理器中复制的文件会粘贴为指向其路径的 `@` 提及；剪贴板中没有图片时，提示符下方会给出说明。
+
+macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均可）。长边超过 2576 像素的图片会缩小到该尺寸，反正 API 也会缩小；缩小后仍超过 3.75 MB（base64 后 5 MB，即 API 的上限）的图片以 JPEG 发送。Linux 上由 `wl-paste` 或 `xclip` 原样提供 PNG、JPEG、GIF 或 WebP 图片，上限相同。
+
 ## REPL
 
 助手的 Markdown 在流式输出时即时渲染（逐行；表格在完整后对齐）。工具调用显示为 `● bash(cargo test)` 并带有结果的前几行，前台子代理的调用列在其 `agent` 调用之下，后台子代理结束时显示一行，并有旋转指示器显示正在运行的内容。每轮结束时显示耗时、输出 token 数和上下文大小。当 stdout 不是终端（或设置了 `NO_COLOR`）时，文本按原样输出，没有样式和摘要；一次性模式下错误输出到 stderr，退出码非零。
@@ -168,6 +175,7 @@ harness --help                          # 查看全部选项
 | 行尾 `\`、Alt+Enter | 在新行继续这条消息 |
 | `/` | 在提示符下方打开命令菜单；随输入收窄，↑/↓ 选择，Tab 填入，Enter 运行。`/model ` 之后会列出模型 |
 | `@` | 打开文件菜单（见[用 `@` 附加文件](#用--附加文件)） |
+| Ctrl+V | 粘贴剪贴板中的图片（见[粘贴图片](#粘贴图片)） |
 
 ## 恢复会话
 
@@ -279,7 +287,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 
 - `src/main.rs` — 启动：配置、工具、技能、MCP 服务器、代理；然后进入 CLI 或 web 前端
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分
-- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、旋转指示器与轮次显示（`output.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、带菜单按键、补全、多行输入以及为子代理报告唤醒提示符的 rustyline 辅助（`repl.rs`）
+- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、旋转指示器与轮次显示（`output.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、带菜单按键、补全、多行输入、Ctrl+V 粘贴以及为子代理报告唤醒提示符的 rustyline 辅助（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
 - `src/llm/` — LLM 网关
@@ -288,7 +296,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
   - `http.rs` — 带重试的 POST、SSE 读取器
 - `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
-- `src/mentions.rs` — `@路径` 的解析与展开为附件块
+- `src/mentions.rs` — `@路径` 的解析与展开为附件块；粘贴图片的附件块
 - `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read` 和 `write` 检查的路径规则
 - `src/subagent.rs` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具
 - `src/subagent/runtime.rs` — 一个会话的子代理：前台与后台运行、后续追问、停止、向主代理收件箱报告

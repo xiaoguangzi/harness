@@ -1,15 +1,16 @@
 //! Line editing for the REPL: history, a menu under the prompt (commands
 //! while a `/command` is typed, files while an `@path` is), Tab completion,
-//! and multi-line input (a line ending in `\` continues).
+//! multi-line input (a line ending in `\` continues) and pasting images with
+//! Ctrl+V.
 //!
 //! The menu is drawn as a multi-line hint. Up/Down move its selection and
 //! Tab fills it in; Enter runs a command, or fills in a file. A choice is
 //! typed through the completer, which puts the cursor after it.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -20,9 +21,11 @@ use rustyline::{
     Modifiers, RepeatCount,
 };
 
+use super::clipboard::{self, Clip, Image};
 use super::menu::{Command, Kind, Menu, list_dir, mention_at_end};
 use super::text;
 use crate::agent::Inbox;
+use crate::mentions;
 
 /// Lets a background subagent's report start a turn while the prompt waits
 /// for input. The line editor can't be told to stop reading, so this sends
@@ -100,6 +103,7 @@ impl Hint for MenuHint {
 #[derive(Helper)]
 pub struct ReplHelper {
     menu: Arc<Menu>,
+    pasted: Arc<Mutex<Pasted>>,
     /// Command names, for Tab completion when the menu is not shown.
     names: Vec<String>,
     styled: bool,
@@ -109,21 +113,31 @@ pub struct ReplHelper {
 impl ReplHelper {
     pub fn new(commands: Vec<Command>, styled: bool, wake: Option<Arc<Wake>>) -> Self {
         let names = commands.iter().map(|c| c.name.clone()).collect();
-        Self { menu: Arc::new(Menu::new(commands, ".")), names, styled, wake }
+        Self { menu: Arc::new(Menu::new(commands, ".")), pasted: Arc::default(), names, styled, wake }
     }
 
-    /// Binds the keys that drive the menu.
+    /// Binds the keys that drive the menu, and Ctrl+V.
     pub fn bind_keys<H: Helper, I: rustyline::history::History>(&self, editor: &mut Editor<H, I>) {
         let keys = [(KeyCode::Up, MenuKey::Up), (KeyCode::Down, MenuKey::Down), (KeyCode::Tab, MenuKey::Tab), (KeyCode::Enter, MenuKey::Enter)];
         for (code, key) in keys {
             let handler = MenuKeyHandler { menu: self.menu.clone(), key };
             editor.bind_sequence(KeyEvent(code, Modifiers::NONE), EventHandler::Conditional(Box::new(handler)));
         }
+        let paste = PasteHandler { pasted: self.pasted.clone() };
+        editor.bind_sequence(KeyEvent::ctrl('V'), EventHandler::Conditional(Box::new(paste)));
     }
 
-    /// Call before reading a line: files are searched afresh.
-    pub fn new_line(&self) {
+    /// Call before reading a line: files are searched afresh, and images
+    /// pasted into it are numbered after `last_image`, the conversation's
+    /// last.
+    pub fn new_line(&self, last_image: usize) {
         self.menu.forget_files();
+        *self.pasted.lock().unwrap() = Pasted { last: last_image, ..Pasted::default() };
+    }
+
+    /// The images pasted into the last line read, by number.
+    pub fn take_images(&self) -> Vec<(usize, Image)> {
+        std::mem::take(&mut self.pasted.lock().unwrap().images)
     }
 
     /// The command Enter picked from the menu for the last line read.
@@ -182,6 +196,74 @@ impl ConditionalEventHandler for MenuKeyHandler {
     }
 }
 
+/// Images pasted into the line being edited. Each shows in it as
+/// `[Image #n]`, numbered on from the conversation's, so the model can tell
+/// them apart from earlier ones.
+#[derive(Default)]
+struct Pasted {
+    images: Vec<(usize, Image)>,
+    last: usize,
+    /// Why Ctrl+V pasted nothing, shown under the line until it changes:
+    /// (the line, the hint).
+    notice: Option<(String, String)>,
+}
+
+struct PasteHandler {
+    pasted: Arc<Mutex<Pasted>>,
+}
+
+impl ConditionalEventHandler for PasteHandler {
+    /// Types a placeholder for the clipboard's image, or `@` mentions of the
+    /// files copied; otherwise says why nothing was pasted.
+    fn handle(&self, _evt: &Event, _n: RepeatCount, _positive: bool, ctx: &EventContext) -> Option<Cmd> {
+        let clip = clipboard::read();
+        let mut pasted = self.pasted.lock().unwrap();
+        let text = match clip {
+            Ok(Some(Clip::Image(image))) => {
+                pasted.last += 1;
+                let n = pasted.last;
+                pasted.images.push((n, image));
+                mentions::image_placeholder(n)
+            }
+            Ok(Some(Clip::Files(paths))) => file_mentions(&paths, &std::env::current_dir().unwrap_or_default()),
+            Ok(None) => {
+                let key = if cfg!(target_os = "macos") { "Cmd+V" } else { "Ctrl+Shift+V" };
+                pasted.notice = Some((ctx.line().to_string(), format!("\n  no image in the clipboard (text pastes with {key})")));
+                return Some(Cmd::Repaint);
+            }
+            Err(e) => {
+                pasted.notice = Some((ctx.line().to_string(), format!("\n  ! {e}")));
+                return Some(Cmd::Repaint);
+            }
+        };
+        Some(Cmd::Insert(1, spaced(ctx.line(), ctx.pos(), &text)))
+    }
+}
+
+/// `@` mentions of `paths`, relative to `cwd` when inside it.
+fn file_mentions(paths: &[PathBuf], cwd: &Path) -> String {
+    let mentions: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            let path = match path.strip_prefix(cwd) {
+                Ok(rel) if rel.as_os_str().is_empty() => ".".into(),
+                Ok(rel) => rel.to_string_lossy(),
+                Err(_) => path.to_string_lossy(),
+            };
+            if path.contains(char::is_whitespace) { format!("@\"{path}\"") } else { format!("@{path}") }
+        })
+        .collect();
+    mentions.join(" ")
+}
+
+/// `text` to insert at byte `pos` of `line`, set off from the words around
+/// it by spaces.
+fn spaced(line: &str, pos: usize, text: &str) -> String {
+    let before = line[..pos].chars().next_back().is_some_and(|c| !c.is_whitespace());
+    let after = !line[pos..].starts_with(char::is_whitespace);
+    format!("{}{text}{}", if before { " " } else { "" }, if after { " " } else { "" })
+}
+
 /// What choosing `path` types: a directory stays open for its entries, a
 /// file is finished with a space, and a path with spaces is quoted.
 fn file_text(path: &str) -> String {
@@ -202,6 +284,14 @@ impl Hinter for ReplHelper {
         if let Some(wake) = &self.wake {
             wake.edited(line);
         }
+        {
+            let mut pasted = self.pasted.lock().unwrap();
+            match &pasted.notice {
+                Some((shown_for, hint)) if shown_for == line => return Some(MenuHint(hint.clone())),
+                Some(_) => pasted.notice = None,
+                None => {}
+            }
+        }
         if pos < line.len() {
             return None;
         }
@@ -216,10 +306,14 @@ impl Highlighter for ReplHelper {
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        match self.menu.styled(hint) {
-            Some(styled) if self.styled => Cow::Owned(styled),
-            _ => Cow::Borrowed(hint),
+        if !self.styled {
+            return Cow::Borrowed(hint);
         }
+        if let Some(styled) = self.menu.styled(hint) {
+            return Cow::Owned(styled);
+        }
+        let notice = self.pasted.lock().unwrap().notice.as_ref().is_some_and(|(_, shown)| shown == hint);
+        if notice { Cow::Owned(format!("\x1b[33m{hint}\x1b[0m")) } else { Cow::Borrowed(hint) }
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
@@ -314,6 +408,22 @@ mod tests {
     fn joins_continued_lines() {
         assert_eq!(join_continuations("a\\\nb\\\nc"), "a\nb\nc");
         assert_eq!(join_continuations("C:\\dir"), "C:\\dir");
+    }
+
+    #[test]
+    fn pasted_text_is_set_off_by_spaces() {
+        assert_eq!(spaced("", 0, "[Image #1]"), "[Image #1] ");
+        assert_eq!(spaced("look at", 7, "[Image #1]"), " [Image #1] ");
+        assert_eq!(spaced("look at ", 8, "[Image #1]"), "[Image #1] ");
+        assert_eq!(spaced("a b", 1, "x"), " x");
+        assert_eq!(spaced("看看", "看".len(), "x"), " x ");
+    }
+
+    #[test]
+    fn copied_files_become_mentions() {
+        let cwd = Path::new("/work/repo");
+        let paths = [PathBuf::from("/work/repo/src/a.rs"), PathBuf::from("/tmp/My Shot.png"), PathBuf::from("/work/repo")];
+        assert_eq!(file_mentions(&paths, cwd), "@src/a.rs @\"/tmp/My Shot.png\" @.");
     }
 
     #[test]

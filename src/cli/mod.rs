@@ -1,5 +1,6 @@
 //! Terminal frontend: the interactive REPL and one-shot mode.
 
+mod clipboard;
 mod diff;
 mod keys;
 mod markdown;
@@ -25,6 +26,7 @@ use crate::session::{self, Recorder, Resume, Store};
 use crate::skills::Skill;
 use crate::subagent::AgentDef;
 use crate::tools::FileTracker;
+use clipboard::Image;
 pub use output::Output;
 use output::{Terminal, TurnEnd};
 use menu::Command;
@@ -91,7 +93,8 @@ pub async fn run(
         return match parse_input(&line, skills) {
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
-                let mut result = submit(agent, &line, &prompt, files, &out, &mut term, recorder.as_mut()).await;
+                let attached = attachments(&line, &[], files);
+                let mut result = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut()).await;
                 // Answer background subagents' reports as they come in, and
                 // exit once none is left running.
                 while result.is_ok() {
@@ -163,7 +166,7 @@ pub async fn run(
         // Reading a line blocks; let the runtime move other tasks (such as
         // MCP connections) off this worker meanwhile.
         if let Some(helper) = editor.helper() {
-            helper.new_line();
+            helper.new_line(mentions::last_pasted_image(agent.messages()));
         }
         out.hold(true);
         let read = tokio::task::block_in_place(|| editor.readline("❯ "));
@@ -195,6 +198,7 @@ pub async fn run(
             Err(e) => return Err(e.into()),
         };
         interrupted = false;
+        let images = editor.helper().map(ReplHelper::take_images).unwrap_or_default();
         let mut line = repl::join_continuations(line.trim());
         if let Some(command) = editor.helper().and_then(ReplHelper::take_accepted) {
             // Enter ran the command selected in the menu; show it in place
@@ -268,7 +272,8 @@ pub async fn run(
             Input::Error(e) => out.line(out.paint("31", &e)),
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
-                let _ = submit(agent, &line, &prompt, files, &out, &mut term, recorder.as_mut()).await;
+                let attached = attachments(&line, &images, files);
+                let _ = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut()).await;
                 out.line("");
             }
         }
@@ -354,18 +359,27 @@ fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &Output,
     Ok(())
 }
 
-/// Attaches the files `@`-mentioned in `line` and runs the turn.
+/// The files `@`-mentioned in `line`, and the pasted `images` whose
+/// placeholders are still in it.
+fn attachments(line: &str, images: &[(usize, Image)], files: &FileTracker) -> mentions::Expanded {
+    let mut expanded = mentions::expand(line, files);
+    for (n, image) in images.iter().filter(|(n, _)| line.contains(&mentions::image_placeholder(*n))) {
+        expanded.attachments.push(mentions::pasted_image(*n, &image.media_type, &image.data));
+    }
+    expanded
+}
+
+/// Shows what is attached to `line` and runs the turn.
 async fn submit(
     agent: &mut Agent,
     line: &str,
     prompt: &str,
-    files: &FileTracker,
+    expanded: mentions::Expanded,
     out: &Output,
     term: &mut Terminal,
     recorder: Option<&mut Recorder>,
 ) -> Result<(), TurnEnd> {
     let first = agent.messages().is_empty();
-    let expanded = mentions::expand(line, files);
     for a in &expanded.attachments {
         out.line(out.paint("2", &format!("  + {}", a.label)));
     }
@@ -515,7 +529,7 @@ fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, out: &Outpu
             if crate::sandbox::active().is_some() { " · sandboxed" } else { "" }
         ),
     ));
-    out.line(out.paint("2", "  / for commands · @ for files · Esc or Ctrl-C to interrupt"));
+    out.line(out.paint("2", "  / for commands · @ for files · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt"));
     out.line("");
 }
 
@@ -533,6 +547,7 @@ fn print_help(skills: &[Skill]) {
     let keys = [
         ("/<skill> [args]", "run a skill"),
         ("@path", "attach a file, directory, image or PDF; @ opens a file menu (@file#L10-20 for lines)"),
+        ("Ctrl+V", "paste an image from the clipboard (files copied in Finder or a file manager become @ mentions)"),
         ("\\ or Alt+Enter", "continue on a new line"),
         ("↑ ↓ Tab Enter", "pick from the menu shown while typing / or @"),
         ("Esc", "interrupt the running turn"),
@@ -657,6 +672,15 @@ fn print_mcp(mcp: &mcp::Manager) {
 mod tests {
     use super::*;
     use crate::skills;
+
+    #[test]
+    fn attaches_pasted_images_still_in_the_line() {
+        let image = |n: usize| (n, Image { media_type: "image/png".into(), data: vec![n as u8] });
+        let images = [image(1), image(2), image(10)];
+        let attached = attachments("compare [Image #2] with [Image #10]", &images, &FileTracker::default());
+        let labels: Vec<&str> = attached.attachments.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, vec!["[Image #2] (image, 1 B)", "[Image #10] (image, 1 B)"]);
+    }
 
     #[test]
     fn parses_commands() {

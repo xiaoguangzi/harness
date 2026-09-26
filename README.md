@@ -7,6 +7,7 @@ A minimal coding-agent harness in Rust. It talks to any mix of LLM gateways that
 
 - Rust 1.88+
 - [ugrep](https://github.com/Genivia/ugrep) on `PATH` for the `grep` tool (`apt install ugrep` / `brew install ugrep`)
+- On Linux, `wl-paste` ([wl-clipboard](https://github.com/bugaevc/wl-clipboard), Wayland) or `xclip` (X11) for [pasting images](#pasting-images); macOS needs nothing extra
 
 ## Usage
 
@@ -142,6 +143,12 @@ Mention a path with `@` and its contents are attached to your message, so the mo
 
 Mentions work mid-sentence without spaces (`看看@src/main.rs的代码`); trailing punctuation is ignored. Only existing paths are attached, and an `@` right after an e-mail-style character is left alone, so `me@example.com` stays text. In the REPL, typing `@` opens a file menu under the prompt: it lists the current directory, then searches the project's files (what `git ls-files` lists, or a walk outside git) as you type, best matches first (path prefix, file name, substring, then fuzzy). ↑/↓ select, Tab or Enter fills in the path, and a directory stays open for its entries. Git-ignored entries are hidden unless you type into that directory (`@target/`). Attached text files count as read for the `write` tool. The REPL also keeps line-editing history in `~/.harness/history`.
 
+### Pasting images
+
+In the REPL, Ctrl+V pastes the image in the clipboard, such as a screenshot. It is Ctrl+V on macOS too, because Cmd+V belongs to the terminal, which only pastes text. The image shows in the prompt as `[Image #1]` and goes with the message as long as that placeholder is still in it, so deleting the placeholder drops the image. Numbers carry on through the conversation, so a later message can refer back to `[Image #1]`. Files copied in Finder or a file manager are pasted as `@` mentions of their paths instead, and when the clipboard has no image, a note under the prompt says so.
+
+On macOS the clipboard is read through `osascript` (any image type an app puts there). An image whose long edge is over 2576 pixels is scaled down to that, since the API would scale it down anyway, and one still over 3.75 MB (5 MB in base64, the API's limit) is sent as a JPEG. On Linux, `wl-paste` or `xclip` supply PNG, JPEG, GIF or WebP images as they are, up to the same limit.
+
 ## REPL
 
 The assistant's Markdown is rendered as it streams (a line at a time; tables are aligned once complete). Tool calls show as `● bash(cargo test)` with the first lines of their result, a foreground subagent's calls are listed under its `agent` call, a background subagent gets a line when it ends, and a spinner shows what is running. Each turn ends with its time, output tokens and context size. When stdout is not a terminal (or `NO_COLOR` is set), text is printed as is, without styling or the summary; in one-shot mode errors go to stderr and the exit code is non-zero.
@@ -167,6 +174,7 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 | `\` at line end, Alt+Enter | continue the message on a new line |
 | `/` | open the command menu under the prompt; it narrows as you type, ↑/↓ select, Tab fills in, Enter runs. After `/model ` it lists models |
 | `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |
+| Ctrl+V | paste an image from the clipboard (see [Pasting images](#pasting-images)) |
 
 ## Resuming conversations
 
@@ -278,7 +286,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 
 - `src/main.rs` — startup: settings, tools, skills, MCP servers, agents; then the CLI or web frontend
 - `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section
-- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with menu keys, completion, multi-line input and waking the prompt for a subagent's report (`repl.rs`)
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner and turn display (`output.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with menu keys, completion, multi-line input, pasting with Ctrl+V and waking the prompt for a subagent's report (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
 - `src/llm/` — LLM gateways
@@ -287,7 +295,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST with retries, SSE reader
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
-- `src/mentions.rs` — `@path` parsing and expansion into attachment blocks
+- `src/mentions.rs` — `@path` parsing and expansion into attachment blocks; pasted images' blocks
 - `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read` and `write` check
 - `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
 - `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox

@@ -13,6 +13,9 @@
 //! an e-mail-address character, so `me@example.com` and `@username` are left
 //! alone. Trailing punctuation or Chinese text after the path is ignored
 //! (`@main.rs,` / `看看@main.rs的代码`).
+//!
+//! Images pasted into the REPL are attachments too, shown in the prompt as
+//! `[Image #n]`.
 
 use std::path::Path;
 
@@ -20,6 +23,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 
+use crate::llm::Message;
 use crate::tools::{FileTracker, number_lines};
 
 const MAX_TEXT_LINES: usize = 2000;
@@ -167,10 +171,7 @@ fn attach(mention: &Mention, files: &FileTracker) -> Result<Attachment, String> 
         let bytes = read_capped(path, meta.len(), MAX_IMAGE_BYTES)?;
         return Ok(Attachment {
             label: format!("{} (image, {})", mention.path, human_size(meta.len())),
-            blocks: vec![
-                json!({"type": "text", "text": format!("Image @{}:", mention.path)}),
-                json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": BASE64.encode(bytes)}}),
-            ],
+            blocks: vec![json!({"type": "text", "text": format!("Image @{}:", mention.path)}), image_block(media_type, &bytes)],
         });
     }
     if ext == "pdf" {
@@ -185,6 +186,36 @@ fn attach(mention: &Mention, files: &FileTracker) -> Result<Attachment, String> 
         });
     }
     attach_text(mention, meta.len(), files)
+}
+
+fn image_block(media_type: &str, bytes: &[u8]) -> Value {
+    json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": BASE64.encode(bytes)}})
+}
+
+/// What stands for pasted image `n` in the prompt.
+pub fn image_placeholder(n: usize) -> String {
+    format!("[Image #{n}]")
+}
+
+/// Pasted image `n`, introduced by its placeholder.
+pub fn pasted_image(n: usize, media_type: &str, bytes: &[u8]) -> Attachment {
+    let name = image_placeholder(n);
+    Attachment {
+        label: format!("{name} (image, {})", human_size(bytes.len() as u64)),
+        blocks: vec![json!({"type": "text", "text": format!("{name}:")}), image_block(media_type, bytes)],
+    }
+}
+
+/// The highest pasted image number in a conversation, so the next one gets
+/// a number of its own; 0 if it has none.
+pub fn last_pasted_image(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .flat_map(|m| &m.content)
+        .filter_map(|b| b["text"].as_str()?.strip_prefix("[Image #")?.strip_suffix("]:")?.parse().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 fn attach_text(mention: &Mention, size: u64, files: &FileTracker) -> Result<Attachment, String> {
@@ -245,7 +276,7 @@ fn read_capped(path: &Path, size: u64, max: u64) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| e.to_string())
 }
 
-fn human_size(bytes: u64) -> String {
+pub fn human_size(bytes: u64) -> String {
     match bytes {
         b if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
         b if b >= 1024 => format!("{:.1} KB", b as f64 / 1024.0),
@@ -338,6 +369,23 @@ mod tests {
             assert_eq!(blocks[1]["source"]["media_type"], "image/png");
             assert_eq!(e.warnings, vec!["@blob.bin: binary file, not attached"]);
         });
+    }
+
+    #[test]
+    fn pasted_images() {
+        let image = pasted_image(3, "image/png", b"hi");
+        assert_eq!(image.label, "[Image #3] (image, 2 B)");
+        assert_eq!(image.blocks[0], json!({"type": "text", "text": "[Image #3]:"}));
+        assert_eq!(image.blocks[1]["source"], json!({"type": "base64", "media_type": "image/png", "data": "aGk="}));
+
+        let messages = vec![
+            Message::user(image.blocks.clone()),
+            Message::user(vec![json!({"type": "text", "text": "[Image #7]: typed, not pasted"})]),
+            Message::user(pasted_image(12, "image/png", b"").blocks),
+        ];
+        assert_eq!(last_pasted_image(&messages), 12);
+        assert_eq!(last_pasted_image(&messages[..2]), 3);
+        assert_eq!(last_pasted_image(&[]), 0);
     }
 
     #[test]
