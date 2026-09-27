@@ -2,6 +2,7 @@
 //! results back, and repeat until the model ends its turn.
 
 mod compact;
+mod usage;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,6 +18,7 @@ use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
 
 pub use compact::is_compacted;
+pub use usage::UsageLog;
 
 /// Told to the model about a turn the user cancelled.
 pub const INTERRUPTED: &str = "[Interrupted by the user]";
@@ -168,6 +170,8 @@ pub struct Agent {
     subagents: Arc<Subagents>,
     /// Commands `bash` runs in the background for this conversation.
     shells: Arc<Shells>,
+    /// Tokens used so far, shared with the subagents.
+    usage: Arc<UsageLog>,
     /// The history length after the last response, and the tokens that
     /// response reported for everything up to it; `None` once the history
     /// changed otherwise.
@@ -181,7 +185,8 @@ pub struct Agent {
 impl Agent {
     pub fn new(client: Client, tools: ToolRegistry, system: impl Into<String>) -> Self {
         let inbox = Arc::new(Inbox::default());
-        let subagents = Arc::new(Subagents::new(inbox.clone()));
+        let usage = Arc::new(UsageLog::default());
+        let subagents = Arc::new(Subagents::new(inbox.clone(), usage.clone()));
         let shells = Arc::new(Shells::new(inbox.clone()));
         Self {
             client,
@@ -192,6 +197,7 @@ impl Agent {
             inbox,
             subagents,
             shells,
+            usage,
             context: None,
             compactions: 0,
             turn_compacted: false,
@@ -231,6 +237,23 @@ impl Agent {
 
     pub fn shells(&self) -> &Arc<Shells> {
         &self.shells
+    }
+
+    /// The tokens this conversation and its subagents used so far.
+    pub fn usage(&self) -> &Arc<UsageLog> {
+        &self.usage
+    }
+
+    /// Counts this agent's requests in `log` too, as a subagent's are in
+    /// its parent's.
+    pub fn set_usage(&mut self, log: Arc<UsageLog>) {
+        self.usage = log;
+    }
+
+    /// About how many tokens the next request would take of the context
+    /// window.
+    pub fn context_tokens(&self) -> u64 {
+        self.context_size(&self.tools.definitions())
     }
 
     /// Forgets the conversation, stopping its subagents and background
@@ -366,18 +389,23 @@ impl Agent {
             }
             self.compact_if_full(&definitions, observer).await?;
             observer.on_request_start();
+            let (log, model) = (&self.usage, self.client.spec());
             let mut on_event = |event: StreamEvent| match event {
                 StreamEvent::TextDelta(text) => observer.on_text_delta(text),
                 StreamEvent::TextEnd => observer.on_text_end(),
                 StreamEvent::ThinkingDelta(text) => observer.on_thinking_delta(text),
                 StreamEvent::ToolInputStart(name) => observer.on_tool_input_start(name),
                 StreamEvent::ToolInputDelta(json) => observer.on_tool_input_delta(json),
-                StreamEvent::PartialUsage(usage) => observer.on_usage(&usage),
+                StreamEvent::PartialUsage(usage) => {
+                    log.record(model, &usage);
+                    observer.on_usage(&usage);
+                }
                 StreamEvent::Retry { error, attempt, wait } => observer.on_retry(error, attempt, wait),
             };
             let response =
                 self.client.create(&self.system, &definitions, &self.messages, &mut on_event).await?;
             if let Some(usage) = &response.usage {
+                self.usage.record(self.client.spec(), usage);
                 observer.on_usage(usage);
             }
             let stop_reason = response.stop_reason.as_deref().unwrap_or("");

@@ -277,6 +277,8 @@ impl Accumulator {
         if usage.is_object() {
             response.usage = Some(Usage {
                 input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+                cache_read_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+                cache_write_tokens: 0,
                 output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
             });
         }
@@ -470,10 +472,13 @@ mod tests {
             json!({"type": "response.output_item.done", "output_index": 3,
                    "item": {"type": "function_call", "call_id": "c2", "name": "write", "arguments": "{\"path\": "}}),
             json!({"type": "response.completed", "response": {"status": "completed",
-                   "usage": {"input_tokens": 120, "output_tokens": 30}}}),
+                   "usage": {"input_tokens": 120, "input_tokens_details": {"cached_tokens": 100}, "output_tokens": 30}}}),
         ]);
         assert_eq!(streamed, "你好|");
-        assert_eq!(resp.usage, Some(Usage { input_tokens: 120, output_tokens: 30 }));
+        assert_eq!(
+            resp.usage,
+            Some(Usage { input_tokens: 120, cache_read_tokens: 100, cache_write_tokens: 0, output_tokens: 30 })
+        );
         assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(
             resp.content,

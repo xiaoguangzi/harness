@@ -946,7 +946,7 @@ fn todo_lines(out: &Output, input: &Value) -> Vec<String> {
 }
 
 /// `12345` -> `12.3k`.
-fn tokens(n: u64) -> String {
+pub(super) fn tokens(n: u64) -> String {
     if n < 1000 { n.to_string() } else { format!("{:.1}k", n as f64 / 1000.0) }
 }
 

@@ -353,7 +353,7 @@ impl Tool for AgentTool {
             None if input.run_in_background => {
                 return ToolOutput::error("run_in_background needs a conversation to report back to");
             }
-            None => (Arc::new(Subagents::new(Arc::default())), self.client.clone()),
+            None => (Arc::new(Subagents::new(Arc::default(), Arc::default())), self.client.clone()),
         };
         let client = match client_from(def, &parent) {
             Ok(c) => c,

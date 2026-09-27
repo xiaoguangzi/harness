@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 
 use super::{MAX_RESULT_BYTES, Reporter};
-use crate::agent::{Agent, Inbox, Observer};
+use crate::agent::{Agent, Inbox, Observer, UsageLog};
 use crate::llm::Client;
 use crate::tools::{ToolOutput, truncate};
 
@@ -66,6 +66,8 @@ impl Status {
 pub struct Subagents {
     /// The parent's inbox, where background reports go.
     parent: Arc<Inbox>,
+    /// The parent's token counts, which the subagents add to.
+    usage: Arc<UsageLog>,
     /// Where progress goes, if the frontend set its own place.
     reporter: Mutex<Option<Reporter>>,
     /// In the order they started.
@@ -136,8 +138,8 @@ pub enum Sent {
 }
 
 impl Subagents {
-    pub fn new(parent: Arc<Inbox>) -> Self {
-        Self { parent, reporter: Mutex::new(None), children: Mutex::new(Vec::new()) }
+    pub fn new(parent: Arc<Inbox>, usage: Arc<UsageLog>) -> Self {
+        Self { parent, usage, reporter: Mutex::new(None), children: Mutex::new(Vec::new()) }
     }
 
     /// Sends this conversation's subagent progress to `reporter` instead of
@@ -149,7 +151,7 @@ impl Subagents {
     /// Starts `agent` on `prompt` as a new subagent.
     pub fn spawn(
         &self,
-        agent: Agent,
+        mut agent: Agent,
         agent_type: &str,
         description: &str,
         prompt: String,
@@ -158,6 +160,7 @@ impl Subagents {
     ) -> Result<Run> {
         let mut children = self.children.lock().unwrap();
         check_capacity(&children)?;
+        agent.set_usage(self.usage.clone());
         while children.len() >= MAX_KEPT {
             let Some(oldest) = children.iter().position(|c| !c.is_running()) else { break };
             children.remove(oldest);

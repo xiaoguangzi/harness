@@ -166,6 +166,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/clear` | 开始新会话 |
 | `/compact [重点]` | 总结会话以腾出上下文（见[上下文压缩](#上下文压缩)）；`重点` 指定摘要要特别保留的内容 |
 | `/resume [id]` | 继续当前目录下之前的会话（见[恢复会话](#恢复会话)） |
+| `/usage` | 按模型显示 REPL 启动以来用掉的 token（请求数、输入、缓存读取与写入、输出；包括子代理和上下文压缩，`/clear` 和 `/resume` 后不清零），以及当前会话大约占用了多少上下文窗口 |
 | `/tools` | 列出模型可调用的工具 |
 | `/skills` | 列出发现的技能 |
 | `/agents` | 列出子代理类型及其权限和工具 |
@@ -309,6 +310,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 - `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、带输入框横线、菜单按键、补全、多行输入、Ctrl+V 粘贴以及为子代理报告唤醒提示符的 rustyline 辅助（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
+- `src/agent/usage.rs` — `/usage` 显示的按模型统计的 token 数，与子代理共享
 - `src/agent/compact.rs` — 上下文压缩：何时压缩、总结请求、替换会话的新历史
 - `src/llm/` — LLM 网关
   - `config.rs` — 由配置和环境变量得到 provider、模型 spec 解析、按 provider/模型的设置

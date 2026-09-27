@@ -154,10 +154,11 @@ impl Agent {
             _ => request.push(Message::user(vec![prompt])),
         }
         // The summary is not shown as it streams.
-        let mut on_event = |event: StreamEvent| {
-            if let StreamEvent::Retry { error, attempt, wait } = event {
-                observer.on_retry(error, attempt, wait);
-            }
+        let (log, model) = (&self.usage, self.client.spec());
+        let mut on_event = |event: StreamEvent| match event {
+            StreamEvent::Retry { error, attempt, wait } => observer.on_retry(error, attempt, wait),
+            StreamEvent::PartialUsage(usage) => log.record(model, &usage),
+            _ => {}
         };
         let response = loop {
             match self.client.create(&self.system, definitions, &request, &mut on_event).await {
@@ -167,6 +168,9 @@ impl Agent {
                 Ok(response) => break response,
             }
         };
+        if let Some(usage) = &response.usage {
+            self.usage.record(self.client.spec(), usage);
+        }
         let summary: String =
             response.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
         match response.stop_reason.as_deref() {
@@ -499,6 +503,12 @@ mod tests {
         assert_eq!(agent.messages.len(), 3);
         assert_eq!(seen.0.len(), 1);
         assert!(seen.0[0].0 >= 9_000 && seen.0[0].1 < 1_000, "{:?}", seen.0);
+
+        let usage = agent.usage().models();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].0, "mock/main");
+        assert_eq!(usage[0].1.requests, 2, "the summary and the answer");
+        assert_eq!((usage[0].1.usage.input_tokens, usage[0].1.usage.output_tokens), (600, 20));
     }
 
     #[tokio::test]

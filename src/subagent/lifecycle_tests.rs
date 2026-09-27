@@ -126,7 +126,7 @@ impl Observer for Quiet {
 
 fn conversation() -> (Arc<Inbox>, Arc<Subagents>) {
     let inbox = Arc::new(Inbox::default());
-    (inbox.clone(), Arc::new(Subagents::new(inbox)))
+    (inbox.clone(), Arc::new(Subagents::new(inbox, Arc::default())))
 }
 
 fn first_id(subagents: &Subagents) -> String {

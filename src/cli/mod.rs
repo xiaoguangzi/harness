@@ -36,13 +36,14 @@ use menu::Command;
 use repl::{ReplHelper, Wake};
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 14] = [
+const BUILTINS: [(&str, &str); 15] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
     ("/clear", "start a new conversation"),
     ("/compact", "summarize the conversation to free context; /compact <focus> says what to keep"),
     ("/resume", "pick up an earlier conversation from this directory"),
+    ("/usage", "show the tokens used so far and how full the context is"),
     ("/tools", "list the tools the model can call"),
     ("/skills", "list available skills"),
     ("/agents", "list subagent types and their tools"),
@@ -322,6 +323,7 @@ pub async fn run(
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
             Input::Sandbox => print_sandbox(),
+            Input::Usage => print_usage(agent),
             Input::Model(None) => print_models(agent),
             Input::Model(Some(spec)) => match agent.client().switch(&spec) {
                 Ok(client) => {
@@ -653,6 +655,8 @@ enum Input {
     /// `/stop` stops every running subagent; `/stop <id>` that one.
     Stop(Option<String>),
     Sandbox,
+    /// `/usage` shows the tokens used and the context's size.
+    Usage,
     /// `/model` shows the current model; `/model <spec>` switches.
     Model(Option<String>),
     /// `/resume` lists saved conversations to pick from; `/resume <id>`
@@ -690,6 +694,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "tasks" => Input::Tasks,
         "stop" => Input::Stop(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "sandbox" => Input::Sandbox,
+        "usage" => Input::Usage,
         "model" => Input::Model(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "effort" => match args.trim() {
             "" => Input::Effort(None),
@@ -779,6 +784,43 @@ fn print_sandbox() {
     for (label, value) in sandbox.describe() {
         println!("  \x1b[1m{label:<10}\x1b[0m {value}");
     }
+}
+
+fn print_usage(agent: &Agent) {
+    let models = agent.usage().models();
+    if models.is_empty() {
+        println!("no requests yet");
+    } else {
+        let width = models.iter().map(|(m, _)| m.len()).max().unwrap_or(0).max("model".len());
+        println!(
+            "  \x1b[2m{:<width$}  {:>8}  {:>9}  {:>10}  {:>11}  {:>9}\x1b[0m",
+            "model", "requests", "input", "cache read", "cache write", "output"
+        );
+        for (model, t) in &models {
+            let u = &t.usage;
+            println!(
+                "  \x1b[1m{model:<width$}\x1b[0m  {:>8}  {:>9}  {:>10}  {:>11}  {:>9}",
+                t.requests,
+                output::tokens(u.input_tokens),
+                output::tokens(u.cache_read_tokens),
+                output::tokens(u.cache_write_tokens),
+                output::tokens(u.output_tokens)
+            );
+        }
+        let input: u64 = models.iter().map(|(_, t)| t.usage.input_tokens).sum();
+        let cached: u64 = models.iter().map(|(_, t)| t.usage.cache_read_tokens).sum();
+        if let Some(percent) = (cached * 100).checked_div(input) {
+            println!("  \x1b[2m{percent}% of input tokens came from the prompt cache\x1b[0m");
+        }
+    }
+    let used = agent.context_tokens();
+    let window = agent.client().context_window();
+    let size = match window {
+        // A model the providers do not know.
+        w if w >= u64::from(u32::MAX) => String::new(),
+        w => format!(" of {} ({}%)", output::tokens(w), used * 100 / w.max(1)),
+    };
+    println!("context: about {} tokens{size}", output::tokens(used));
 }
 
 fn print_skills(skills: &[Skill]) {
@@ -904,6 +946,7 @@ mod tests {
         assert_eq!(parse_input("/compact keep the API notes", &skills), Input::Compact(Some("keep the API notes".into())));
         assert_eq!(parse_input("/tools", &skills), Input::ListTools);
         assert_eq!(parse_input("/tasks", &skills), Input::Tasks);
+        assert_eq!(parse_input("/usage", &skills), Input::Usage);
         assert_eq!(parse_input("/stop", &skills), Input::Stop(None));
         assert_eq!(parse_input("/stop a3f9c2", &skills), Input::Stop(Some("a3f9c2".into())));
         assert_eq!(parse_input("/resume", &skills), Input::Resume(None));

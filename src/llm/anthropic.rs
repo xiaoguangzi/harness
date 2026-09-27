@@ -261,6 +261,8 @@ impl Accumulator {
         let total = self.response.usage.get_or_insert_default();
         if input.iter().sum::<u64>() > 0 {
             total.input_tokens = input.iter().sum();
+            total.cache_write_tokens = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            total.cache_read_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
         }
         if let Some(output) = usage["output_tokens"].as_u64() {
             total.output_tokens = output;
@@ -417,7 +419,10 @@ mod tests {
             json!({"type": "message_stop"}),
         ]);
         assert_eq!(streamed, "Hello|");
-        assert_eq!(resp.usage, Some(Usage { input_tokens: 115, output_tokens: 42 }));
+        assert_eq!(
+            resp.usage,
+            Some(Usage { input_tokens: 115, cache_read_tokens: 100, cache_write_tokens: 5, output_tokens: 42 })
+        );
         assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
         assert_eq!(
             resp.content,
@@ -453,7 +458,7 @@ mod tests {
             json!({"type": "message_start", "message": {"content": [], "usage": {"input_tokens": 0, "output_tokens": 0}}}),
             json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"input_tokens": 816, "output_tokens": 46}}),
         ]);
-        assert_eq!(resp.usage, Some(Usage { input_tokens: 816, output_tokens: 46 }));
+        assert_eq!(resp.usage, Some(Usage { input_tokens: 816, output_tokens: 46, ..Usage::default() }));
     }
 
     #[test]

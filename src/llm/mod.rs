@@ -103,6 +103,10 @@ pub struct Response {
 pub struct Usage {
     /// Every input token, cached or not: the size of the context sent.
     pub input_tokens: u64,
+    /// The part of `input_tokens` read from the prompt cache.
+    pub cache_read_tokens: u64,
+    /// The part of `input_tokens` written to the prompt cache.
+    pub cache_write_tokens: u64,
     pub output_tokens: u64,
 }
 
