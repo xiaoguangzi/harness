@@ -1,6 +1,7 @@
-//! The input box: a line between two rules, pinned under the output. The
-//! line editor draws it while the REPL waits; while a turn runs, the output
-//! draws it under the status and what is typed there lands in a [`Draft`].
+//! The input box: a line between two rules, under the output and kept on
+//! the bottom rows of the screen. The line editor draws it while the REPL
+//! waits; while a turn runs, the output draws it under the status and what
+//! is typed there lands in a [`Draft`].
 //! A message sent from it meanwhile goes to the model at its next step; a
 //! command waits for the turn to end.
 
@@ -24,6 +25,24 @@ pub const PROMPT_SGR: &str = "1;35";
 /// width so it never wraps.
 pub fn rule(width: usize) -> String {
     "─".repeat(width.saturating_sub(1))
+}
+
+/// Moves the cursor to the start of screen row `row`, from 0.
+pub fn goto(row: usize) -> String {
+    format!("\x1b[{};1H", row + 1)
+}
+
+/// Closes `rows` blank rows from screen row `at` on: what is under them
+/// moves up, the cursor with it.
+pub fn close_gap(at: usize, rows: usize) -> String {
+    if rows == 0 { String::new() } else { format!("\x1b7{}\x1b[{rows}M\x1b8\x1b[{rows}A", goto(at)) }
+}
+
+/// Opens `rows` blank rows at screen row `at`: what is under it moves down,
+/// the cursor with it, and the screen's last `rows`, which must be blank,
+/// drop off.
+pub fn open_gap(at: usize, rows: usize) -> String {
+    if rows == 0 { String::new() } else { format!("\x1b7{}\x1b[{rows}L\x1b8\x1b[{rows}B", goto(at)) }
 }
 
 /// Text typed into the box while a turn runs.

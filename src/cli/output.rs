@@ -11,6 +11,7 @@ use serde_json::Value;
 use super::diff;
 use super::input::{self, Queued, Typing};
 use super::markdown::Markdown;
+use super::repl;
 use super::text;
 use crate::agent::{INTERRUPTED, Inbox, Observer};
 use crate::llm::{MAX_RETRIES, Message, Usage, retry_reason};
@@ -48,10 +49,17 @@ struct State {
     status: Option<Status>,
     /// The input box, while a turn runs in the REPL.
     input: Option<InputBox>,
-    /// Whether the status or input box is on screen, on the last rows; the
-    /// cursor is on `cursor_row` of them.
+    /// Whether the status or input box is on screen, on the last `rows`;
+    /// the cursor is on `cursor_row` of them.
     drawn: bool,
+    rows: usize,
     cursor_row: usize,
+    /// In the REPL, the screen row the next output goes on, while the
+    /// terminal keeps `size`: what is drawn then goes on the screen's
+    /// bottom rows, with blank rows between it and the output until the
+    /// output fills the screen. Otherwise it goes right under the output.
+    end: Option<usize>,
+    size: (usize, Option<usize>),
     frame: usize,
     /// Lines printed while the line editor reads, shown once it is done:
     /// printing then would tear up the line being edited.
@@ -76,7 +84,17 @@ struct InputBox {
 impl Output {
     pub fn stdout() -> Self {
         let styled = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-        let state = State { status: None, input: None, drawn: false, cursor_row: 0, frame: 0, held: None };
+        let state = State {
+            status: None,
+            input: None,
+            drawn: false,
+            rows: 0,
+            cursor_row: 0,
+            end: None,
+            size: (0, None),
+            frame: 0,
+            held: None,
+        };
         Self { state: Arc::new(Mutex::new(state)), styled }
     }
 
@@ -134,6 +152,25 @@ impl Output {
 
     pub fn styled(&self) -> bool {
         self.styled
+    }
+
+    /// Notes that the output goes on from the start of screen row `row`,
+    /// where the cursor is, with nothing drawn under it: from then on, the
+    /// status and input box are drawn on the bottom rows.
+    pub fn set_end(&self, row: usize) {
+        let mut state = self.state.lock().unwrap();
+        if self.styled && !state.drawn {
+            state.end = Some(row);
+            state.size = (text::terminal_width(), text::terminal_height());
+        }
+    }
+
+    /// The screen row the output goes on from, if known, with nothing
+    /// drawn under it.
+    pub fn end(&self) -> Option<usize> {
+        let state = self.state.lock().unwrap();
+        let size = (text::terminal_width(), text::terminal_height());
+        state.end.filter(|_| !state.drawn && state.size == size)
     }
 
     /// Wraps `s` in an SGR color, when styled.
@@ -212,32 +249,22 @@ impl Output {
     /// Prints `printed` above the status and input box, and redraws them,
     /// in one write.
     fn show(&self, state: &mut State, printed: &str) {
-        let redraw = self.styled && (state.status.is_some() || state.input.is_some());
-        if printed.is_empty() && !redraw && !state.drawn {
+        if printed.is_empty() && !self.redraws(state) && !state.drawn {
             return;
         }
         let mut screen = String::new();
         if self.styled {
             screen.push_str(SYNC_START);
         }
-        if std::mem::take(&mut state.drawn) {
-            screen.push_str(&clear_sequence(state.cursor_row));
+        let size = (text::terminal_width(), text::terminal_height());
+        if size != state.size {
+            // Rows moved about as the terminal reflowed them.
+            state.end = None;
+            state.size = size;
         }
-        screen.push_str(printed);
-        if redraw {
-            let (rows, cursor) = render(state, |sgr, s| self.paint(sgr, s));
-            let last = rows.len() - 1;
-            screen.push_str(&rows.join("\n"));
-            let (row, col) = cursor.unwrap_or((last, text::width(&rows[last])));
-            if row < last {
-                screen.push_str(&format!("\x1b[{}A", last - row));
-            }
-            screen.push('\r');
-            if col > 0 {
-                screen.push_str(&format!("\x1b[{col}C"));
-            }
-            state.drawn = true;
-            state.cursor_row = row;
+        match (state.end, size.1) {
+            (Some(end), Some(height)) => self.draw_pinned(state, &mut screen, printed, end, height),
+            _ => self.draw_under(state, &mut screen, printed),
         }
         if self.styled {
             screen.push_str(SYNC_END);
@@ -245,6 +272,76 @@ impl Output {
         let mut stdout = io::stdout().lock();
         let _ = stdout.write_all(screen.as_bytes());
         let _ = stdout.flush();
+    }
+
+    /// Draws right under the output: the status and input box follow it
+    /// down, and are redrawn from the cursor's row in them.
+    fn draw_under(&self, state: &mut State, screen: &mut String, printed: &str) {
+        if std::mem::take(&mut state.drawn) {
+            screen.push_str(&clear_sequence(state.cursor_row));
+        }
+        screen.push_str(printed);
+        if !self.redraws(state) {
+            return;
+        }
+        let (rows, cursor) = render(state, |sgr, s| self.paint(sgr, s));
+        let last = rows.len() - 1;
+        screen.push_str(&rows.join("\n"));
+        let (row, col) = cursor.unwrap_or((last, text::width(&rows[last])));
+        if row < last {
+            screen.push_str(&format!("\x1b[{}A", last - row));
+        }
+        screen.push('\r');
+        if col > 0 {
+            screen.push_str(&format!("\x1b[{col}C"));
+        }
+        state.drawn = true;
+        state.rows = rows.len();
+        state.cursor_row = row;
+    }
+
+    /// Draws the status and input box on the screen's `height` rows' last
+    /// ones, and the output from row `end` on, scrolling once it reaches
+    /// them.
+    fn draw_pinned(&self, state: &mut State, screen: &mut String, printed: &str, mut end: usize, height: usize) {
+        if std::mem::take(&mut state.drawn) {
+            screen.push_str(&input::goto(height.saturating_sub(state.rows)));
+            screen.push_str("\x1b[J");
+        }
+        if !printed.is_empty() {
+            screen.push_str(&input::goto(end));
+            screen.push_str(printed);
+            end = (end + repl::layout(&text::strip_ansi(printed), text::terminal_width()).0).min(height - 1);
+        }
+        if self.redraws(state) {
+            let (rows, cursor) = render(state, |sgr, s| self.paint(sgr, s));
+            let top = height.saturating_sub(rows.len());
+            if end > top {
+                // Scroll the output up to make room.
+                screen.push_str(&input::goto(height - 1));
+                screen.push_str(&"\n".repeat(end - top));
+                end = top;
+            }
+            screen.push_str(&input::goto(top));
+            screen.push_str(&rows.join("\n"));
+            let last = rows.len() - 1;
+            let (row, col) = cursor.unwrap_or((last, text::width(&rows[last])));
+            screen.push_str(&input::goto(top + row));
+            if col > 0 {
+                screen.push_str(&format!("\x1b[{col}C"));
+            }
+            state.drawn = true;
+            state.rows = rows.len();
+            state.cursor_row = row;
+        } else {
+            screen.push_str(&input::goto(end));
+        }
+        state.end = Some(end);
+    }
+
+    /// Whether the status or input box is to be drawn.
+    fn redraws(&self, state: &State) -> bool {
+        self.styled && (state.status.is_some() || state.input.is_some())
     }
 
     pub fn line(&self, line: impl AsRef<str>) {

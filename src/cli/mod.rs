@@ -150,8 +150,8 @@ pub async fn run(
     // handler, installed from here on, instead of ending the process.
     let _sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
     // On a terminal, the prompt is drawn as an input box, which stays under
-    // the output while a turn runs; what is typed there carries over to the
-    // prompt after it.
+    // the output while a turn runs, on the bottom rows of the screen; what
+    // is typed there carries over to the prompt after it.
     let boxed = std::io::stdin().is_terminal() && out.styled();
     let helper = ReplHelper::new(commands, boxed, wake.clone());
     helper.bind_keys(&mut editor);
@@ -194,18 +194,35 @@ pub async fn run(
                 // Reading a line blocks; let the runtime move other tasks
                 // (such as MCP connections) off this worker meanwhile.
                 out.hold(true);
+                // Where the output ends is asked afresh, as commands print
+                // without `out`.
+                if boxed
+                    && let Some(helper) = editor.helper()
+                    && let Some(end) = keys::cursor_row().or_else(|| out.end())
+                {
+                    helper.pin(end, &format!("{before}{after}"));
+                }
                 let read = tokio::task::block_in_place(|| editor.readline_with_initial(&prompt, (&before, &after)));
                 let woken =
                     wake.as_ref().is_some_and(|w| w.finish_reading()) && matches!(read, Err(ReadlineError::Interrupted));
                 // Take the input box off the screen; a line sent shows as
                 // a plain prompt instead.
                 if boxed && let Some(helper) = editor.helper() {
-                    let shown = match &read {
-                        Ok(line) => Some(line.as_str()),
-                        Err(ReadlineError::Eof) => Some(""),
-                        Err(_) => None,
-                    };
-                    print!("\x1b[{}A\r\x1b[J", helper.rows_used(&prompt, shown));
+                    match helper.unpin() {
+                        // The box, and the blank rows above it.
+                        Some(end) => {
+                            print!("{}\x1b[J", input::goto(end));
+                            out.set_end(end);
+                        }
+                        None => {
+                            let shown = match &read {
+                                Ok(line) => Some(line.as_str()),
+                                Err(ReadlineError::Eof) => Some(""),
+                                Err(_) => None,
+                            };
+                            print!("\x1b[{}A\r\x1b[J", helper.rows_used(&prompt, shown));
+                        }
+                    }
                     let _ = std::io::stdout().flush();
                 }
                 // What subagents printed meanwhile.

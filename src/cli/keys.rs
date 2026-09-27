@@ -6,6 +6,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
@@ -19,6 +20,10 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 /// Longest escape sequence taken apart; anything longer is dropped.
 const MAX_SEQUENCE: usize = 32;
+/// How long to wait for the terminal to say where the cursor is.
+const REPORT_WAIT: Duration = Duration::from_millis(500);
+/// Set once the terminal didn't answer, so it isn't asked again.
+static NO_REPORT: AtomicBool = AtomicBool::new(false);
 
 /// A key that edits the input box.
 #[derive(Debug, PartialEq)]
@@ -298,6 +303,58 @@ fn parse_csi(buf: &[u8]) -> Parsed {
     Parsed::Key(key, end + 1)
 }
 
+/// The screen row the cursor is on, from 0 at the top, as the terminal
+/// reports it. `None` when stdin or stdout isn't a terminal, when input is
+/// waiting (it would come before the answer, and be lost), or when no
+/// answer comes. Only while nothing else reads stdin.
+pub fn cursor_row() -> Option<usize> {
+    if NO_REPORT.load(Ordering::Relaxed) || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return None;
+    }
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) } != 0 {
+        return None;
+    }
+    // The answer comes as input: read it byte by byte, without echoing it.
+    let mut raw = saved;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+        return None;
+    }
+    let row = ask_row();
+    unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved) };
+    row
+}
+
+fn ask_row() -> Option<usize> {
+    if readable(0) {
+        return None;
+    }
+    io::stdout().write_all(b"\x1b[6n").and_then(|()| io::stdout().flush()).ok()?;
+    let deadline = Instant::now() + REPORT_WAIT;
+    let mut reply = Vec::new();
+    let mut buf = [0u8; MAX_SEQUENCE];
+    while !reply.ends_with(b"R") {
+        let left = deadline.saturating_duration_since(Instant::now()).as_millis() as libc::c_int;
+        if left == 0 || !readable(left) || reply.len() > MAX_SEQUENCE {
+            NO_REPORT.store(true, Ordering::Relaxed);
+            return None;
+        }
+        let n = read(&mut buf)?;
+        reply.extend_from_slice(&buf[..n]);
+    }
+    report_row(&reply)
+}
+
+/// The row in a cursor position report, `ESC [ row ; col R`, from 0.
+fn report_row(reply: &[u8]) -> Option<usize> {
+    let start = reply.windows(2).rposition(|w| w == b"\x1b[")? + 2;
+    let body = std::str::from_utf8(&reply[start..reply.len() - 1]).ok()?;
+    body.split_once(';')?.0.parse::<usize>().ok()?.checked_sub(1)
+}
+
 /// Whether stdin has input (or has hung up) within `timeout_ms`.
 fn readable(timeout_ms: libc::c_int) -> bool {
     let mut fd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
@@ -321,6 +378,13 @@ mod tests {
 
     fn text(s: &str, n: usize) -> Parsed {
         Parsed::Key(Key::Text(s.into()), n)
+    }
+
+    #[test]
+    fn reads_the_row_from_a_position_report() {
+        assert_eq!(report_row(b"\x1b[12;1R"), Some(11));
+        assert_eq!(report_row(b"x\x1b[1;80R"), Some(0));
+        assert_eq!(report_row(b"\x1b[;1R"), None);
     }
 
     #[test]

@@ -149,6 +149,19 @@ pub fn terminal_width() -> usize {
     std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(80)
 }
 
+/// The terminal's height in rows, when stdout is one.
+pub fn terminal_height() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: TIOCGWINSZ only writes a `winsize` into the given struct.
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_row > 0 {
+            return Some(size.ws_row as usize);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

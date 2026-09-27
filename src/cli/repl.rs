@@ -5,11 +5,15 @@
 //!
 //! On a terminal the line is drawn in the input box: the prompt carries the
 //! rule above it, and the hint the rule below. The menu is drawn as more of
-//! the hint. Up/Down move its selection and Tab fills it in; Enter runs a
-//! command, or fills in a file. A choice is typed through the completer,
-//! which puts the cursor after it.
+//! the hint. The box sits on the screen's bottom rows, with blank rows
+//! between it and the output until the output fills the screen; as the box
+//! grows (the menu opens, say) it takes those rows before the screen
+//! scrolls, and as it shrinks it moves back down. Up/Down move the menu's
+//! selection and Tab fills it in; Enter runs a command, or fills in a file.
+//! A choice is typed through the completer, which puts the cursor after it.
 
 use std::borrow::Cow;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -114,13 +118,61 @@ pub struct ReplHelper {
     wake: Option<Arc<Wake>>,
     /// The line and hint last drawn.
     shown: Mutex<(String, String)>,
+    /// Keeps the box on the bottom rows, while a line is read.
+    pin: Mutex<Option<Pin>>,
+}
+
+/// Where the input box is, to keep it on the screen's bottom rows.
+struct Pin {
+    /// The screen row the output goes on from: the rows from there to the
+    /// box are blank.
+    end: usize,
+    /// Rows the line editor last drew, from the prompt's first row down to
+    /// the screen's last.
+    rows: usize,
+    /// Rows to move the box down by once it is drawn.
+    lower: usize,
+    /// The terminal's size; after a resize nothing is known.
+    size: (usize, usize),
 }
 
 impl ReplHelper {
     pub fn new(commands: Vec<Command>, styled: bool, wake: Option<Arc<Wake>>) -> Self {
         let names = commands.iter().map(|c| c.name.clone()).collect();
         let menu = Arc::new(Menu::new(commands, "."));
-        Self { menu, pasted: Arc::default(), names, styled, wake, shown: Mutex::default() }
+        Self { menu, pasted: Arc::default(), names, styled, wake, shown: Mutex::default(), pin: Mutex::default() }
+    }
+
+    /// Puts the input box of the next line read, starting with `initial`,
+    /// on the screen's bottom rows, given that the output goes on from the
+    /// start of screen row `end`, where the cursor is. The output scrolls up
+    /// if there isn't room.
+    pub fn pin(&self, end: usize, initial: &str) {
+        let (width, Some(height)) = (text::terminal_width(), text::terminal_height()) else { return };
+        if !self.styled {
+            return;
+        }
+        let shown = format!("{}{initial}\n{}", self.prompt(), input::rule(width));
+        let rows = rows(&shown, width).min(height);
+        let top = height - rows;
+        let mut end = end.min(height - 1);
+        let mut screen = String::new();
+        if end > top {
+            screen.push_str(&input::goto(height - 1));
+            screen.push_str(&"\n".repeat(end - top));
+            end = top;
+        }
+        screen.push_str(&input::goto(top));
+        print!("{screen}");
+        let _ = std::io::stdout().flush();
+        *self.pin.lock().unwrap() = Some(Pin { end, rows, lower: 0, size: (width, height) });
+    }
+
+    /// Once the line editor returns: the screen row the output goes on
+    /// from, if the box was kept on the bottom rows (and the terminal kept
+    /// its size).
+    pub fn unpin(&self) -> Option<usize> {
+        self.pin.lock().unwrap().take().map(|pin| pin.end)
     }
 
     /// The prompt. On a terminal, it starts with a row for the input box's
@@ -349,8 +401,37 @@ impl Hinter for ReplHelper {
         } else {
             below
         };
-        *self.shown.lock().unwrap() = (line.to_string(), hint.clone().unwrap_or_default());
+        let shown = hint.clone().unwrap_or_default();
+        self.keep_pinned(&format!("{}{line}{shown}", self.prompt()));
+        *self.shown.lock().unwrap() = (line.to_string(), shown);
         hint.map(MenuHint)
+    }
+}
+
+impl ReplHelper {
+    /// Before the line editor draws `shown` in place of what it drew last:
+    /// a taller box first moves up into the blank rows above it, as far as
+    /// they go (the screen scrolls for the rest); a shorter one moves down
+    /// once drawn.
+    fn keep_pinned(&self, shown: &str) {
+        let mut pin = self.pin.lock().unwrap();
+        let Some(p) = pin.as_mut() else { return };
+        let (width, Some(height)) = (text::terminal_width(), text::terminal_height()) else { return };
+        if (width, height) != p.size {
+            *pin = None;
+            return;
+        }
+        let rows = rows(shown, width).min(height);
+        if rows > p.rows {
+            let grow = rows - p.rows;
+            let up = grow.min((height - p.rows).saturating_sub(p.end));
+            print!("{}", input::close_gap(p.end, up));
+            let _ = std::io::stdout().flush();
+            p.end -= grow - up;
+        } else {
+            p.lower = p.rows - rows;
+        }
+        p.rows = rows;
     }
 }
 
@@ -381,7 +462,13 @@ impl Highlighter for ReplHelper {
         } else {
             below.to_string()
         };
-        Cow::Owned(format!("\n\x1b[2m{rule}\x1b[0m{below}"))
+        // The line editor moves the cursor from the drawing's end
+        // relatively, so it follows the box moving down.
+        let lower = match self.pin.lock().unwrap().as_mut() {
+            Some(pin) => input::open_gap(pin.end, std::mem::take(&mut pin.lower)),
+            None => String::new(),
+        };
+        Cow::Owned(format!("\n\x1b[2m{rule}\x1b[0m{below}{lower}"))
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
@@ -411,7 +498,7 @@ fn fills_last_row(shown: &str, cols: usize) -> bool {
 
 /// The row and column where `shown` ends at `cols` columns, by the line
 /// editor's own layout rules.
-fn layout(shown: &str, cols: usize) -> (usize, usize) {
+pub(super) fn layout(shown: &str, cols: usize) -> (usize, usize) {
     let (mut row, mut col) = (0, 0);
     for c in shown.chars() {
         if c == '\n' {
