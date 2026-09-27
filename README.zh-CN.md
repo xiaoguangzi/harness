@@ -239,6 +239,10 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 - 工具以 `mcp__<server>__<tool>` 形式暴露。文本、内嵌文本资源和 PNG/JPEG/GIF/WebP 图片会传回给模型。
 - stdio 服务器的 stderr 写入 `$TMPDIR/harness-mcp-<server>.log`。
 
+## 项目说明
+
+如果工作目录下有 `AGENTS.md`，系统提示词会告诉模型它的存在，模型需要了解项目约定时自己用 `read` 读取。文件内容不会放进提示词，也不会查找其他文件（`CLAUDE.md`、上级目录或 `~` 下的文件）。
+
 ## 技能（Skills）
 
 技能是一个包含 `SKILL.md` 的目录（[Agent Skills](https://agentskills.io) 格式）：

@@ -124,6 +124,9 @@ fn environment() -> String {
     if let Some(shell) = shell {
         lines.push(format!("- User's shell: {shell} (the `bash` tool always runs bash)"));
     }
+    if let Some(note) = agents_md(&cwd) {
+        lines.push(note);
+    }
     if let Some(sandbox) = crate::sandbox::active() {
         lines.push(format!("- Sandbox: {}", sandbox.prompt_note()));
     }
@@ -131,6 +134,16 @@ fn environment() -> String {
         lines.push(format!("- Today's date: {date}"));
     }
     lines.join("\n")
+}
+
+/// Points the model at the project's `AGENTS.md`, if there is one. Its
+/// contents stay out of the prompt; the model reads it when it needs to.
+fn agents_md(dir: &Path) -> Option<String> {
+    dir.join("AGENTS.md").is_file().then(|| {
+        "- Project notes: `AGENTS.md` in the working directory has the project's conventions and \
+         commands; read it before changing code here."
+            .to_string()
+    })
 }
 
 /// The local date as `YYYY-MM-DD`.
@@ -200,6 +213,15 @@ mod tests {
         async fn run(&self, _: serde_json::Value) -> crate::tools::ToolOutput {
             crate::tools::ToolOutput::ok("")
         }
+    }
+
+    #[test]
+    fn mentions_agents_md_only_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(agents_md(dir.path()), None);
+        std::fs::write(dir.path().join("AGENTS.md"), "# notes").unwrap();
+        let note = agents_md(dir.path()).unwrap();
+        assert!(note.contains("`AGENTS.md`") && !note.contains("# notes"), "{note}");
     }
 
     #[test]

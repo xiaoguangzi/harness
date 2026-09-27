@@ -238,6 +238,10 @@ Declare servers under `mcpServers` in the [settings](#settings), in the same sha
 - Tools are exposed as `mcp__<server>__<tool>`. Text, embedded text resources and PNG/JPEG/GIF/WebP images are passed back to the model.
 - A stdio server's stderr goes to `$TMPDIR/harness-mcp-<server>.log`.
 
+## Project notes
+
+If the working directory has an `AGENTS.md`, the system prompt tells the model it is there, and the model reads it with `read` when it needs the project's conventions. Its contents are not put into the prompt, and no other file (a `CLAUDE.md`, one in a parent directory or in `~`) is looked for.
+
 ## Skills
 
 A skill is a directory with a `SKILL.md` (the [Agent Skills](https://agentskills.io) format):
