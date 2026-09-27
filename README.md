@@ -57,7 +57,7 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 
 | Key | |
 |---|---|
-| `model`, `subagent_model`, `effort`, `max_tokens`, `providers` | models and [LLM gateways](#llm-gateways) |
+| `model`, `subagent_model`, `effort`, `max_tokens`, `context_window`, `providers` | models and [LLM gateways](#llm-gateways) |
 | `mcpServers` | [MCP servers](#mcp-servers) |
 | `sandbox` | the [sandbox](#sandbox) |
 
@@ -67,7 +67,7 @@ Every key is optional, and unknown keys are an error. Nothing is read from the p
 
 `harness --web` (or `--web=ADDR`, default `127.0.0.1:8787`) starts a browser UI instead of the REPL:
 
-- **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore`, `general-purpose` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results. Each subagent gets a card with its tool calls, status, report and a Stop button, and a background subagent's report starts a turn by itself when the task is idle. Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands and foreground subagents are stopped; background subagents carry on) or delete it (which stops its subagents too). `@path` mentions and `/<skill> args` work as in the REPL.
+- **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore`, `general-purpose` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results. Each subagent gets a card with its tool calls, status, report and a Stop button, and a background subagent's report starts a turn by itself when the task is idle. Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands and foreground subagents are stopped; background subagents carry on) or delete it (which stops its subagents too). `@path` mentions, `/<skill> args` and `/compact` work as in the REPL.
 - **工具 (Tools)**: every registered tool (built-in, skill, MCP, `agent`) with its description and schema; fill in JSON input and call it directly.
 - **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for the settings file. A save is validated with the environment first; the model setup then applies without a restart, and idle tasks move to it (`mcpServers` and `sandbox` changes apply on the next start).
 - **Agents / Skills / MCP**: what was discovered and which MCP servers connected.
@@ -118,6 +118,7 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 | `api_key` | sent as `x-api-key` (Anthropic) or `Authorization: Bearer` (OpenAI); override with `"auth": "bearer"` / `"x-api-key"` |
 | `headers` | extra request headers |
 | `max_tokens` | output cap: top level, per provider or per model |
+| `context_window` | the model's context window in tokens (default `200000`): top level, per provider or per model; the conversation is [compacted](#compaction) before it fills up |
 | `effort` | top level or per model: `low`, `medium`, `high` (default), `xhigh` or `max`. Sent as Anthropic `output_config.effort` or OpenAI `reasoning.effort`; `extra_body` still overrides it, e.g. `{"output_config": null}` for a model that takes no effort |
 | `extra_body` | merged into every request body, also per model; a `null` removes a default key, e.g. `{"thinking": null}` for a model without adaptive thinking, or `{"include": null}` for a gateway that rejects encrypted reasoning |
 | `fallbacks`, `eager_input_streaming` | Anthropic-only API features; default on for `api.anthropic.com`, off for gateways |
@@ -161,6 +162,7 @@ The prompt is an input box between two rules that stays at the bottom, under the
 | `/model [spec]` | show providers and models, or switch to `<provider>/<model>` |
 | `/effort [level]` | show the reasoning effort, or set it: `low`, `medium`, `high`, `xhigh`, `max`, or `auto` for the configured one |
 | `/clear` | start a new conversation |
+| `/compact [focus]` | summarize the conversation to free context (see [Compaction](#compaction)); `focus` says what the summary should keep |
 | `/resume [id]` | pick up an earlier conversation from this directory (see [Resuming](#resuming-conversations)) |
 | `/tools` | list the tools the model can call |
 | `/skills` | list discovered skills |
@@ -177,6 +179,12 @@ The prompt is an input box between two rules that stays at the bottom, under the
 | `/` | open the command menu under the prompt; it narrows as you type, ↑/↓ select, Tab fills in, Enter runs. After `/model ` it lists models |
 | `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |
 | Ctrl+V | paste an image from the clipboard (see [Pasting images](#pasting-images)) |
+
+## Compaction
+
+Before a request would leave too little of the model's `context_window` for a full response (`max_tokens`) plus a margin of 5% of the window, the model summarizes the conversation and the summary replaces it, as in Codex. With a 256k window and the default `max_tokens` of 64k that is at about 179k tokens; with a 1M window, at about 886k. The summary is asked for with an ordinary request (the same system prompt and tools, so the cached prefix still applies) that ends in a summarization prompt: progress and decisions, the user's constraints, files involved, errors and their fixes, what remains and the next step. The new history is one message: the user's own messages, word for word up to about 20k tokens counting from the newest, then the summary, then the 5 files read most recently, as they are now (each cut to about 5k tokens, and all of them to 10% of the window). The assistant turns, tool results and attachments are gone, and only the re-attached files still count as read for `edit` and `write`.
+
+This happens before a turn starts (the new message stays as it is, after the summary) and between tool rounds within a turn, so a long task carries on by itself; the REPL shows `✻ Compacted the conversation: context 172.4k → about 9.8k`. `/compact [focus]` does it on demand. If the summarization request itself is too long, its oldest exchanges are left out; if the context is still too full afterwards, or fills up again three times in one turn, the turn stops with an error instead of looping. A compaction can be interrupted like a turn, which leaves the history as it was. Saved sessions store the compacted history, and a resumed one shows `✻ Conversation compacted` where it happened.
 
 ## Resuming conversations
 
@@ -295,6 +303,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 - `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner, input box and turn display (`output.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with the input box's rules, menu keys, completion, multi-line input, pasting with Ctrl+V and waking the prompt for a subagent's report (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
+- `src/agent/compact.rs` — compaction: when to compact, the summarization request, the history that replaces the conversation
 - `src/llm/` — LLM gateways
   - `config.rs` — providers from the settings and environment, model spec resolution, per-provider/model settings
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)

@@ -1,6 +1,8 @@
 //! The agent loop: send the conversation, run any requested tools, send the
 //! results back, and repeat until the model ends its turn.
 
+mod compact;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +14,8 @@ use tokio::sync::Notify;
 use crate::llm::{Client, Message, StreamEvent, Usage};
 use crate::subagent::Subagents;
 use crate::tools::{ToolOutput, ToolRegistry};
+
+pub use compact::is_compacted;
 
 /// Told to the model about a turn the user cancelled.
 pub const INTERRUPTED: &str = "[Interrupted by the user]";
@@ -40,6 +44,11 @@ pub trait Observer: Send {
     /// streamed since the last `on_request_start` is void, and output
     /// starts over. `attempt` counts from 1 to `llm::MAX_RETRIES`.
     fn on_retry(&mut self, _error: &anyhow::Error, _attempt: u32, _wait: Duration) {}
+    /// The conversation is being summarized to make room in the context.
+    fn on_compact_start(&mut self) {}
+    /// The summary replaced the history: the context went from `before` to
+    /// about `after` tokens.
+    fn on_compact_end(&mut self, _before: u64, _after: u64) {}
 }
 
 /// Messages for the model that arrive from elsewhere while it works or
@@ -156,13 +165,32 @@ pub struct Agent {
     /// Subagents this conversation started, kept for follow-ups. Their
     /// background reports arrive in `inbox`.
     subagents: Arc<Subagents>,
+    /// The history length after the last response, and the tokens that
+    /// response reported for everything up to it; `None` once the history
+    /// changed otherwise.
+    context: Option<(usize, u64)>,
+    /// Compactions in the running turn.
+    compactions: u32,
+    /// Whether a compaction in the running turn took in its prompt.
+    turn_compacted: bool,
 }
 
 impl Agent {
     pub fn new(client: Client, tools: ToolRegistry, system: impl Into<String>) -> Self {
         let inbox = Arc::new(Inbox::default());
         let subagents = Arc::new(Subagents::new(inbox.clone()));
-        Self { client, tools, system: system.into(), messages: Vec::new(), turn_start: None, inbox, subagents }
+        Self {
+            client,
+            tools,
+            system: system.into(),
+            messages: Vec::new(),
+            turn_start: None,
+            inbox,
+            subagents,
+            context: None,
+            compactions: 0,
+            turn_compacted: false,
+        }
     }
 
     /// The `provider/model` in use.
@@ -202,6 +230,7 @@ impl Agent {
         self.inbox.clear();
         self.messages.clear();
         self.turn_start = None;
+        self.context = None;
     }
 
     /// The conversation so far.
@@ -242,23 +271,26 @@ impl Agent {
     /// inbox goes first. Empty `content` runs a turn for the inbox alone,
     /// and does nothing if that is empty too. The history only ever grows
     /// by appending, so earlier turns (and their thinking blocks) stay
-    /// intact.
+    /// intact, except that a compaction replaces it when the context fills
+    /// up (see `compact`).
     pub async fn run_turn(&mut self, content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
         self.settle();
         let arrived = self.inbox.take();
         if content.is_empty() && arrived.is_empty() {
             return Ok(());
         }
-        let turn_start = self.messages.len();
-        self.turn_start = Some(turn_start);
+        self.turn_start = Some(self.messages.len());
+        (self.compactions, self.turn_compacted) = (0, false);
         self.messages.push(Message::user(arrived.iter().cloned().chain(content).collect()));
         let (subagents, client) = (self.subagents.clone(), self.client.clone());
         let result = crate::subagent::scope(subagents, client, self.run_loop(observer)).await;
         if result.is_err() {
+            // A compaction moves the turn's start.
+            let turn_start = self.turn_start.unwrap_or_default();
             self.repair_after_error(turn_start);
             // A turn that got nowhere is removed, but what had arrived for
             // the model stays: it can't be sent again.
-            if self.messages.len() == turn_start && !arrived.is_empty() {
+            if self.messages.len() == turn_start && !arrived.is_empty() && !self.turn_compacted {
                 self.messages.push(Message::user(arrived));
             }
         }
@@ -281,6 +313,7 @@ impl Agent {
         if self.messages.len() == turn_start + 1 {
             self.messages.truncate(turn_start);
         }
+        self.context = None;
     }
 
     /// Leaves the history valid after a cancelled turn, keeping what the
@@ -319,6 +352,7 @@ impl Agent {
                     _ => self.messages.push(Message::user(arrived)),
                 }
             }
+            self.compact_if_full(&definitions, observer).await?;
             observer.on_request_start();
             let mut on_event = |event: StreamEvent| match event {
                 StreamEvent::TextDelta(text) => observer.on_text_delta(text),
@@ -345,6 +379,9 @@ impl Agent {
             let tool_uses: Vec<Value> =
                 content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
             self.messages.push(Message { role: "assistant", content, source: Some(self.client.spec().to_string()) });
+            if let Some(usage) = &response.usage {
+                self.context = Some((self.messages.len(), usage.input_tokens + usage.output_tokens));
+            }
 
             match stop_reason {
                 "tool_use" => {}

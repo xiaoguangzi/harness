@@ -35,6 +35,7 @@ pub struct Settings {
     pub subagent_model: Option<String>,
     pub effort: Option<Effort>,
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u32>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default, rename = "mcpServers")]

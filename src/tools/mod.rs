@@ -99,6 +99,8 @@ pub trait Tool: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// The tracker the file tools share, if they are registered.
+    files: Option<FileTracker>,
 }
 
 impl ToolRegistry {
@@ -114,7 +116,8 @@ impl ToolRegistry {
         registry.register(GrepTool);
         registry.register(ReadTool::new(files.clone()));
         registry.register(EditTool::new(files.clone()));
-        registry.register(WriteTool::new(files));
+        registry.register(WriteTool::new(files.clone()));
+        registry.files = Some(files);
         registry
     }
 
@@ -130,6 +133,13 @@ impl ToolRegistry {
         if self.get("write").is_some() {
             self.register(WriteTool::new(files.clone()));
         }
+        self.files = Some(files.clone());
+    }
+
+    /// The tracker of the file tools, e.g. to re-attach the files read
+    /// most recently after compacting the conversation.
+    pub fn files(&self) -> Option<&FileTracker> {
+        self.files.as_ref()
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
@@ -211,10 +221,18 @@ pub(crate) fn parse_input<T: serde::de::DeserializeOwned>(input: Value) -> Resul
 /// not seen or that changed since it was read.
 #[derive(Clone, Default)]
 pub struct FileTracker {
-    seen: Arc<Mutex<HashMap<PathBuf, Option<SystemTime>>>>,
+    /// Each file's modification time when it was recorded, and a counter
+    /// value saying how recently that was.
+    seen: Arc<Mutex<Seen>>,
     /// Held while a tool checks, changes and records a file, so calls from
     /// one response that change the same file apply one after another.
     changing: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Default)]
+struct Seen {
+    files: HashMap<PathBuf, (Option<SystemTime>, u64)>,
+    counter: u64,
 }
 
 impl FileTracker {
@@ -227,7 +245,25 @@ impl FileTracker {
     }
 
     pub fn record(&self, path: &Path) {
-        self.seen.lock().unwrap().insert(Self::key(path), Self::mtime(path));
+        let mut seen = self.seen.lock().unwrap();
+        seen.counter += 1;
+        let entry = (Self::mtime(path), seen.counter);
+        seen.files.insert(Self::key(path), entry);
+    }
+
+    /// The `n` files recorded most recently, most recent first, as
+    /// absolute paths.
+    pub fn recent(&self, n: usize) -> Vec<PathBuf> {
+        let seen = self.seen.lock().unwrap();
+        let mut files: Vec<(&PathBuf, u64)> = seen.files.iter().map(|(path, (_, at))| (path, *at)).collect();
+        files.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+        files.into_iter().take(n).map(|(path, _)| path.clone()).collect()
+    }
+
+    /// Forgets every file but `keep`, e.g. once the model no longer sees
+    /// the others' contents.
+    pub fn retain(&self, keep: &[PathBuf]) {
+        self.seen.lock().unwrap().files.retain(|path, _| keep.contains(path));
     }
 
     /// Waits for any other change through this tracker to finish; hold the
@@ -241,12 +277,12 @@ impl FileTracker {
         if !path.exists() {
             return Ok(());
         }
-        match self.seen.lock().unwrap().get(&Self::key(path)) {
+        match self.seen.lock().unwrap().files.get(&Self::key(path)) {
             None => Err(format!(
                 "{} already exists; read it with the `read` tool before changing it",
                 path.display()
             )),
-            Some(seen) if *seen != Self::mtime(path) => Err(format!(
+            Some((seen, _)) if *seen != Self::mtime(path) => Err(format!(
                 "{} changed since it was last read; read it again before changing it",
                 path.display()
             )),

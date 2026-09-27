@@ -36,11 +36,12 @@ use menu::Command;
 use repl::{ReplHelper, Wake};
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 13] = [
+const BUILTINS: [(&str, &str); 14] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
     ("/clear", "start a new conversation"),
+    ("/compact", "summarize the conversation to free context; /compact <focus> says what to keep"),
     ("/resume", "pick up an earlier conversation from this directory"),
     ("/tools", "list the tools the model can call"),
     ("/skills", "list available skills"),
@@ -255,6 +256,14 @@ pub async fn run(
                     rec.restart();
                 }
                 out.line(out.paint("2", "conversation cleared"));
+            }
+            Input::Compact(focus) => {
+                if agent.messages().is_empty() {
+                    out.line(out.paint("2", "nothing to compact yet"));
+                    continue;
+                }
+                let _ = compact_shown(agent, focus.as_deref(), &out, &mut term, recorder.as_mut()).await;
+                out.line("");
             }
             Input::Resume(id) => {
                 let Some(rec) = recorder.as_mut() else {
@@ -508,6 +517,33 @@ async fn run_shown(
     result
 }
 
+/// Compacts the conversation until done or interrupted, showing it like a
+/// turn, and saves the result.
+async fn compact_shown(
+    agent: &mut Agent,
+    focus: Option<&str>,
+    out: &Output,
+    term: &mut Terminal,
+    recorder: Option<&mut Recorder>,
+) -> Result<(), TurnEnd> {
+    term.begin_turn();
+    let mut keys = KeyWatch::start();
+    let result = tokio::select! {
+        result = agent.compact(focus, &mut *term) => result.map_err(TurnEnd::Failed),
+        _ = tokio::signal::ctrl_c() => Err(TurnEnd::Interrupted),
+        _ = keys.pressed() => Err(TurnEnd::Interrupted),
+    };
+    drop(keys);
+    term.end_turn(&result);
+    if let Some(rec) = recorder
+        && result.is_ok()
+        && let Err(e) = rec.save(agent.messages(), agent.model())
+    {
+        out.line(out.paint("33", &format!("conversation not saved: {e:#}")));
+    }
+    result
+}
+
 /// Types `key` into the input box. Enter hands what it holds to `tx`.
 fn type_key(out: &Output, key: Key, tx: &tokio::sync::mpsc::UnboundedSender<(String, Vec<(usize, Image)>)>) {
     match key {
@@ -581,6 +617,8 @@ enum Input {
     Exit,
     Help,
     Clear,
+    /// `/compact [focus]` summarizes the conversation.
+    Compact(Option<String>),
     ListSkills,
     ListTools,
     ListMcp,
@@ -618,6 +656,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "exit" | "quit" => Input::Exit,
         "help" => Input::Help,
         "clear" => Input::Clear,
+        "compact" => Input::Compact(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "resume" => Input::Resume(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "skills" => Input::ListSkills,
         "tools" => Input::ListTools,
@@ -831,6 +870,8 @@ mod tests {
         assert_eq!(parse_input("exit now", &skills), Input::Prompt("exit now".into()));
         assert_eq!(parse_input("how do I exit vim", &skills), Input::Prompt("how do I exit vim".into()));
         assert_eq!(parse_input("/clear", &skills), Input::Clear);
+        assert_eq!(parse_input("/compact", &skills), Input::Compact(None));
+        assert_eq!(parse_input("/compact keep the API notes", &skills), Input::Compact(Some("keep the API notes".into())));
         assert_eq!(parse_input("/tools", &skills), Input::ListTools);
         assert_eq!(parse_input("/tasks", &skills), Input::Tasks);
         assert_eq!(parse_input("/stop", &skills), Input::Stop(None));

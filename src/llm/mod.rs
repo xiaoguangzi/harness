@@ -153,6 +153,16 @@ impl Client {
             .unwrap_or(self.providers.effort)
     }
 
+    /// The output cap requests are sent with.
+    pub fn max_tokens(&self) -> u64 {
+        self.providers.target(&self.spec).map_or(0, |t| t.max_tokens()).into()
+    }
+
+    /// The model's context window in tokens, as configured.
+    pub fn context_window(&self) -> u64 {
+        self.providers.target(&self.spec).map_or(u32::MAX, |t| t.context_window()).into()
+    }
+
     /// Overrides the configured effort, or restores it with `None`. Kept
     /// across [`Client::switch`].
     pub fn set_effort(&mut self, effort: Option<Effort>) {

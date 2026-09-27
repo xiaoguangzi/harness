@@ -58,7 +58,7 @@ harness --help                          # 查看全部选项
 
 | 键 | 说明 |
 |---|---|
-| `model`、`subagent_model`、`effort`、`max_tokens`、`providers` | 模型和 [LLM 网关](#llm-网关) |
+| `model`、`subagent_model`、`effort`、`max_tokens`、`context_window`、`providers` | 模型和 [LLM 网关](#llm-网关) |
 | `mcpServers` | [MCP 服务器](#mcp-服务器) |
 | `sandbox` | [沙箱](#沙箱) |
 
@@ -68,7 +68,7 @@ harness --help                          # 查看全部选项
 
 `harness --web`（或 `--web=ADDR`，默认 `127.0.0.1:8787`）启动浏览器 UI 而非 REPL：
 
-- **任务 (Tasks)**：把任务派发给主代理，或直接派发给某个子代理类型（`explore`、`general-purpose` 或自定义代理），也可指定模型。任务在后台运行，可以多个并发；每个任务都是独立的会话，流式展示文本、工具调用和结果。每个子代理有一张卡片，显示它的工具调用、状态、报告和停止按钮；任务空闲时，后台子代理的报告会自动开始新的一轮。可以用后续消息继续任务、切换模型、取消任务（运行中的 `bash` 命令和前台子代理会停止，后台子代理继续运行）或删除任务（其子代理也会停止）。`@路径` 提及和 `/<skill> args` 与 REPL 中一致。
+- **任务 (Tasks)**：把任务派发给主代理，或直接派发给某个子代理类型（`explore`、`general-purpose` 或自定义代理），也可指定模型。任务在后台运行，可以多个并发；每个任务都是独立的会话，流式展示文本、工具调用和结果。每个子代理有一张卡片，显示它的工具调用、状态、报告和停止按钮；任务空闲时，后台子代理的报告会自动开始新的一轮。可以用后续消息继续任务、切换模型、取消任务（运行中的 `bash` 命令和前台子代理会停止，后台子代理继续运行）或删除任务（其子代理也会停止）。`@路径` 提及、`/<skill> args` 和 `/compact` 与 REPL 中一致。
 - **工具 (Tools)**：列出所有已注册的工具（内置、技能、MCP、`agent`）及其描述和 schema；填入 JSON 输入即可直接调用。
 - **模型配置 (Models)**：当前生效的 provider 和模型，以及配置文件的表单或原始 JSON 编辑器。保存时会先结合环境变量校验，模型配置随即无需重启生效，空闲任务会切换过去（`mcpServers` 和 `sandbox` 的修改在下次启动时生效）。
 - **Agents / Skills / MCP**：发现了哪些内容，以及哪些 MCP 服务器已连接。
@@ -119,6 +119,7 @@ harness --help                          # 查看全部选项
 | `api_key` | 以 `x-api-key`（Anthropic）或 `Authorization: Bearer`（OpenAI）发送；可用 `"auth": "bearer"` / `"x-api-key"` 覆盖 |
 | `headers` | 额外的请求头 |
 | `max_tokens` | 输出上限：顶层、按 provider 或按模型设置 |
+| `context_window` | 模型的上下文窗口（token 数，默认 `200000`）：顶层、按 provider 或按模型设置；会话在窗口占满前会被[压缩](#上下文压缩) |
 | `effort` | 顶层或按模型设置：`low`、`medium`、`high`（默认）、`xhigh` 或 `max`。以 Anthropic 的 `output_config.effort` 或 OpenAI 的 `reasoning.effort` 发送；`extra_body` 仍可覆盖它，例如对不支持 effort 的模型用 `{"output_config": null}` |
 | `extra_body` | 合并进每个请求体，也可按模型设置；`null` 会移除默认键，例如对不支持自适应思考的模型用 `{"thinking": null}`，或对拒绝加密推理的网关用 `{"include": null}` |
 | `fallbacks`、`eager_input_streaming` | 仅 Anthropic 的 API 特性；`api.anthropic.com` 默认开启，网关默认关闭 |
@@ -162,6 +163,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/model [spec]` | 显示 provider 和模型，或切换到 `<provider>/<model>` |
 | `/effort [level]` | 显示推理强度，或设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
 | `/clear` | 开始新会话 |
+| `/compact [重点]` | 总结会话以腾出上下文（见[上下文压缩](#上下文压缩)）；`重点` 指定摘要要特别保留的内容 |
 | `/resume [id]` | 继续当前目录下之前的会话（见[恢复会话](#恢复会话)） |
 | `/tools` | 列出模型可调用的工具 |
 | `/skills` | 列出发现的技能 |
@@ -178,6 +180,12 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/` | 在提示符下方打开命令菜单；随输入收窄，↑/↓ 选择，Tab 填入，Enter 运行。`/model ` 之后会列出模型 |
 | `@` | 打开文件菜单（见[用 `@` 附加文件](#用--附加文件)） |
 | Ctrl+V | 粘贴剪贴板中的图片（见[粘贴图片](#粘贴图片)） |
+
+## 上下文压缩
+
+当一次请求之后，模型 `context_window` 剩下的空间不够放一次完整回复（`max_tokens`）再加窗口 5% 的余量时，模型先总结会话，再用摘要替换历史，做法与 Codex 相同。窗口 256k、`max_tokens` 为默认的 64k 时，阈值约为 179k token；窗口 1M 时约为 886k。摘要通过一次普通请求获得（system 提示词和工具不变，缓存前缀仍然命中），请求末尾是一段总结提示：进展和决定、用户的约束、涉及的文件、遇到的错误及修复、剩余工作和下一步。新的历史只有一条消息：用户自己发过的消息（从最新往前，原文保留约 2 万 token），然后是摘要，然后是最近读过的 5 个文件的当前内容（每个约 5k token 以内，总共不超过窗口的 10%）。assistant 回复、工具结果和附件都会丢弃，只有重新附上的文件仍算作 `edit` 和 `write` 已读过。
+
+压缩发生在一轮开始前（新消息原样保留在摘要之后），也发生在同一轮的工具调用之间，所以长任务会自己继续下去；REPL 会显示 `✻ Compacted the conversation: context 172.4k → about 9.8k`。`/compact [重点]` 可以手动压缩。如果总结请求本身也超长，会去掉最早的几轮对话再试；如果压缩后上下文仍然太满，或同一轮里第三次又被填满，这一轮会报错停止，而不是无限循环。压缩可以像普通一轮一样打断，打断后历史保持原样。保存的会话存的是压缩后的历史，恢复时会在压缩处显示 `✻ Conversation compacted`。
 
 ## 恢复会话
 
@@ -296,6 +304,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 - `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、带输入框横线、菜单按键、补全、多行输入、Ctrl+V 粘贴以及为子代理报告唤醒提示符的 rustyline 辅助（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
+- `src/agent/compact.rs` — 上下文压缩：何时压缩、总结请求、替换会话的新历史
 - `src/llm/` — LLM 网关
   - `config.rs` — 由配置和环境变量得到 provider、模型 spec 解析、按 provider/模型的设置
   - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退）

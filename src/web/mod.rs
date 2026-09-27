@@ -37,7 +37,7 @@ use crate::skills::Skill;
 use crate::subagent::{AgentDef, AgentTool, MessageAgentTool, Reporter, StopAgentTool};
 use crate::tools::{FileTracker, ToolRegistry};
 
-use tasks::Task;
+use tasks::{Task, Work};
 
 const INDEX_HTML: &str = include_str!("index.html");
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8787";
@@ -542,8 +542,17 @@ async fn send_message(
     if prompt.is_empty() {
         return Err(bad_request("the prompt is empty"));
     }
-    let (content, user) = user_message(&state, prompt, &task.files)?;
-    task.start_turn(content, user).map_err(|e| api_error(StatusCode::CONFLICT, e))?;
+    let (work, user) = match prompt.strip_prefix("/compact").filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+        Some(focus) => {
+            let focus = Some(focus.trim()).filter(|f| !f.is_empty()).map(String::from);
+            (Work::Compact(focus), json!({"type": "user", "text": prompt, "attachments": [], "warnings": []}))
+        }
+        None => {
+            let (content, user) = user_message(&state, prompt, &task.files)?;
+            (Work::Turn(content), user)
+        }
+    };
+    task.start(work, user).map_err(|e| api_error(StatusCode::CONFLICT, e))?;
     Ok(Json(task.summary()))
 }
 

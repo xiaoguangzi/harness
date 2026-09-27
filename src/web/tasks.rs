@@ -44,6 +44,15 @@ impl Status {
     }
 }
 
+/// What a task runs in the background.
+pub enum Work {
+    /// A turn on these user message contents; empty for what waits in the
+    /// inbox.
+    Turn(Vec<Value>),
+    /// Compacting the conversation (`/compact`), with what to focus on.
+    Compact(Option<String>),
+}
+
 struct Meta {
     status: Status,
     model: String,
@@ -155,6 +164,11 @@ impl Task {
     /// Starts a turn in the background. `user` is the event describing the
     /// user's message. Fails if a turn is already running.
     pub fn start_turn(self: &Arc<Self>, content: Vec<Value>, user: Value) -> Result<(), &'static str> {
+        self.start(Work::Turn(content), user)
+    }
+
+    /// Starts `work` in the background, like [`Task::start_turn`].
+    pub fn start(self: &Arc<Self>, work: Work, user: Value) -> Result<(), &'static str> {
         let mut meta = self.meta.lock().unwrap();
         if meta.status == Status::Running {
             return Err("the task is still running; wait for it or cancel it");
@@ -167,7 +181,11 @@ impl Task {
         let task = self.clone();
         let run = async move {
             let mut agent = task.agent.lock().await;
-            let result = agent.run_turn(content, &mut WebObserver { task: &task }).await;
+            let observer = &mut WebObserver { task: &task };
+            let result = match work {
+                Work::Turn(content) => agent.run_turn(content, observer).await,
+                Work::Compact(focus) => agent.compact(focus.as_deref(), observer).await,
+            };
             drop(agent);
             task.finish(result);
             // Reports that arrived as the turn ended get a turn of their own.
@@ -238,6 +256,14 @@ impl Observer for WebObserver<'_> {
     fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
         let content = crate::tools::truncate(&output.content, MAX_EVENT_RESULT_BYTES);
         self.task.push(json!({"type": "tool_result", "name": name, "content": content, "is_error": output.is_error}));
+    }
+
+    fn on_compact_start(&mut self) {
+        self.task.push(json!({"type": "compact_start"}));
+    }
+
+    fn on_compact_end(&mut self, before: u64, after: u64) {
+        self.task.push(json!({"type": "compact", "before": before, "after": after}));
     }
 
     fn on_retry(&mut self, error: &anyhow::Error, attempt: u32, wait: Duration) {

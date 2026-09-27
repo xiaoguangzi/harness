@@ -323,6 +323,14 @@ pub fn replay(out: &Output, messages: &[Message]) {
             out.line(out.paint("33", "■ Interrupted"));
             out.line("");
         }
+        if crate::agent::is_compacted(m) {
+            if std::mem::take(&mut tools) {
+                out.line("");
+            }
+            out.line(out.paint("2", "✻ Conversation compacted"));
+            out.line("");
+            continue;
+        }
         if m.role == "user" {
             let prompt = m.content.iter().rev().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).find(|t| *t != INTERRUPTED);
             if let Some(prompt) = prompt.filter(|_| !m.content.iter().any(|b| b["type"] == "tool_result")) {
@@ -754,6 +762,23 @@ impl Observer for Terminal {
         }
         self.separate(Block::Tools);
         self.out.line(self.out.paint("33", &format!("↻ Response broke off {detail}")));
+    }
+
+    fn on_compact_start(&mut self) {
+        self.end_text();
+        self.enter(Phase::Waiting, "Compacting the conversation…");
+    }
+
+    fn on_compact_end(&mut self, before: u64, after: u64) {
+        self.context_tokens = after;
+        let note = format!("✻ Compacted the conversation: context {} → about {}", tokens(before), tokens(after));
+        if !self.out.styled() {
+            eprintln!("{note}");
+        } else {
+            self.separate(Block::Tools);
+            self.out.line(self.out.paint("2", &note));
+        }
+        self.enter(Phase::Waiting, WAITING);
     }
 
     fn on_usage(&mut self, usage: &Usage) {

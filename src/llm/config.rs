@@ -43,6 +43,7 @@ use crate::util::{expand_env, merge_json};
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-5";
 const DEFAULT_MAX_TOKENS: u32 = 64_000;
+const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
 const DEFAULT_EFFORT: Effort = Effort::High;
 const OFFICIAL_ANTHROPIC_HOST: &str = "api.anthropic.com";
 
@@ -117,6 +118,9 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     pub max_tokens: Option<u32>,
+    /// The models' context window, in tokens; the conversation is compacted
+    /// before it fills up.
+    pub context_window: Option<u32>,
     /// Merged into every request body; a `null` value removes a key.
     pub extra_body: Option<Map<String, Value>>,
     /// Anthropic only: server-side refusal fallbacks. Default: on for the
@@ -135,6 +139,7 @@ pub struct ProviderConfig {
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u32>,
     pub effort: Option<Effort>,
     pub extra_body: Option<Map<String, Value>>,
 }
@@ -151,6 +156,8 @@ pub struct Providers {
     pub effort: Effort,
     /// `max_tokens` for providers and models without their own.
     max_tokens: Option<u32>,
+    /// `context_window` for providers and models without their own.
+    context_window: Option<u32>,
 }
 
 /// Everything needed to send one request: a provider plus a model on it.
@@ -163,6 +170,8 @@ pub struct Target<'a> {
     pub effort: Effort,
     /// The top-level `max_tokens`, for providers and models without one.
     pub(super) default_max_tokens: Option<u32>,
+    /// The top-level `context_window`, likewise.
+    pub(super) default_context_window: Option<u32>,
 }
 
 impl Providers {
@@ -232,6 +241,7 @@ impl Providers {
             subagent_model: None,
             effort: effort.unwrap_or(DEFAULT_EFFORT),
             max_tokens,
+            context_window: settings.context_window,
         };
         let requested = env("HARNESS_MODEL").or(settings.model.clone()).or_else(|| this.fallback_default());
         let requested = requested.ok_or_else(|| {
@@ -291,7 +301,14 @@ impl Providers {
         let (provider, model) = spec.split_once('/').ok_or_else(|| anyhow!("unresolved model spec `{spec}`"))?;
         let config = self.providers.get(provider).ok_or_else(|| anyhow!("unknown provider `{provider}`"))?;
         let effort = config.models.get(model).and_then(|m| m.effort).unwrap_or(self.effort);
-        Ok(Target { provider, config, model, effort, default_max_tokens: self.max_tokens })
+        Ok(Target {
+            provider,
+            config,
+            model,
+            effort,
+            default_max_tokens: self.max_tokens,
+            default_context_window: self.context_window,
+        })
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -321,6 +338,7 @@ impl ProviderConfig {
             auth: Some(auth),
             headers: BTreeMap::new(),
             max_tokens: None,
+            context_window: None,
             extra_body: None,
             fallbacks: None,
             eager_input_streaming: None,
@@ -350,6 +368,14 @@ impl Target<'_> {
             .or(self.config.max_tokens)
             .or(self.default_max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS)
+    }
+
+    pub fn context_window(&self) -> u32 {
+        self.model_config()
+            .and_then(|m| m.context_window)
+            .or(self.config.context_window)
+            .or(self.default_context_window)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW)
     }
 
     /// Applies the provider's, then the model's, `extra_body` to `body`.
@@ -459,12 +485,18 @@ pub(crate) mod tests {
         assert_eq!(body, json!({"model": "gpt-5", "reasoning": {"effort": "high"}}));
         assert_eq!(p.target("relay-b/other").unwrap().max_tokens(), 8000);
         assert_eq!(p.target("relay-a/m").unwrap().max_tokens(), DEFAULT_MAX_TOKENS);
+        assert_eq!(p.target("relay-a/m").unwrap().context_window(), DEFAULT_CONTEXT_WINDOW);
 
         let mut s = two_relays();
         s.max_tokens = Some(2000);
         let p = Providers::from_parts(&s, &no_env).unwrap();
         assert_eq!(p.target("relay-a/m").unwrap().max_tokens(), 2000, "the top-level default");
         assert_eq!(p.target("relay-b/other").unwrap().max_tokens(), 8000, "the provider's own wins");
+        s.context_window = Some(100_000);
+        s.providers.get_mut("relay-b").unwrap().models.get_mut("gpt-5").unwrap().context_window = Some(400_000);
+        let p = Providers::from_parts(&s, &no_env).unwrap();
+        assert_eq!(p.target("relay-a/m").unwrap().context_window(), 100_000);
+        assert_eq!(p.target("relay-b/gpt-5").unwrap().context_window(), 400_000, "the model's own wins");
         let env = |k: &str| (k == "HARNESS_MAX_TOKENS").then(|| "3000".to_string());
         assert_eq!(Providers::from_parts(&s, &env).unwrap().target("relay-a/m").unwrap().max_tokens(), 3000);
     }

@@ -248,6 +248,31 @@ fn attach_text(mention: &Mention, size: u64, files: &FileTracker) -> Result<Atta
     })
 }
 
+/// A text file as an attachment block, as `@path` attaches it but cut to
+/// `max_bytes` (on a line boundary, saying so), and recorded in `files`.
+/// `None` for a file that is gone, binary or empty.
+pub fn reattach(path: &Path, max_bytes: usize, files: &FileTracker) -> Option<Value> {
+    let meta = std::fs::metadata(path).ok().filter(|m| m.is_file() && m.len() > 0)?;
+    let bytes = read_capped(path, meta.len(), MAX_TEXT_BYTES).ok().filter(|b| !b.contains(&0))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let total = text.lines().count();
+    let mut body = number_lines(&text, 1, MAX_TEXT_LINES).ok()?;
+    let mut shown = body.lines().count();
+    if body.len() > max_bytes {
+        let cut = body[..max_bytes].rfind('\n').map_or(0, |i| i + 1);
+        body.truncate(cut);
+        shown = body.lines().count();
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let name = path.strip_prefix(&cwd).unwrap_or(path).display();
+    let (attr, note) = match shown < total {
+        true => (format!(" lines=\"1-{shown}\""), format!("... ({total} lines in all; read the rest if you need it)\n")),
+        false => (String::new(), String::new()),
+    };
+    files.record(path);
+    Some(json!({"type": "text", "text": format!("<file path=\"{name}\"{attr}>\n{body}{note}</file>")}))
+}
+
 fn attach_dir(dir: &str) -> Result<Attachment, String> {
     let mut entries: Vec<String> = std::fs::read_dir(dir)
         .map_err(|e| e.to_string())?
