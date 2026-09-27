@@ -28,7 +28,8 @@ use crate::tools::{FileTracker, number_lines};
 
 const MAX_TEXT_LINES: usize = 2000;
 const MAX_TEXT_BYTES: u64 = 1024 * 1024;
-const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// The API takes images up to 5 MB in base64.
+const MAX_IMAGE_BYTES: u64 = 3_932_160;
 const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_DIR_ENTRIES: usize = 500;
 const TRAILING_PUNCTUATION: &[char] = &[',', '.', ';', ':', '!', '?', ')', ']', '}', '"', '\'', '，', '。', '；', '：', '！', '？', '）'];
@@ -159,33 +160,47 @@ fn attach(mention: &Mention, files: &FileTracker) -> Result<Attachment, String> 
     if meta.is_dir() {
         return attach_dir(&mention.path);
     }
-    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    let media_type = match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    };
-    if let Some(media_type) = media_type {
-        let bytes = read_capped(path, meta.len(), MAX_IMAGE_BYTES)?;
-        return Ok(Attachment {
-            label: format!("{} (image, {})", mention.path, human_size(meta.len())),
-            blocks: vec![json!({"type": "text", "text": format!("Image @{}:", mention.path)}), image_block(media_type, &bytes)],
-        });
-    }
-    if ext == "pdf" {
-        let bytes = read_capped(path, meta.len(), MAX_PDF_BYTES)?;
-        return Ok(Attachment {
-            label: format!("{} (PDF, {})", mention.path, human_size(meta.len())),
-            blocks: vec![json!({
-                "type": "document",
-                "title": mention.path,
-                "source": {"type": "base64", "media_type": "application/pdf", "data": BASE64.encode(bytes)},
-            })],
-        });
+    if let Some(media) = media_block(path, &mention.path, meta.len()) {
+        let (label, block) = media?;
+        let mut blocks = Vec::new();
+        if block["type"] == "image" {
+            blocks.push(json!({"type": "text", "text": format!("Image @{}:", mention.path)}));
+        }
+        blocks.push(block);
+        return Ok(Attachment { label, blocks });
     }
     attach_text(mention, meta.len(), files)
+}
+
+/// An image (png, jpg, gif, webp) or PDF file as a content block, with a
+/// label such as `shot.png (image, 120 KB)`; `None` for other files. `name`
+/// is how the file is referred to, and `size` its length.
+pub fn media_block(path: &Path, name: &str, size: u64) -> Option<Result<(String, Value), String>> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let media_type = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        _ => return None,
+    };
+    let limit = if ext == "pdf" { MAX_PDF_BYTES } else { MAX_IMAGE_BYTES };
+    let bytes = match read_capped(path, size, limit) {
+        Ok(bytes) => bytes,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(Ok(match ext.as_str() {
+        "pdf" => (
+            format!("{name} (PDF, {})", human_size(size)),
+            json!({
+                "type": "document",
+                "title": name,
+                "source": {"type": "base64", "media_type": media_type, "data": BASE64.encode(bytes)},
+            }),
+        ),
+        _ => (format!("{name} (image, {})", human_size(size)), image_block(media_type, &bytes)),
+    }))
 }
 
 fn image_block(media_type: &str, bytes: &[u8]) -> Value {

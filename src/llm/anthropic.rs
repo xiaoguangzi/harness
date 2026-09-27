@@ -58,10 +58,14 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
             def
         })
         .collect();
+    let media_inside = target.tool_result_media();
     let messages: Vec<Value> = messages
         .iter()
         .filter_map(|m| {
-            let content = history_blocks(m, &spec);
+            let mut content = history_blocks(m, &spec);
+            if !media_inside {
+                content = lift_tool_media(content);
+            }
             (!content.is_empty()).then(|| json!({"role": m.role, "content": content}))
         })
         .collect();
@@ -104,6 +108,36 @@ fn history_blocks(message: &Message, spec: &str) -> Vec<Value> {
         })
         .cloned()
         .collect()
+}
+
+/// Moves the images and PDFs out of a user message's tool results, to
+/// follow the last result as blocks of their own: many gateways drop them
+/// from tool results but pass them in a user message.
+fn lift_tool_media(blocks: Vec<Value>) -> Vec<Value> {
+    let mut lifted = Vec::new();
+    let mut blocks: Vec<Value> = blocks
+        .into_iter()
+        .map(|mut block| {
+            if block["type"] == "tool_result"
+                && let Some(items) = block["content"].as_array()
+                && items.iter().any(|i| i["type"] != "text")
+            {
+                let (mut text, media): (Vec<Value>, Vec<Value>) =
+                    items.iter().cloned().partition(|i| i["type"] == "text");
+                text.push(json!({"type": "text", "text": "(The image or PDF itself follows the tool results.)"}));
+                lifted.extend(media);
+                block["content"] = Value::Array(text);
+            }
+            block
+        })
+        .collect();
+    if !lifted.is_empty() {
+        let at = blocks.iter().rposition(|b| b["type"] == "tool_result").map_or(0, |i| i + 1);
+        let mut follow = vec![json!({"type": "text", "text": "Files returned by the tool calls above:"})];
+        follow.extend(lifted);
+        blocks.splice(at..at, follow);
+    }
+    blocks
 }
 
 /// Folds stream events into complete content blocks.
@@ -269,6 +303,35 @@ mod tests {
     use crate::llm::Usage;
     use crate::llm::Providers;
     use crate::llm::config::tests::{file, no_env};
+
+    #[test]
+    fn tool_result_media_follows_the_results_on_gateways() {
+        let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}});
+        let results = vec![
+            json!({"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "shot.png"}, image]}),
+            json!({"type": "tool_result", "tool_use_id": "t2", "content": "ok"}),
+            json!({"type": "text", "text": "a message that arrived"}),
+        ];
+        let lifted = lift_tool_media(results.clone());
+        assert_eq!(lifted[0]["content"][0], json!({"type": "text", "text": "shot.png"}));
+        assert!(lifted[0]["content"][1]["text"].as_str().unwrap().contains("follows the tool results"));
+        assert_eq!(lifted[1], results[1]);
+        assert_eq!(lifted[2]["text"], "Files returned by the tool calls above:");
+        assert_eq!(lifted[3], image);
+        assert_eq!(lifted[4], results[2]);
+        assert_eq!(lift_tool_media(vec![results[1].clone()]), vec![results[1].clone()], "nothing to move");
+
+        let config = |url: &str| {
+            file(json!({"model": "p/m", "providers": {"p": {"protocol": "anthropic", "base_url": url, "api_key": "k"}}}))
+        };
+        let messages = vec![Message::user(results)];
+        for (url, inside) in [("https://gw.example.com", false), ("https://api.anthropic.com", true)] {
+            let providers = Providers::from_parts(&config(url), &no_env).unwrap();
+            let body = build_body(&providers.target("p/m").unwrap(), "sys", &[], &messages);
+            let first = &body["messages"][0]["content"][0]["content"];
+            assert_eq!(first[1]["type"], if inside { "image" } else { "text" }, "{url}");
+        }
+    }
 
     #[test]
     fn builds_body_per_provider_and_filters_foreign_blocks() {

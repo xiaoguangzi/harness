@@ -18,7 +18,8 @@ const GUIDANCE: &[(&str, &str)] = &[
     (
         "read",
         "view a file with line numbers. Read the code you are about to change or explain; page \
-         through large files with `offset` and `limit`.",
+         through large files with `offset` and `limit`. It also shows you images and PDFs, such as \
+         screenshots a test wrote.",
     ),
     (
         "edit",
@@ -33,6 +34,12 @@ const GUIDANCE: &[(&str, &str)] = &[
          part of a file, which is what `edit` is for. An existing file must have been read (or \
          attached) first.",
     ),
+    (
+        "todo_write",
+        "keep a checklist for work with three or more steps, which the user sees: write it when you \
+         start, mark each item in_progress as you begin it (one at a time) and completed as soon as \
+         it is done, and add items you discover. Skip it for small tasks.",
+    ),
     ("grep", "search file contents by regular expression. Use it instead of running grep or rg through `bash`."),
     (
         "bash",
@@ -42,8 +49,15 @@ const GUIDANCE: &[(&str, &str)] = &[
          Node or Perl scripts, `sed -i`, heredocs or `>` redirection into files. Those changes go \
          through `edit` and `write`, which check that you read the file and show the user the \
          change; commands that edit files themselves are refused. Running the project's own build \
-         steps, formatters and code generators is fine.",
+         steps, formatters and code generators is fine. Start dev servers, watchers and other \
+         commands that keep running with `run_in_background`.",
     ),
+    (
+        "bash_output",
+        "read what a background command printed since you last looked, and whether it still runs. \
+         You are told when one exits by itself, so don't poll it in a loop.",
+    ),
+    ("kill_shell", "stop a background command you no longer need, such as a dev server once you are done with it."),
     (
         "skill",
         "load instructions for a specialised kind of task. When the request matches one of the \

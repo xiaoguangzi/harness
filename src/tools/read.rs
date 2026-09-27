@@ -37,6 +37,8 @@ impl Tool for ReadTool {
         "Read a text file and return its contents with 1-based line numbers. \
          Reads up to 2000 lines by default; use `offset` and `limit` to page through \
          larger files. Lines longer than 2000 characters are truncated. \
+         Images (png, jpg, gif, webp, up to 3.75 MB) and PDFs (up to 20 MB) are returned \
+         for you to view; `offset` and `limit` do not apply to them. \
          Relative paths resolve against the working directory."
     }
 
@@ -76,6 +78,15 @@ impl Tool for ReadTool {
             && let Err(e) = sandbox.check_read(input.path.as_ref())
         {
             return ToolOutput::error(e);
+        }
+        let path: &std::path::Path = input.path.as_ref();
+        if let Ok(meta) = std::fs::metadata(path)
+            && let Some(media) = crate::mentions::media_block(path, &input.path, meta.len())
+        {
+            return match media {
+                Ok((label, block)) => ToolOutput { images: vec![block], ..ToolOutput::ok(label) },
+                Err(e) => ToolOutput::error(format!("{}: {e}", input.path)),
+            };
         }
         let offset = input.offset.unwrap_or(1).max(1);
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT).max(1);
@@ -214,6 +225,29 @@ mod tests {
 
     fn path(f: &tempfile::NamedTempFile) -> String {
         f.path().to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn returns_images_and_pdfs_as_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let out = read_tool().run(json!({"path": png})).await;
+        assert!(!out.is_error && out.content.ends_with("shot.png (image, 12 B)"), "{}", out.content);
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0]["type"], "image");
+        assert_eq!(out.images[0]["source"]["media_type"], "image/png");
+
+        let pdf = dir.path().join("spec.PDF");
+        std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+        let out = read_tool().run(json!({"path": pdf})).await;
+        assert_eq!(out.images[0]["type"], "document");
+        assert_eq!(out.images[0]["source"]["media_type"], "application/pdf");
+
+        let big = dir.path().join("big.jpg");
+        std::fs::write(&big, vec![0u8; 4_000_000]).unwrap();
+        let out = read_tool().run(json!({"path": big})).await;
+        assert!(out.is_error && out.content.contains("limit"), "{}", out.content);
     }
 
     #[tokio::test]

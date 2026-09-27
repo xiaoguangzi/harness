@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 
 use crate::llm::{Client, Message, StreamEvent, Usage};
 use crate::subagent::Subagents;
+use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
 
 pub use compact::is_compacted;
@@ -165,6 +166,8 @@ pub struct Agent {
     /// Subagents this conversation started, kept for follow-ups. Their
     /// background reports arrive in `inbox`.
     subagents: Arc<Subagents>,
+    /// Commands `bash` runs in the background for this conversation.
+    shells: Arc<Shells>,
     /// The history length after the last response, and the tokens that
     /// response reported for everything up to it; `None` once the history
     /// changed otherwise.
@@ -179,6 +182,7 @@ impl Agent {
     pub fn new(client: Client, tools: ToolRegistry, system: impl Into<String>) -> Self {
         let inbox = Arc::new(Inbox::default());
         let subagents = Arc::new(Subagents::new(inbox.clone()));
+        let shells = Arc::new(Shells::new(inbox.clone()));
         Self {
             client,
             tools,
@@ -187,6 +191,7 @@ impl Agent {
             turn_start: None,
             inbox,
             subagents,
+            shells,
             context: None,
             compactions: 0,
             turn_compacted: false,
@@ -224,9 +229,15 @@ impl Agent {
         &self.subagents
     }
 
-    /// Forgets the conversation, stopping its subagents.
+    pub fn shells(&self) -> &Arc<Shells> {
+        &self.shells
+    }
+
+    /// Forgets the conversation, stopping its subagents and background
+    /// commands.
     pub fn clear(&mut self) {
         self.subagents.reset();
+        self.shells.reset();
         self.inbox.clear();
         self.messages.clear();
         self.turn_start = None;
@@ -282,8 +293,9 @@ impl Agent {
         self.turn_start = Some(self.messages.len());
         (self.compactions, self.turn_compacted) = (0, false);
         self.messages.push(Message::user(arrived.iter().cloned().chain(content).collect()));
-        let (subagents, client) = (self.subagents.clone(), self.client.clone());
-        let result = crate::subagent::scope(subagents, client, self.run_loop(observer)).await;
+        let (subagents, client, shells) = (self.subagents.clone(), self.client.clone(), self.shells.clone());
+        let turn = crate::subagent::scope(subagents, client, self.run_loop(observer));
+        let result = crate::tools::shells::scope(shells, turn).await;
         if result.is_err() {
             // A compaction moves the turn's start.
             let turn_start = self.turn_start.unwrap_or_default();

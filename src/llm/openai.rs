@@ -8,7 +8,7 @@
 //! | user `text` / `image` / `document` | user message: `input_text` / `input_image` / `input_file` |
 //! | assistant `text`                   | assistant message with `output_text`      |
 //! | assistant `tool_use`               | `function_call`                           |
-//! | user `tool_result`                 | `function_call_output` (images follow in a user message) |
+//! | user `tool_result`                 | `function_call_output` (images and PDFs follow in a user message) |
 //! | `openai_reasoning` (same model)    | the original `reasoning` item             |
 //! | `thinking`                         | dropped (Anthropic-only)                  |
 //!
@@ -113,23 +113,23 @@ fn assistant_items(message: &Message, own: bool, input: &mut Vec<Value>) {
 
 fn user_items(message: &Message, input: &mut Vec<Value>) {
     let mut parts = Vec::new();
-    let mut result_images = Vec::new();
+    let mut result_files = Vec::new();
     for block in &message.content {
         match block["type"].as_str().unwrap_or("") {
             "tool_result" => {
                 let (text, images) = split_tool_result(&block["content"]);
                 let output = if block["is_error"] == true { format!("Error: {text}") } else { text };
                 input.push(json!({"type": "function_call_output", "call_id": block["tool_use_id"], "output": output}));
-                result_images.extend(images);
+                result_files.extend(images);
             }
             _ => parts.extend(user_part(block)),
         }
     }
     // Function call outputs are plain text for broad gateway support; any
-    // images a tool returned follow in a user message.
-    if !result_images.is_empty() {
-        let mut content = vec![json!({"type": "input_text", "text": "Images returned by the tool calls above:"})];
-        content.extend(result_images);
+    // images or PDFs a tool returned follow in a user message.
+    if !result_files.is_empty() {
+        let mut content = vec![json!({"type": "input_text", "text": "Files returned by the tool calls above:"})];
+        content.extend(result_files);
         input.push(json!({"role": "user", "content": content}));
     }
     if !parts.is_empty() {
@@ -164,13 +164,13 @@ fn image_part(block: &Value) -> Option<Value> {
 }
 
 /// Splits `tool_result` content (a string or a list of blocks) into text
-/// and `input_image` parts.
+/// and `input_image` / `input_file` parts.
 fn split_tool_result(content: &Value) -> (String, Vec<Value>) {
     match content {
         Value::String(s) => (s.clone(), Vec::new()),
         Value::Array(blocks) => {
             let text: Vec<&str> = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
-            let images = blocks.iter().filter(|b| b["type"] == "image").filter_map(image_part).collect();
+            let images = blocks.iter().filter(|b| b["type"] != "text").filter_map(user_part).collect();
             (text.join("\n"), images)
         }
         _ => (String::new(), Vec::new()),
@@ -390,6 +390,7 @@ mod tests {
             Message::user(vec![json!({"type": "tool_result", "tool_use_id": "call_1", "is_error": true, "content": [
                 {"type": "text", "text": "boom"},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBB"}},
+                {"type": "document", "title": "spec.pdf", "source": {"type": "base64", "media_type": "application/pdf", "data": "CCC"}},
             ]})]),
             Message {
                 role: "assistant",
@@ -413,8 +414,9 @@ mod tests {
                 json!({"type": "function_call", "call_id": "call_1", "name": "grep", "arguments": "{\"pattern\":\"x\"}"}),
                 json!({"type": "function_call_output", "call_id": "call_1", "output": "Error: boom"}),
                 json!({"role": "user", "content": [
-                    {"type": "input_text", "text": "Images returned by the tool calls above:"},
+                    {"type": "input_text", "text": "Files returned by the tool calls above:"},
                     {"type": "input_image", "image_url": "data:image/png;base64,BBB"},
+                    {"type": "input_file", "filename": "spec.pdf", "file_data": "data:application/pdf;base64,CCC"},
                 ]}),
                 json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "From another model."}]}),
             ]

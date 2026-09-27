@@ -50,6 +50,9 @@ const SUMMARY_PREFIX: &str = "This conversation was compacted to fit the context
 written by the model that did the work so far, and replaces the earlier turns; the user's messages from them are \
 above. Build on the work already done and avoid repeating it.";
 
+/// Starts the todo list a compaction carries over.
+const TODO_PREFIX: &str = "Your todo list before the compaction (keep it current with todo_write):";
+
 /// Whether `message` is the one a compaction left in place of the history.
 pub fn is_compacted(message: &Message) -> bool {
     message.role == "user" && message.content.iter().any(is_summary)
@@ -177,6 +180,17 @@ impl Agent {
         let mut content: Vec<Value> =
             kept_user_messages(history).into_iter().map(|text| json!({"type": "text", "text": text})).collect();
         content.push(json!({"type": "text", "text": format!("{SUMMARY_PREFIX}\n\n<summary>\n{}\n</summary>", summary.trim())}));
+        // The latest todo list goes on as it was.
+        let todos = history
+            .iter()
+            .rev()
+            .flat_map(|m| m.content.iter().rev())
+            .find(|b| b["type"] == "tool_use" && b["name"] == "todo_write")
+            .map(|b| crate::tools::todo::checklist(&b["input"]))
+            .filter(|list| !list.is_empty());
+        if let Some(list) = todos {
+            content.push(json!({"type": "text", "text": format!("{TODO_PREFIX}\n{list}")}));
+        }
         // The files it read last, as they are now. The model no longer sees
         // the others, so it must read them again before changing them.
         if let Some(files) = self.tools.files() {
@@ -236,7 +250,7 @@ fn kept_user_messages(history: &[Message]) -> Vec<String> {
         .filter_map(|b| b["text"].as_str().filter(|_| b["type"] == "text"))
         .filter(|t| !t.is_empty() && *t != INTERRUPTED)
         .filter(|t| {
-            !["<file ", "<directory ", "<subagent-notification>", "The files read most recently"]
+            !["<file ", "<directory ", "<subagent-notification>", "<shell-notification>", "The files read most recently", TODO_PREFIX]
                 .iter()
                 .any(|p| t.starts_with(p))
         });
@@ -493,8 +507,10 @@ mod tests {
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, "alpha\nbeta\n").unwrap();
         let read = json!({"type": "tool_use", "id": "t1", "name": "read", "input": {"path": path}});
+        let todos = json!({"type": "tool_use", "id": "t2", "name": "todo_write", "input": {"todos": [
+            {"content": "Read the notes", "status": "in_progress"}, {"content": "Answer", "status": "pending"}]}});
         let (client, mut requests) = gateway(move |n| match n {
-            0 => (vec![read.clone()], "tool_use", 9_000),
+            0 => (vec![todos.clone(), read.clone()], "tool_use", 9_000),
             _ => (vec![text("finished")], "end_turn", 500),
         })
         .await;
@@ -517,6 +533,8 @@ mod tests {
         assert!(compacted[1].starts_with(SUMMARY_PREFIX));
         let file = compacted.iter().find(|t| t.starts_with("<file ")).expect("the file read is attached again");
         assert!(file.contains("alpha") && file.contains("beta"), "{file}");
+        let todo = compacted.iter().find(|t| t.starts_with(TODO_PREFIX)).expect("the todo list goes on");
+        assert!(todo.ends_with("- [ ] Read the notes (in progress)\n- [ ] Answer"), "{todo}");
 
         assert_eq!(agent.messages.len(), 2);
         assert_eq!(agent.last_text(0), "finished");

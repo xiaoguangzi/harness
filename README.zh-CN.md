@@ -123,6 +123,7 @@ harness --help                          # 查看全部选项
 | `effort` | 顶层或按模型设置：`low`、`medium`、`high`（默认）、`xhigh` 或 `max`。以 Anthropic 的 `output_config.effort` 或 OpenAI 的 `reasoning.effort` 发送；`extra_body` 仍可覆盖它，例如对不支持 effort 的模型用 `{"output_config": null}` |
 | `extra_body` | 合并进每个请求体，也可按模型设置；`null` 会移除默认键，例如对不支持自适应思考的模型用 `{"thinking": null}`，或对拒绝加密推理的网关用 `{"include": null}` |
 | `fallbacks`、`eager_input_streaming` | 仅 Anthropic 的 API 特性；`api.anthropic.com` 默认开启，网关默认关闭 |
+| `tool_result_media` | 仅 Anthropic：工具返回的图片和 PDF（`read`、MCP 工具）放在 `tool_result` 里。`api.anthropic.com` 默认开启；网关默认关闭，此时它们放在同一条消息里、紧跟工具结果之后，因为很多网关会丢掉工具结果里的图片 |
 | `prompt_cache` | Anthropic 自动提示词缓存；默认开启 |
 | `models` | 按模型的覆盖项；列出的模型会显示在 `/model` 和 Tab 补全中 |
 
@@ -153,7 +154,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 
 ## REPL
 
-助手的 Markdown 在流式输出时即时渲染（逐行；表格在完整后对齐）。工具调用显示为 `● bash(cargo test)` 并带有结果的前几行，前台子代理的调用列在其 `agent` 调用之下，后台子代理结束时显示一行，并有旋转指示器显示正在运行的内容。每轮结束时显示耗时、输出 token 数和上下文大小。当 stdout 不是终端（或设置了 `NO_COLOR`）时，文本按原样输出，没有样式和摘要；一次性模式下错误输出到 stderr，退出码非零。
+助手的 Markdown 在流式输出时即时渲染（逐行；表格在完整后对齐）。工具调用显示为 `● bash(cargo test)` 并带有结果的前几行，模型的待办清单（`todo_write`）显示为勾选列表（`✔` 已完成、`◼` 进行中、`☐` 待办），前台子代理的调用列在其 `agent` 调用之下，后台子代理结束时显示一行，并有旋转指示器显示正在运行的内容。每轮结束时显示耗时、输出 token 数和上下文大小。当 stdout 不是终端（或设置了 `NO_COLOR`）时，文本按原样输出，没有样式和摘要；一次性模式下错误输出到 stderr，退出码非零。
 
 提示符是一个夹在两条横线之间的输入框，始终停在最下方，位于输出和旋转指示器之下，在一轮运行期间也是如此。模型工作时输入的内容会进入这个输入框：按 Enter 后，这条消息列在输入框上方，直到模型在下一次请求中拿到它（跟在当时正在运行的工具调用结果之后；如果模型正在写回答，它会继续而不是结束本轮），之后它显示在会话中。`@路径` 提及和 Ctrl+V 在这里同样可用；菜单和历史只在提示符处可用。一轮运行期间发送的 `/命令` 会等本轮结束再执行。如果中断本轮，模型尚未拿到的消息会回到输入框中；本轮结束后，输入框里剩下的内容仍会保留在提示符中。
 
@@ -168,8 +169,8 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/tools` | 列出模型可调用的工具 |
 | `/skills` | 列出发现的技能 |
 | `/agents` | 列出子代理类型及其权限和工具 |
-| `/tasks` | 列出本会话启动的子代理：ID、状态、模型、工具调用次数、耗时 |
-| `/stop [id]` | 停止一个运行中的子代理，或全部停止（见[子代理](#子代理subagents)） |
+| `/tasks` | 列出本会话启动的子代理（ID、状态、模型、工具调用次数、耗时）和[后台命令](#后台命令) |
+| `/stop [id]` | 停止一个运行中的子代理或后台命令（`shell_1`），或全部停止（见[子代理](#子代理subagents)） |
 | `/mcp` | 列出 MCP 服务器、其工具和日志文件 |
 | `/sandbox` | 显示沙箱允许的操作（见[沙箱](#沙箱)） |
 | `/<skill> [args]` | 直接运行一个技能（一次性模式同样可用：`harness /greet Bob`） |
@@ -181,9 +182,13 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `@` | 打开文件菜单（见[用 `@` 附加文件](#用--附加文件)） |
 | Ctrl+V | 粘贴剪贴板中的图片（见[粘贴图片](#粘贴图片)） |
 
+## 后台命令
+
+`bash` 加上 `run_in_background: true` 会启动一个持续运行的命令（如开发服务器、watcher 或耗时的构建），并立即返回它的 ID（`shell_1`）。`bash_output` 返回它自上次查看以来的输出（stdout 和 stderr 合在一起，最多返回最新的 30000 字节；最多保留 1 MB）以及它是否仍在运行；`kill_shell` 停止它及其启动的进程。自行退出的命令会通知模型，模型空闲时会因此开始新的一轮，与后台子代理的报告相同。后台命令与其他 `bash` 命令一样受沙箱和文件修改规则约束，每个会话最多同时运行 8 个。`/tasks` 列出它们，`/stop shell_1` 停止一个，`/stop` 全部停止（会告知模型）；`/clear`、`/resume`、删除 Web 任务或退出程序都会杀掉它们。
+
 ## 上下文压缩
 
-当一次请求之后，模型 `context_window` 剩下的空间不够放一次完整回复（`max_tokens`）再加窗口 5% 的余量时，模型先总结会话，再用摘要替换历史，做法与 Codex 相同。窗口 256k、`max_tokens` 为默认的 64k 时，阈值约为 179k token；窗口 1M 时约为 886k。摘要通过一次普通请求获得（system 提示词和工具不变，缓存前缀仍然命中），请求末尾是一段总结提示：进展和决定、用户的约束、涉及的文件、遇到的错误及修复、剩余工作和下一步。新的历史只有一条消息：用户自己发过的消息（从最新往前，原文保留约 2 万 token），然后是摘要，然后是最近读过的 5 个文件的当前内容（每个约 5k token 以内，总共不超过窗口的 10%）。assistant 回复、工具结果和附件都会丢弃，只有重新附上的文件仍算作 `edit` 和 `write` 已读过。
+当一次请求之后，模型 `context_window` 剩下的空间不够放一次完整回复（`max_tokens`）再加窗口 5% 的余量时，模型先总结会话，再用摘要替换历史，做法与 Codex 相同。窗口 256k、`max_tokens` 为默认的 64k 时，阈值约为 179k token；窗口 1M 时约为 886k。摘要通过一次普通请求获得（system 提示词和工具不变，缓存前缀仍然命中），请求末尾是一段总结提示：进展和决定、用户的约束、涉及的文件、遇到的错误及修复、剩余工作和下一步。新的历史只有一条消息：用户自己发过的消息（从最新往前，原文保留约 2 万 token），然后是摘要、最新的待办清单，以及最近读过的 5 个文件的当前内容（每个约 5k token 以内，总共不超过窗口的 10%）。assistant 回复、工具结果和附件都会丢弃，只有重新附上的文件仍算作 `edit` 和 `write` 已读过。
 
 压缩发生在一轮开始前（新消息原样保留在摘要之后），也发生在同一轮的工具调用之间，所以长任务会自己继续下去；REPL 会显示 `✻ Compacted the conversation: context 172.4k → about 9.8k`。`/compact [重点]` 可以手动压缩。如果总结请求本身也超长，会去掉最早的几轮对话再试；如果压缩后上下文仍然太满，或同一轮里第三次又被填满，这一轮会报错停止，而不是无限循环。压缩可以像普通一轮一样打断，打断后历史保持原样。保存的会话存的是压缩后的历史，恢复时会在压缩处显示 `✻ Conversation compacted`。
 
@@ -284,7 +289,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
   You are a code reviewer...
   ```
 
-- **自定义代理默认只读**：只读代理只会获得标记为只读的工具（`read`、`grep`、`skill`，以及服务器设置了 `readOnlyHint` 的 MCP 工具），即使它的 `tools` 列表写了其他工具也不行。`tools` 用于进一步收窄。
+- **自定义代理默认只读**：只读代理只会获得标记为只读的工具（`read`、`grep`、`todo_write`、`skill`，以及服务器设置了 `readOnlyHint` 的 MCP 工具），即使它的 `tools` 列表写了其他工具也不行。`tools` 用于进一步收窄。
 - 子代理不能再启动子代理。它们的文件读取使用自己的追踪器，因此不会计入主代理 `edit` 和 `write` 所需的已读记录。
 - 模型：代理的 `model`，否则 `subagent_model` / `HARNESS_SUBAGENT_MODEL`，否则会话当前使用的模型（包括 `/model`、`/effort` 切换之后）；任意 `<provider>/<model>`。
 - `/agents` 列出可用类型。
@@ -319,9 +324,11 @@ description: Draft release notes from the git log. Use when asked for a changelo
 - `src/skills.rs` — 技能发现、`SKILL.md` frontmatter 解析、`skill` 工具
 - `src/tools/` — `Tool` trait、注册表和 `FileTracker`（共享的读/改/写状态）
   - `bash.rs` — 通过 `bash -c` 运行命令（超时、输出截断）；拒绝自行修改文件的命令（写文件的内联 Python/Node/Perl 脚本、`sed -i`、写入文件的 heredoc 或 `echo`），这些修改应走 `edit` / `write`
-  - `read.rs` — 读取文本文件并带行号（`offset` / `limit` 分页）
+  - `read.rs` — 读取文本文件并带行号（`offset` / `limit` 分页），或读取图片、PDF 供模型查看
   - `edit.rs` — 把文件中一段精确且唯一的文本替换掉（`replace_all` 则替换全部出现），修改的开销只取决于改动本身；与 `write` 相同的先读规则，同一次回复中对同一文件的多个修改按顺序生效
   - `write.rs` — 创建或覆盖文件；已存在的文件必须先被读取且此后未被修改
+  - `shells.rs` — 后台命令（`bash` 的 `run_in_background`）：每个会话各自的一组，`bash_output` 和 `kill_shell` 工具，退出时通知收件箱
+  - `todo.rs` — `todo_write` 工具：模型的待办清单，每次整体发送
   - `grep.rs` — 通过 ugrep 的正则搜索（PCRE，遵循 `.gitignore`，`files_with_matches` / `content` / `count` 模式）
 
 在官方 Anthropic API 上，工具以 `eager_input_streaming` 声明，因此较大的输入（例如 `write` 的文件内容）会在生成时流式传输。此后 API 不再校验工具输入，所以每个内置工具都把输入解析成严格的结构体（拒绝未知字段），流式 JSON 解析失败的调用不会执行：模型会得到 `INVALID_JSON` 错误结果。MCP 工具保持输入缓冲开启，因此 API 会按服务器提供的 schema 校验其输入。

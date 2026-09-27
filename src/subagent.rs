@@ -524,7 +524,7 @@ mod tests {
     fn read_only_is_the_default() {
         let mut def = explore();
         def.tools = None;
-        assert_eq!(names(&agent_tool(vec![]).registry_for(&def)), vec!["grep", "read"]);
+        assert_eq!(names(&agent_tool(vec![]).registry_for(&def)), vec!["grep", "read", "todo_write"]);
     }
 
     #[test]

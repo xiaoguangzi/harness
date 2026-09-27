@@ -9,6 +9,8 @@ mod bash;
 mod edit;
 mod grep;
 mod read;
+pub mod shells;
+pub mod todo;
 mod write;
 
 pub use bash::BashTool;
@@ -16,6 +18,8 @@ pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub(crate) use read::number_lines;
+pub use shells::{BashOutputTool, KillShellTool};
+pub use todo::TodoTool;
 pub use write::WriteTool;
 
 use std::collections::{BTreeMap, HashMap};
@@ -33,7 +37,8 @@ use serde_json::{Value, json};
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
-    /// Anthropic `image` content blocks sent alongside the text.
+    /// Anthropic `image` or `document` content blocks sent alongside the
+    /// text.
     pub images: Vec<Value>,
     /// A file the tool changed, for the frontend to show as a diff; not
     /// sent to the model.
@@ -113,7 +118,10 @@ impl ToolRegistry {
     pub fn with_defaults(files: FileTracker) -> Self {
         let mut registry = Self::new();
         registry.register(BashTool);
+        registry.register(BashOutputTool);
+        registry.register(KillShellTool);
         registry.register(GrepTool);
+        registry.register(TodoTool);
         registry.register(ReadTool::new(files.clone()));
         registry.register(EditTool::new(files.clone()));
         registry.register(WriteTool::new(files.clone()));

@@ -128,6 +128,11 @@ pub struct ProviderConfig {
     pub fallbacks: Option<bool>,
     /// Anthropic only: unbuffered tool-input streaming. Default as above.
     pub eager_input_streaming: Option<bool>,
+    /// Anthropic only: images and PDFs a tool returns stay inside its
+    /// `tool_result`, rather than follow the results as blocks of their
+    /// own, which gateways that drop them from tool results still pass.
+    /// Default as above.
+    pub tool_result_media: Option<bool>,
     /// Anthropic only: automatic prompt caching. Default: on.
     pub prompt_cache: Option<bool>,
     /// Per-model overrides; listed models are offered by `/model`.
@@ -342,6 +347,7 @@ impl ProviderConfig {
             extra_body: None,
             fallbacks: None,
             eager_input_streaming: None,
+            tool_result_media: None,
             prompt_cache: None,
             models: BTreeMap::new(),
         }
@@ -394,6 +400,10 @@ impl Target<'_> {
 
     pub fn eager_input_streaming(&self) -> bool {
         self.config.eager_input_streaming.unwrap_or_else(|| self.config.is_official_anthropic())
+    }
+
+    pub fn tool_result_media(&self) -> bool {
+        self.config.tool_result_media.unwrap_or_else(|| self.config.is_official_anthropic())
     }
 
     pub fn prompt_cache(&self) -> bool {

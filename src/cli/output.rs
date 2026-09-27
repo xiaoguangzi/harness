@@ -350,6 +350,9 @@ pub fn replay(out: &Output, messages: &[Message]) {
             for b in m.content.iter().filter(|b| b["type"] == "tool_result") {
                 let name = b["tool_use_id"].as_str().and_then(|id| names.get(id)).map_or("", String::as_str);
                 let is_error = b["is_error"].as_bool().unwrap_or(false);
+                if name == "todo_write" && !is_error {
+                    continue;
+                }
                 let content = match &b["content"] {
                     Value::String(s) => s.clone(),
                     Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
@@ -379,6 +382,13 @@ pub fn replay(out: &Output, messages: &[Message]) {
                         out.line(text);
                     }
                     out.line("");
+                }
+                Some("tool_use") if b["name"] == "todo_write" => {
+                    if let Some(id) = b["id"].as_str() {
+                        names.insert(id.to_string(), "todo_write".to_string());
+                    }
+                    out.lines(&todo_lines(out, &b["input"]));
+                    tools = true;
                 }
                 Some("tool_use") => {
                     let name = b["name"].as_str().unwrap_or("");
@@ -716,6 +726,10 @@ impl Observer for Terminal {
         let status = if self.calls == 1 { format!("Running {name}…") } else { format!("Running {} tools…", self.calls) };
         self.enter(Phase::Running, &status);
         self.separate(Block::Tools);
+        if name == "todo_write" {
+            self.out.lines(&todo_lines(&self.out, input));
+            return;
+        }
         let width = text::terminal_width();
         self.out.line(format!("{} {}", self.out.paint("32", "●"), call_label(name, input, width.saturating_sub(4))));
     }
@@ -726,6 +740,8 @@ impl Observer for Terminal {
         let prefix = if self.calls > 1 { format!("{name}: ") } else { String::new() };
         let width = text::terminal_width().saturating_sub(6);
         let shown: Vec<String> = match &output.change {
+            // The list itself was shown with the call.
+            _ if name == "todo_write" && !output.is_error => Vec::new(),
             Some(change) if !output.is_error => diff::render(change, width, |sgr, s| self.out.paint(sgr, s))
                 .into_iter()
                 .enumerate()
@@ -813,6 +829,25 @@ fn partial_argument(json: &str) -> Option<String> {
     })
 }
 
+/// A `todo_write` call as a checklist.
+fn todo_lines(out: &Output, input: &Value) -> Vec<String> {
+    let items = crate::tools::todo::items(input);
+    let done = items.iter().filter(|(status, _)| *status == "completed").count();
+    let mut lines = vec![format!("{} {}", out.paint("32", "●"), out.paint("1", &format!("Todos ({done}/{})", items.len())))];
+    let width = text::terminal_width().saturating_sub(8);
+    for (i, (status, content)) in items.iter().enumerate() {
+        let lead = out.paint("2", if i == 0 { "  ⎿ " } else { "    " });
+        let content = text::fit(&text::printable(content), width);
+        let item = match *status {
+            "completed" => out.paint("2", &format!("✔ {content}")),
+            "in_progress" => out.paint("1", &format!("◼ {content}")),
+            _ => format!("☐ {content}"),
+        };
+        lines.push(format!("{lead}{item}"));
+    }
+    lines
+}
+
 /// `12345` -> `12.3k`.
 fn tokens(n: u64) -> String {
     if n < 1000 { n.to_string() } else { format!("{:.1}k", n as f64 / 1000.0) }
@@ -853,7 +888,8 @@ fn result_lines(name: &str, content: &str, is_error: bool, width: usize) -> Vec<
     if lines.is_empty() {
         return vec!["(no output)".to_string()];
     }
-    if name == "read" && !is_error {
+    // Numbered lines; an image or PDF read shows its label instead.
+    if name == "read" && !is_error && lines[0].split_whitespace().next().is_some_and(|n| n.parse::<u64>().is_ok()) {
         return vec![format!("Read {} lines", lines.len())];
     }
     let mut shown: Vec<String> = lines.iter().take(RESULT_LINES).map(|l| text::fit(l, width)).collect();
@@ -905,5 +941,6 @@ mod tests {
             vec!["1", "2", "3", "… +2 lines"]
         );
         assert_eq!(result_lines("read", "No such file", true, 80), vec!["No such file"]);
+        assert_eq!(result_lines("read", "shot.png (image, 12 KB)", false, 80), vec!["shot.png (image, 12 KB)"]);
     }
 }

@@ -370,7 +370,7 @@ async fn general_purpose_gets_the_main_tools_but_cannot_delegate() {
     let mock = Mock::new(|_| answer("ok")).await;
     let tool = AgentTool::new(Arc::new(vec![general_purpose()]), mock.tools(), mock.client.clone(), silent());
     let registry = tool.registry_for(&general_purpose());
-    assert_eq!(registry.names().collect::<Vec<_>>(), vec!["bash", "edit", "grep", "read", "write"]);
+    assert_eq!(registry.names().collect::<Vec<_>>(), vec!["bash", "bash_output", "edit", "grep", "kill_shell", "read", "todo_write", "write"]);
 }
 
 #[tokio::test]

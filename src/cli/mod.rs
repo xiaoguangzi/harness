@@ -46,7 +46,7 @@ const BUILTINS: [(&str, &str); 14] = [
     ("/tools", "list the tools the model can call"),
     ("/skills", "list available skills"),
     ("/agents", "list subagent types and their tools"),
-    ("/tasks", "list the subagents this conversation started"),
+    ("/tasks", "list the subagents and background commands this conversation started"),
     ("/stop", "stop running subagents, or one with /stop <id>"),
     ("/mcp", "list MCP servers and their tools"),
     ("/sandbox", "show what the sandbox allows commands to do"),
@@ -286,11 +286,19 @@ pub async fn run(
             Input::ListTools => print_tools(agent),
             Input::ListMcp => print_mcp(mcp),
             Input::ListAgents => print_agents(agent_defs),
-            Input::Tasks => print_tasks(&agent.subagents().list()),
+            Input::Tasks => print_tasks(&agent.subagents().list(), &agent.shells().list()),
             Input::Stop(None) => {
                 let stopped = agent.subagents().stop_all();
-                out.line(out.paint("2", &format!("stopped {stopped} subagent{}", if stopped == 1 { "" } else { "s" })));
+                let killed = agent.shells().stop_all();
+                let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+                let note = format!("stopped {} and {}", plural(stopped, "subagent"), plural(killed, "background command"));
+                out.line(out.paint("2", &note));
             }
+            Input::Stop(Some(id)) if id.starts_with("shell_") => match agent.shells().stop(&id) {
+                Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
+                Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
+                Err(e) => out.line(out.paint("31", &e)),
+            },
             Input::Stop(Some(id)) => match agent.subagents().stop(&id, true) {
                 Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
                 Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
@@ -793,9 +801,9 @@ fn print_agents(defs: &[AgentDef]) {
     }
 }
 
-fn print_tasks(subagents: &[Value]) {
-    if subagents.is_empty() {
-        println!("no subagents in this conversation");
+fn print_tasks(subagents: &[Value], shells: &[(String, String, bool)]) {
+    if subagents.is_empty() && shells.is_empty() {
+        println!("no subagents or background commands in this conversation");
         return;
     }
     for s in subagents {
@@ -820,6 +828,11 @@ fn print_tasks(subagents: &[Value]) {
             text::printable(s["label"].as_str().unwrap_or("")),
             info.join(" · ")
         );
+    }
+    for (id, command, running) in shells {
+        let (color, status) = if *running { ("36", "running") } else { ("2", "ended") };
+        let command = text::fit(&text::printable(command.lines().next().unwrap_or("")), 80);
+        println!("  \x1b[1m{id}\x1b[0m  \x1b[{color}m{status:<9}\x1b[0m  \x1b[2m$ {command}\x1b[0m");
     }
     println!("\x1b[90mstop one with /stop <id>, or every running one with /stop\x1b[0m");
 }

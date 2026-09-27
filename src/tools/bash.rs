@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 use super::{Tool, ToolOutput, parse_input, truncate_counting};
 use crate::sandbox;
@@ -15,7 +15,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_OUTPUT_BYTES: usize = 30_000;
 /// How long to keep reading output once bash has exited.
-const PIPE_GRACE: Duration = Duration::from_millis(200);
+pub(super) const PIPE_GRACE: Duration = Duration::from_millis(200);
 
 /// Runs a command with `bash -c` in the harness working directory, in the
 /// sandbox when it is on.
@@ -26,6 +26,8 @@ pub struct BashTool;
 struct Input {
     command: String,
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    run_in_background: bool,
 }
 
 #[async_trait]
@@ -44,7 +46,9 @@ impl Tool for BashTool {
          Node or Perl scripts that change files. Use the `read` tool to view files, `edit` to \
          change them, `write` to create them, and the `grep` tool to search. Commands that \
          change files themselves (inline scripts that write files, `sed -i`, heredocs or \
-         `echo` redirected into a file) are refused."
+         `echo` redirected into a file) are refused. With `run_in_background`, the command \
+         keeps running (dev servers, watchers, long builds) and the call returns a shell id \
+         at once: read its output with `bash_output`, stop it with `kill_shell`."
     }
 
     fn input_schema(&self) -> Value {
@@ -57,7 +61,11 @@ impl Tool for BashTool {
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Timeout in milliseconds (default 120000, max 600000)."
+                    "description": "Timeout in milliseconds (default 120000, max 600000); not for background commands."
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Run the command in the background and return its shell id at once (default false)."
                 }
             },
             "required": ["command"],
@@ -78,29 +86,23 @@ impl Tool for BashTool {
                  tests, git and running programs."
             ));
         }
+        if input.run_in_background {
+            let Some(shells) = super::shells::current() else {
+                return ToolOutput::error("Background commands only run within a conversation");
+            };
+            return match shells.start(&input.command) {
+                Ok(id) => ToolOutput::ok(format!(
+                    "Started in the background as {id}. Read its output with bash_output, and stop it with \
+                     kill_shell. You will be told when it exits; don't poll it in a loop."
+                )),
+                Err(e) => ToolOutput::error(e),
+            };
+        }
         let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
-        // Its own process group, so its children can be killed with it.
-        let (mut command, _sandboxed) = match sandbox::active() {
-            Some(sandbox) => match sandbox.command("bash", ["-c", &input.command]) {
-                Ok((command, guard)) => (command, Some(guard)),
-                Err(e) => return ToolOutput::error(format!("Failed to spawn bash: {e}")),
-            },
-            None => {
-                let mut command = Command::new("bash");
-                command.arg("-c").arg(&input.command).process_group(0);
-                (command, None)
-            }
-        };
-        let child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
-        let mut child = match child {
-            Ok(c) => c,
-            Err(e) => return ToolOutput::error(format!("Failed to spawn bash: {e}")),
+        let (mut child, _sandboxed) = match spawn(&input.command) {
+            Ok(spawned) => spawned,
+            Err(e) => return ToolOutput::error(e),
         };
         // On a timeout, or when this call is dropped (the turn was
         // cancelled), everything the command started goes too.
@@ -159,6 +161,25 @@ impl Tool for BashTool {
     }
 }
 
+/// Starts `bash -c command` with its output piped, in the sandbox when it
+/// is on, in a process group of its own so its children can be killed with
+/// it. Keep the guard until the process exits.
+pub(super) fn spawn(command: &str) -> Result<(Child, Option<sandbox::Guard>), String> {
+    let (mut cmd, guard) = match sandbox::active() {
+        Some(sandbox) => match sandbox.command("bash", ["-c", command]) {
+            Ok((cmd, guard)) => (cmd, Some(guard)),
+            Err(e) => return Err(format!("Failed to spawn bash: {e}")),
+        },
+        None => {
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c").arg(command).process_group(0);
+            (cmd, None)
+        }
+    };
+    let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn();
+    child.map(|child| (child, guard)).map_err(|e| format!("Failed to spawn bash: {e}"))
+}
+
 /// The first `MAX_OUTPUT_BYTES` of a stream, and how many bytes came after.
 #[derive(Default)]
 struct Capture {
@@ -186,7 +207,7 @@ impl Capture {
 
 /// Kills a process group with SIGKILL when dropped, unless its id was
 /// cleared.
-struct KillGroup(Option<u32>);
+pub(super) struct KillGroup(pub(super) Option<u32>);
 
 impl Drop for KillGroup {
     fn drop(&mut self) {

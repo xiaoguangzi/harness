@@ -122,6 +122,7 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 | `effort` | top level or per model: `low`, `medium`, `high` (default), `xhigh` or `max`. Sent as Anthropic `output_config.effort` or OpenAI `reasoning.effort`; `extra_body` still overrides it, e.g. `{"output_config": null}` for a model that takes no effort |
 | `extra_body` | merged into every request body, also per model; a `null` removes a default key, e.g. `{"thinking": null}` for a model without adaptive thinking, or `{"include": null}` for a gateway that rejects encrypted reasoning |
 | `fallbacks`, `eager_input_streaming` | Anthropic-only API features; default on for `api.anthropic.com`, off for gateways |
+| `tool_result_media` | Anthropic only: images and PDFs a tool returns (`read`, MCP tools) stay inside its `tool_result`. Default on for `api.anthropic.com`; off for gateways, where they follow the tool results in the same message instead, because many gateways drop them from tool results |
 | `prompt_cache` | Anthropic automatic prompt caching; default on |
 | `models` | per-model overrides; listed models show in `/model` and Tab completion |
 
@@ -152,7 +153,7 @@ On macOS the clipboard is read through `osascript` (any image type an app puts t
 
 ## REPL
 
-The assistant's Markdown is rendered as it streams (a line at a time; tables are aligned once complete). Tool calls show as `● bash(cargo test)` with the first lines of their result, a foreground subagent's calls are listed under its `agent` call, a background subagent gets a line when it ends, and a spinner shows what is running. Each turn ends with its time, output tokens and context size. When stdout is not a terminal (or `NO_COLOR` is set), text is printed as is, without styling or the summary; in one-shot mode errors go to stderr and the exit code is non-zero.
+The assistant's Markdown is rendered as it streams (a line at a time; tables are aligned once complete). Tool calls show as `● bash(cargo test)` with the first lines of their result, the model's todo list (`todo_write`) as a checklist with `✔` done, `◼` in progress and `☐` pending items, a foreground subagent's calls are listed under its `agent` call, a background subagent gets a line when it ends, and a spinner shows what is running. Each turn ends with its time, output tokens and context size. When stdout is not a terminal (or `NO_COLOR` is set), text is printed as is, without styling or the summary; in one-shot mode errors go to stderr and the exit code is non-zero.
 
 The prompt is an input box between two rules that stays at the bottom, under the output and the spinner, while a turn runs too. What you type while the model works goes into it: press Enter and the message is listed above the box until the model gets it with its next request (after the tool calls running then; if the model was writing its answer, it carries on instead of ending the turn), and then it shows in the conversation. `@path` mentions and Ctrl+V work there too; the menus and history only at the prompt. A `/command` sent while a turn runs waits for the turn to end. If you interrupt the turn, messages the model has not got yet go back into the box, and anything left in the box is still there at the prompt after the turn.
 
@@ -167,8 +168,8 @@ The prompt is an input box between two rules that stays at the bottom, under the
 | `/tools` | list the tools the model can call |
 | `/skills` | list discovered skills |
 | `/agents` | list subagent types, their permission and tools |
-| `/tasks` | list the subagents this conversation started: id, status, model, tool calls, time |
-| `/stop [id]` | stop a running subagent, or all of them (see [Subagents](#subagents)) |
+| `/tasks` | list the subagents this conversation started (id, status, model, tool calls, time) and its [background commands](#background-commands) |
+| `/stop [id]` | stop a running subagent or background command (`shell_1`), or all of them (see [Subagents](#subagents)) |
 | `/mcp` | list MCP servers, their tools and log files |
 | `/sandbox` | show what the sandbox allows (see [Sandbox](#sandbox)) |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
@@ -180,9 +181,13 @@ The prompt is an input box between two rules that stays at the bottom, under the
 | `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |
 | Ctrl+V | paste an image from the clipboard (see [Pasting images](#pasting-images)) |
 
+## Background commands
+
+`bash` with `run_in_background: true` starts a command that keeps running, such as a dev server, a watcher or a long build, and returns its id (`shell_1`) at once. `bash_output` returns what it printed since the last look (stdout and stderr together, the newest 30000 bytes of it; up to 1 MB is kept) and whether it still runs; `kill_shell` stops it and the processes it started. A command that exits by itself is reported to the model, which then gets a turn if it is idle, like a background subagent's report. Background commands run under the same sandbox and file-change rules as other `bash` commands, at most 8 at once per conversation. `/tasks` lists them, `/stop shell_1` stops one and `/stop` all of them (the model is told); `/clear`, `/resume`, deleting a web task or quitting kills them.
+
 ## Compaction
 
-Before a request would leave too little of the model's `context_window` for a full response (`max_tokens`) plus a margin of 5% of the window, the model summarizes the conversation and the summary replaces it, as in Codex. With a 256k window and the default `max_tokens` of 64k that is at about 179k tokens; with a 1M window, at about 886k. The summary is asked for with an ordinary request (the same system prompt and tools, so the cached prefix still applies) that ends in a summarization prompt: progress and decisions, the user's constraints, files involved, errors and their fixes, what remains and the next step. The new history is one message: the user's own messages, word for word up to about 20k tokens counting from the newest, then the summary, then the 5 files read most recently, as they are now (each cut to about 5k tokens, and all of them to 10% of the window). The assistant turns, tool results and attachments are gone, and only the re-attached files still count as read for `edit` and `write`.
+Before a request would leave too little of the model's `context_window` for a full response (`max_tokens`) plus a margin of 5% of the window, the model summarizes the conversation and the summary replaces it, as in Codex. With a 256k window and the default `max_tokens` of 64k that is at about 179k tokens; with a 1M window, at about 886k. The summary is asked for with an ordinary request (the same system prompt and tools, so the cached prefix still applies) that ends in a summarization prompt: progress and decisions, the user's constraints, files involved, errors and their fixes, what remains and the next step. The new history is one message: the user's own messages, word for word up to about 20k tokens counting from the newest, then the summary, the latest todo list, and the 5 files read most recently, as they are now (each cut to about 5k tokens, and all of them to 10% of the window). The assistant turns, tool results and attachments are gone, and only the re-attached files still count as read for `edit` and `write`.
 
 This happens before a turn starts (the new message stays as it is, after the summary) and between tool rounds within a turn, so a long task carries on by itself; the REPL shows `✻ Compacted the conversation: context 172.4k → about 9.8k`. `/compact [focus]` does it on demand. If the summarization request itself is too long, its oldest exchanges are left out; if the context is still too full afterwards, or fills up again three times in one turn, the turn stops with an error instead of looping. A compaction can be interrupted like a turn, which leaves the history as it was. Saved sessions store the compacted history, and a resumed one shows `✻ Conversation compacted` where it happened.
 
@@ -283,7 +288,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   You are a code reviewer...
   ```
 
-- **Custom agents default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further.
+- **Custom agents default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `todo_write`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further.
 - Subagents cannot start subagents. Their file reads use their own tracker, so they never count as reads for the main agent's `edit` and `write`.
 - Model: the agent's `model`, else `subagent_model` / `HARNESS_SUBAGENT_MODEL`, else the model the conversation is on now (after any `/model` or `/effort`); any `<provider>/<model>`.
 - `/agents` lists the available types.
@@ -318,9 +323,11 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/edit/write state)
   - `bash.rs` — run a command via `bash -c` (timeout, output truncation); refuses commands that change files themselves (inline Python/Node/Perl scripts that write files, `sed -i`, heredocs or `echo` into a file), which go through `edit` / `write`
-  - `read.rs` — read a text file with line numbers (`offset` / `limit` paging)
+  - `read.rs` — read a text file with line numbers (`offset` / `limit` paging), or an image or PDF for the model to view
   - `edit.rs` — replace an exact, unique string in a file (or every occurrence with `replace_all`), so a change costs as much as the change; the same read-first rule as `write`, and edits to one file from one response apply in order
   - `write.rs` — create or overwrite a file; an existing file must have been read first and be unchanged since
+  - `shells.rs` — background commands (`bash` `run_in_background`): each conversation's own set, the `bash_output` and `kill_shell` tools, exit reports to the inbox
+  - `todo.rs` — the `todo_write` tool: the model's checklist, sent whole each time
   - `grep.rs` — regex search via ugrep (PCRE, honours `.gitignore`, `files_with_matches` / `content` / `count` modes)
 
 On the official Anthropic API, tools are declared with `eager_input_streaming`, so large inputs (such as file contents for `write`) stream as they are generated. The API then no longer validates tool input, so each built-in tool parses its input into a strict struct (unknown fields rejected), and a call whose streamed JSON does not parse is not run: the model gets an `INVALID_JSON` error result instead. MCP tools keep input buffering on, so the API validates their input against the server-provided schema.
