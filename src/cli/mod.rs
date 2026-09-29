@@ -529,6 +529,8 @@ async fn run_shown(
         *input.typing = out.close_input();
         if result.is_err() {
             input.typing.recall(&inbox);
+            // What the model got before the interrupt is in its history.
+            input.typing.queued.clear();
         }
     }
     term.end_turn(&result);
@@ -579,6 +581,7 @@ fn type_key(out: &Output, key: Key, tx: &tokio::sync::mpsc::UnboundedSender<(Str
                 let _ = tx.send(message);
             }
         }
+        Key::Up if out.edit_queued() => {}
         Key::PasteImage => match clipboard::read() {
             Ok(Some(Clip::Image(image))) => {
                 out.edit_input(|typing| typing.draft.paste_image(image));
@@ -754,6 +757,7 @@ fn print_help(skills: &[Skill]) {
         ("Ctrl+V", "paste an image from the clipboard (files copied in Finder or a file manager become @ mentions)"),
         ("\\ or Alt+Enter", "continue on a new line"),
         ("↑ ↓ Tab Enter", "pick from the menu shown while typing / or @"),
+        ("↑", "while the model works: edit the messages queued for it"),
         ("Esc", "interrupt the running turn"),
         ("Ctrl-C", "interrupt the running turn; twice at the prompt to quit"),
     ];

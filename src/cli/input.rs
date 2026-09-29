@@ -18,6 +18,8 @@ const DRAFT_ROWS: usize = 8;
 const QUEUED_ROWS: usize = 4;
 /// Shown in the empty box while a turn runs.
 const PLACEHOLDER: &str = "Type a message; the model reads it at its next step";
+/// Shown in the empty box instead while messages are queued.
+const EDIT_HINT: &str = "Press ↑ to edit queued messages";
 pub const PROMPT: &str = "❯ ";
 pub const PROMPT_SGR: &str = "1;35";
 
@@ -184,12 +186,17 @@ impl Draft {
     }
 
     /// The box's rows, at most `width - 1` columns wide, and where the
-    /// cursor goes in them: (row, column).
-    pub fn render(&self, width: usize, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, (usize, usize)) {
+    /// cursor goes in them: (row, column). An empty box shows `placeholder`.
+    pub fn render(
+        &self,
+        width: usize,
+        placeholder: &str,
+        paint: impl Fn(&str, &str) -> String,
+    ) -> (Vec<String>, (usize, usize)) {
         let prompt = paint(PROMPT_SGR, PROMPT.trim_end()) + " ";
         let room = width.saturating_sub(3).max(1);
         if self.text.is_empty() {
-            return (vec![format!("{prompt}{}", paint("2", &text::fit(PLACEHOLDER, room)))], (0, 2));
+            return (vec![format!("{prompt}{}", paint("2", &text::fit(placeholder, room)))], (0, 2));
         }
         let (mut rows, mut row, mut used) = (Vec::new(), String::new(), 0);
         let mut cursor = (0, 0);
@@ -262,6 +269,13 @@ pub struct Typing {
 }
 
 impl Typing {
+    /// The draft's rows and cursor, as [`Draft::render`] gives them; an
+    /// empty box says how to edit what is queued.
+    pub fn render(&self, width: usize, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, (usize, usize)) {
+        let placeholder = if self.queued.is_empty() { PLACEHOLDER } else { EDIT_HINT };
+        self.draft.render(width, placeholder, paint)
+    }
+
     /// Dim rows listing the queued messages, shown above the box.
     pub fn queued_rows(&self, width: usize, paint: impl Fn(&str, &str) -> String) -> Vec<String> {
         let room = width.saturating_sub(3);
@@ -289,25 +303,36 @@ impl Typing {
         delivered
     }
 
-    /// After a turn was cut short, puts what the model never got back into
-    /// the draft, ahead of what was typed since: messages still in `inbox`
-    /// (taken out of it) and commands.
-    pub fn recall(&mut self, inbox: &Inbox) {
+    /// Up on the draft's first line, as in Claude Code: puts the queued
+    /// messages the model hasn't got yet back into the draft, to edit and
+    /// send again. False if there were none, and Up moves the cursor.
+    pub fn edit_queued(&mut self, inbox: &Inbox) -> bool {
+        !self.draft.text[..self.draft.cursor].contains('\n') && self.recall(inbox)
+    }
+
+    /// Puts what the model never got back into the draft, ahead of what
+    /// was typed since: messages still in `inbox` (taken out of it) and
+    /// commands. Messages it already has stay listed until they show in
+    /// the conversation. False if nothing came back.
+    pub fn recall(&mut self, inbox: &Inbox) -> bool {
         let mut texts = Vec::new();
         for q in std::mem::take(&mut self.queued) {
             if q.id.is_none_or(|id| inbox.withdraw(id)) {
                 texts.push(q.text);
                 self.draft.images.extend(q.images);
+            } else {
+                self.queued.push(q);
             }
         }
         if texts.is_empty() {
-            return;
+            return false;
         }
         if !self.draft.text.is_empty() {
             texts.push(std::mem::take(&mut self.draft.text));
         }
         self.draft.text = texts.join("\n");
         self.draft.cursor = self.draft.text.len();
+        true
     }
 
     /// The next command queued to run after the turn.
@@ -373,12 +398,12 @@ mod tests {
     fn renders_rows_and_the_cursor() {
         // 10 columns leave 7 for text.
         let d = draft("abcdefghij\nk", 9);
-        let (rows, cursor) = d.render(10, plain);
+        let (rows, cursor) = d.render(10, PLACEHOLDER, plain);
         assert_eq!(rows, vec!["❯ abcdefg", "  hij", "  k"]);
         assert_eq!(cursor, (1, 4));
-        let (rows, cursor) = draft("", 0).render(20, plain);
+        let (rows, cursor) = draft("", 0).render(20, PLACEHOLDER, plain);
         assert_eq!((rows[0].as_str(), cursor), ("❯ Type a message; …", (0, 2)));
-        let (_, cursor) = draft("abc\n", 4).render(20, plain);
+        let (_, cursor) = draft("abc\n", 4).render(20, PLACEHOLDER, plain);
         assert_eq!(cursor, (1, 2));
     }
 
@@ -395,8 +420,36 @@ mod tests {
             sent: Vec::new(),
         };
         assert_eq!(typing.take_delivered(&inbox).len(), 1);
-        typing.recall(&inbox);
+        assert!(typing.recall(&inbox));
         assert_eq!(typing.draft.text, "unseen\n/model\ntyped");
         assert!(!inbox.wants_turn());
+        assert!(!typing.recall(&inbox));
+    }
+
+    #[test]
+    fn up_on_the_first_line_edits_what_is_queued() {
+        let inbox = Inbox::default();
+        let queued = |text: &str, id| Queued { text: text.into(), images: Vec::new(), id, shown: Vec::new() };
+        let taken = inbox.push_content(Vec::new(), true);
+        inbox.take();
+        let waiting = inbox.push_content(Vec::new(), true);
+        let mut typing = Typing {
+            draft: draft("a\nb", 3),
+            queued: vec![queued("handed over", Some(taken)), queued("unseen", Some(waiting))],
+            sent: Vec::new(),
+        };
+        assert_eq!(typing.render(80, plain).0[0], "❯ a");
+        assert!(!typing.edit_queued(&inbox), "not on the first line");
+        typing.draft.cursor = 1;
+        assert!(typing.edit_queued(&inbox));
+        assert_eq!(typing.draft.text, "unseen\na\nb");
+        assert!(!inbox.waiting(waiting));
+        // The model has the other one; it stays listed until it shows.
+        assert_eq!(typing.queued.len(), 1);
+        typing.draft = Draft::default();
+        assert_eq!(typing.render(80, plain).0[0], format!("❯ {EDIT_HINT}"));
+        assert_eq!(typing.take_delivered(&inbox).len(), 1);
+        assert!(!typing.edit_queued(&inbox));
+        assert_eq!(typing.render(80, plain).0[0], format!("❯ {PLACEHOLDER}"));
     }
 }

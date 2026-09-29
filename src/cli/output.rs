@@ -124,6 +124,18 @@ impl Output {
         Some(result)
     }
 
+    /// Puts the queued messages the model hasn't got yet back into the input
+    /// box, to edit (see [`Typing::edit_queued`]); false if there were none.
+    pub fn edit_queued(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(input) = state.input.as_mut() else { return false };
+        let recalled = input.typing.edit_queued(&input.inbox);
+        if recalled {
+            self.show(&mut state, "");
+        }
+        recalled
+    }
+
     /// Takes the queued messages the model has now been handed out of the
     /// input box.
     pub fn take_delivered(&self) -> Vec<Queued> {
@@ -532,7 +544,7 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
     rows.extend(input.typing.queued_rows(width, &paint));
     let rule = paint("2", &input::rule(width));
     rows.push(rule.clone());
-    let (draft, (row, col)) = input.typing.draft.render(width, &paint);
+    let (draft, (row, col)) = input.typing.render(width, &paint);
     let cursor = (rows.len() + row, col);
     rows.extend(draft);
     rows.push(rule);
