@@ -6,29 +6,29 @@
 <title>harness</title>
 <style>
 :root {
-  --bg: #f5f6fa; --panel: #ffffff; --panel2: #f8f9fc;
-  --line: #e8ebf1; --line-strong: #d8dde7;
-  --text: #161a24; --muted: #6b7486;
-  --accent: #5a63f0; --accent-hover: #4750e6; --accent-soft: #eef0fe; --accent-ring: rgba(90, 99, 240, .16);
-  --ok: #129d60; --ok-soft: #e4f6ed; --warn: #b45309; --warn-soft: #fcf3e2;
-  --err: #d8434b; --err-soft: #fdeded;
-  --code: #f3f4f8;
-  --brand: #5a63f0;
-  --shadow-sm: 0 1px 2px rgba(22, 26, 40, .06);
-  --shadow: 0 1px 2px rgba(22, 26, 40, .04), 0 4px 16px rgba(22, 26, 40, .06);
-  --shadow-lg: 0 16px 48px rgba(22, 26, 40, .18);
+  --bg: #f6f5f1; --panel: #ffffff; --panel2: #faf9f6;
+  --line: #e9e6df; --line-strong: #dad6cc;
+  --text: #1f1d1a; --muted: #77726a;
+  --accent: #c2603f; --accent-hover: #a94f31; --accent-soft: #f9ebe4; --accent-ring: rgba(194, 96, 63, .18);
+  --ok: #2f8f5b; --ok-soft: #e5f3ea; --warn: #a8670f; --warn-soft: #fbf1dc;
+  --err: #c9403a; --err-soft: #fbeae8;
+  --code: #f1efe9;
+  --brand: #c2603f;
+  --shadow-sm: 0 1px 2px rgba(40, 30, 20, .06);
+  --shadow: 0 1px 2px rgba(40, 30, 20, .04), 0 4px 16px rgba(40, 30, 20, .06);
+  --shadow-lg: 0 16px 48px rgba(40, 30, 20, .18);
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0b0d12; --panel: #14161d; --panel2: #191c25;
-    --line: #242835; --line-strong: #343a49;
-    --text: #e6e9f0; --muted: #8b93a6;
-    --accent: #828bff; --accent-hover: #979eff; --accent-soft: #222848; --accent-ring: rgba(130, 139, 255, .22);
-    --ok: #3ecf82; --ok-soft: #12291d; --warn: #eab308; --warn-soft: #2b230d;
-    --err: #f47171; --err-soft: #331a1c;
-    --code: #1a1d26;
-    --brand: #4f57e0;
+    --bg: #171614; --panel: #1f1e1b; --panel2: #242320;
+    --line: #2f2d29; --line-strong: #403d37;
+    --text: #ece9e2; --muted: #9a958b;
+    --accent: #e0805c; --accent-hover: #ea9473; --accent-soft: #35261f; --accent-ring: rgba(224, 128, 92, .24);
+    --ok: #4cc283; --ok-soft: #14291d; --warn: #e3ac3b; --warn-soft: #2d2510;
+    --err: #ef7a72; --err-soft: #341c1a;
+    --code: #262522;
+    --brand: #c2603f;
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, .4);
     --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 4px 16px rgba(0, 0, 0, .35);
     --shadow-lg: 0 16px 48px rgba(0, 0, 0, .55);
@@ -270,7 +270,11 @@ table tr:hover td { background: color-mix(in srgb, var(--code) 55%, transparent)
 }
 .composer-card textarea:focus { border: 0; box-shadow: none; }
 .composer-foot { display: flex; gap: 8px; align-items: center; padding: 5px 8px 9px 11px; }
-.composer-foot input { width: 200px; flex: none; padding: 5px 10px; font-size: 12.5px; border-radius: 8px; }
+.composer-foot select { width: auto; max-width: 260px; flex: none; padding: 4px 30px 4px 11px; font-size: 12.5px; border-radius: 999px; }
+select {
+  appearance: none; -webkit-appearance: none; cursor: pointer; text-overflow: ellipsis;
+  background: var(--panel) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='%23948e84' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E") right 11px center / 12px no-repeat;
+}
 .hint-enter { margin-left: auto; color: var(--muted); font-size: 11.5px; white-space: nowrap; }
 
 @media (max-width: 760px) {
@@ -288,7 +292,7 @@ table tr:hover td { background: color-mix(in srgb, var(--code) 55%, transparent)
 </head>
 <body>
 <header>
-  <h1><svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><rect width="24" height="24" rx="7" fill="#5a63f0"/><path d="M12 5.5l1.7 4.8 4.8 1.7-4.8 1.7-1.7 4.8-1.7-4.8-4.8-1.7 4.8-1.7z" fill="#fff"/></svg>harness</h1>
+  <h1><svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><rect width="24" height="24" rx="7" fill="#c2603f"/><path d="M12 5.5l1.7 4.8 4.8 1.7-4.8 1.7-1.7 4.8-1.7-4.8-4.8-1.7 4.8-1.7z" fill="#fff"/></svg>harness</h1>
   <nav>
     <button data-page="tasks" class="active">任务</button>
     <button data-page="tools">工具</button>
@@ -384,8 +388,18 @@ function modelOptions() {
   const set = new Set([a.default_model, a.subagent_model, ...a.models].filter(Boolean));
   return [...set];
 }
-function modelDatalist(id) {
-  return h("datalist", { id }, modelOptions().map(m => h("option", { value: m })));
+// A dropdown of the known models; `current` is kept as an option even if it is not listed.
+function modelSelect(current, defaultLabel, attrs) {
+  const sel = h("select", attrs);
+  if (defaultLabel !== undefined) sel.append(h("option", { value: "" }, defaultLabel));
+  setModel(sel, current);
+  return sel;
+}
+function setModel(sel, value) {
+  const have = new Set([...sel.options].map(o => o.value));
+  for (const m of modelOptions()) if (!have.has(m)) { sel.append(h("option", { value: m }, m)); have.add(m); }
+  if (value && !have.has(value)) sel.append(h("option", { value }, value));
+  sel.value = value || "";
 }
 
 // ---------------------------------------------------------------- markdown
@@ -504,14 +518,14 @@ function showNewTask() {
   let agentName = "main";
   const chips = h("div", { class: "chips" });
   const agentHint = h("div", { class: "note", style: "margin:8px 0 0" });
-  const model = h("input", { list: "dl-new-model", placeholder: "默认模型" });
+  const model = modelSelect("", "默认模型", { title: "本任务使用的模型" });
   const syncHint = () => {
-    chips.replaceChildren(h("button", { class: "chip" + (agentName === "main" ? " active" : ""), onclick: () => { agentName = "main"; syncHint(); prompt.focus(); } }, "main"),
-      agents.map(a => h("button", { class: "chip" + (agentName === a.name ? " active" : ""), title: a.description, onclick: () => { agentName = a.name; syncHint(); prompt.focus(); } }, a.name)));
+    chips.replaceChildren(...[h("button", { class: "chip" + (agentName === "main" ? " active" : ""), onclick: () => { agentName = "main"; syncHint(); prompt.focus(); } }, "main"),
+      ...agents.map(a => h("button", { class: "chip" + (agentName === a.name ? " active" : ""), title: a.description, onclick: () => { agentName = a.name; syncHint(); prompt.focus(); } }, a.name))]);
     const a = agents.find(x => x.name === agentName);
     agentHint.textContent = a ? a.description + (a.tools ? `  [工具: ${a.tools.join(", ")}]` : "") : "主 agent：可使用 bash / read / write / grep / skill / MCP 工具，并可再派发子 agent。";
     const act = info && info.config.active;
-    model.placeholder = (a ? (a.model || (act && act.subagent_model) || (act && act.default_model)) : (act ? act.default_model : "未配置"));
+    model.options[0].textContent = "默认 · " + (a ? (a.model || (act && act.subagent_model) || (act && act.default_model)) : (act ? act.default_model : "未配置"));
   };
   syncHint();
 
@@ -544,7 +558,7 @@ function showNewTask() {
     h("div", { class: "newtask-composer" },
       h("div", { class: "composer-card" }, prompt,
         h("div", { class: "composer-foot" },
-          model, modelDatalist("dl-new-model"),
+          model,
           h("span", { class: "hint-enter" }, "Enter 发送 · Shift+Enter 换行"),
           send)))));
   prompt.focus();
@@ -574,7 +588,7 @@ function openTask(id) {
     if (!e.shiftKey || e.ctrlKey || e.metaKey) { e.preventDefault(); doSend(); }
   });
 
-  const model = h("input", { list: "dl-task-model", id: "task-model", value: t.model, title: "切换本任务的模型" });
+  const model = modelSelect(t.model, undefined, { id: "task-model", title: "切换本任务的模型" });
   const head = h("div", { class: "taskhead" },
     h("span", { class: "title", id: "task-title" }, t.title),
     h("span", { class: "badge " + t.status, id: "task-status" }, STATUS[t.status] || t.status),
@@ -583,7 +597,7 @@ function openTask(id) {
       try { await api("POST", `/api/tasks/${id}/cancel`); refreshTasks(); } catch (e) { toast(e.message, true); } } }, "取消"),
     h("details", { class: "menu" }, h("summary", { title: "更多" }, "⋯"),
       h("div", { class: "pop" },
-        h("label", { style: "margin:0" }, "本任务的模型"), model, modelDatalist("dl-task-model"),
+        h("label", { style: "margin:0" }, "本任务的模型"), model,
         h("button", { class: "btn", onclick: async () => {
           try { await api("POST", `/api/tasks/${id}/model`, { model: model.value }); toast("已切换模型"); refreshTasks(); }
           catch (e) { toast(e.message, true); } } }, "切换模型"),
@@ -615,7 +629,7 @@ function updateTaskHead(t) {
   document.getElementById("task-agent").textContent = t.agent;
   document.getElementById("task-cancel").disabled = t.status !== "running";
   const m = document.getElementById("task-model");
-  if (m && document.activeElement !== m) m.value = t.model;
+  if (m && document.activeElement !== m) setModel(m, t.model);
 }
 
 function stickToBottom(fn) {
