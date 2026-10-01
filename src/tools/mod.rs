@@ -10,6 +10,7 @@ mod edit;
 mod grep;
 mod read;
 pub mod shells;
+#[allow(dead_code)] // `todo_write` isn't registered; see `with_defaults`
 pub mod todo;
 mod write;
 
@@ -19,6 +20,7 @@ pub use grep::GrepTool;
 pub use read::ReadTool;
 pub(crate) use read::number_lines;
 pub use shells::{BashOutputTool, KillShellTool};
+#[allow(unused_imports)]
 pub use todo::TodoTool;
 pub use write::WriteTool;
 
@@ -121,7 +123,9 @@ impl ToolRegistry {
         registry.register(BashOutputTool);
         registry.register(KillShellTool);
         registry.register(GrepTool);
-        registry.register(TodoTool);
+        // `todo_write` is off: current models plan well enough without it. The tool, its
+        // rendering and its compaction handling stay, so re-enabling it is this one line.
+        // registry.register(TodoTool);
         registry.register(ReadTool::new(files.clone()));
         registry.register(EditTool::new(files.clone()));
         registry.register(WriteTool::new(files.clone()));
