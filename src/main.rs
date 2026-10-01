@@ -1,5 +1,6 @@
 mod agent;
 mod cli;
+mod hooks;
 mod llm;
 mod mcp;
 mod mentions;
@@ -57,12 +58,13 @@ async fn main() -> Result<ExitCode> {
     }
     let (settings_path, args) = settings::parse_flag(args)?;
     settings::set_path(settings_path);
-    let settings = Settings::load()?;
+    let mut settings = Settings::load()?;
     for file in settings::legacy_files() {
         eprintln!("\x1b[33m{} is no longer read; move its settings into ~/.harness/settings.json\x1b[0m", file.display());
     }
     let (sandbox_flag, args) = sandbox::parse_flag(args);
     sandbox::init(sandbox_flag, &settings.sandbox).await?;
+    hooks::init(std::mem::take(&mut settings.hooks));
     let web_addr = web::parse_flag(&args)?;
     // The web UI can fix a missing or broken provider setup, so it starts
     // without one.

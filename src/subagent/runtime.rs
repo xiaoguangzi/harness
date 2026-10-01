@@ -18,6 +18,7 @@ use tokio::task::AbortHandle;
 
 use super::{MAX_RESULT_BYTES, Reporter};
 use crate::agent::{Agent, Inbox, Observer, UsageLog};
+use crate::hooks::Hooks;
 use crate::llm::Client;
 use crate::tools::{ToolOutput, truncate};
 
@@ -70,6 +71,8 @@ pub struct Subagents {
     usage: Arc<UsageLog>,
     /// Where progress goes, if the frontend set its own place.
     reporter: Mutex<Option<Reporter>>,
+    /// The parent's hooks, which each subagent runs as its own.
+    hooks: Mutex<Hooks>,
     /// In the order they started.
     children: Mutex<Vec<Arc<Child>>>,
 }
@@ -138,8 +141,13 @@ pub enum Sent {
 }
 
 impl Subagents {
-    pub fn new(parent: Arc<Inbox>, usage: Arc<UsageLog>) -> Self {
-        Self { parent, usage, reporter: Mutex::new(None), children: Mutex::new(Vec::new()) }
+    pub fn new(parent: Arc<Inbox>, usage: Arc<UsageLog>, hooks: Hooks) -> Self {
+        Self { parent, usage, reporter: Mutex::new(None), hooks: Mutex::new(hooks), children: Mutex::new(Vec::new()) }
+    }
+
+    /// Gives subagents started from here on `hooks` (as theirs).
+    pub fn set_hooks(&self, hooks: Hooks) {
+        *self.hooks.lock().unwrap() = hooks;
     }
 
     /// Sends this conversation's subagent progress to `reporter` instead of
@@ -165,8 +173,10 @@ impl Subagents {
             let Some(oldest) = children.iter().position(|c| !c.is_running()) else { break };
             children.remove(oldest);
         }
+        let id = new_id(&children);
+        agent.set_hooks(self.hooks.lock().unwrap().for_subagent(&id, agent_type));
         let child = Arc::new(Child {
-            id: new_id(&children),
+            id,
             agent_type: agent_type.to_string(),
             description: description.to_string(),
             model: agent.model().to_string(),

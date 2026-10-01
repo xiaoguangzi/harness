@@ -12,6 +12,7 @@ use futures::future::join_all;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
+use crate::hooks::{self, Event, Hooks, Outcome};
 use crate::llm::{Client, Message, StreamEvent, Usage};
 use crate::subagent::Subagents;
 use crate::tools::shells::Shells;
@@ -52,6 +53,9 @@ pub trait Observer: Send {
     /// The summary replaced the history: the context went from `before` to
     /// about `after` tokens.
     fn on_compact_end(&mut self, _before: u64, _after: u64) {}
+    /// A hook has something for the user: its `systemMessage`, what it
+    /// blocked, or how it failed.
+    fn on_hook(&mut self, _message: &str) {}
 }
 
 /// Messages for the model that arrive from elsewhere while it works or
@@ -180,13 +184,22 @@ pub struct Agent {
     compactions: u32,
     /// Whether a compaction in the running turn took in its prompt.
     turn_compacted: bool,
+    hooks: Hooks,
+    /// Why the next request starts a session for the SessionStart hooks
+    /// (`startup`, `clear`, `resume`, `compact`), if it does; for a
+    /// subagent, `startup` runs the SubagentStart hooks.
+    session_start: Option<&'static str>,
+    /// Whether SessionStart hooks ran for this conversation, so SessionEnd
+    /// hooks run when it ends.
+    in_session: bool,
 }
 
 impl Agent {
     pub fn new(client: Client, tools: ToolRegistry, system: impl Into<String>) -> Self {
         let inbox = Arc::new(Inbox::default());
         let usage = Arc::new(UsageLog::default());
-        let subagents = Arc::new(Subagents::new(inbox.clone(), usage.clone()));
+        let hooks = Hooks::default();
+        let subagents = Arc::new(Subagents::new(inbox.clone(), usage.clone(), hooks.clone()));
         let shells = Arc::new(Shells::new(inbox.clone()));
         Self {
             client,
@@ -201,6 +214,9 @@ impl Agent {
             context: None,
             compactions: 0,
             turn_compacted: false,
+            hooks,
+            session_start: Some("startup"),
+            in_session: false,
         }
     }
 
@@ -239,6 +255,17 @@ impl Agent {
         &self.shells
     }
 
+    /// The hooks this conversation runs.
+    pub fn hooks(&self) -> &Hooks {
+        &self.hooks
+    }
+
+    /// Runs `hooks` instead, e.g. a subagent's; its subagents get them too.
+    pub fn set_hooks(&mut self, hooks: Hooks) {
+        self.subagents.set_hooks(hooks.clone());
+        self.hooks = hooks;
+    }
+
     /// The tokens this conversation and its subagents used so far.
     pub fn usage(&self) -> &Arc<UsageLog> {
         &self.usage
@@ -265,6 +292,7 @@ impl Agent {
         self.messages.clear();
         self.turn_start = None;
         self.context = None;
+        self.session_start = Some("clear");
     }
 
     /// The conversation so far.
@@ -277,6 +305,7 @@ impl Agent {
     pub fn restore(&mut self, messages: Vec<Message>) {
         self.clear();
         self.messages = messages;
+        self.session_start = Some("resume");
     }
 
     /// Repairs the history after a cancelled turn now, rather than when the
@@ -307,12 +336,16 @@ impl Agent {
     /// by appending, so earlier turns (and their thinking blocks) stay
     /// intact, except that a compaction replaces it when the context fills
     /// up (see `compact`).
-    pub async fn run_turn(&mut self, content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
+    pub async fn run_turn(&mut self, mut content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
         self.settle();
+        if !content.is_empty() && !self.hooks.is_subagent() {
+            self.prompt_hooks(&mut content, observer).await?;
+        }
         let arrived = self.inbox.take();
         if content.is_empty() && arrived.is_empty() {
             return Ok(());
         }
+        let session_start = self.session_start;
         self.turn_start = Some(self.messages.len());
         (self.compactions, self.turn_compacted) = (0, false);
         self.messages.push(Message::user(arrived.iter().cloned().chain(content).collect()));
@@ -328,9 +361,70 @@ impl Agent {
             if self.messages.len() == turn_start && !arrived.is_empty() && !self.turn_compacted {
                 self.messages.push(Message::user(arrived));
             }
+            // What SessionStart hooks added went with the turn.
+            if self.messages.len() <= turn_start {
+                self.session_start = self.session_start.or(session_start);
+            }
         }
         self.turn_start = None;
         result
+    }
+
+    /// Runs the UserPromptSubmit hooks on the prompt in `content` (its last
+    /// text block): they may refuse it, or add to it.
+    async fn prompt_hooks(&mut self, content: &mut Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
+        let prompt = content.iter().rev().find(|b| b["type"] == "text").and_then(|b| b["text"].as_str());
+        let outcome = self.hooks.user_prompt_submit(prompt.unwrap_or_default(), self.client.spec()).await;
+        show_notices(&outcome, observer);
+        if let Some(reason) = outcome.block.or(outcome.halt) {
+            let reason = if reason.is_empty() { String::new() } else { format!(": {reason}") };
+            bail!("a UserPromptSubmit hook blocked the prompt{reason}");
+        }
+        let added = outcome.context.iter().map(|c| hooks::feedback(Event::UserPromptSubmit, c));
+        content.extend(added.map(|text| json!({"type": "text", "text": text})));
+        Ok(())
+    }
+
+    /// Runs the SessionStart hooks if a session starts with this request,
+    /// or a subagent's SubagentStart hooks before its first one; what they
+    /// add goes with it.
+    async fn session_hooks(&mut self, observer: &mut dyn Observer) {
+        let Some(source) = self.session_start.take() else { return };
+        let (event, outcome) = if self.hooks.is_subagent() {
+            if source != "startup" {
+                return;
+            }
+            (Event::SubagentStart, self.hooks.subagent_start(self.client.spec()).await)
+        } else {
+            self.in_session = true;
+            (Event::SessionStart, self.hooks.session_start(source, self.client.spec()).await)
+        };
+        show_notices(&outcome, observer);
+        if let Some(reason) = &outcome.block {
+            observer.on_hook(&format!("{} hook: {reason}", event.as_str()));
+        }
+        let added: Vec<Value> =
+            outcome.context.iter().map(|c| json!({"type": "text", "text": hooks::feedback(event, c)})).collect();
+        if added.is_empty() {
+            return;
+        }
+        match self.messages.last_mut() {
+            Some(last) if last.role == "user" => last.content.extend(added),
+            _ => self.messages.push(Message::user(added)),
+        }
+    }
+
+    /// Runs the SessionEnd hooks for `reason` if this conversation started a
+    /// session, before it is cleared, replaced or dropped; returns what
+    /// they have for the user.
+    pub async fn end_session(&mut self, reason: &str) -> Vec<String> {
+        if !std::mem::take(&mut self.in_session) {
+            return Vec::new();
+        }
+        let outcome = self.hooks.session_end(reason, self.client.spec()).await;
+        let mut notices = outcome.notices;
+        notices.extend(outcome.block.map(|reason| format!("SessionEnd hook: {reason}")));
+        notices
     }
 
     /// Leaves the history valid after a failed turn. Tool calls that never
@@ -377,6 +471,8 @@ impl Agent {
 
     async fn run_loop(&mut self, observer: &mut dyn Observer) -> Result<()> {
         let definitions = self.tools.definitions();
+        // Whether a Stop hook already kept this turn going.
+        let mut stop_hook_active = false;
 
         loop {
             // What arrived meanwhile goes after the prompt or the tool results.
@@ -388,6 +484,7 @@ impl Agent {
                 }
             }
             self.compact_if_full(&definitions, observer).await?;
+            self.session_hooks(observer).await;
             observer.on_request_start();
             let (log, model) = (&self.usage, self.client.spec());
             let mut on_event = |event: StreamEvent| match event {
@@ -438,29 +535,83 @@ impl Agent {
                 // Something arrived while the model was answering: it
                 // carries on with that rather than end the turn.
                 _ if self.inbox.wants_turn() => continue,
-                _ => return Ok(()),
+                _ => {
+                    // A Stop hook may send the model back to work.
+                    let last = self.last_text(self.messages.len() - 1);
+                    let outcome = self.hooks.stop(stop_hook_active, &last, self.client.spec()).await;
+                    show_notices(&outcome, observer);
+                    let event = self.hooks.stop_event();
+                    match (outcome.halt, outcome.block) {
+                        (None, Some(reason)) => {
+                            observer.on_hook(&format!("{} hook: {reason}", event.as_str()));
+                            let feedback = json!({"type": "text", "text": hooks::feedback(event, &reason)});
+                            self.messages.push(Message::user(vec![feedback]));
+                            stop_hook_active = true;
+                            continue;
+                        }
+                        _ => return Ok(()),
+                    }
+                }
             }
 
-            for t in &tool_uses {
-                observer.on_tool_call(t["name"].as_str().unwrap_or(""), &t["input"]);
+            // PreToolUse hooks see every call first; they may refuse one or
+            // change its input.
+            let invalid = &response.invalid_tool_inputs;
+            let (tools, hooks, model) = (&self.tools, &self.hooks, self.client.spec());
+            let checks = join_all(tool_uses.iter().map(|t| async {
+                let id = t["id"].as_str().unwrap_or("");
+                if invalid.contains_key(id) {
+                    return Outcome::default();
+                }
+                hooks.pre_tool_use(t["name"].as_str().unwrap_or(""), id, &t["input"], model).await
+            }))
+            .await;
+            for (t, check) in tool_uses.iter().zip(&checks) {
+                let input = check.updated_input.as_ref().unwrap_or(&t["input"]);
+                observer.on_tool_call(t["name"].as_str().unwrap_or(""), input);
+                show_notices(check, observer);
             }
             // Run all tool calls from this response concurrently, then send
             // every result back in a single user message. A call whose
             // streamed input was not valid JSON is not run; the model gets
             // the raw text back so it can retry.
-            let invalid = &response.invalid_tool_inputs;
-            let outputs = join_all(tool_uses.iter().map(|t| async {
-                let id = t["id"].as_str().unwrap_or("");
-                match invalid.get(id) {
-                    Some(raw) => ToolOutput::error(json!({"INVALID_JSON": raw}).to_string()),
-                    None => self.tools.run(t["name"].as_str().unwrap_or(""), t["input"].clone()).await,
+            let outputs = join_all(tool_uses.iter().zip(checks).map(|(t, check)| async move {
+                let (id, name) = (t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""));
+                if let Some(raw) = invalid.get(id) {
+                    return (ToolOutput::error(json!({"INVALID_JSON": raw}).to_string()), check, None);
                 }
+                if let Some(reason) = &check.block {
+                    let text = hooks::feedback(Event::PreToolUse, &format!("The call was blocked: {reason}"));
+                    return (ToolOutput::error(text), check, None);
+                }
+                if check.halt.is_some() {
+                    return (ToolOutput::error("The call was not run: a hook stopped the turn"), check, None);
+                }
+                let input = check.updated_input.clone().unwrap_or_else(|| t["input"].clone());
+                let mut out = tools.run(name, input.clone()).await;
+                let post = hooks.post_tool_use(name, id, &input, &out, model).await;
+                let event = if out.is_error { Event::PostToolUseFailure } else { Event::PostToolUse };
+                if let Some(text) = &post.updated_output {
+                    out.content = text.clone();
+                }
+                let added = check.context.iter().map(|c| hooks::feedback(Event::PreToolUse, c));
+                let added = added.chain(post.block.iter().chain(&post.context).map(|c| hooks::feedback(event, c)));
+                for text in added {
+                    out.content.truncate(out.content.trim_end().len());
+                    out.content.push_str(&format!("\n\n{text}"));
+                }
+                (out, check, Some(post))
             }))
             .await;
 
             let mut results = Vec::with_capacity(outputs.len());
-            for (t, out) in tool_uses.iter().zip(outputs) {
+            let mut halt = None;
+            for (t, (out, check, post)) in tool_uses.iter().zip(outputs) {
                 observer.on_tool_result(t["name"].as_str().unwrap_or(""), &out);
+                if let Some(post) = &post {
+                    show_notices(post, observer);
+                }
+                halt = halt.or(check.halt).or(post.and_then(|p| p.halt));
                 results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": t["id"],
@@ -468,8 +619,23 @@ impl Agent {
                     "is_error": out.is_error,
                 }));
             }
+            // A hook said to stop (`continue: false`): the turn ends here.
+            if let Some(reason) = halt {
+                let reason = if reason.is_empty() { String::new() } else { format!(": {reason}") };
+                observer.on_hook(&format!("A hook stopped the turn{reason}"));
+                results.push(json!({"type": "text", "text": format!("[Stopped by a hook{reason}]")}));
+                self.messages.push(Message::user(results));
+                return Ok(());
+            }
             self.messages.push(Message::user(results));
         }
+    }
+}
+
+/// Passes what hooks had for the user on to the frontend.
+fn show_notices(outcome: &Outcome, observer: &mut dyn Observer) {
+    for notice in &outcome.notices {
+        observer.on_hook(notice);
     }
 }
 
@@ -518,5 +684,118 @@ mod tests {
                 text(INTERRUPTED),
             ]
         );
+    }
+
+    #[derive(Default)]
+    struct Notices(Vec<String>);
+
+    impl Observer for Notices {
+        fn on_text_delta(&mut self, _: &str) {}
+        fn on_text_end(&mut self) {}
+        fn on_tool_call(&mut self, _: &str, _: &Value) {}
+        fn on_tool_result(&mut self, _: &str, _: &ToolOutput) {}
+        fn on_hook(&mut self, message: &str) {
+            self.0.push(message.to_string());
+        }
+    }
+
+    fn command(command: &str) -> Value {
+        json!([{"hooks": [{"type": "command", "command": command}]}])
+    }
+
+    #[tokio::test]
+    async fn hooks_around_a_turn() {
+        use compact::tests::{gateway, texts};
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("stopped");
+        let (client, mut requests) = gateway(|n| match n {
+            0 => (vec![json!({"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "rm -rf /"}})], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
+        agent.set_hooks(crate::hooks::tests::hooks(json!({
+            "SessionStart": command("echo on branch main"),
+            "UserPromptSubmit": command("echo '{\"hookSpecificOutput\": {\"additionalContext\": \"ticket 42\"}}'"),
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo 'no rm' >&2; exit 2"}]}],
+            // Sends the model back once, then lets it stop.
+            "Stop": command(&format!("[ -e {0} ] && exit 0; touch {0}; echo 'run the tests' >&2; exit 2", marker.display())),
+        })));
+        let mut seen = Notices::default();
+        agent.run_turn(vec![text("clean up")], &mut seen).await.unwrap();
+
+        let first = requests.recv().await.unwrap();
+        let prompt = texts(&first["messages"][0]);
+        assert_eq!(prompt[0], "clean up");
+        assert!(prompt[1].contains("ticket 42") && prompt[1].starts_with("<hook-feedback event=\"UserPromptSubmit\">"));
+        assert!(prompt[2].contains("on branch main") && prompt[2].contains("SessionStart"));
+
+        let second = requests.recv().await.unwrap();
+        let result = &second["messages"][2]["content"][0];
+        assert_eq!(result["is_error"], true);
+        assert!(result["content"].as_str().unwrap().contains("The call was blocked: no rm"), "{result}");
+
+        let third = requests.recv().await.unwrap();
+        let feedback = texts(&third["messages"][4]);
+        assert!(feedback[0].contains("run the tests") && feedback[0].contains("event=\"Stop\""), "{feedback:?}");
+        assert!(requests.try_recv().is_err(), "the second stop is let through");
+        assert_eq!(seen.0, ["Stop hook: run the tests"]);
+
+        // The next turn is no new session.
+        agent.run_turn(vec![text("thanks")], &mut seen).await.unwrap();
+        let fourth = requests.recv().await.unwrap();
+        let last = fourth["messages"].as_array().unwrap().last().unwrap().clone();
+        assert!(texts(&last).iter().all(|t| !t.contains("on branch main")), "{last}");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_prompt_is_not_sent() {
+        let (client, mut requests) = compact::tests::gateway(|_| (vec![text("hi")], "end_turn", 100)).await;
+        let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
+        agent.set_hooks(crate::hooks::tests::hooks(json!({"UserPromptSubmit": command("echo 'has a secret' >&2; exit 2")})));
+        let error = agent.run_turn(vec![text("key=abc")], &mut Notices::default()).await.unwrap_err();
+        assert!(error.to_string().contains("has a secret"), "{error}");
+        assert!(agent.messages().is_empty());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn subagent_start_and_session_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let ended = dir.path().join("ended");
+        let (client, mut requests) = compact::tests::gateway(|_| (vec![text("ok")], "end_turn", 100)).await;
+        let hooks = crate::hooks::tests::hooks(json!({
+            "SubagentStart": command("echo only read files"),
+            "SessionEnd": command(&format!("cat >> {}", ended.display())),
+        }));
+
+        let mut sub = Agent::new(client.clone(), ToolRegistry::default(), "sys");
+        sub.set_hooks(hooks.for_subagent("a1", "explore"));
+        sub.run_turn(vec![text("find it")], &mut Notices::default()).await.unwrap();
+        let first = requests.recv().await.unwrap();
+        let sent = compact::tests::texts(&first["messages"][0]);
+        assert!(sent[1].contains("only read files") && sent[1].contains("SubagentStart"), "{sent:?}");
+        sub.run_turn(vec![text("and more")], &mut Notices::default()).await.unwrap();
+        let second = requests.recv().await.unwrap();
+        assert_eq!(compact::tests::texts(&second["messages"][2]), ["and more"], "only before its first run");
+        sub.end_session("other").await;
+        assert!(!ended.exists(), "subagents have no session");
+
+        let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
+        agent.set_hooks(hooks);
+        agent.end_session("clear").await;
+        assert!(!ended.exists(), "no session started yet");
+        agent.run_turn(vec![text("hi")], &mut Notices::default()).await.unwrap();
+        agent.end_session("clear").await;
+        agent.end_session("clear").await;
+        agent.clear();
+        agent.run_turn(vec![text("again")], &mut Notices::default()).await.unwrap();
+        agent.end_session("prompt_input_exit").await;
+        let reasons: Vec<String> = std::fs::read_to_string(&ended)
+            .unwrap()
+            .split_inclusive('}')
+            .map(|j| serde_json::from_str::<Value>(j).unwrap()["reason"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(reasons, ["clear", "prompt_input_exit"]);
     }
 }

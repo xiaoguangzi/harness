@@ -71,6 +71,9 @@ pub async fn run(
     let mut term = Terminal::new(out.clone());
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     let mut recorder = Store::default_location().map(|store| Recorder::new(store, cwd));
+    if let Some(rec) = &recorder {
+        tell_hooks(agent, rec);
+    }
     let one_shot = !args.is_empty();
 
     if !one_shot {
@@ -88,7 +91,7 @@ pub async fn run(
             Resume::Pick => pick_session(rec, &out)?,
         };
         if let Some(id) = id {
-            resume_session(agent, rec, &id, &out, !one_shot)?;
+            resume_session(agent, rec, &id, &out, !one_shot).await?;
         }
     }
 
@@ -115,6 +118,7 @@ pub async fn run(
                     }
                     result = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut(), None).await;
                 }
+                show_hook_notices(&out, agent.end_session("other").await);
                 Ok(match result {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(TurnEnd::Interrupted) => ExitCode::from(130),
@@ -269,9 +273,11 @@ pub async fn run(
             Input::Exit => break,
             Input::Help => print_help(skills),
             Input::Clear => {
+                show_hook_notices(&out, agent.end_session("clear").await);
                 agent.clear();
                 if let Some(rec) = recorder.as_mut() {
                     rec.restart();
+                    tell_hooks(agent, rec);
                 }
                 out.line(out.paint("2", "conversation cleared"));
             }
@@ -292,10 +298,11 @@ pub async fn run(
                     Some(id) => Ok(Some(id)),
                     None => pick_session(rec, &out),
                 };
-                let resumed = id.and_then(|id| match id {
-                    Some(id) => resume_session(agent, rec, &id, &out, true),
-                    None => Ok(()),
-                });
+                let resumed = match id {
+                    Ok(Some(id)) => resume_session(agent, rec, &id, &out, true).await,
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(e),
+                };
                 if let Err(e) = resumed {
                     out.line(out.paint("31", &format!("{e:#}")));
                 }
@@ -353,6 +360,7 @@ pub async fn run(
             }
         }
     }
+    show_hook_notices(&out, agent.end_session("prompt_input_exit").await);
     if let Some(path) = &history {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -411,8 +419,9 @@ fn pick_session(rec: &Recorder, out: &Output) -> Result<Option<String>> {
 /// Loads a saved conversation into the agent, on the model it last used
 /// when that is still configured, and continues recording it. With `show`,
 /// its last turns are shown again.
-fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &Output, show: bool) -> Result<()> {
+async fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &Output, show: bool) -> Result<()> {
     let (meta, messages) = rec.store().load(id)?;
+    show_hook_notices(out, agent.end_session("resume").await);
     agent.restore(messages);
     let mut notes = Vec::new();
     if !meta.model.is_empty() && meta.model != agent.model() {
@@ -422,6 +431,7 @@ fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &Output,
         }
     }
     rec.resume(meta);
+    tell_hooks(agent, rec);
     if show {
         output::replay(out, agent.messages());
         let title = if rec.meta().title.is_empty() { "conversation" } else { rec.meta().title.as_str() };
@@ -432,6 +442,18 @@ fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &Output,
         out.line(out.paint("33", &note));
     }
     Ok(())
+}
+
+/// Shows what SessionEnd hooks had for the user.
+fn show_hook_notices(out: &Output, notices: Vec<String>) {
+    for notice in notices {
+        out.line(out.paint("33", &format!("⚑ {}", text::printable(&notice))));
+    }
+}
+
+/// Tells the agent's hooks which saved conversation they run for.
+fn tell_hooks(agent: &Agent, rec: &Recorder) {
+    agent.hooks().set_session(&rec.meta().id, Some(rec.file()));
 }
 
 /// The files `@`-mentioned in `line`, and the pasted `images` whose

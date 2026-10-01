@@ -94,7 +94,7 @@ impl Agent {
     pub async fn compact(&mut self, focus: Option<&str>, observer: &mut dyn Observer) -> Result<()> {
         self.settle();
         let definitions = self.tools.definitions();
-        self.compact_history(focus, &definitions, observer).await
+        self.compact_history(Trigger::Manual(focus), &definitions, observer).await.map(drop)
     }
 
     /// Compacts the conversation if the next request would come too close
@@ -110,8 +110,12 @@ impl Agent {
                  reads is too large for the context window"
             );
         }
+        // A PreCompact hook may keep the history as it is; the request then
+        // goes as it is too.
+        if !self.compact_history(Trigger::Auto, definitions, observer).await? {
+            return Ok(());
+        }
         self.compactions += 1;
-        self.compact_history(None, definitions, observer).await?;
         let size = self.context_size(definitions);
         if size >= limit {
             bail!(
@@ -126,20 +130,32 @@ impl Agent {
     /// with it. A user message that has not been answered yet (a turn about
     /// to start) stays as it is, after the summary. The history changes
     /// only once the summary is in, so cancelling leaves it as it was.
+    /// Returns false if a PreCompact hook blocked it.
     async fn compact_history(
         &mut self,
-        focus: Option<&str>,
+        trigger: Trigger<'_>,
         definitions: &[ToolDef],
         observer: &mut dyn Observer,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let (trigger, focus) = match trigger {
+            Trigger::Manual(focus) => ("manual", focus),
+            Trigger::Auto => ("auto", None),
+        };
         let pending = match self.messages.last() {
             Some(last) if last.role == "user" && !has_tool_results(last) => 1,
             _ => 0,
         };
-        let history = &self.messages[..self.messages.len() - pending];
-        if history.is_empty() {
-            return Ok(());
+        if self.messages.len() == pending {
+            return Ok(true);
         }
+        let outcome = self.hooks.pre_compact(trigger, focus.unwrap_or_default(), self.client.spec()).await;
+        super::show_notices(&outcome, observer);
+        if let Some(reason) = outcome.block.or(outcome.halt) {
+            let reason = if reason.is_empty() { String::new() } else { format!(": {reason}") };
+            observer.on_hook(&format!("A PreCompact hook kept the conversation from being compacted{reason}"));
+            return Ok(false);
+        }
+        let history = &self.messages[..self.messages.len() - pending];
         let before = self.context_size(definitions);
         observer.on_compact_start();
 
@@ -222,6 +238,7 @@ impl Agent {
         self.messages = vec![Message::user(content)];
         self.messages.extend(pending);
         self.context = None;
+        self.session_start = Some("compact");
         // The running turn now starts after the summary; if the summary took
         // in the turn's own prompt, it has none to remove after an error.
         if self.turn_start.is_some() {
@@ -229,8 +246,18 @@ impl Agent {
             self.turn_compacted |= self.messages.len() == 1;
         }
         observer.on_compact_end(before, self.context_size(definitions));
-        Ok(())
+        let outcome = self.hooks.post_compact(trigger, summary.trim(), self.client.spec()).await;
+        super::show_notices(&outcome, observer);
+        Ok(true)
     }
+}
+
+/// What starts a compaction.
+enum Trigger<'a> {
+    /// `/compact`, with what to focus on.
+    Manual(Option<&'a str>),
+    /// The context filling up.
+    Auto,
 }
 
 /// How many input tokens a request may carry before the conversation is
@@ -332,7 +359,7 @@ fn estimate_text(text: &str) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn text(t: &str) -> Value {
@@ -410,7 +437,7 @@ mod tests {
     /// A gateway speaking the Anthropic streaming protocol: a summary for a
     /// summarization request, else `reply(request number)`, each reporting
     /// `input_tokens`. The request bodies go to the returned receiver.
-    async fn gateway(
+    pub(crate) async fn gateway(
         reply: impl Fn(usize) -> (Vec<Value>, &'static str, u64) + Send + Sync + 'static,
     ) -> (crate::llm::Client, tokio::sync::mpsc::UnboundedReceiver<Value>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -472,7 +499,7 @@ mod tests {
         }
     }
 
-    fn texts(message: &Value) -> Vec<String> {
+    pub(crate) fn texts(message: &Value) -> Vec<String> {
         message["content"].as_array().unwrap().iter().filter_map(|b| b["text"].as_str().map(String::from)).collect()
     }
 
@@ -594,5 +621,39 @@ mod tests {
         let image = json!({"type": "image", "source": {"type": "base64", "data": "A".repeat(4_000_000)}});
         assert_eq!(estimate(&image), 1_600);
         assert_eq!(estimate_text("12345678"), 2);
+    }
+
+    #[tokio::test]
+    async fn compaction_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pre, post) = (dir.path().join("pre.json"), dir.path().join("post.json"));
+        let (client, mut requests) = gateway(|_| (vec![text("answer")], "end_turn", 500)).await;
+        let mut agent = Agent::new(client, crate::tools::ToolRegistry::new(), "sys");
+        let command = |command: String| json!([{"type": "command", "command": command}]);
+        agent.set_hooks(crate::hooks::tests::hooks(json!({
+            "PreCompact": [
+                {"matcher": "manual", "hooks": command(format!("cat > {}", pre.display()))},
+                {"matcher": "auto", "hooks": command("echo 'not now' >&2; exit 2".into())}
+            ],
+            "PostCompact": [{"hooks": command(format!("cat > {}", post.display()))}]
+        })));
+        agent.messages = vec![user("plan the API"), assistant(vec![text("planned")])];
+        agent.compact(Some("the API notes"), &mut Seen::default()).await.unwrap();
+        requests.recv().await.unwrap();
+        assert!(is_compacted(&agent.messages[0]));
+        let read = |path: &std::path::Path| serde_json::from_str::<Value>(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let (pre, post) = (read(&pre), read(&post));
+        assert_eq!((pre["trigger"].as_str(), pre["custom_instructions"].as_str()), (Some("manual"), Some("the API notes")));
+        assert_eq!((post["trigger"].as_str(), post["compact_summary"].as_str()), (Some("manual"), Some("SUMMARY")));
+
+        // Blocked: the request goes as it is.
+        agent.messages = vec![user("first task"), assistant(vec![text("done")])];
+        agent.context = Some((2, 9_000));
+        let mut seen = Seen::default();
+        agent.run_turn(vec![text("next task")], &mut seen).await.unwrap();
+        let sent = requests.recv().await.unwrap();
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 3, "not a summary request: {sent}");
+        assert!(seen.0.is_empty());
+        assert_eq!(agent.messages.len(), 4);
     }
 }

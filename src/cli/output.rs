@@ -894,6 +894,18 @@ impl Observer for Terminal {
         self.enter(Phase::Waiting, "Compacting the conversation…");
     }
 
+    fn on_hook(&mut self, message: &str) {
+        if !self.out.styled() {
+            eprintln!("hook: {message}");
+            return;
+        }
+        self.end_text();
+        self.separate(Block::Tools);
+        for line in message.lines() {
+            self.out.line(self.out.paint("33", &format!("⚑ {}", text::printable(line))));
+        }
+    }
+
     fn on_compact_end(&mut self, before: u64, after: u64) {
         self.context_tokens = after;
         let note = format!("✻ Compacted the conversation: context {} → about {}", tokens(before), tokens(after));

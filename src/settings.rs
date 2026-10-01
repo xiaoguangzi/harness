@@ -1,5 +1,5 @@
 //! The settings file, `~/.harness/settings.json`: the model and provider
-//! setup, MCP servers and the sandbox in one place.
+//! setup, MCP servers, the sandbox and hooks in one place.
 //!
 //! ```json
 //! {
@@ -7,14 +7,15 @@
 //!   "effort": "high",
 //!   "providers": { "relay-a": { "protocol": "anthropic", "base_url": "...", "api_key": "${RELAY_A_KEY}" } },
 //!   "mcpServers": { "exa": { "url": "https://mcp.exa.ai/mcp" } },
-//!   "sandbox": { "enabled": true, "network": false }
+//!   "sandbox": { "enabled": true, "network": false },
+//!   "hooks": { "PostToolUse": [{ "matcher": "Edit|Write", "hooks": [{ "type": "command", "command": "fmt.sh" }] }] }
 //! }
 //! ```
 //!
 //! `--settings FILE` or `$HARNESS_SETTINGS` reads another file instead.
 //! Nothing is read from the project: a repository could otherwise send
 //! requests carrying your API keys to its own server, start MCP commands or
-//! loosen the sandbox.
+//! hooks, or loosen the sandbox.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,7 @@ use serde::Deserialize;
 
 use crate::llm::Effort;
 use crate::llm::config::ProviderConfig;
-use crate::{mcp, sandbox};
+use crate::{hooks, mcp, sandbox};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +43,8 @@ pub struct Settings {
     pub mcp_servers: BTreeMap<String, mcp::ServerConfig>,
     #[serde(default)]
     pub sandbox: sandbox::Config,
+    #[serde(default)]
+    pub hooks: hooks::Config,
 }
 
 static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -119,7 +122,8 @@ mod tests {
               "model": "gw/m", "effort": "xhigh", "max_tokens": 1000,
               "providers": {"gw": {"protocol": "anthropic", "base_url": "https://gw.example.com"}},
               "mcpServers": {"exa": {"url": "https://mcp.exa.ai/mcp"}},
-              "sandbox": {"enabled": true, "allow_write": ["~/.cache"]}
+              "sandbox": {"enabled": true, "allow_write": ["~/.cache"]},
+              "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "true"}]}]}
             }"#,
         )
         .unwrap();
@@ -129,10 +133,12 @@ mod tests {
         assert_eq!(s.providers.len(), 1);
         assert_eq!(s.mcp_servers.keys().collect::<Vec<_>>(), ["exa"]);
         assert_eq!(s.sandbox.enabled, Some(true));
+        assert_eq!(s.hooks.len(), 1);
 
         assert!(Settings::parse("  ").unwrap().providers.is_empty());
         assert!(Settings::parse(r#"{"default_model": "gw/m"}"#).is_err(), "unknown keys are rejected");
         assert!(Settings::parse(r#"{"sandbox": {"netwrok": true}}"#).is_err());
+        assert!(Settings::parse(r#"{"hooks": {"Stop": [{"hooks": [{"type": "command"}]}]}}"#).is_err());
     }
 
     #[test]

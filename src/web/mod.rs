@@ -593,6 +593,10 @@ async fn delete_task(State(state): State<Shared>, Path(id): Path<u64>) -> ApiRes
     // Open event streams may keep the task alive for a while; its subagents
     // stop now.
     task.subagents.reset();
+    // Once the cancelled turn lets go of the agent.
+    tokio::spawn(async move {
+        task.agent.lock().await.end_session("other").await;
+    });
     Ok(Json(json!({"deleted": id})))
 }
 

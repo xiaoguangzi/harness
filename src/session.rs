@@ -168,6 +168,11 @@ impl Recorder {
         &self.meta
     }
 
+    /// The file the conversation is saved to (once it has a message).
+    pub fn file(&self) -> PathBuf {
+        self.store.path(&self.meta.id)
+    }
+
     /// Records a new conversation from here on, e.g. after `/clear`; the
     /// previous one stays saved.
     pub fn restart(&mut self) {

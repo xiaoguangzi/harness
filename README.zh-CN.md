@@ -61,8 +61,9 @@ harness --help                          # 查看全部选项
 | `model`、`subagent_model`、`effort`、`max_tokens`、`context_window`、`providers` | 模型和 [LLM 网关](#llm-网关) |
 | `mcpServers` | [MCP 服务器](#mcp-服务器) |
 | `sandbox` | [沙箱](#沙箱) |
+| `hooks` | [Hooks](#hooks) |
 
-所有键都可省略，未知的键会报错。项目目录中的配置一概不读（包括项目的 `.mcp.json`）：否则仓库可以把带着你 API key 的请求发到它自己的服务器、启动 MCP 命令或放宽沙箱。项目中的 `.harness/agents`、`.harness/skills` 及 `.claude/` 下的同名目录仍会读取，因为它们只增加提示词。旧版本读取 `~/.harness/providers.json`、`mcp.json` 和 `sandbox.json`；这些文件存在时 harness 会给出警告，其内容应移到上面对应的键下（`default_model` 改名为 `model`）。
+所有键都可省略，未知的键会报错。项目目录中的配置一概不读（包括项目的 `.mcp.json`）：否则仓库可以把带着你 API key 的请求发到它自己的服务器、启动 MCP 命令或 hook，或放宽沙箱。项目中的 `.harness/agents`、`.harness/skills` 及 `.claude/` 下的同名目录仍会读取，因为它们只增加提示词。旧版本读取 `~/.harness/providers.json`、`mcp.json` 和 `sandbox.json`；这些文件存在时 harness 会给出警告，其内容应移到上面对应的键下（`default_model` 改名为 `model`）。
 
 ## Web UI
 
@@ -71,7 +72,7 @@ harness --help                          # 查看全部选项
 - **任务 (Tasks)**：把任务派发给主代理，或直接派发给某个子代理类型（`explore`、`general-purpose` 或自定义代理），也可指定模型。任务在后台运行，可以多个并发；每个任务都是独立的会话，流式展示文本、工具调用和结果。每个子代理有一张卡片，显示它的工具调用、状态、报告和停止按钮；任务空闲时，后台子代理的报告会自动开始新的一轮。可以用后续消息继续任务、切换模型、取消任务（运行中的 `bash` 命令和前台子代理会停止，后台子代理继续运行）或删除任务（其子代理也会停止）。`@路径` 提及、`/<skill> args` 和 `/compact` 与 REPL 中一致。
 - 助手文本按 Markdown 流式渲染（代码块、列表、表格、链接）；工具调用的摘要行直接显示它的对象（`bash` 命令、文件路径、`grep` 模式）。切换模型和删除任务放在任务头部的 `⋯` 菜单里。
 - **工具 (Tools)**：列出所有已注册的工具（内置、技能、MCP、`agent`）及其描述和 schema；填入 JSON 输入即可直接调用。
-- **模型配置 (Models)**：当前生效的 provider 和模型，以及配置文件的表单或原始 JSON 编辑器。保存时会先结合环境变量校验，模型配置随即无需重启生效，空闲任务会切换过去（`mcpServers` 和 `sandbox` 的修改在下次启动时生效）。
+- **模型配置 (Models)**：当前生效的 provider 和模型，以及配置文件的表单或原始 JSON 编辑器。保存时会先结合环境变量校验，模型配置随即无需重启生效，空闲任务会切换过去（`mcpServers`、`sandbox` 和 `hooks` 的修改在下次启动时生效）。
 - **Agents / Skills / MCP**：发现了哪些内容，以及哪些 MCP 服务器已连接。
 
 即使没有可用的 provider，服务器也会启动，因此可以在浏览器里配置第一个模型。该 API 能执行命令，所以做了防护：每个 API 请求都需要 token，绑定回环地址时也不例外（本机其他用户同样能访问回环端口），启动时会打印带有 token 的 URL（`http://HOST:PORT/#token=...`，浏览器会记住它，之后新开的标签页也能用）；绑定回环地址时，请求还必须使用回环主机名（防 DNS rebinding）；改变状态的请求需要 `X-Harness` 请求头（防跨站请求）。UI 保存的配置文件只有其所有者可读。
@@ -217,7 +218,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 - **网络**：只允许回环地址（本地服务和测试可用，DNS 和外连会失败），除非设置 `"network": true`。
 - 命令在没有终端的新会话中运行。Linux 上还有独立的 PID 命名空间，后台任务随命令一起结束；macOS 上无法运行 setuid 程序（`sudo`、`ps`）。
 
-`read`、`edit` 和 `write` 工具按同样的规则检查。`/sandbox` 显示这些规则，REPL 横幅会显示 `sandboxed`，系统提示词也会告诉模型这些限制，让它报告被拦截的操作，而不是设法绕过。MCP 服务器和 harness 本身不在沙箱中。
+`read`、`edit` 和 `write` 工具按同样的规则检查。`/sandbox` 显示这些规则，REPL 横幅会显示 `sandboxed`，系统提示词也会告诉模型这些限制，让它报告被拦截的操作，而不是设法绕过。MCP 服务器、[hooks](#hooks) 和 harness 本身不在沙箱中。
 
 ```json
 {
@@ -254,6 +255,45 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 - 服务器在启动时并发连接；连接失败的服务器会被报告并跳过。
 - 工具以 `mcp__<server>__<tool>` 形式暴露。文本、内嵌文本资源和 PNG/JPEG/GIF/WebP 图片会传回给模型。
 - stdio 服务器的 stderr 写入 `$TMPDIR/harness-mcp-<server>.log`。
+
+## Hooks
+
+Hooks 在 agent 循环的特定时机运行你自己的命令：拦截危险命令、编辑后格式化文件、给 prompt 补充上下文，或者在测试通过前让模型继续干活。格式沿用 [Claude Code 的 hooks](https://code.claude.com/docs/en/hooks)（Codex 也是同一套），为它们写的脚本在这里也能用。在[配置](#配置)的 `hooks` 下声明：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "~/.harness/hooks/guard.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write", "hooks": [{ "type": "command", "command": "~/.harness/hooks/format.sh", "timeout": 30 }] }
+    ]
+  }
+}
+```
+
+| 事件 | 运行时机 | matcher 匹配 | 能做什么 |
+|---|---|---|---|
+| `PreToolUse` | 工具调用之前 | 工具名 | 拦截调用（退出码 2，或 `permissionDecision: "deny"`）、修改输入（`updatedInput`）、补充上下文 |
+| `PostToolUse` | 调用成功之后 | 工具名 | 给模型反馈（退出码 2，或 `decision: "block"` 加 `reason`）、补充上下文、替换结果（`updatedToolOutput`） |
+| `PostToolUseFailure` | 调用失败之后 | 工具名 | 给模型反馈、补充上下文 |
+| `UserPromptSubmit` | 你的 prompt 发出之前 | — | 拒绝它（退出码 2 或 `decision: "block"`；原因显示给你）、补充上下文 |
+| `Stop` | 模型结束回合时 | — | 让它继续干活（退出码 2 或 `decision: "block"`；原因就是给它的指示） |
+| `SubagentStart` | 子代理的第一个请求之前 | agent 类型 | 给子代理补充上下文 |
+| `SubagentStop` | 子代理结束一次运行时 | agent 类型 | 与 `Stop` 相同，作用于子代理 |
+| `PreCompact` | 会话[压缩](#上下文压缩)之前 | `manual`（`/compact`）、`auto` | 阻止压缩（退出码 2 或 `decision: "block"`）；自动压缩被阻止时跳过压缩、请求照常发出，可能超出上下文窗口 |
+| `PostCompact` | 压缩之后 | `manual`、`auto` | 不影响执行；会收到摘要 |
+| `SessionStart` | 会话的第一个请求之前，以及 `/clear`、`/resume` 或压缩之后 | `startup`、`clear`、`resume`、`compact` | 补充上下文 |
+| `SessionEnd` | 发过请求的会话结束时：`/clear` 或 `/resume` 替换它之前、退出 REPL 时、one-shot 运行结束时、删除其 web 任务时 | `clear`、`resume`、`prompt_input_exit`、`other` | 不影响执行；默认只有 1.5 秒，可用 `timeout` 设置（最多 60 秒） |
+
+- hook 以 `sh -c <command>` 在工作目录中运行，不在沙箱内，`$CLAUDE_PROJECT_DIR` 和 `$HARNESS_PROJECT_DIR` 都设为工作目录。事件以 JSON 从 stdin 传入：`session_id`、`transcript_path`（保存的会话文件）、`cwd`、`hook_event_name`、`model`、`permission_mode`（固定为 `bypassPermissions`：harness 运行工具前从不询问）、子代理中的 `agent_id` 和 `agent_type`，以及事件自己的字段（`tool_name`、`tool_use_id`、`tool_input`、`tool_response` 或 `error`；`prompt`；`stop_hook_active`、`last_assistant_message`；`trigger`、`custom_instructions`、`compact_summary`；`source`、`reason`）。
+- 退出码 0：stdout 以 `{` 开头时按 JSON 读取（`continue` / `stopReason`、`systemMessage`、`decision` / `reason`、`hookSpecificOutput`），否则对 `SessionStart`、`SubagentStart` 和 `UserPromptSubmit` 作为给模型的上下文，对其他事件忽略。退出码 2 表示拦截，stderr 是原因。其他退出码、超时（`timeout`，单位秒，默认 600）或无效 JSON 会显示给你，不影响执行。`continue: false` 结束当前回合。
+- 工具也可以用 Claude Code 的名字匹配，hook 看到的也是这些名字：`bash` 是 `Bash`，`read` / `edit` / `write` / `grep` 是 `Read` / `Edit` / `Write` / `Grep`，`agent` 是 `Agent`（或 `Task`）；MCP 工具仍是 `mcp__<server>__<tool>`。只由名字组成的 matcher（`Edit|Write`）做精确匹配，其他的按正则表达式匹配（`mcp__fs__.*`），空串或 `*` 匹配全部。文件工具的 `path` 也会以 `file_path` 给出，`updatedInput` 用哪个都可以。
+- `permissionDecision: "ask"` 会拒绝调用，因为没有人可以询问。
+- 匹配同一事件的所有 hook 同时运行；同一条命令列出两次只运行一次。hooks 在子代理（用 `SubagentStop` 代替 `Stop`）和 web 任务中同样生效。
+- hook 给模型的内容放在 `<hook-feedback>` 块中；给你的内容（`systemMessage`、拒绝原因、运行失败）显示为 `⚑` 开头的一行。
+- 只支持 `command` 类型的 hook 和上面这些事件；其他 hook 类型（`http`、`prompt`、`agent`、`mcp_tool`）、`async` 以及其他事件在配置中会报错。hooks 只从配置文件读取，仓库无法自行添加；修改在下次启动时生效。
 
 ## 项目说明
 
@@ -325,6 +365,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 - `src/subagent.rs` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具
 - `src/subagent/runtime.rs` — 一个会话的子代理：前台与后台运行、后续追问、停止、向主代理收件箱报告
 - `src/mcp.rs` — MCP 客户端：服务器配置、连接、`mcp__*` 工具适配器
+- `src/hooks.rs` — hooks：配置中的 `hooks` 部分、matcher、Claude Code 工具名、运行命令并解析其输出
 - `src/skills.rs` — 技能发现、`SKILL.md` frontmatter 解析、`skill` 工具
 - `src/tools/` — `Tool` trait、注册表和 `FileTracker`（共享的读/改/写状态）
   - `bash.rs` — 通过 `bash -c` 运行命令（超时、输出截断）；拒绝自行修改文件的命令（写文件的内联 Python/Node/Perl 脚本、`sed -i`、写入文件的 heredoc 或 `echo`），这些修改应走 `edit` / `write`

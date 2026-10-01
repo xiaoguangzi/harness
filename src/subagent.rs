@@ -39,6 +39,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::Agent;
+use crate::hooks::Hooks;
 use crate::llm::Client;
 use crate::skills::{parse_frontmatter, split_frontmatter};
 use crate::tools::{FileTracker, Tool, ToolOutput, ToolRegistry, parse_input};
@@ -353,7 +354,7 @@ impl Tool for AgentTool {
             None if input.run_in_background => {
                 return ToolOutput::error("run_in_background needs a conversation to report back to");
             }
-            None => (Arc::new(Subagents::new(Arc::default(), Arc::default())), self.client.clone()),
+            None => (Arc::new(Subagents::new(Arc::default(), Arc::default(), Hooks::default())), self.client.clone()),
         };
         let client = match client_from(def, &parent) {
             Ok(c) => c,

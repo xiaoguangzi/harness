@@ -207,7 +207,7 @@ impl Capture {
 
 /// Kills a process group with SIGKILL when dropped, unless its id was
 /// cleared.
-pub(super) struct KillGroup(pub(super) Option<u32>);
+pub(crate) struct KillGroup(pub(crate) Option<u32>);
 
 impl Drop for KillGroup {
     fn drop(&mut self) {

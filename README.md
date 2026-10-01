@@ -60,8 +60,9 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 | `model`, `subagent_model`, `effort`, `max_tokens`, `context_window`, `providers` | models and [LLM gateways](#llm-gateways) |
 | `mcpServers` | [MCP servers](#mcp-servers) |
 | `sandbox` | the [sandbox](#sandbox) |
+| `hooks` | [hooks](#hooks) |
 
-Every key is optional, and unknown keys are an error. Nothing is read from the project directory (a project's `.mcp.json` included): a repository could otherwise send requests carrying your API keys to its own server, start MCP commands or loosen the sandbox. The project's `.harness/agents`, `.harness/skills` and their `.claude/` counterparts are still read, as they only add prompts. Older versions read `~/.harness/providers.json`, `mcp.json` and `sandbox.json`; the harness warns while they exist, and their contents go under the keys above (`default_model` is now `model`).
+Every key is optional, and unknown keys are an error. Nothing is read from the project directory (a project's `.mcp.json` included): a repository could otherwise send requests carrying your API keys to its own server, start MCP commands or hooks, or loosen the sandbox. The project's `.harness/agents`, `.harness/skills` and their `.claude/` counterparts are still read, as they only add prompts. Older versions read `~/.harness/providers.json`, `mcp.json` and `sandbox.json`; the harness warns while they exist, and their contents go under the keys above (`default_model` is now `model`).
 
 ## Web UI
 
@@ -70,7 +71,7 @@ Every key is optional, and unknown keys are an error. Nothing is read from the p
 - **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore`, `general-purpose` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results. Each subagent gets a card with its tool calls, status, report and a Stop button, and a background subagent's report starts a turn by itself when the task is idle. Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands and foreground subagents are stopped; background subagents carry on) or delete it (which stops its subagents too). `@path` mentions, `/<skill> args` and `/compact` work as in the REPL.
 - Assistant text is rendered as Markdown as it streams (code blocks, lists, tables, links); a tool call's summary line shows what it is about (the `bash` command, the file path, the `grep` pattern). Model switching and deletion sit under the `⋯` menu of the task header.
 - **工具 (Tools)**: every registered tool (built-in, skill, MCP, `agent`) with its description and schema; fill in JSON input and call it directly.
-- **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for the settings file. A save is validated with the environment first; the model setup then applies without a restart, and idle tasks move to it (`mcpServers` and `sandbox` changes apply on the next start).
+- **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for the settings file. A save is validated with the environment first; the model setup then applies without a restart, and idle tasks move to it (`mcpServers`, `sandbox` and `hooks` changes apply on the next start).
 - **Agents / Skills / MCP**: what was discovered and which MCP servers connected.
 
 The server starts even without a usable provider, so the first model can be configured in the browser. The API can run commands, so it is guarded: every API request needs a token, even on a loopback address (other users of the machine can reach that too), and the startup line prints a URL that carries it (`http://HOST:PORT/#token=...`; the browser remembers it for later tabs); on a loopback address, requests must also use a loopback host name (no DNS rebinding); and state-changing requests need an `X-Harness` header (no cross-site requests). The settings file the UI saves is readable by its owner only.
@@ -216,7 +217,7 @@ They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r
 - **Network**: loopback only (local servers and tests work; DNS and outbound connections fail), unless `"network": true`.
 - Commands run in a new session without a terminal. On Linux they also get their own PID namespace, so background jobs end with the command; on macOS, setuid programs (`sudo`, `ps`) cannot run.
 
-The `read`, `edit` and `write` tools check the same rules. `/sandbox` shows them, the REPL banner says `sandboxed`, and the system prompt tells the model the limits, so it reports a blocked action instead of working around it. MCP servers and the harness itself are not sandboxed.
+The `read`, `edit` and `write` tools check the same rules. `/sandbox` shows them, the REPL banner says `sandboxed`, and the system prompt tells the model the limits, so it reports a blocked action instead of working around it. MCP servers, [hooks](#hooks) and the harness itself are not sandboxed.
 
 ```json
 {
@@ -253,6 +254,45 @@ Declare servers under `mcpServers` in the [settings](#settings), in the same sha
 - Servers connect concurrently at startup; a server that fails is reported and skipped.
 - Tools are exposed as `mcp__<server>__<tool>`. Text, embedded text resources and PNG/JPEG/GIF/WebP images are passed back to the model.
 - A stdio server's stderr goes to `$TMPDIR/harness-mcp-<server>.log`.
+
+## Hooks
+
+Hooks run your own commands at points of the agent loop: to block dangerous commands, format files after an edit, add context to a prompt, or keep the model working until the tests pass. They follow [Claude Code's hook format](https://code.claude.com/docs/en/hooks), which Codex shares, so scripts written for those work here. Declare them under `hooks` in the [settings](#settings):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "~/.harness/hooks/guard.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write", "hooks": [{ "type": "command", "command": "~/.harness/hooks/format.sh", "timeout": 30 }] }
+    ]
+  }
+}
+```
+
+| Event | Runs | Matcher | What it can do |
+|---|---|---|---|
+| `PreToolUse` | before a tool call | tool name | block the call (exit 2, or `permissionDecision: "deny"`), change its input (`updatedInput`), add context |
+| `PostToolUse` | after a call that succeeded | tool name | give the model feedback (exit 2, or `decision: "block"` with a `reason`), add context, replace the result (`updatedToolOutput`) |
+| `PostToolUseFailure` | after a call that failed | tool name | give the model feedback, add context |
+| `UserPromptSubmit` | before your prompt is sent | — | refuse it (exit 2 or `decision: "block"`; the reason is shown to you), add context |
+| `Stop` | when the model ends its turn | — | send it back to work (exit 2 or `decision: "block"`; the reason is its instruction) |
+| `SubagentStart` | before a subagent's first request | agent type | add context for the subagent |
+| `SubagentStop` | when a subagent ends its run | agent type | the same as `Stop`, for the subagent |
+| `PreCompact` | before the conversation is [compacted](#compaction) | `manual` (`/compact`), `auto` | keep it from being compacted (exit 2 or `decision: "block"`); an automatic compaction is then skipped and the request goes as it is, which may overflow the context |
+| `PostCompact` | after it was compacted | `manual`, `auto` | nothing; it gets the summary |
+| `SessionStart` | before the first request of a conversation, and after `/clear`, `/resume` or a compaction | `startup`, `clear`, `resume`, `compact` | add context |
+| `SessionEnd` | when a conversation that sent a request ends: before `/clear` or `/resume` replaces it, when you quit the REPL, at the end of a one-shot run, when its web task is deleted | `clear`, `resume`, `prompt_input_exit`, `other` | nothing; it gets 1.5 s unless it sets `timeout` (at most 60 s) |
+
+- A hook runs as `sh -c <command>` in the working directory, outside the sandbox, with `$CLAUDE_PROJECT_DIR` and `$HARNESS_PROJECT_DIR` set to it. It gets the event as JSON on stdin: `session_id`, `transcript_path` (the saved session file), `cwd`, `hook_event_name`, `model`, `permission_mode` (always `bypassPermissions`: the harness never asks before running a tool), `agent_id` and `agent_type` in a subagent, and the event's own fields (`tool_name`, `tool_use_id`, `tool_input`, `tool_response` or `error`; `prompt`; `stop_hook_active`, `last_assistant_message`; `trigger`, `custom_instructions`, `compact_summary`; `source`, `reason`).
+- Exit code 0: stdout is read as JSON if it starts with `{` (`continue` / `stopReason`, `systemMessage`, `decision` / `reason`, `hookSpecificOutput`), otherwise it is context for the model for `SessionStart`, `SubagentStart` and `UserPromptSubmit`, and ignored for the rest. Exit code 2 blocks, with stderr as the reason. Another exit code, a timeout (`timeout`, in seconds, default 600) or bad JSON is shown to you and changes nothing. `continue: false` ends the turn.
+- Tools also match, and appear to hooks, under their Claude Code names: `bash` is `Bash`, `read` / `edit` / `write` / `grep` are `Read` / `Edit` / `Write` / `Grep`, `agent` is `Agent` (or `Task`); MCP tools keep `mcp__<server>__<tool>`. A matcher made of names (`Edit|Write`) matches them exactly, anything else is a regular expression (`mcp__fs__.*`), and an empty one or `*` matches everything. The file tools' `path` also comes as `file_path`, and an `updatedInput` may use either.
+- `permissionDecision: "ask"` refuses the call, as there is no one to ask.
+- All the hooks matching an event run at once; a command listed twice runs once. Hooks run in subagents too (`SubagentStop` instead of `Stop`) and in web tasks.
+- What hooks tell the model arrives in `<hook-feedback>` blocks; what they have for you (a `systemMessage`, a refusal, a failure) shows as a `⚑` line.
+- Only `command` hooks and the events above are supported; other hook types (`http`, `prompt`, `agent`, `mcp_tool`), `async` and other events are an error in the settings. Hooks come only from the settings file, so a repository cannot add any; changes apply on the next start.
 
 ## Project notes
 
@@ -324,6 +364,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 - `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
 - `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox
 - `src/mcp.rs` — MCP client: server configs, connections, `mcp__*` tool adapters
+- `src/hooks.rs` — hooks: the settings' `hooks` section, matchers, Claude Code tool names, running the commands and reading their answers
 - `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, the `skill` tool
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/edit/write state)
   - `bash.rs` — run a command via `bash -c` (timeout, output truncation); refuses commands that change files themselves (inline Python/Node/Perl scripts that write files, `sed -i`, heredocs or `echo` into a file), which go through `edit` / `write`

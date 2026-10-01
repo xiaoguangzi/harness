@@ -204,6 +204,7 @@ details.tool.subagent { border-left: 3px solid var(--accent); }
 .sub { color: var(--muted); font: 12px var(--mono); padding-left: 12px; border-left: 2px solid var(--line-strong); }
 .note { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
 .note.err { color: var(--err); white-space: pre-wrap; }
+.note.hook { color: var(--warn); white-space: pre-wrap; }
 
 /* ---------- task head / result ---------- */
 .taskhead { display: flex; gap: 10px; align-items: center; padding: 14px 4px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
@@ -707,6 +708,8 @@ function renderEvent(ev) {
       }
       case "retry": assistantEl = null;
         transcript.append(h("div", { class: "note" }, `↻ 回复中断（${ev.message}），${ev.wait}s 后重新请求（${ev.attempt}/${ev.max}）`)); break;
+      case "hook": assistantEl = null;
+        transcript.append(h("div", { class: "note hook" }, "⚑ " + ev.message)); break;
       case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台子 agent 有了结果，继续")); break;
       case "tool_result": {
         const i = pending.findIndex(x => x.name === ev.name);

@@ -262,6 +262,10 @@ impl Observer for WebObserver<'_> {
         self.task.push(json!({"type": "compact_start"}));
     }
 
+    fn on_hook(&mut self, message: &str) {
+        self.task.push(json!({"type": "hook", "message": message}));
+    }
+
     fn on_compact_end(&mut self, before: u64, after: u64) {
         self.task.push(json!({"type": "compact", "before": before, "after": after}));
     }

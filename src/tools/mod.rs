@@ -15,6 +15,7 @@ pub mod todo;
 mod write;
 
 pub use bash::BashTool;
+pub(crate) use bash::KillGroup;
 pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
