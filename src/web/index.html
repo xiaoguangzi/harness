@@ -524,7 +524,7 @@ function showNewTask() {
     chips.replaceChildren(...[h("button", { class: "chip" + (agentName === "main" ? " active" : ""), onclick: () => { agentName = "main"; syncHint(); prompt.focus(); } }, "main"),
       ...agents.map(a => h("button", { class: "chip" + (agentName === a.name ? " active" : ""), title: a.description, onclick: () => { agentName = a.name; syncHint(); prompt.focus(); } }, a.name))]);
     const a = agents.find(x => x.name === agentName);
-    agentHint.textContent = a ? a.description + (a.tools ? `  [工具: ${a.tools.join(", ")}]` : "") : "主 agent：可使用 bash / read / write / grep / skill / MCP 工具，并可再派发子 agent。";
+    agentHint.textContent = a ? a.description + (a.tools ? `  [工具: ${a.tools.join(", ")}]` : "") : "主 agent：可使用 bash / read / write / grep / glob / skill / MCP 工具，并可再派发子 agent。";
     const act = info && info.config.active;
     model.options[0].textContent = "默认 · " + (a ? (a.model || (act && act.subagent_model) || (act && act.default_model)) : (act ? act.default_model : "未配置"));
   };

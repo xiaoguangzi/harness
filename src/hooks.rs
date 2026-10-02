@@ -160,6 +160,8 @@ const ALIASES: &[(&str, &[&str])] = &[
     ("bash", &["Bash"]),
     ("bash_output", &["BashOutput"]),
     ("edit", &["Edit"]),
+    // `LS` lists a directory; agents that list it get `glob` for that.
+    ("glob", &["Glob", "LS"]),
     ("grep", &["Grep"]),
     ("kill_shell", &["KillShell"]),
     ("message_agent", &["SendMessage"]),
@@ -829,6 +831,8 @@ pub(crate) mod tests {
         assert_eq!(outcome.context, ["/p/root/x /p/root"]);
         assert_eq!(tool_named("Bash"), Some("bash"));
         assert_eq!(tool_named("KillShell"), Some("kill_shell"));
-        assert_eq!(tool_named("Glob"), None);
+        assert_eq!(tool_named("Glob"), Some("glob"));
+        assert_eq!(tool_named("LS"), Some("glob"));
+        assert_eq!(tool_named("WebFetch"), None);
     }
 }

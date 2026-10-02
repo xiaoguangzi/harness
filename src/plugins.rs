@@ -704,7 +704,7 @@ mod tests {
         ("skills/review/SKILL.md", "---\ndescription: Review code\n---\nLook at ${CLAUDE_PLUGIN_ROOT}/rules.md\n"),
         ("commands/commit.md", "---\ndescription: Commit\n---\nCommit $ARGUMENTS\n"),
         ("commands/db/migrate.md", "Run the migrations\n"),
-        ("agents/reviewer.md", "---\ndescription: Reviews\ntools: Read, Grep, Glob\nmodel: sonnet\n---\nUse ${CLAUDE_PLUGIN_ROOT}.\n"),
+        ("agents/reviewer.md", "---\ndescription: Reviews\ntools: Read, Grep, Glob, LS\nmodel: sonnet\n---\nUse ${CLAUDE_PLUGIN_ROOT}.\n"),
         (
             "hooks/hooks.json",
             r#"{"description": "x", "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/fmt.sh\""}]}], "Notification": []}}"#,
@@ -736,6 +736,7 @@ mod tests {
         let agent = &loaded.agents[0];
         assert_eq!(agent.name, "kit:reviewer");
         assert_eq!(agent.tools.as_deref().unwrap(), ["read", "grep", "glob"]);
+        assert_eq!(agent.permission, subagent::Permission::Write, "plugin agents may write unless they say otherwise");
         assert_eq!(agent.model, None, "Claude Code's alias means the default model");
         assert_eq!(agent.prompt, format!("Use {}.", root.display()));
 

@@ -7,6 +7,7 @@
 
 pub mod bash;
 mod edit;
+mod glob;
 mod grep;
 mod read;
 pub mod shells;
@@ -17,6 +18,7 @@ mod write;
 pub use bash::BashTool;
 pub(crate) use bash::KillGroup;
 pub use edit::EditTool;
+pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub(crate) use read::number_lines;
@@ -124,6 +126,7 @@ impl ToolRegistry {
         registry.register(BashOutputTool);
         registry.register(KillShellTool);
         registry.register(GrepTool);
+        registry.register(GlobTool);
         // `todo_write` is off: current models plan well enough without it. The tool, its
         // rendering and its compaction handling stay, so re-enabling it is this one line.
         // registry.register(TodoTool);

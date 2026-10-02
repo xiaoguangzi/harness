@@ -9,7 +9,7 @@
 //! conversation is kept, so `message_agent` can send it follow-ups, and
 //! `stop_agent` stops it.
 //!
-//! The built-in `explore` agent only has the `grep` tool; `general-purpose`
+//! The built-in `explore` agent only has `grep` and `glob`; `general-purpose`
 //! has every tool but these three. Custom agents are Markdown files in
 //! `.harness/agents/` or `.claude/agents/` (project or `~`):
 //!
@@ -95,16 +95,17 @@ impl AgentDef {
 pub fn explore() -> AgentDef {
     AgentDef {
         name: "explore".into(),
-        description: "Codebase search agent with only the `grep` tool. Use it for open-ended questions \
-                      that need many searches (where is X implemented, which files use Y, how is Z wired \
-                      up) when you only need the conclusion, not the search output. It cannot modify \
-                      anything."
+        description: "Codebase search agent with only the `grep` and `glob` tools. Use it for open-ended \
+                      questions that need many searches (where is X implemented, which files use Y, how \
+                      is Z wired up) when you only need the conclusion, not the search output. It cannot \
+                      modify anything."
             .into(),
         prompt: "You are an exploration agent: a code search specialist working for another agent. You \
                  get one question about the codebase; answer it by searching.\n\n\
-                 Your only tool is `grep`:\n\
-                 - Find candidate files with the default `files_with_matches` mode, narrowing with \
-                 `glob` and `path`.\n\
+                 Your tools are `grep` and `glob`:\n\
+                 - Find candidate files with `glob` when you know their names or paths (`**/*_test.go`), \
+                 and with `grep`'s default `files_with_matches` mode when you know what they contain, \
+                 narrowing with its `glob` and `path`.\n\
                  - Then look at the code with `output_mode: \"content\"` and `context` lines around a \
                  match (for example the definition of a function), rather than broad patterns that \
                  return everything.\n\
@@ -114,7 +115,7 @@ pub fn explore() -> AgentDef {
                  you could not determine. Quote code only when a few lines are essential."
             .into(),
         permission: Permission::ReadOnly,
-        tools: Some(vec!["grep".into()]),
+        tools: Some(vec!["grep".into(), "glob".into()]),
         model: None,
         path: None,
     }
@@ -166,7 +167,9 @@ pub fn discover(roots: &[PathBuf]) -> (Vec<AgentDef>, Vec<String>) {
             entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "md")).collect();
         files.sort();
         for file in files {
-            let parsed = std::fs::read_to_string(&file).map_err(|e| e.to_string()).and_then(|t| parse_def(&t, &file));
+            let parsed = std::fs::read_to_string(&file)
+                .map_err(|e| e.to_string())
+                .and_then(|t| parse_def(&t, &file, Permission::ReadOnly));
             match parsed {
                 Ok(def) => {
                     defs.entry(def.name.clone()).or_insert(def);
@@ -182,16 +185,21 @@ pub fn discover(roots: &[PathBuf]) -> (Vec<AgentDef>, Vec<String>) {
 }
 
 /// A plugin's agent from `file`, named `<prefix>:<name>`, with the
-/// plugin's path variables replaced in its prompt.
+/// plugin's path variables replaced in its prompt. Unlike the user's own
+/// agents it may write unless it says `permission: read-only`: plugins are
+/// written for Claude Code, where `tools` is the whole list of what an
+/// agent gets (all of them without it), and the user chose to enable it.
 pub fn plugin_def(file: &Path, prefix: &str, plugin: &PluginDirs) -> Result<AgentDef, String> {
     let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
-    let mut def = parse_def(&text, file)?;
+    let mut def = parse_def(&text, file, Permission::Write)?;
     def.name = format!("{prefix}:{}", def.name);
     def.prompt = plugin.expand(&def.prompt);
     Ok(def)
 }
 
-fn parse_def(text: &str, file: &Path) -> Result<AgentDef, String> {
+/// The agent defined in `text`, with `default` permission unless it gives
+/// one.
+fn parse_def(text: &str, file: &Path, default: Permission) -> Result<AgentDef, String> {
     let (front, body) = split_frontmatter(text).ok_or("missing `---` frontmatter")?;
     let fields = parse_frontmatter(front);
     let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -201,7 +209,8 @@ fn parse_def(text: &str, file: &Path) -> Result<AgentDef, String> {
     }
     let description = fields.get("description").cloned().filter(|d| !d.is_empty()).ok_or("missing `description`")?;
     let permission = match fields.get("permission").map(|p| p.to_ascii_lowercase()).as_deref() {
-        None | Some("read-only" | "readonly" | "read_only") => Permission::ReadOnly,
+        None => default,
+        Some("read-only" | "readonly" | "read_only") => Permission::ReadOnly,
         Some("write") => Permission::Write,
         Some(other) => return Err(format!("unknown permission `{other}` (use `read-only` or `write`)")),
     };
@@ -209,14 +218,19 @@ fn parse_def(text: &str, file: &Path) -> Result<AgentDef, String> {
     // frontmatter parser into `- read - grep`). Claude Code names such as
     // `Read` or `KillShell` become the harness's; MCP names keep their case.
     let tools = fields.get("tools").map(|t| {
-        list_field(t)
-            .into_iter()
-            .map(|n| match hooks::tool_named(&n) {
+        let mut tools: Vec<String> = Vec::new();
+        for name in list_field(t) {
+            let name = match hooks::tool_named(&name) {
                 Some(tool) => tool.to_string(),
-                None if n.starts_with("mcp__") => n,
-                None => n.to_ascii_lowercase(),
-            })
-            .collect()
+                None if name.starts_with("mcp__") => name,
+                None => name.to_ascii_lowercase(),
+            };
+            // `Glob` and `LS` are both `glob`.
+            if !tools.contains(&name) {
+                tools.push(name);
+            }
+        }
+        tools
     });
     // Claude Code's model aliases name no model a gateway knows: they get
     // the default, as `inherit` does.
@@ -537,9 +551,9 @@ mod tests {
     }
 
     #[test]
-    fn explore_only_gets_grep() {
+    fn explore_only_gets_grep_and_glob() {
         let tool = agent_tool(vec![explore()]);
-        assert_eq!(names(&tool.registry_for(&explore())), vec!["grep"]);
+        assert_eq!(names(&tool.registry_for(&explore())), vec!["glob", "grep"]);
         assert!(tool.read_only());
     }
 
@@ -547,7 +561,33 @@ mod tests {
     fn read_only_is_the_default() {
         let mut def = explore();
         def.tools = None;
-        assert_eq!(names(&agent_tool(vec![]).registry_for(&def)), vec!["grep", "read"]);
+        assert_eq!(names(&agent_tool(vec![]).registry_for(&def)), vec!["glob", "grep", "read"]);
+    }
+
+    #[test]
+    fn plugin_agents_get_the_tools_they_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = PluginDirs { root: dir.path().into(), data: dir.path().into() };
+        let def = |name: &str, front: &str| {
+            let file = dir.path().join(format!("{name}.md"));
+            std::fs::write(&file, format!("---\ndescription: d\n{front}---\nprompt\n")).unwrap();
+            plugin_def(&file, "p", &plugin).unwrap()
+        };
+        let tool = agent_tool(vec![]);
+        // Claude Code's names, some the harness lacks; `tools` is the whole list.
+        let fixer = def("fixer", "tools: Read, Grep, Glob, LS, Edit, Bash, WebFetch\n");
+        assert_eq!(fixer.permission, Permission::Write);
+        assert_eq!(names(&tool.registry_for(&fixer)), vec!["bash", "edit", "glob", "grep", "read"]);
+        // Without `tools`, every tool but the subagent ones.
+        let all = tool.registry_for(&def("all", ""));
+        assert!(all.get("write").is_some() && all.get("bash").is_some(), "{:?}", names(&all));
+        // It can still ask for less.
+        let reader = def("reader", "tools: Read, Bash\npermission: read-only\n");
+        assert_eq!(names(&tool.registry_for(&reader)), vec!["read"]);
+        // The user's own agents stay read-only by default.
+        let own = "---\ndescription: d\ntools: Read, Bash\n---\np\n";
+        let own = parse_def(own, Path::new("own.md"), Permission::ReadOnly);
+        assert_eq!(names(&tool.registry_for(&own.unwrap())), vec!["read"]);
     }
 
     #[test]
@@ -614,8 +654,8 @@ mod tests {
     #[test]
     fn reports_unknown_tool_names() {
         let mut def = explore();
-        def.tools = Some(vec!["read".into(), "glob".into()]);
+        def.tools = Some(vec!["read".into(), "webfetch".into()]);
         let tool = agent_tool(vec![def]);
-        assert_eq!(tool.unknown_tools(), vec![("explore".to_string(), "glob".to_string())]);
+        assert_eq!(tool.unknown_tools(), vec![("explore".to_string(), "webfetch".to_string())]);
     }
 }

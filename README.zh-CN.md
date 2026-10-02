@@ -7,7 +7,7 @@
 ## 环境要求
 
 - Rust 1.88+
-- `PATH` 上需要有 [ugrep](https://github.com/Genivia/ugrep)，供 `grep` 工具使用（`apt install ugrep` / `brew install ugrep`）
+- `PATH` 上需要有 [ugrep](https://github.com/Genivia/ugrep)，供 `grep` 和 `glob` 工具使用（`apt install ugrep` / `brew install ugrep`）
 - Linux 上[粘贴图片](#粘贴图片)需要 `wl-paste`（[wl-clipboard](https://github.com/bugaevc/wl-clipboard)，Wayland）或 `xclip`（X11）；macOS 无需额外安装
 
 ## 用法
@@ -214,7 +214,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 
 ## 沙箱
 
-`harness --sandbox`（或 `HARNESS_SANDBOX=1`，或在配置的 `sandbox` 部分写 `"enabled": true`）让模型的 `bash` 命令和 `grep` 搜索在操作系统沙箱里运行：macOS 用系统自带的 Seatbelt（`sandbox-exec`），Linux 用 [bubblewrap](https://github.com/containers/bubblewrap)（`apt install bubblewrap` / `dnf install bubblewrap`；它需要非特权用户命名空间，有些容器里没有）。`--no-sandbox` 或 `HARNESS_SANDBOX=0` 可以单次关闭。沙箱无法启动时，harness 直接退出，不会在没有沙箱的情况下运行。
+`harness --sandbox`（或 `HARNESS_SANDBOX=1`，或在配置的 `sandbox` 部分写 `"enabled": true`）让模型的 `bash` 命令和 `grep` / `glob` 搜索在操作系统沙箱里运行：macOS 用系统自带的 Seatbelt（`sandbox-exec`），Linux 用 [bubblewrap](https://github.com/containers/bubblewrap)（`apt install bubblewrap` / `dnf install bubblewrap`；它需要非特权用户命名空间，有些容器里没有）。`--no-sandbox` 或 `HARNESS_SANDBOX=0` 可以单次关闭。沙箱无法启动时，harness 直接退出，不会在没有沙箱的情况下运行。
 
 - **读**：除 `deny_read` 以外都可读。
 - **写**：只能写工作目录、临时目录（`/tmp`、`/var/tmp`、`$TMPDIR`，macOS 上还有每用户的临时和缓存目录）以及 `allow_write`。工作目录中的 `.harness/`、`.claude/`、`.mcp.json`，以及 git 仓库中的 `.git/hooks/` 和 `.git/config` 保持只读，因为它们会让代码之后在沙箱外运行（MCP 服务器、hooks、`core.fsmonitor`）；`.git` 本身不能被重命名或删除。
@@ -292,7 +292,7 @@ Hooks 在 agent 循环的特定时机运行你自己的命令：拦截危险命�
 
 - hook 以 `sh -c <command>` 在工作目录中运行，不在沙箱内，`$CLAUDE_PROJECT_DIR` 和 `$HARNESS_PROJECT_DIR` 都设为工作目录。事件以 JSON 从 stdin 传入：`session_id`、`transcript_path`（保存的会话文件）、`cwd`、`hook_event_name`、`model`、`permission_mode`（固定为 `bypassPermissions`：harness 运行工具前从不询问）、子代理中的 `agent_id` 和 `agent_type`，以及事件自己的字段（`tool_name`、`tool_use_id`、`tool_input`、`tool_response` 或 `error`；`prompt`；`stop_hook_active`、`last_assistant_message`；`trigger`、`custom_instructions`、`compact_summary`；`source`、`reason`）。
 - 退出码 0：stdout 以 `{` 开头时按 JSON 读取（`continue` / `stopReason`、`systemMessage`、`decision` / `reason`、`hookSpecificOutput`），否则对 `SessionStart`、`SubagentStart` 和 `UserPromptSubmit` 作为给模型的上下文，对其他事件忽略。退出码 2 表示拦截，stderr 是原因。其他退出码、超时（`timeout`，单位秒，默认 600）或无效 JSON 会显示给你，不影响执行。`continue: false` 结束当前回合。
-- 工具也可以用 Claude Code 的名字匹配，hook 看到的也是这些名字：`bash` 是 `Bash`，`read` / `edit` / `write` / `grep` 是 `Read` / `Edit` / `Write` / `Grep`，`agent` 是 `Agent`（或 `Task`）；MCP 工具仍是 `mcp__<server>__<tool>`。只由名字组成的 matcher（`Edit|Write`）做精确匹配，其他的按正则表达式匹配（`mcp__fs__.*`），空串或 `*` 匹配全部。文件工具的 `path` 也会以 `file_path` 给出，`updatedInput` 用哪个都可以。
+- 工具也可以用 Claude Code 的名字匹配，hook 看到的也是这些名字：`bash` 是 `Bash`，`read` / `edit` / `write` / `grep` / `glob` 是 `Read` / `Edit` / `Write` / `Grep` / `Glob`，`agent` 是 `Agent`（或 `Task`）；MCP 工具仍是 `mcp__<server>__<tool>`。只由名字组成的 matcher（`Edit|Write`）做精确匹配，其他的按正则表达式匹配（`mcp__fs__.*`），空串或 `*` 匹配全部。文件工具的 `path` 也会以 `file_path` 给出，`updatedInput` 用哪个都可以。
 - `permissionDecision: "ask"` 会拒绝调用，因为没有人可以询问。
 - 匹配同一事件的所有 hook 同时运行；同一条命令列出两次只运行一次。hooks 在子代理（用 `SubagentStop` 代替 `Stop`）和 web 任务中同样生效。
 - hook 给模型的内容放在 `<hook-feedback>` 块中；给你的内容（`systemMessage`、拒绝原因、运行失败）显示为 `⚑` 开头的一行。
@@ -326,7 +326,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 
 主代理可以用 `agent` 工具委派一个自包含的任务。子代理在自己的全新会话中运行，有自己的系统提示和工具集，只有最终报告会返回，从而把漫长的搜索挡在主上下文之外。同一次响应中启动的多个子代理并行运行。
 
-- **`explore`**（内置）：只有 `grep` 工具的代码库搜索代理。用于“X 在哪里 / 哪些文件用了 Y”这类问题。
+- **`explore`**（内置）：只有 `grep` 和 `glob` 工具的代码库搜索代理。用于“X 在哪里 / 哪些文件用了 Y”这类问题。
 - **`general-purpose`**（内置）：拥有主代理全部工具（`bash`、`edit`、`write`、MCP 工具等，受同一沙箱约束）的编码代理，用于多步调研或范围明确的修改。子代理共享工作目录，因此主代理会被要求给每个修改文件的子代理分配各自的文件。
 - **自定义代理**：`.harness/agents/` 或 `.claude/agents/`（项目或 `~`）中的 Markdown 文件（先找到的优先，与内置代理同名的文件会覆盖内置项）：
 
@@ -341,10 +341,10 @@ description: Draft release notes from the git log. Use when asked for a changelo
   You are a code reviewer...
   ```
 
-- **自定义代理默认只读**：只读代理只会获得标记为只读的工具（`read`、`grep`、`skill`，以及服务器设置了 `readOnlyHint` 的 MCP 工具），即使它的 `tools` 列表写了其他工具也不行。`tools` 用于进一步收窄。
+- **自定义代理默认只读**：只读代理只会获得标记为只读的工具（`read`、`grep`、`glob`、`skill`，以及服务器设置了 `readOnlyHint` 的 MCP 工具），即使它的 `tools` 列表写了其他工具也不行。`tools` 用于进一步收窄。
 - 子代理不能再启动子代理。它们的文件读取使用自己的追踪器，因此不会计入主代理 `edit` 和 `write` 所需的已读记录。
 - 模型：代理的 `model`，否则 `subagent_model` / `HARNESS_SUBAGENT_MODEL`，否则会话当前使用的模型（包括 `/model`、`/effort` 切换之后）；任意 `<provider>/<model>`。Claude Code 的 `sonnet`、`opus`、`haiku` 别名视同未设置，与 `inherit` 相同。
-- 工具可以用 Claude Code 的名称（`Read`、`Bash`、`KillShell`），会映射为 harness 自己的工具。
+- 工具可以用 Claude Code 的名称（`Read`、`Bash`、`KillShell`），会映射为 harness 自己的工具（`LS` 映射为 `glob`）。
 - `/agents` 列出可用类型。
 
 ### 后台子代理与后续追问
@@ -389,7 +389,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 
 - `.claude-plugin/plugin.json` 可以省略；没有它时由市场条目代替，插件名取目录名。清单中的路径必须位于插件目录之内。
 - `${CLAUDE_PLUGIN_ROOT}` 和 `${CLAUDE_PLUGIN_DATA}` 会在 hook 命令、MCP 服务器配置以及技能、命令和代理的文本中被替换；hook 和 stdio MCP 服务器还会以环境变量的形式拿到它们。
-- 插件代理遵循[自定义代理](#子代理subagents)的规则：除非声明 `permission: write`，否则只读，并且只能用 harness 有的工具（Claude Code 的 `Glob`、`LS`、`WebFetch` 等会被跳过）。
+- 插件代理按 Claude Code 的方式获得 `tools`，即这份列表就是代理能用的全部工具：除非声明 `permission: read-only`，否则可以写（`bash`、`edit`、`write`），不写 `tools` 则获得除子代理工具外的全部工具。这和你的[自定义代理](#子代理subagents)默认只读不同：插件是你启用的，它的代理也是按这套规则写的。harness 没有的工具（`WebFetch`、`WebSearch`、`TodoWrite`）会被跳过。
 - harness 用不了的部分会在启动时给出警告并略过，插件的其余部分照常加载：它不运行的 hook 事件或类型、MCP 包（`.mcpb`）、配置不被接受的 MCP 服务器。LSP 服务器、输出风格、monitors、`userConfig` 和 `dependencies` 会被忽略。
 - `/plugins`（以及 Web UI 的环境页）列出每个插件提供的内容，或它未能加载的原因。
 - 插件会运行命令（hook、MCP 服务器、命令中的 `!` 行），因此只有你的配置和命令行可以启用插件，项目不行。
@@ -426,6 +426,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
   - `shells.rs` — 后台命令（`bash` 的 `run_in_background`）：每个会话各自的一组，`bash_output` 和 `kill_shell` 工具，退出时通知收件箱
   - `todo.rs` — `todo_write` 工具：模型的待办清单，每次整体发送（未注册，保留以便重新启用）
   - `grep.rs` — 通过 ugrep 的正则搜索（PCRE，遵循 `.gitignore`，`files_with_matches` / `content` / `count` 模式）
+  - `glob.rs` — 通过 ugrep 按 glob 模式查找文件（`.gitignore` 与沙箱规则同 `grep`；支持 `{a,b}`；最近修改的在前）
 
 在官方 Anthropic API 上，工具以 `eager_input_streaming` 声明，因此较大的输入（例如 `write` 的文件内容）会在生成时流式传输。此后 API 不再校验工具输入，所以每个内置工具都把输入解析成严格的结构体（拒绝未知字段），流式 JSON 解析失败的调用不会执行：模型会得到 `INVALID_JSON` 错误结果。MCP 工具保持输入缓冲开启，因此 API 会按服务器提供的 schema 校验其输入。
 

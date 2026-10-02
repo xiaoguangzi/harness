@@ -151,8 +151,8 @@ async fn foreground_reports_come_back_as_text_and_can_be_continued() {
         assert!(out.content.starts_with("first report\n\n(agent_id: "), "{}", out.content);
         let body = mock.next().await;
         assert_eq!(body["model"], "switched");
-        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
-        assert_eq!(body["tools"][0]["name"], "grep");
+        let names: Vec<&str> = body["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, ["glob", "grep"]);
 
         let id = first_id(&subagents);
         let out = tools.run("message_agent", json!({"agent_id": id, "message": "and then?"})).await;
@@ -370,7 +370,7 @@ async fn general_purpose_gets_the_main_tools_but_cannot_delegate() {
     let mock = Mock::new(|_| answer("ok")).await;
     let tool = AgentTool::new(Arc::new(vec![general_purpose()]), mock.tools(), mock.client.clone(), silent());
     let registry = tool.registry_for(&general_purpose());
-    assert_eq!(registry.names().collect::<Vec<_>>(), vec!["bash", "bash_output", "edit", "grep", "kill_shell", "read", "write"]);
+    assert_eq!(registry.names().collect::<Vec<_>>(), vec!["bash", "bash_output", "edit", "glob", "grep", "kill_shell", "read", "write"]);
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
+use super::glob::expand_braces;
 use super::{Tool, ToolOutput, parse_input, truncate};
 use crate::sandbox;
 
@@ -67,7 +68,8 @@ impl Input {
         if self.case_insensitive {
             args.push("--ignore-case".into());
         }
-        if let Some(glob) = &self.glob {
+        // ugrep's globs have no `{a,b}`: one `--glob` for each alternative.
+        for glob in self.glob.iter().flat_map(|g| expand_braces(g)) {
             args.push(format!("--glob={glob}"));
         }
         args.push("-e".into());
@@ -142,55 +144,11 @@ impl Tool for GrepTool {
             Err(e) => return e,
         };
 
-        let command = match sandbox::active() {
-            Some(sandbox) => sandbox.command("ugrep", input.ugrep_args()).map(|(c, guard)| (c, Some(guard))),
-            None => {
-                let mut command = Command::new("ugrep");
-                command.args(input.ugrep_args());
-                Ok((command, None))
-            }
+        let stdout = match ugrep(input.ugrep_args()).await {
+            Ok(Some(stdout)) => stdout,
+            Ok(None) => return ToolOutput::ok("No matches found"),
+            Err(e) => return e,
         };
-        let spawned = command.and_then(|(mut command, guard)| {
-            let child = command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
-            Ok((child, guard))
-        });
-        let (child, _sandboxed) = match spawned {
-            Ok(spawned) => spawned,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return ToolOutput::error(
-                    "ugrep is not installed. Install it (e.g. `apt install ugrep` or \
-                     `brew install ugrep`) to enable the grep tool.",
-                );
-            }
-            Err(e) => return ToolOutput::error(format!("Failed to run ugrep: {e}")),
-        };
-        let output = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return ToolOutput::error(format!("Failed to run ugrep: {e}")),
-            Err(_) => return ToolOutput::error("Search timed out; narrow `path` or `glob`"),
-        };
-
-        // ugrep exits 0 on matches, 1 on no matches, 2 on errors. Files it
-        // cannot read (such as those the sandbox hides) are skipped quietly
-        // but still make it exit 2.
-        let quiet = output.stderr.is_empty();
-        match output.status.code() {
-            Some(0) => {}
-            Some(2) if quiet && !output.stdout.is_empty() => {}
-            Some(1) => return ToolOutput::ok("No matches found"),
-            Some(2) if quiet => return ToolOutput::ok("No matches found"),
-            _ => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return ToolOutput::error(format!("ugrep failed: {}", stderr.trim()));
-            }
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let limit = input.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT).max(1);
         let total = stdout.lines().count();
         let mut text: String = stdout.lines().take(limit).collect::<Vec<_>>().join("\n");
@@ -199,6 +157,59 @@ impl Tool for GrepTool {
         }
         ToolOutput::ok(truncate(&text, MAX_OUTPUT_BYTES))
     }
+}
+
+/// Runs ugrep with `args`, in the sandbox when it is on: what it printed,
+/// `None` if it found nothing, or the error for the model.
+pub(super) async fn ugrep(args: Vec<String>) -> Result<Option<String>, ToolOutput> {
+    let command = match sandbox::active() {
+        Some(sandbox) => sandbox.command("ugrep", args).map(|(c, guard)| (c, Some(guard))),
+        None => {
+            let mut command = Command::new("ugrep");
+            command.args(args);
+            Ok((command, None))
+        }
+    };
+    let spawned = command.and_then(|(mut command, guard)| {
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        Ok((child, guard))
+    });
+    let (child, _sandboxed) = match spawned {
+        Ok(spawned) => spawned,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ToolOutput::error(
+                "ugrep is not installed. Install it (e.g. `apt install ugrep` or \
+                 `brew install ugrep`) to enable the grep and glob tools.",
+            ));
+        }
+        Err(e) => return Err(ToolOutput::error(format!("Failed to run ugrep: {e}"))),
+    };
+    let output = match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(ToolOutput::error(format!("Failed to run ugrep: {e}"))),
+        Err(_) => return Err(ToolOutput::error("Search timed out; narrow `path` or `glob`")),
+    };
+
+    // ugrep exits 0 on matches, 1 on no matches, 2 on errors. Files it
+    // cannot read (such as those the sandbox hides) are skipped quietly
+    // but still make it exit 2.
+    let quiet = output.stderr.is_empty();
+    match output.status.code() {
+        Some(0) => {}
+        Some(2) if quiet && !output.stdout.is_empty() => {}
+        Some(1) => return Ok(None),
+        Some(2) if quiet => return Ok(None),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ToolOutput::error(format!("ugrep failed: {}", stderr.trim())));
+        }
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
 #[cfg(test)]
@@ -238,6 +249,13 @@ mod tests {
         }))
         .await;
         assert!(out.content.ends_with("a.rs:2:fn helper() {}"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn glob_alternatives() {
+        let dir = fixture();
+        let out = grep(json!({"pattern": "main", "path": dir.path(), "glob": "*.{rs,txt}", "case_insensitive": true})).await;
+        assert!(out.content.contains("a.rs") && out.content.contains("b.txt"), "{}", out.content);
     }
 
     #[tokio::test]

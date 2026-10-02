@@ -41,9 +41,10 @@ const GUIDANCE: &[(&str, &str)] = &[
          it is done, and add items you discover. Skip it for small tasks.",
     ),
     ("grep", "search file contents by regular expression. Use it instead of running grep or rg through `bash`."),
+    ("glob", "find files by name or path pattern. Use it instead of running find or ls -R through `bash`."),
     (
         "bash",
-        "builds, tests, git, listing files and other shell work. Every call is a fresh process, so \
+        "builds, tests, git and other shell work. Every call is a fresh process, so \
          `cd` does not persist: use absolute paths or `cd dir && command`. Do not use it to read or \
          search files when the tools above can, and never to create or change files: no Python, \
          Node or Perl scripts, `sed -i`, heredocs or `>` redirection into files. Those changes go \
@@ -186,7 +187,7 @@ mod tests {
     fn fills_the_template() {
         let prompt = main(&ToolRegistry::with_defaults(FileTracker::default()));
         assert!(!prompt.contains("{{"), "{prompt}");
-        for tool in ["read", "edit", "write", "grep", "bash"] {
+        for tool in ["read", "edit", "write", "grep", "glob", "bash"] {
             assert!(prompt.contains(&format!("- `{tool}`: ")), "missing {tool}");
         }
         assert!(!prompt.contains("`skill`:") && !prompt.contains("`agent`:"));

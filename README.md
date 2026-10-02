@@ -6,7 +6,7 @@ A minimal coding-agent harness in Rust. It talks to any mix of LLM gateways that
 ## Requirements
 
 - Rust 1.88+
-- [ugrep](https://github.com/Genivia/ugrep) on `PATH` for the `grep` tool (`apt install ugrep` / `brew install ugrep`)
+- [ugrep](https://github.com/Genivia/ugrep) on `PATH` for the `grep` and `glob` tools (`apt install ugrep` / `brew install ugrep`)
 - On Linux, `wl-paste` ([wl-clipboard](https://github.com/bugaevc/wl-clipboard), Wayland) or `xclip` (X11) for [pasting images](#pasting-images); macOS needs nothing extra
 
 ## Usage
@@ -213,7 +213,7 @@ They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r
 
 ## Sandbox
 
-`harness --sandbox` (or `HARNESS_SANDBOX=1`, or `"enabled": true` in the settings' `sandbox` section) runs the model's `bash` commands and `grep` searches in an OS sandbox: Seatbelt (`sandbox-exec`, built in) on macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux (`apt install bubblewrap` / `dnf install bubblewrap`; it needs unprivileged user namespaces, which some containers lack). `--no-sandbox` or `HARNESS_SANDBOX=0` turns it off for one run. If the sandbox cannot start, the harness exits rather than run without it.
+`harness --sandbox` (or `HARNESS_SANDBOX=1`, or `"enabled": true` in the settings' `sandbox` section) runs the model's `bash` commands and `grep` / `glob` searches in an OS sandbox: Seatbelt (`sandbox-exec`, built in) on macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux (`apt install bubblewrap` / `dnf install bubblewrap`; it needs unprivileged user namespaces, which some containers lack). `--no-sandbox` or `HARNESS_SANDBOX=0` turns it off for one run. If the sandbox cannot start, the harness exits rather than run without it.
 
 - **Reads**: everything except `deny_read`.
 - **Writes**: only the working directory, the temp directories (`/tmp`, `/var/tmp`, `$TMPDIR`, and on macOS the per-user temp and cache directories) and `allow_write`. In the working directory, `.harness/`, `.claude/`, `.mcp.json` and, in a git repository, `.git/hooks/` and `.git/config` stay read-only, because they make code run outside the sandbox later (MCP servers, hooks, `core.fsmonitor`); `.git` itself cannot be renamed or removed.
@@ -291,7 +291,7 @@ Hooks run your own commands at points of the agent loop: to block dangerous comm
 
 - A hook runs as `sh -c <command>` in the working directory, outside the sandbox, with `$CLAUDE_PROJECT_DIR` and `$HARNESS_PROJECT_DIR` set to it. It gets the event as JSON on stdin: `session_id`, `transcript_path` (the saved session file), `cwd`, `hook_event_name`, `model`, `permission_mode` (always `bypassPermissions`: the harness never asks before running a tool), `agent_id` and `agent_type` in a subagent, and the event's own fields (`tool_name`, `tool_use_id`, `tool_input`, `tool_response` or `error`; `prompt`; `stop_hook_active`, `last_assistant_message`; `trigger`, `custom_instructions`, `compact_summary`; `source`, `reason`).
 - Exit code 0: stdout is read as JSON if it starts with `{` (`continue` / `stopReason`, `systemMessage`, `decision` / `reason`, `hookSpecificOutput`), otherwise it is context for the model for `SessionStart`, `SubagentStart` and `UserPromptSubmit`, and ignored for the rest. Exit code 2 blocks, with stderr as the reason. Another exit code, a timeout (`timeout`, in seconds, default 600) or bad JSON is shown to you and changes nothing. `continue: false` ends the turn.
-- Tools also match, and appear to hooks, under their Claude Code names: `bash` is `Bash`, `read` / `edit` / `write` / `grep` are `Read` / `Edit` / `Write` / `Grep`, `agent` is `Agent` (or `Task`); MCP tools keep `mcp__<server>__<tool>`. A matcher made of names (`Edit|Write`) matches them exactly, anything else is a regular expression (`mcp__fs__.*`), and an empty one or `*` matches everything. The file tools' `path` also comes as `file_path`, and an `updatedInput` may use either.
+- Tools also match, and appear to hooks, under their Claude Code names: `bash` is `Bash`, `read` / `edit` / `write` / `grep` / `glob` are `Read` / `Edit` / `Write` / `Grep` / `Glob`, `agent` is `Agent` (or `Task`); MCP tools keep `mcp__<server>__<tool>`. A matcher made of names (`Edit|Write`) matches them exactly, anything else is a regular expression (`mcp__fs__.*`), and an empty one or `*` matches everything. The file tools' `path` also comes as `file_path`, and an `updatedInput` may use either.
 - `permissionDecision: "ask"` refuses the call, as there is no one to ask.
 - All the hooks matching an event run at once; a command listed twice runs once. Hooks run in subagents too (`SubagentStop` instead of `Stop`) and in web tasks.
 - What hooks tell the model arrives in `<hook-feedback>` blocks; what they have for you (a `systemMessage`, a refusal, a failure) shows as a `⚑` line.
@@ -325,7 +325,7 @@ As in Claude Code:
 
 The main agent can delegate a self-contained task with the `agent` tool. A subagent runs in its own fresh conversation with its own system prompt and tool set, and only its final report comes back, which keeps long searches out of the main context. Several subagents started in one response run in parallel.
 
-- **`explore`** (built-in): a codebase search agent whose only tool is `grep`. Use it for "where is X / which files use Y" questions.
+- **`explore`** (built-in): a codebase search agent whose only tools are `grep` and `glob`. Use it for "where is X / which files use Y" questions.
 - **`general-purpose`** (built-in): a coding agent with the main agent's tools (`bash`, `edit`, `write`, MCP tools and the rest, under the same sandbox) for multi-step research or a well-scoped change. Subagents share the working directory, so the main agent is told to give each one that changes files its own files.
 - **Custom agents**: Markdown files in `.harness/agents/` or `.claude/agents/` (project or `~`; the first found wins, and a file named like a built-in overrides it):
 
@@ -340,10 +340,10 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   You are a code reviewer...
   ```
 
-- **Custom agents default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further.
+- **Custom agents default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `glob`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further.
 - Subagents cannot start subagents. Their file reads use their own tracker, so they never count as reads for the main agent's `edit` and `write`.
 - Model: the agent's `model`, else `subagent_model` / `HARNESS_SUBAGENT_MODEL`, else the model the conversation is on now (after any `/model` or `/effort`); any `<provider>/<model>`. Claude Code's `sonnet`, `opus` and `haiku` aliases count as unset, like `inherit`.
-- Tools may be named as in Claude Code (`Read`, `Bash`, `KillShell`); they map to the harness's own.
+- Tools may be named as in Claude Code (`Read`, `Bash`, `KillShell`); they map to the harness's own (`LS` to `glob`).
 - `/agents` lists the available types.
 
 ### Background subagents and follow-ups
@@ -388,7 +388,7 @@ Each part of a plugin is named after it, as in Claude Code:
 
 - `.claude-plugin/plugin.json` is optional; without it a marketplace entry stands in for it, and the plugin's name is the directory's. Manifest paths must stay inside the plugin.
 - `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` are replaced in hook commands, MCP server configs, and skill, command and agent text; hooks and stdio MCP servers also get them as environment variables.
-- Plugin agents follow the rules of [custom agents](#subagents): read-only unless they say `permission: write`, and only with the tools the harness has (Claude Code's `Glob`, `LS` or `WebFetch` are skipped).
+- Plugin agents get their `tools` as in Claude Code, where that list is all an agent gets: they may write (`bash`, `edit`, `write`) unless they say `permission: read-only`, and without `tools` they get every tool but the subagent ones. Unlike your [custom agents](#subagents), which stay read-only by default: you enabled the plugin, and its agents were written for these rules. Tools the harness lacks (`WebFetch`, `WebSearch`, `TodoWrite`) are skipped.
 - What the harness cannot use is left out with a warning at startup, and the rest of the plugin loads: hook events or types it does not run, MCP bundles (`.mcpb`), MCP servers whose config it does not accept. LSP servers, output styles, monitors, `userConfig` and `dependencies` are ignored.
 - `/plugins` (and the web UI's environment page) lists each plugin with what it adds, or why it was not loaded.
 - Plugins run commands (hooks, MCP servers, `!` lines in their commands), so only your settings and the command line enable them, never the project.
@@ -425,6 +425,7 @@ Each part of a plugin is named after it, as in Claude Code:
   - `shells.rs` — background commands (`bash` `run_in_background`): each conversation's own set, the `bash_output` and `kill_shell` tools, exit reports to the inbox
   - `todo.rs` — the `todo_write` tool: the model's checklist, sent whole each time (not registered: kept for re-enabling)
   - `grep.rs` — regex search via ugrep (PCRE, honours `.gitignore`, `files_with_matches` / `content` / `count` modes)
+  - `glob.rs` — find files by glob pattern via ugrep (same `.gitignore` and sandbox rules as `grep`; `{a,b}` alternatives; newest first)
 
 On the official Anthropic API, tools are declared with `eager_input_streaming`, so large inputs (such as file contents for `write`) stream as they are generated. The API then no longer validates tool input, so each built-in tool parses its input into a strict struct (unknown fields rejected), and a call whose streamed JSON does not parse is not run: the model gets an `INVALID_JSON` error result instead. MCP tools keep input buffering on, so the API validates their input against the server-provided schema.
 
