@@ -1,5 +1,5 @@
-//! Hooks: shell commands from the settings file that run at points of the
-//! agent loop, in the format of Claude Code's (which Codex shares), so
+//! Hooks: shell commands from the settings file (and the plugins it
+//! enables) that run at points of the agent loop, in the format of Claude Code's (which Codex shares), so
 //! scripts written for those work here too.
 //!
 //! ```json
@@ -102,6 +102,9 @@ struct Handler {
     command: String,
     /// Seconds.
     timeout: Option<u64>,
+    /// Set for a plugin's hooks: `CLAUDE_PLUGIN_ROOT` and the like.
+    #[serde(skip)]
+    env: Vec<(String, String)>,
 }
 
 /// Only command hooks are supported.
@@ -169,6 +172,11 @@ const ALIASES: &[(&str, &[&str])] = &[
 /// Tools whose `path` is Claude Code's `file_path`.
 const FILE_TOOLS: &[&str] = &["read", "edit", "write"];
 
+/// The tool Claude Code calls `alias` (`Bash` is `bash`).
+pub fn tool_named(alias: &str) -> Option<&'static str> {
+    ALIASES.iter().find(|(_, aliases)| aliases.contains(&alias)).map(|(name, _)| *name)
+}
+
 fn aliases(tool: &str) -> &'static [&'static str] {
     ALIASES.iter().find(|(name, _)| *name == tool).map_or(&[], |(_, aliases)| aliases)
 }
@@ -211,6 +219,49 @@ fn input_from_hook(tool: &str, mut input: Value) -> Value {
 /// Hook output for the model, marked as such.
 pub fn feedback(event: Event, text: &str) -> String {
     format!("<hook-feedback event=\"{}\">\n{text}\n</hook-feedback>", event.as_str())
+}
+
+/// A plugin's hooks, from its `hooks/hooks.json` or manifest: the event map
+/// `events` with `vars` (`${CLAUDE_PLUGIN_ROOT}` and the like) replaced in
+/// the commands and set in their environment. What the harness cannot run
+/// (another event, another type of hook) is left out with a warning rather
+/// than failing the plugin, which is not the user's to fix.
+pub fn plugin_config(events: &Value, vars: &[(String, String)], warnings: &mut Vec<String>) -> Config {
+    let mut config = Config::new();
+    let Some(events) = events.as_object() else {
+        warnings.push("hooks: expected an object of events".into());
+        return config;
+    };
+    for (name, groups) in events {
+        let Ok(event) = serde_json::from_value::<Event>(Value::String(name.clone())) else {
+            warnings.push(format!("hook event `{name}` is not supported; its hooks are left out"));
+            continue;
+        };
+        for group in groups.as_array().into_iter().flatten() {
+            let matcher = match Matcher::try_from(group["matcher"].as_str().unwrap_or_default().to_string()) {
+                Ok(matcher) => matcher,
+                Err(e) => {
+                    warnings.push(format!("{name} hook matcher: {e}"));
+                    continue;
+                }
+            };
+            let mut hooks = Vec::new();
+            for handler in group["hooks"].as_array().into_iter().flatten() {
+                let kind = handler["type"].as_str().unwrap_or_default();
+                let Some(command) = handler["command"].as_str().filter(|_| kind == "command") else {
+                    warnings.push(format!("{name} hook of type `{kind}` is not supported; left out"));
+                    continue;
+                };
+                let command = vars.iter().fold(command.to_string(), |c, (k, v)| c.replace(&format!("${{{k}}}"), v));
+                let timeout = handler["timeout"].as_u64();
+                hooks.push(Handler { _kind: Kind::Command, command, timeout, env: vars.to_vec() });
+            }
+            if !hooks.is_empty() {
+                config.entry(event).or_default().push(Group { matcher, hooks });
+            }
+        }
+    }
+    config
 }
 
 static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
@@ -398,7 +449,7 @@ impl Hooks {
                 }
                 _ => h.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs),
             };
-            run_command(&h.command, &input, timeout)
+            run_command(&h.command, &h.env, &input, timeout)
         }))
         .await;
         for (handler, reply) in handlers.iter().zip(replies) {
@@ -514,9 +565,14 @@ impl Outcome {
 
 /// Runs `sh -c command` with `input` on stdin, in a process group of its
 /// own that is killed if it times out or the call is dropped.
-async fn run_command(command: &str, input: &str, timeout: Duration) -> Result<Reply, String> {
+async fn run_command(
+    command: &str,
+    env: &[(String, String)],
+    input: &str,
+    timeout: Duration,
+) -> Result<Reply, String> {
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command).process_group(0);
+    cmd.arg("-c").arg(command).process_group(0).envs(env.iter().map(|(k, v)| (k, v)));
     if let Ok(dir) = std::env::current_dir() {
         cmd.env("CLAUDE_PROJECT_DIR", &dir).env("HARNESS_PROJECT_DIR", &dir);
     }
@@ -730,5 +786,26 @@ pub(crate) mod tests {
         let outcome = h.stop(false, "", "m").await;
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(outcome.notices[0].contains("timed out"), "{:?}", outcome.notices);
+    }
+
+    #[tokio::test]
+    async fn plugin_hooks() {
+        let vars = vec![("CLAUDE_PLUGIN_ROOT".to_string(), "/p/root".to_string())];
+        let events = json!({
+            "UserPromptSubmit": [{"hooks": [
+                {"type": "command", "command": "echo \"${CLAUDE_PLUGIN_ROOT}/x $CLAUDE_PLUGIN_ROOT\"", "timeout": 5},
+                {"type": "prompt", "prompt": "is this ok?"}
+            ]}],
+            "Notification": [{"hooks": [{"type": "command", "command": "true"}]}]
+        });
+        let mut warnings = Vec::new();
+        let config = plugin_config(&events, &vars, &mut warnings);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("`Notification`")) && warnings.iter().any(|w| w.contains("`prompt`")));
+        let outcome = Hooks::with_config(Arc::new(config)).user_prompt_submit("hi", "m").await;
+        assert_eq!(outcome.context, ["/p/root/x /p/root"]);
+        assert_eq!(tool_named("Bash"), Some("bash"));
+        assert_eq!(tool_named("KillShell"), Some("kill_shell"));
+        assert_eq!(tool_named("Glob"), None);
     }
 }

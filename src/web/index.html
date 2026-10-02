@@ -949,7 +949,13 @@ async function showEnvPage() {
       info.mcp.length ? h("table", {}, h("tr", {}, h("th", {}, "服务器"), h("th", {}, "状态 / 工具")),
         info.mcp.map(m => h("tr", {}, h("td", { class: "mono" }, m.name),
           h("td", {}, m.error ? h("span", { style: "color:var(--err)" }, m.error) : h("span", { class: "mono" }, m.tools.join(", ") || "(无工具)")))))
-        : h("p", { class: "note" }, "未配置 MCP 服务器（~/.harness/settings.json 的 mcpServers）")));
+        : h("p", { class: "note" }, "未配置 MCP 服务器（~/.harness/settings.json 的 mcpServers）")),
+    h("div", { class: "card" }, h("h2", {}, "插件"),
+      info.plugins.length ? h("table", {}, h("tr", {}, h("th", {}, "插件"), h("th", {}, "内容 / 状态")),
+        info.plugins.map(p => h("tr", {}, h("td", { class: "mono" }, p.id + (p.version ? " v" + p.version : "")),
+          h("td", {}, p.error ? h("span", { style: "color:var(--err)" }, p.error) : (p.parts.join("，") || "（无可用内容）"),
+            p.description ? h("div", {}, p.description) : null, p.root ? h("div", { class: "muted mono" }, p.root) : null))))
+        : h("p", { class: "note" }, "未启用插件（~/.harness/settings.json 的 enabledPlugins，或 --plugin-dir）")));
 }
 
 // ---------------------------------------------------------------- start

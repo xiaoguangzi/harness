@@ -4,6 +4,7 @@ mod hooks;
 mod llm;
 mod mcp;
 mod mentions;
+mod plugins;
 mod prompt;
 mod sandbox;
 mod session;
@@ -39,6 +40,7 @@ Options:
       --sandbox       Run the model's commands in an OS sandbox
       --no-sandbox    Turn the sandbox off even if configured
       --settings FILE Read settings from FILE instead
+      --plugin-dir DIR Load the plugin in DIR as well (repeatable)
   -h, --help          Print this help
   -V, --version       Print the version
 
@@ -58,12 +60,28 @@ async fn main() -> Result<ExitCode> {
     }
     let (settings_path, args) = settings::parse_flag(args)?;
     settings::set_path(settings_path);
+    let (plugin_dirs, args) = plugins::parse_flag(args)?;
     let mut settings = Settings::load()?;
     for file in settings::legacy_files() {
         eprintln!("\x1b[33m{} is no longer read; move its settings into ~/.harness/settings.json\x1b[0m", file.display());
     }
     let (sandbox_flag, args) = sandbox::parse_flag(args);
     sandbox::init(sandbox_flag, &settings.sandbox).await?;
+    let from_plugins = plugins::load(&settings, &plugin_dirs);
+    for w in &from_plugins.warnings {
+        eprintln!("\x1b[33m{w}\x1b[0m");
+    }
+    let plugins = from_plugins.plugins;
+    for plugin in &plugins.list {
+        if let Err(e) = &plugin.outcome {
+            eprintln!("\x1b[33mplugin {} not loaded: {e}\x1b[0m", plugin.id);
+        }
+    }
+    for (event, groups) in from_plugins.hooks {
+        settings.hooks.entry(event).or_default().extend(groups);
+    }
+    settings.mcp_servers.extend(from_plugins.mcp_servers);
+    tools::bash::add_to_path(from_plugins.bin_dirs);
     hooks::init(std::mem::take(&mut settings.hooks));
     let web_addr = web::parse_flag(&args)?;
     // The web UI can fix a missing or broken provider setup, so it starts
@@ -75,14 +93,17 @@ async fn main() -> Result<ExitCode> {
     let files = FileTracker::default();
     let mut registry = ToolRegistry::with_defaults(files.clone());
 
-    let (skills, warnings) = skills::discover(&skills::default_roots());
+    let (mut skills, warnings) = skills::discover(&skills::default_roots());
     for w in warnings {
         eprintln!("\x1b[33mskill skipped: {w}\x1b[0m");
     }
-    let skills = Arc::new(skills);
-    if !skills.is_empty() {
-        registry.register(SkillTool::new(skills.clone()));
+    skills.extend(from_plugins.skills);
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    let skill_tool = SkillTool::new(&skills);
+    if !skill_tool.is_empty() {
+        registry.register(skill_tool);
     }
+    let skills = Arc::new(skills);
 
     let mcp = mcp::Manager::start(&settings.mcp_servers, &mut registry).await;
     for status in &mcp.statuses {
@@ -91,10 +112,12 @@ async fn main() -> Result<ExitCode> {
         }
     }
 
-    let (agent_defs, warnings) = subagent::discover(&subagent::default_roots());
+    let (mut agent_defs, warnings) = subagent::discover(&subagent::default_roots());
     for w in warnings {
         eprintln!("\x1b[33magent skipped: {w}\x1b[0m");
     }
+    agent_defs.extend(from_plugins.agents);
+    agent_defs.sort_by(|a, b| a.name.cmp(&b.name));
     let agent_defs = Arc::new(agent_defs);
     let out = cli::Output::stdout();
     // Web tasks show their subagents' progress themselves; this is for the
@@ -119,6 +142,7 @@ async fn main() -> Result<ExitCode> {
             skills,
             agent_defs,
             mcp: Value::Array(mcp_status),
+            plugins: plugins.to_json(),
             reporter,
         };
         let result = web::serve(&addr, setup).await;
@@ -139,7 +163,7 @@ async fn main() -> Result<ExitCode> {
 
     let system = prompt::main(&registry);
     let mut agent = Agent::new(client, registry, system);
-    let result = cli::run(&mut agent, args, &skills, &agent_defs, &mcp, &files, out).await;
+    let result = cli::run(&mut agent, args, &skills, &agent_defs, &mcp, &plugins, &files, out).await;
     // The agent's tools hold the MCP connections; release them first.
     drop(agent);
     mcp.shutdown().await;

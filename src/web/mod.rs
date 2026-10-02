@@ -54,6 +54,8 @@ pub struct Setup {
     pub agent_defs: Arc<Vec<AgentDef>>,
     /// MCP server statuses, as shown in the UI.
     pub mcp: Value,
+    /// The enabled plugins, as shown in the UI.
+    pub plugins: Value,
     pub reporter: Reporter,
 }
 
@@ -79,6 +81,7 @@ struct AppState {
     skills: Arc<Vec<Skill>>,
     agent_defs: Arc<Vec<AgentDef>>,
     mcp: Value,
+    plugins: Value,
     reporter: Reporter,
     live: RwLock<Live>,
     tasks: Mutex<BTreeMap<u64, Arc<Task>>>,
@@ -121,6 +124,7 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
         skills: setup.skills,
         agent_defs: setup.agent_defs,
         mcp: setup.mcp,
+        plugins: setup.plugins,
         reporter: setup.reporter,
         live: RwLock::new(live),
         tasks: Mutex::new(BTreeMap::new()),
@@ -316,6 +320,7 @@ async fn info(State(state): State<Shared>) -> Json<Value> {
     let skills: Vec<Value> = state
         .skills
         .iter()
+        .filter(|s| s.user_invocable)
         .map(|s| json!({"name": s.name, "description": s.description, "dir": s.dir.display().to_string()}))
         .collect();
     Json(json!({
@@ -329,6 +334,7 @@ async fn info(State(state): State<Shared>) -> Json<Value> {
         "agents": agents,
         "skills": skills,
         "mcp": state.mcp,
+        "plugins": state.plugins,
     }))
 }
 
@@ -426,16 +432,16 @@ async fn call_tool(
 
 /// The message content for `line`: `/<skill> args` loads that skill, and
 /// `@path` mentions are attached. Also returns the user event for the log.
-fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiResult<(Vec<Value>, Value)> {
+async fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiResult<(Vec<Value>, Value)> {
     let prompt = match line.strip_prefix('/') {
         Some(command) => {
             let (name, args) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
             let skill = state
                 .skills
                 .iter()
-                .find(|s| s.name == name)
+                .find(|s| s.name == name && s.user_invocable)
                 .ok_or_else(|| bad_request(format!("unknown skill /{name}")))?;
-            skill.invocation_prompt(args).map_err(bad_request)?
+            skill.invocation_prompt(args).await.map_err(bad_request)?
         }
         None => line.to_string(),
     };
@@ -518,7 +524,7 @@ async fn create_task(State(state): State<Shared>, Json(req): Json<NewTask>) -> A
         };
         Agent::new(client, tools, system)
     };
-    let (content, user) = user_message(&state, prompt, &files)?;
+    let (content, user) = user_message(&state, prompt, &files).await?;
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let title = req.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| title_for(prompt));
     let task = Task::new(id, title, def, files, agent);
@@ -548,7 +554,7 @@ async fn send_message(
             (Work::Compact(focus), json!({"type": "user", "text": prompt, "attachments": [], "warnings": []}))
         }
         None => {
-            let (content, user) = user_message(&state, prompt, &task.files)?;
+            let (content, user) = user_message(&state, prompt, &task.files).await?;
             (Work::Turn(content), user)
         }
     };

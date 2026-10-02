@@ -39,9 +39,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::Agent;
-use crate::hooks::Hooks;
+use crate::hooks::{self, Hooks};
 use crate::llm::Client;
-use crate::skills::{parse_frontmatter, split_frontmatter};
+use crate::skills::{PluginDirs, list_field, parse_frontmatter, split_frontmatter};
 use crate::tools::{FileTracker, Tool, ToolOutput, ToolRegistry, parse_input};
 pub use runtime::{Subagents, scope};
 
@@ -181,6 +181,16 @@ pub fn discover(roots: &[PathBuf]) -> (Vec<AgentDef>, Vec<String>) {
     (defs.into_values().collect(), warnings)
 }
 
+/// A plugin's agent from `file`, named `<prefix>:<name>`, with the
+/// plugin's path variables replaced in its prompt.
+pub fn plugin_def(file: &Path, prefix: &str, plugin: &PluginDirs) -> Result<AgentDef, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    let mut def = parse_def(&text, file)?;
+    def.name = format!("{prefix}:{}", def.name);
+    def.prompt = plugin.expand(&def.prompt);
+    Ok(def)
+}
+
 fn parse_def(text: &str, file: &Path) -> Result<AgentDef, String> {
     let (front, body) = split_frontmatter(text).ok_or("missing `---` frontmatter")?;
     let fields = parse_frontmatter(front);
@@ -196,15 +206,24 @@ fn parse_def(text: &str, file: &Path) -> Result<AgentDef, String> {
         Some(other) => return Err(format!("unknown permission `{other}` (use `read-only` or `write`)")),
     };
     // Accepts `read, grep`, `[read, grep]` and YAML lists (joined by the
-    // frontmatter parser into `- read - grep`). Claude Code style names
-    // such as `Read` are lowercased; MCP names keep their case.
+    // frontmatter parser into `- read - grep`). Claude Code names such as
+    // `Read` or `KillShell` become the harness's; MCP names keep their case.
     let tools = fields.get("tools").map(|t| {
-        t.split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']')
-            .filter(|n| !n.is_empty() && *n != "-")
-            .map(|n| if n.starts_with("mcp__") { n.to_string() } else { n.to_ascii_lowercase() })
+        list_field(t)
+            .into_iter()
+            .map(|n| match hooks::tool_named(&n) {
+                Some(tool) => tool.to_string(),
+                None if n.starts_with("mcp__") => n,
+                None => n.to_ascii_lowercase(),
+            })
             .collect()
     });
-    let model = fields.get("model").cloned().filter(|m| !m.is_empty() && m != "inherit");
+    // Claude Code's model aliases name no model a gateway knows: they get
+    // the default, as `inherit` does.
+    let model = fields
+        .get("model")
+        .cloned()
+        .filter(|m| !m.is_empty() && !matches!(m.as_str(), "inherit" | "sonnet" | "opus" | "haiku"));
     let prompt = body.trim().to_string();
     if prompt.is_empty() {
         return Err("empty system prompt".into());
@@ -255,9 +274,12 @@ impl AgentTool {
     }
 
     /// Tool names in `defs` that no available tool matches.
+    /// Plugins' agents (`<plugin>:<name>`) are left out: they are written
+    /// for Claude Code, some of whose tools the harness lacks, and the user
+    /// has no lists to fix.
     pub fn unknown_tools(&self) -> Vec<(String, String)> {
         let mut unknown = Vec::new();
-        for def in self.defs.iter() {
+        for def in self.defs.iter().filter(|d| !d.name.contains(':')) {
             let registry = self.registry_for(&AgentDef { tools: None, permission: Permission::Write, ..def.clone() });
             for name in def.tools.iter().flatten() {
                 let probe = AgentDef { tools: Some(vec![name.clone()]), ..def.clone() };

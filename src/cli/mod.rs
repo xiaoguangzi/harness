@@ -23,6 +23,7 @@ use crate::agent::{Agent, Inbox};
 use crate::llm;
 use crate::mcp;
 use crate::mentions;
+use crate::plugins::Plugins;
 use crate::session::{self, Recorder, Resume, Store};
 use crate::skills::Skill;
 use crate::subagent::AgentDef;
@@ -36,7 +37,7 @@ use menu::Command;
 use repl::{ReplHelper, Wake};
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 15] = [
+const BUILTINS: [(&str, &str); 16] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
@@ -50,6 +51,7 @@ const BUILTINS: [(&str, &str); 15] = [
     ("/tasks", "list the subagents and background commands this conversation started"),
     ("/stop", "stop running subagents, or one with /stop <id>"),
     ("/mcp", "list MCP servers and their tools"),
+    ("/plugins", "list plugins; /plugins update fetches their latest versions"),
     ("/sandbox", "show what the sandbox allows commands to do"),
     ("/exit", "quit (or exit, Ctrl-D)"),
 ];
@@ -57,12 +59,14 @@ const BUILTINS: [(&str, &str); 15] = [
 /// Saved conversations offered by `/resume`.
 const LISTED_SESSIONS: usize = 20;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     agent: &mut Agent,
     args: Vec<String>,
     skills: &[Skill],
     agent_defs: &[AgentDef],
     mcp: &mcp::Manager,
+    plugins: &Plugins,
     files: &FileTracker,
     out: Output,
 ) -> Result<ExitCode> {
@@ -77,7 +81,7 @@ pub async fn run(
     let one_shot = !args.is_empty();
 
     if !one_shot {
-        print_banner(agent, skills, mcp, &out);
+        print_banner(agent, skills, mcp, plugins, &out);
     }
     if let Some(resume) = resume {
         let Some(rec) = recorder.as_mut() else { anyhow::bail!("no home directory to find saved sessions in") };
@@ -98,7 +102,7 @@ pub async fn run(
     // One-shot mode: `harness "do something"` or `harness /skill args`.
     if one_shot {
         let line = args.join(" ");
-        return match parse_input(&line, skills) {
+        return match render_skill(parse_input(&line, skills)).await {
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
                 let attached = attachments(&line, &[], files);
@@ -131,7 +135,9 @@ pub async fn run(
     }
 
     let mut commands: Vec<Command> = BUILTINS.iter().map(|(name, description)| Command::new(*name, *description)).collect();
-    commands.extend(skills.iter().map(|s| Command::new(format!("/{}", s.name), &s.description)));
+    commands.extend(
+        skills.iter().filter(|s| s.user_invocable).map(|s| Command::new(format!("/{}", s.name), &s.description)),
+    );
     commands.extend(
         agent.client().providers().listed_models().iter().map(|m| Command::new(format!("/model {m}"), "switch to this model")),
     );
@@ -268,7 +274,7 @@ pub async fn run(
                 (line, helper.take_images())
             }
         };
-        match parse_input(&line, skills) {
+        match render_skill(parse_input(&line, skills)).await {
             Input::Empty => {}
             Input::Exit => break,
             Input::Help => print_help(skills),
@@ -310,6 +316,8 @@ pub async fn run(
             Input::ListSkills => print_skills(skills),
             Input::ListTools => print_tools(agent),
             Input::ListMcp => print_mcp(mcp),
+            Input::Plugins { update: false } => print_plugins(plugins),
+            Input::Plugins { update: true } => update_plugins(plugins, &out).await,
             Input::ListAgents => print_agents(agent_defs),
             Input::Tasks => print_tasks(&agent.subagents().list(), &agent.shells().list()),
             Input::Stop(None) => {
@@ -350,6 +358,7 @@ pub async fn run(
                 agent.set_client(client);
             }
             Input::Error(e) => out.line(out.paint("31", &e)),
+            Input::Skill(..) => unreachable!("render_skill made it a prompt"),
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
                 let attached = attachments(&line, &images, files);
@@ -690,11 +699,27 @@ enum Input {
     /// `/effort` shows the effort; `/effort <level>` sets it for this
     /// session, and `/effort auto` restores the configured one.
     Effort(Option<Option<llm::Effort>>),
+    /// `/plugins` lists them; `/plugins update` fetches their latest.
+    Plugins { update: bool },
+    /// `/<skill> args`, before its text is read.
+    Skill(Skill, String),
     Prompt(String),
     Error(String),
 }
 
-/// Interprets a line of user input. `/<skill> args` loads the skill's
+/// Reads the skill a `/<skill> args` line runs into the prompt; other
+/// input passes through.
+async fn render_skill(input: Input) -> Input {
+    match input {
+        Input::Skill(skill, args) => match skill.invocation_prompt(&args).await {
+            Ok(prompt) => Input::Prompt(prompt),
+            Err(e) => Input::Error(e),
+        },
+        input => input,
+    }
+}
+
+/// Interprets a line of user input. `/<skill> args` is to load the skill's
 /// instructions directly into the prompt, saving the model a tool call.
 fn parse_input(line: &str, skills: &[Skill]) -> Input {
     let Some(command) = line.strip_prefix('/') else {
@@ -715,6 +740,11 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "skills" => Input::ListSkills,
         "tools" => Input::ListTools,
         "mcp" => Input::ListMcp,
+        "plugins" | "plugin" => match args.trim() {
+            "" | "list" => Input::Plugins { update: false },
+            "update" => Input::Plugins { update: true },
+            other => Input::Error(format!("unknown /plugins command `{other}` (try /plugins or /plugins update)")),
+        },
         "agents" => Input::ListAgents,
         "tasks" => Input::Tasks,
         "stop" => Input::Stop(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
@@ -729,17 +759,14 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
                 Err(e) => Input::Error(e.to_string()),
             },
         },
-        _ => match skills.iter().find(|s| s.name == name) {
-            Some(skill) => match skill.invocation_prompt(args) {
-                Ok(prompt) => Input::Prompt(prompt),
-                Err(e) => Input::Error(e),
-            },
+        _ => match skills.iter().find(|s| s.name == name && s.user_invocable) {
+            Some(skill) => Input::Skill(skill.clone(), args.to_string()),
             None => Input::Error(format!("unknown command /{name} (try /help)")),
         },
     }
 }
 
-fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, out: &Output) {
+fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, plugins: &Plugins, out: &Output) {
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_default();
     let cwd = match cwd.strip_prefix(&home) {
@@ -747,12 +774,18 @@ fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, out: &Outpu
         _ => cwd,
     };
     let servers = mcp.statuses.iter().filter(|s| s.outcome.is_ok()).count();
+    let loaded = plugins.list.iter().filter(|p| p.outcome.is_ok()).count();
+    let plugins = match loaded {
+        0 => String::new(),
+        1 => " · 1 plugin".to_string(),
+        n => format!(" · {n} plugins"),
+    };
     let effort = out.paint("2", &format!(" · {} effort", agent.client().effort().as_str()));
     out.line(format!("{} {}{effort}", out.paint("1;35", "✻ harness"), out.paint("1", agent.model())));
     out.line(out.paint(
         "2",
         &format!(
-            "  {cwd} · {} tools · {} skills · {servers} MCP servers{}",
+            "  {cwd} · {} tools · {} skills · {servers} MCP servers{plugins}{}",
             agent.tools().names().count(),
             skills.len(),
             if crate::sandbox::active().is_some() { " · sandboxed" } else { "" }
@@ -786,8 +819,8 @@ fn print_help(skills: &[Skill]) {
     for (key, what) in BUILTINS.iter().chain(&keys) {
         println!("  \x1b[1m{key:<16}\x1b[0m {what}");
     }
-    if !skills.is_empty() {
-        let names: Vec<String> = skills.iter().map(|s| format!("/{}", s.name)).collect();
+    let names: Vec<String> = skills.iter().filter(|s| s.user_invocable).map(|s| format!("/{}", s.name)).collect();
+    if !names.is_empty() {
         println!("  \x1b[2mskills: {}\x1b[0m", names.join(" "));
     }
 }
@@ -922,6 +955,49 @@ fn print_tasks(subagents: &[Value], shells: &[(String, String, bool)]) {
     println!("\x1b[90mstop one with /stop <id>, or every running one with /stop\x1b[0m");
 }
 
+fn print_plugins(plugins: &Plugins) {
+    if plugins.list.is_empty() {
+        println!("no plugins enabled (`enabledPlugins` in ~/.harness/settings.json, or --plugin-dir)");
+    }
+    for p in &plugins.list {
+        let version = p.version.as_ref().map_or(String::new(), |v| format!(" \x1b[2mv{v}\x1b[0m"));
+        match &p.outcome {
+            Ok(parts) => {
+                let parts = if parts.is_empty() { "nothing the harness can use".to_string() } else { parts.join(", ") };
+                println!("\x1b[32m●\x1b[0m \x1b[1m{}\x1b[0m{version}  {parts}", p.id);
+            }
+            Err(e) => println!("\x1b[31m●\x1b[0m \x1b[1m{}\x1b[0m  {e}", p.id),
+        }
+        if let Some(description) = &p.description {
+            println!("    {description}");
+        }
+        if let Some(root) = &p.root {
+            println!("    \x1b[90m{}\x1b[0m", root.display());
+        }
+    }
+}
+
+/// Pulls the latest of every plugin and marketplace cloned from git.
+async fn update_plugins(plugins: &Plugins, out: &Output) {
+    let plugins = plugins.clone();
+    out.line(out.paint("2", "updating plugins…"));
+    let lines = match tokio::task::spawn_blocking(move || plugins.update()).await {
+        Ok(lines) => lines,
+        Err(e) => vec![Err(e.to_string())],
+    };
+    if lines.is_empty() {
+        out.line(out.paint("2", "no plugins come from git repositories"));
+        return;
+    }
+    for line in lines {
+        match line {
+            Ok(line) => out.line(line),
+            Err(e) => out.line(out.paint("31", &e)),
+        }
+    }
+    out.line(out.paint("2", "restart harness to use the new versions"));
+}
+
 fn print_mcp(mcp: &mcp::Manager) {
     if mcp.statuses.is_empty() {
         println!("no MCP servers configured (`mcpServers` in ~/.harness/settings.json)");
@@ -954,8 +1030,8 @@ mod tests {
         assert_eq!(labels, vec!["[Image #2] (image, 1 B)", "[Image #10] (image, 1 B)"]);
     }
 
-    #[test]
-    fn parses_commands() {
+    #[tokio::test]
+    async fn parses_commands() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("greet")).unwrap();
         std::fs::write(dir.path().join("greet/SKILL.md"), "---\ndescription: d\n---\nSay hi.\n").unwrap();
@@ -983,7 +1059,10 @@ mod tests {
         assert_eq!(parse_input("/effort XHigh", &skills), Input::Effort(Some(Some(llm::Effort::XHigh))));
         assert_eq!(parse_input("/effort auto", &skills), Input::Effort(Some(None)));
         assert!(matches!(parse_input("/effort huge", &skills), Input::Error(_)));
-        match parse_input("/greet  Bob ", &skills) {
+        assert_eq!(parse_input("/plugins", &skills), Input::Plugins { update: false });
+        assert_eq!(parse_input("/plugins update", &skills), Input::Plugins { update: true });
+        assert!(matches!(parse_input("/plugins remove x", &skills), Input::Error(_)));
+        match render_skill(parse_input("/greet  Bob ", &skills)).await {
             Input::Prompt(p) => {
                 assert!(p.starts_with("The user invoked the `greet` skill:"));
                 assert!(p.ends_with("Say hi.\n\nARGUMENTS: Bob"), "{p}");

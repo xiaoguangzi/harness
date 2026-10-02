@@ -5,7 +5,7 @@
 //! implementing [`Tool`] and registering it in [`ToolRegistry::with_defaults`];
 //! MCP and skill tools are registered at startup from configuration.
 
-mod bash;
+pub mod bash;
 mod edit;
 mod grep;
 mod read;

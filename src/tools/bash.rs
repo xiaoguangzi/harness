@@ -1,5 +1,8 @@
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::pin::pin;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -161,6 +164,23 @@ impl Tool for BashTool {
     }
 }
 
+/// Directories added to the end of commands' `PATH`: the enabled plugins'
+/// `bin/`. Set once, at startup.
+static EXTRA_PATH: OnceLock<OsString> = OnceLock::new();
+
+/// Puts `dirs` on the `PATH` of the commands the model runs, after the
+/// directories already there, so they cannot shadow a system command.
+pub fn add_to_path(dirs: Vec<PathBuf>) {
+    if dirs.is_empty() {
+        return;
+    }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::env::split_paths(&current).chain(dirs);
+    if let Ok(path) = std::env::join_paths(paths) {
+        let _ = EXTRA_PATH.set(path);
+    }
+}
+
 /// Starts `bash -c command` with its output piped, in the sandbox when it
 /// is on, in a process group of its own so its children can be killed with
 /// it. Keep the guard until the process exits.
@@ -176,6 +196,9 @@ pub(super) fn spawn(command: &str) -> Result<(Child, Option<sandbox::Guard>), St
             (cmd, None)
         }
     };
+    if let Some(path) = EXTRA_PATH.get() {
+        cmd.env("PATH", path);
+    }
     let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn();
     child.map(|child| (child, guard)).map_err(|e| format!("Failed to spawn bash: {e}"))
 }
