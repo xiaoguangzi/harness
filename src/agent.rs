@@ -704,7 +704,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn hooks_around_a_turn() {
+        let _guard = crate::util::lock_cwd();
         use compact::tests::{gateway, texts};
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("stopped");
@@ -749,7 +751,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_blocked_prompt_is_not_sent() {
+        let _guard = crate::util::lock_cwd();
         let (client, mut requests) = compact::tests::gateway(|_| (vec![text("hi")], "end_turn", 100)).await;
         let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
         agent.set_hooks(crate::hooks::tests::hooks(json!({"UserPromptSubmit": command("echo 'has a secret' >&2; exit 2")})));
@@ -760,7 +764,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn subagent_start_and_session_end() {
+        let _guard = crate::util::lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let ended = dir.path().join("ended");
         let (client, mut requests) = compact::tests::gateway(|_| (vec![text("ok")], "end_turn", 100)).await;

@@ -624,7 +624,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn compaction_hooks() {
+        let _guard = crate::util::lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let (pre, post) = (dir.path().join("pre.json"), dir.path().join("post.json"));
         let (client, mut requests) = gateway(|_| (vec![text("answer")], "end_turn", 500)).await;

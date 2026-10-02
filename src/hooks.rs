@@ -609,7 +609,10 @@ async fn run_command(
 pub(crate) mod tests {
     use super::*;
 
-    /// Hooks from a JSON `hooks` section.
+    /// Hooks from a JSON `hooks` section. Tests that run them hold
+    /// [`crate::util::lock_cwd`]: the hook processes inherit the working
+    /// directory, which a test elsewhere moves into a temporary directory
+    /// and deletes, making `sh` complain on stderr.
     pub(crate) fn hooks(config: Value) -> Hooks {
         Hooks::with_config(Arc::new(serde_json::from_value(config).unwrap()))
     }
@@ -663,7 +666,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn hooks_get_the_event_on_stdin() {
+        let _guard = crate::util::lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let seen = dir.path().join("seen.json");
         let h = command("PreToolUse", "Write", &format!("cat > {}", seen.display()));
@@ -693,7 +698,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn exit_code_2_blocks_with_stderr() {
+        let _guard = crate::util::lock_cwd();
         let h = command("PreToolUse", "Bash", "echo 'no rm -rf' >&2; exit 2");
         let outcome = h.pre_tool_use("bash", "t", &json!({"command": "rm -rf /"}), "m").await;
         assert_eq!(outcome.block.as_deref(), Some("no rm -rf"));
@@ -706,7 +713,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn json_output() {
+        let _guard = crate::util::lock_cwd();
         let deny = r#"echo '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "not here"}}'"#;
         let outcome = command("PreToolUse", "*", deny).pre_tool_use("bash", "t", &json!({}), "m").await;
         assert_eq!(outcome.block.as_deref(), Some("not here"));
@@ -727,7 +736,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn plain_output_is_context_only_for_some_events() {
+        let _guard = crate::util::lock_cwd();
         let outcome = command("SessionStart", "startup", "echo on main").session_start("startup", "m").await;
         assert_eq!(outcome.context, ["on main"]);
         let outcome = command("SessionStart", "resume", "echo on main").session_start("startup", "m").await;
@@ -737,7 +748,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn failures_run_the_failure_event() {
+        let _guard = crate::util::lock_cwd();
         let h = hooks(json!({
             "PostToolUse": [{"hooks": [{"type": "command", "command": "echo '{\"decision\": \"block\", \"reason\": \"ok\"}'"}]}],
             "PostToolUseFailure": [{"hooks": [{"type": "command", "command": "echo '{\"hookSpecificOutput\": {\"additionalContext\": \"failed\"}}'"}]}]
@@ -749,7 +762,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn subagents_run_subagent_stop() {
+        let _guard = crate::util::lock_cwd();
         let h = hooks(json!({
             "Stop": [{"hooks": [{"type": "command", "command": "echo main >&2; exit 2"}]}],
             "SubagentStop": [{"matcher": "explore", "hooks": [{"type": "command", "command": "cat >&2; exit 2"}]}]
@@ -763,14 +778,18 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn subagent_start_matches_the_agent_type() {
+        let _guard = crate::util::lock_cwd();
         let h = command("SubagentStart", "explore", "echo look in src/ first");
         assert_eq!(h.for_subagent("a1", "explore").subagent_start("m").await.context, ["look in src/ first"]);
         assert!(h.for_subagent("a2", "general-purpose").subagent_start("m").await.context.is_empty());
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn session_end_hooks_get_little_time() {
+        let _guard = crate::util::lock_cwd();
         let h = command("SessionEnd", "clear", "sleep 30");
         let started = std::time::Instant::now();
         let outcome = h.session_end("clear", "m").await;
@@ -780,7 +799,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_hook_that_runs_too_long_is_killed() {
+        let _guard = crate::util::lock_cwd();
         let h = hooks(json!({"Stop": [{"hooks": [{"type": "command", "command": "sleep 30", "timeout": 1}]}]}));
         let started = std::time::Instant::now();
         let outcome = h.stop(false, "", "m").await;
@@ -789,7 +810,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn plugin_hooks() {
+        let _guard = crate::util::lock_cwd();
         let vars = vec![("CLAUDE_PLUGIN_ROOT".to_string(), "/p/root".to_string())];
         let events = json!({
             "UserPromptSubmit": [{"hooks": [
