@@ -253,7 +253,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 }
 ```
 
-- 传输方式：`stdio`（设置了 `command` 时的默认值）和可流式的 `http`（设置了 `url` 时的默认值），通过官方 Rust SDK [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) 实现。
+- 传输方式：`stdio`（设置了 `command` 时的默认值）和可流式的 `http`（设置了 `url` 时的默认值），通过官方 Rust SDK [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) 实现。stdio 服务器可以用 `cwd` 指定运行目录。不支持需要 OAuth 登录的服务器。
 - 每个字符串中的 `${VAR}` / `${VAR:-default}` 都会从环境变量展开。
 - 服务器在启动时并发连接；连接失败的服务器会被报告并跳过。
 - 工具以 `mcp__<server>__<tool>` 形式暴露。文本、内嵌文本资源和 PNG/JPEG/GIF/WebP 图片会传回给模型。
@@ -322,6 +322,8 @@ description: Draft release notes from the git log. Use when asked for a changelo
 - `` !`command` ``（位于行首或空格之后）和 ```` ```! ```` 代码块在加载技能时运行，并替换为它们的输出。它们与 `bash` 工具的命令一样运行，开启沙箱时在沙箱内；任一命令失败，技能就不会加载。只有在模型可加载的技能都不含这类命令时，只读子代理才会获得 `skill` 工具。
 - `disable-model-invocation: true` 让模型不能加载该技能（只能用 `/<name>` 运行）；`user-invocable: false` 让它不出现在 `/` 命令中。
 
+Claude Code 的命令（技能的旧形式）同样可用：`.harness/commands/`、`.claude/commands/` 或 `~` 下同名目录（靠前的优先）中的每个 Markdown 文件都以 `/<文件名>` 运行，子目录会多一段（`frontend/component.md` 是 `/frontend:component`）。它们支持相同的 frontmatter（没有 `description` 时用第一行作为说明）和占位符；除非设置 `disable-model-invocation`，模型也能通过 `skill` 工具加载它们。技能与命令重名时技能优先。
+
 ## 子代理（Subagents）
 
 主代理可以用 `agent` 工具委派一个自包含的任务。子代理在自己的全新会话中运行，有自己的系统提示和工具集，只有最终报告会返回，从而把漫长的搜索挡在主上下文之外。同一次响应中启动的多个子代理并行运行。
@@ -357,7 +359,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 
 ## 插件（Plugins）
 
-插件采用 [Claude Code 的格式](https://code.claude.com/docs/en/plugins-reference)：一个目录，打包了技能、命令、子代理、hook 和 MCP 服务器，通常从插件市场（在 `.claude-plugin/marketplace.json` 中列出插件的仓库）安装。在[配置](#配置)中用 Claude Code 的键、以 `<plugin>@<marketplace>` 启用：
+插件采用 [Claude Code 的格式](https://code.claude.com/docs/en/plugins-reference)：一个目录，打包了技能、命令、子代理、hook 和 MCP 服务器，通常从插件市场（在 `.claude-plugin/marketplace.json` 中列出插件的仓库）安装。[Codex 的插件](https://developers.openai.com/codex/plugins/build)也能加载（见下文）。在[配置](#配置)中用 Claude Code 的键、以 `<plugin>@<marketplace>` 启用：
 
 ```json
 {
@@ -371,7 +373,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 }
 ```
 
-- `claude-plugins-official`（[anthropics/claude-plugins-official](https://github.com/anthropics/claude-plugins-official)）无需声明即可使用。其他市场可以来自 `github`（`repo`、`ref`、`path`）、`git`（`url`、`ref`、`path`）、`directory`（`path`，原地读取，修改在下次启动时生效）或 `file`（指向 `marketplace.json` 的 `path`）。
+- `claude-plugins-official`（[anthropics/claude-plugins-official](https://github.com/anthropics/claude-plugins-official)）和 Codex 的 `openai-curated`（[openai/plugins](https://github.com/openai/plugins)）无需声明即可使用；Codex 的个人市场 `~/.agents/plugins/marketplace.json` 也一样，按它自己声明的名字使用。其他市场可以来自 `github`（`repo`、`ref`、`path`）、`git`（`url`、`ref`、`path`）、`directory`（`path`，原地读取，修改在下次启动时生效）或 `file`（指向 `marketplace.json` 的 `path`）。
 - 市场中的插件可以就在市场里（相对路径，或 `metadata.pluginRoot` 下的裸名称），也可以在各自的仓库中（`github`、`url` 和 `git-subdir` 来源，可带 `ref` / `sha`）。不支持 `npm`、`archive` 和 `command` 来源。
 - 缺少的内容在启动时克隆（`git clone --depth 1`）到 `~/.harness/plugins`，只克隆一次。`/plugins update` 把每个市场和插件更新到其分支的最新提交（固定到某个 `sha` 的保持不变）；新版本在下次启动时生效。插件的数据目录（`${CLAUDE_PLUGIN_DATA}`）是 `~/.harness/plugins/data/<id>`。
 - `--plugin-dir DIR` 在本次运行中以 `<name>@inline` 加载 `DIR` 中的插件，与 Claude Code 的同名参数一致。
@@ -388,9 +390,10 @@ description: Draft release notes from the git log. Use when asked for a changelo
 | 可执行文件 | `bin/` | 加到模型所运行命令的 `PATH` 中，排在你自己的目录之后 |
 
 - `.claude-plugin/plugin.json` 可以省略；没有它时由市场条目代替，插件名取目录名。清单中的路径必须位于插件目录之内。
-- `${CLAUDE_PLUGIN_ROOT}` 和 `${CLAUDE_PLUGIN_DATA}` 会在 hook 命令、MCP 服务器配置以及技能、命令和代理的文本中被替换；hook 和 stdio MCP 服务器还会以环境变量的形式拿到它们。
+- Codex 和 Cursor 的目录结构同样识别：`.agents/plugins/marketplace.json` 或 `.cursor-plugin/marketplace.json` 中的市场目录（其中的路径从包含 `.agents/` 的目录算起）、`local` 来源和带 `path` 的 `url` 来源、`.codex-plugin/plugin.json` 或 `.cursor-plugin/plugin.json` 清单，以及根目录下的 [Agent Plugins](https://agent-plugins.org) `plugin.json`（技能在 `skills/`，MCP 服务器在 `mcp.json`，hook 在 `extensions."com.openai"` 下）。hook 和 MCP 服务器也会拿到 Codex 的 `PLUGIN_ROOT` / `PLUGIN_DATA`。Codex 的 apps（ChatGPT 连接器）会被略过；它的 MCP 设置中保留 `cwd`（在插件目录内解析），注释和超时设置则丢弃。
+- `${CLAUDE_PLUGIN_ROOT}` 和 `${CLAUDE_PLUGIN_DATA}`（或 `${PLUGIN_ROOT}` 和 `${PLUGIN_DATA}`）会在 hook 命令、MCP 服务器配置以及技能、命令和代理的文本中被替换；hook 和 stdio MCP 服务器还会以环境变量的形式拿到它们。
 - 插件代理按 Claude Code 的方式获得 `tools`，即这份列表就是代理能用的全部工具：除非声明 `permission: read-only`，否则可以写（`bash`、`edit`、`write`），不写 `tools` 则获得除子代理工具外的全部工具。这和你的[自定义代理](#子代理subagents)默认只读不同：插件是你启用的，它的代理也是按这套规则写的。harness 没有的工具（`WebFetch`、`WebSearch`、`TodoWrite`）会被跳过。
-- harness 用不了的部分会在启动时给出警告并略过，插件的其余部分照常加载：它不运行的 hook 事件或类型、MCP 包（`.mcpb`）、配置不被接受的 MCP 服务器。LSP 服务器、输出风格、monitors、`userConfig` 和 `dependencies` 会被忽略。
+- harness 用不了的部分会在启动时给出警告并略过，插件的其余部分照常加载：它不运行的 hook 事件或类型、MCP 包（`.mcpb`）、需要 OAuth 登录或配置不被接受的 MCP 服务器。LSP 服务器、输出风格、monitors、`userConfig` 和 `dependencies` 会被忽略。
 - `/plugins`（以及 Web UI 的环境页）列出每个插件提供的内容，或它未能加载的原因。
 - 插件会运行命令（hook、MCP 服务器、命令中的 `!` 行），因此只有你的配置和命令行可以启用插件，项目不行。
 

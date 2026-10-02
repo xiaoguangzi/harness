@@ -53,6 +53,8 @@ pub struct ServerConfig {
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// The directory a stdio server runs in, if not the working directory.
+    cwd: Option<String>,
     url: Option<String>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
@@ -60,7 +62,7 @@ pub struct ServerConfig {
 
 #[derive(Debug, PartialEq)]
 enum Transport {
-    Stdio { command: String, args: Vec<String>, env: BTreeMap<String, String> },
+    Stdio { command: String, args: Vec<String>, env: BTreeMap<String, String>, cwd: Option<String> },
     Http { url: String, headers: BTreeMap<String, String> },
 }
 
@@ -72,6 +74,7 @@ impl ServerConfig {
                 command: expand_env(self.command.as_deref().context("stdio server needs `command`")?),
                 args: self.args.iter().map(|a| expand_env(a)).collect(),
                 env: self.env.iter().map(|(k, v)| (k.clone(), expand_env(v))).collect(),
+                cwd: self.cwd.as_deref().map(expand_env),
             }),
             "http" | "streamable-http" => Ok(Transport::Http {
                 url: expand_env(self.url.as_deref().context("http server needs `url`")?),
@@ -95,11 +98,14 @@ impl Server {
             Implementation::new("harness", env!("CARGO_PKG_VERSION")),
         );
         let service = match config.transport()? {
-            Transport::Stdio { command, args, env } => {
+            Transport::Stdio { command, args, env, cwd } => {
                 // Server logs go to a file so they don't interleave with the REPL.
                 let log = std::fs::File::create(log_path(name)).context("creating MCP log file")?;
                 let cmd = tokio::process::Command::new(&command).configure(|c| {
                     c.args(&args).envs(&env);
+                    if let Some(cwd) = &cwd {
+                        c.current_dir(cwd);
+                    }
                     // Its own process group, so Ctrl-C in the terminal (which
                     // interrupts a turn) doesn't reach the server.
                     #[cfg(unix)]
@@ -322,7 +328,7 @@ mod tests {
     #[test]
     fn parses_config_and_infers_transport() {
         let parsed: crate::settings::Settings = serde_json::from_value(json!({"mcpServers": {
-            "local": {"command": "srv", "args": ["--x"], "env": {"K": "V"}},
+            "local": {"command": "srv", "args": ["--x"], "env": {"K": "V"}, "cwd": "/srv"},
             "remote": {"url": "https://example.com/mcp", "headers": {"X-Key": "k"}}
         }}))
         .unwrap();
@@ -332,6 +338,7 @@ mod tests {
                 command: "srv".into(),
                 args: vec!["--x".into()],
                 env: BTreeMap::from([("K".into(), "V".into())]),
+                cwd: Some("/srv".into()),
             }
         );
         assert_eq!(

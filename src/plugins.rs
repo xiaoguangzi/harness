@@ -1,6 +1,9 @@
 //! Plugins in Claude Code's format: a directory bundling skills, commands,
 //! agents, hooks and MCP servers, usually installed from a marketplace (a
-//! repository listing plugins in `.claude-plugin/marketplace.json`).
+//! repository listing plugins in `.claude-plugin/marketplace.json`). Codex's
+//! and Cursor's plugins are much the same and load too: their manifests
+//! (`.codex-plugin/plugin.json`, an Agent Plugins `plugin.json`) and
+//! marketplaces (`.agents/plugins/marketplace.json`) are found as well.
 //!
 //! The settings enable plugins by id, under Claude Code's keys:
 //!
@@ -33,13 +36,23 @@ use serde_json::{Map, Value, json};
 use crate::hooks;
 use crate::mcp::ServerConfig;
 use crate::settings::Settings;
-use crate::skills::{self, PluginDirs, Skill};
+use crate::skills::{self, PluginDirs, Skill, markdown_files, scoped, stem};
 use crate::subagent::{self, AgentDef};
 pub use fetch::Checkout;
 
-/// The marketplace Claude Code knows without being told; so does the
-/// harness.
-const OFFICIAL: (&str, &str) = ("claude-plugins-official", "anthropics/claude-plugins-official");
+/// The marketplaces Claude Code and Codex know without being told, and
+/// their GitHub repositories; the harness knows them too.
+const OFFICIAL: &[(&str, &str)] =
+    &[("claude-plugins-official", "anthropics/claude-plugins-official"), ("openai-curated", "openai/plugins")];
+/// Where a marketplace keeps its catalog: Claude Code's place, Codex's,
+/// Cursor's. The directory they are in is the marketplace's root.
+const CATALOG_FILES: &[&str] =
+    &[".claude-plugin/marketplace.json", ".agents/plugins/marketplace.json", ".cursor-plugin/marketplace.json"];
+/// Where a plugin keeps its manifest, in the same order. An Agent Plugins
+/// `plugin.json` at the root comes after Claude Code's.
+const MANIFEST_FILES: &[&str] = &[".claude-plugin/plugin.json", ".codex-plugin/plugin.json", ".cursor-plugin/plugin.json"];
+/// The schemas an Agent Plugins manifest (Codex's portable format) names.
+const AGENT_PLUGINS_SCHEMA: &str = "https://agent-plugins.org/schemas/";
 
 /// A marketplace under `extraKnownMarketplaces`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -56,7 +69,7 @@ enum MarketplaceSource {
         repo: String,
         #[serde(rename = "ref")]
         git_ref: Option<String>,
-        /// The marketplace file in it, if not `.claude-plugin/marketplace.json`.
+        /// The marketplace file in it, if not in one of the usual places.
         path: Option<String>,
     },
     /// Any git repository.
@@ -66,7 +79,8 @@ enum MarketplaceSource {
         git_ref: Option<String>,
         path: Option<String>,
     },
-    /// A directory holding `.claude-plugin/marketplace.json`, read in place.
+    /// A directory holding `.claude-plugin/marketplace.json` (or Codex's
+    /// `.agents/plugins/marketplace.json`), read in place.
     Directory { path: String },
     /// A `marketplace.json`, read in place.
     File { path: String },
@@ -158,10 +172,13 @@ fn home() -> PathBuf {
 /// those in `dirs`. A plugin that cannot be loaded is listed with its
 /// error; one that has parts the harness cannot use is loaded without them.
 pub fn load(settings: &Settings, dirs: &[PathBuf]) -> Loaded {
-    load_from(settings, dirs, &home())
+    let personal = std::env::var_os("HOME").map(|h| Path::new(&h).join(".agents/plugins/marketplace.json"));
+    load_from(settings, dirs, &home(), personal.as_deref())
 }
 
-fn load_from(settings: &Settings, dirs: &[PathBuf], home: &Path) -> Loaded {
+/// `personal` is Codex's personal marketplace, known by the name it gives
+/// itself.
+fn load_from(settings: &Settings, dirs: &[PathBuf], home: &Path, personal: Option<&Path>) -> Loaded {
     let mut loaded = Loaded::default();
     let mut catalogs: BTreeMap<String, Result<Catalog, String>> = BTreeMap::new();
     for id in settings.enabled_plugins.iter().filter(|(_, on)| **on).map(|(id, _)| id) {
@@ -169,7 +186,7 @@ fn load_from(settings: &Settings, dirs: &[PathBuf], home: &Path) -> Loaded {
             None => Err("expected `<plugin>@<marketplace>`".to_string()),
             Some((name, market)) => {
                 let catalog = catalogs.entry(market.to_string()).or_insert_with(|| {
-                    let catalog = Catalog::open(market, settings, home);
+                    let catalog = Catalog::open(market, settings, home, personal);
                     if let Ok(catalog) = &catalog {
                         loaded.plugins.checkouts.extend(catalog.checkout.clone());
                     }
@@ -221,14 +238,19 @@ struct GitSource {
 }
 
 impl Catalog {
-    fn open(name: &str, settings: &Settings, home: &Path) -> Result<Self, String> {
+    fn open(name: &str, settings: &Settings, home: &Path, personal: Option<&Path>) -> Result<Self, String> {
         if name.is_empty() || name.starts_with('.') || !name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
             return Err(format!("invalid marketplace name `{name}`"));
         }
-        let source = match settings.extra_known_marketplaces.get(name) {
-            Some(market) => market.source.clone(),
-            None if name == OFFICIAL.0 => MarketplaceSource::Github { repo: OFFICIAL.1.into(), git_ref: None, path: None },
-            None => return Err(format!("unknown marketplace `{name}`: declare it under `extraKnownMarketplaces`")),
+        let official = OFFICIAL.iter().find(|(known, _)| *known == name);
+        let personal = personal.filter(|file| read_json(file).is_ok_and(|catalog| catalog["name"] == name));
+        let source = match (settings.extra_known_marketplaces.get(name), official, personal) {
+            (Some(market), _, _) => market.source.clone(),
+            (None, Some((_, repo)), _) => MarketplaceSource::Github { repo: repo.to_string(), git_ref: None, path: None },
+            (None, None, Some(file)) => MarketplaceSource::File { path: file.display().to_string() },
+            (None, None, None) => {
+                return Err(format!("unknown marketplace `{name}`: declare it under `extraKnownMarketplaces`"));
+            }
         };
         let clone = |url: String, git_ref: &Option<String>, path: &Option<String>| {
             let checkout = Checkout {
@@ -239,21 +261,23 @@ impl Catalog {
                 sha: None,
             };
             checkout.ensure()?;
-            let file = inside(&checkout.dir, path.as_deref().unwrap_or(".claude-plugin/marketplace.json"))?;
+            let file = match path {
+                Some(path) => inside(&checkout.dir, path)?,
+                None => catalog_file(&checkout.dir)?,
+            };
             Ok::<_, String>((file, Some(checkout)))
         };
         let (file, checkout) = match &source {
             MarketplaceSource::Github { repo, git_ref, path } => clone(github_url(repo), git_ref, path)?,
             MarketplaceSource::Git { url, git_ref, path } => clone(url.clone(), git_ref, path)?,
-            MarketplaceSource::Directory { path } => (expand_home(path).join(".claude-plugin/marketplace.json"), None),
+            MarketplaceSource::Directory { path } => (catalog_file(&expand_home(path))?, None),
             MarketplaceSource::File { path } => (expand_home(path), None),
         };
         let catalog = read_json(&file)?;
-        let dir = file.parent().unwrap_or(Path::new("."));
-        let root = if dir.ends_with(".claude-plugin") { dir.parent().unwrap_or(dir) } else { dir };
+        let root = catalog_root(&file);
         Ok(Self {
             name: name.to_string(),
-            root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
+            root,
             plugins: catalog["plugins"].as_array().cloned().unwrap_or_default(),
             plugin_root: catalog["metadata"]["pluginRoot"].as_str().map(String::from),
             checkout,
@@ -268,16 +292,24 @@ impl Catalog {
             .iter()
             .find(|p| p["name"] == name)
             .ok_or_else(|| format!("marketplace `{}` has no plugin `{name}`", self.name))?;
-        let (root, checkout) = match &entry["source"] {
-            Value::String(path) => {
+        // A path in the marketplace: a string, or Codex's `local` source.
+        let local = match &entry["source"] {
+            Value::String(path) => Some(path.as_str()),
+            Value::Object(source) if source.get("source").is_some_and(|s| s == "local") => {
+                Some(source.get("path").and_then(Value::as_str).ok_or("plugin source needs `path`")?)
+            }
+            _ => None,
+        };
+        let (root, checkout) = match (local, &entry["source"]) {
+            (Some(path), _) => {
                 let bare = !path.contains('/') && path != ".";
                 let path = match &self.plugin_root {
                     Some(plugin_root) if bare => format!("{}/{path}", plugin_root.trim_end_matches('/')),
-                    _ => path.clone(),
+                    _ => path.to_string(),
                 };
                 (inside(&self.root, &path)?, None)
             }
-            Value::Object(source) => {
+            (None, Value::Object(source)) => {
                 let source = git_source(source)?;
                 let checkout = Checkout {
                     label: format!("plugin {name}@{}", self.name),
@@ -307,7 +339,8 @@ fn git_source(source: &Map<String, Value>) -> Result<GitSource, String> {
     let required = |key: &str| field(key).ok_or_else(|| format!("plugin source needs `{key}`"));
     let (url, path) = match field("source").as_deref() {
         Some("github") => (github_url(&required("repo")?), None),
-        Some("url") => (required("url")?, None),
+        // Codex's may name a directory in it.
+        Some("url") => (required("url")?, field("path")),
         Some("git-subdir") => {
             let url = required("url")?;
             // `owner/repo` is GitHub's.
@@ -316,7 +349,7 @@ fn git_source(source: &Map<String, Value>) -> Result<GitSource, String> {
         }
         Some(other) => {
             return Err(format!(
-                "plugin source `{other}` is not supported (only relative paths, `github`, `url` and `git-subdir`)"
+                "plugin source `{other}` is not supported (only relative paths, `local`, `github`, `url` and `git-subdir`)"
             ));
         }
         None => return Err("plugin source has no `source` type".into()),
@@ -337,10 +370,8 @@ impl Loaded {
         if !root.is_dir() {
             return Err(format!("{} is not a directory", root.display()));
         }
-        let manifest_file = root.join(".claude-plugin/plugin.json");
-        let manifest = match (manifest_file.is_file(), entry) {
-            (true, entry) => {
-                let mut manifest = read_json(&manifest_file)?;
+        let manifest = match (read_manifest(&root)?, entry) {
+            (Some(mut manifest), entry) => {
                 // A marketplace entry may add skills to the plugin's own.
                 if let Some(extra) = entry.filter(|e| e["strict"] != false).map(|e| paths(&e["skills"]))
                     && !extra.is_empty()
@@ -351,8 +382,8 @@ impl Loaded {
                 }
                 manifest
             }
-            (false, Some(entry)) => entry.clone(),
-            (false, None) => Value::Object(Map::new()),
+            (None, Some(entry)) => entry.clone(),
+            (None, None) => Value::Object(Map::new()),
         };
         let dir_name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let name = manifest["name"].as_str().map_or(dir_name, String::from);
@@ -386,6 +417,9 @@ impl Loaded {
         if root.join("bin").is_dir() {
             self.bin_dirs.push(root.join("bin"));
             parts.push("bin/".into());
+        }
+        if manifest.get("apps").is_some() || root.join(".app.json").is_file() {
+            warnings.push("its apps (Codex's ChatGPT connectors) are not supported; left out".into());
         }
         self.warnings.extend(warnings.into_iter().map(|w| format!("plugin {id}: {w}")));
         self.plugins.list.push(Plugin {
@@ -564,9 +598,31 @@ impl Loaded {
                 inline => servers.extend(server_map(inline.clone())),
             }
         }
-        let count = servers.len();
+        let mut count = 0;
         for (server, mut config) in servers {
             expand_strings(&mut config, dirs);
+            let Some(fields) = config.as_object_mut() else {
+                warnings.push(format!("MCP server `{server}`: expected an object; left out"));
+                continue;
+            };
+            if fields.contains_key("oauth") || fields.contains_key("oauth_resource") {
+                warnings.push(format!("MCP server `{server}` signs in with OAuth, which the harness does not do; left out"));
+                continue;
+            }
+            // Codex's: comments, the variables it may see (it sees them all),
+            // its timeouts (the harness has its own), and a directory in the
+            // plugin that a `./` command starts from too.
+            for key in ["note", "description", "env_vars", "startup_timeout_sec", "tool_timeout_sec"] {
+                fields.remove(key);
+            }
+            // Joined without their `.` parts.
+            let join = |dir: &Path, path: &str| dir.join(path).components().collect::<PathBuf>();
+            if let Some(cwd) = fields.get("cwd").and_then(Value::as_str).map(|cwd| join(&dirs.root, cwd)) {
+                if let Some(command) = fields.get("command").and_then(Value::as_str).filter(|c| c.starts_with("./")) {
+                    fields.insert("command".into(), join(&cwd, command).display().to_string().into());
+                }
+                fields.insert("cwd".into(), cwd.display().to_string().into());
+            }
             if config.get("command").is_some() {
                 let env = config.as_object_mut().unwrap().entry("env").or_insert_with(|| Value::Object(Map::new()));
                 if let Some(env) = env.as_object_mut() {
@@ -578,6 +634,7 @@ impl Loaded {
             match serde_json::from_value::<ServerConfig>(config) {
                 Ok(config) => {
                     self.mcp_servers.insert(format!("plugin:{name}:{server}"), config);
+                    count += 1;
                 }
                 Err(e) => warnings.push(format!("MCP server `{server}`: {e}; left out")),
             }
@@ -591,31 +648,13 @@ fn scan_commands(dir: &Path, prefix: &str, plugin: &PluginDirs, out: &mut Vec<Sk
     let mut files = Vec::new();
     markdown_files(dir, prefix, &mut files);
     for (file, prefix) in files {
-        match Skill::command(format!("{prefix}:{}", stem(&file)), &file, Some(plugin.clone())) {
+        match Skill::command(scoped(&prefix, &stem(&file)), &file, Some(plugin.clone())) {
             Ok(skill) => out.push(skill),
             Err(e) => warnings.push(format!("{}: {e}", file.display())),
         }
     }
 }
 
-/// The Markdown files in `dir` and below, sorted, each with `prefix` and
-/// the subdirectories it is in joined by `:`.
-fn markdown_files(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    paths.sort();
-    for path in paths {
-        if path.is_dir() {
-            markdown_files(&path, &format!("{prefix}:{}", stem(&path)), out);
-        } else if path.extension().is_some_and(|e| e == "md") {
-            out.push((path, prefix.to_string()));
-        }
-    }
-}
-
-fn stem(path: &Path) -> String {
-    path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
-}
 
 /// A manifest value that is one item or an array of them.
 fn items(value: &Value) -> Vec<&Value> {
@@ -670,6 +709,73 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
+/// The catalog in marketplace directory `dir`, in whichever usual place.
+fn catalog_file(dir: &Path) -> Result<PathBuf, String> {
+    let found = CATALOG_FILES.iter().map(|f| dir.join(f)).find(|f| f.is_file());
+    found.ok_or_else(|| format!("{} has no {}", dir.display(), CATALOG_FILES.join(" or ")))
+}
+
+/// The marketplace root of catalog `file`: the directory holding the usual
+/// place it is in, else the one it is in.
+fn catalog_root(file: &Path) -> PathBuf {
+    let root = CATALOG_FILES
+        .iter()
+        .find_map(|layout| {
+            let depth = Path::new(layout).components().count();
+            file.ends_with(layout).then(|| file.ancestors().nth(depth)).flatten()
+        })
+        .or_else(|| file.parent())
+        .unwrap_or(Path::new("."));
+    std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// The plugin's manifest, if it has one: Claude Code's, an Agent Plugins
+/// `plugin.json` at the root (Codex's portable format, as Claude Code's
+/// shape), or Codex's or Cursor's, which have Claude Code's shape already.
+fn read_manifest(root: &Path) -> Result<Option<Value>, String> {
+    let file = |f: &str| Some(root.join(f)).filter(|f| f.is_file());
+    if let Some(file) = file(MANIFEST_FILES[0]) {
+        return read_json(&file).map(Some);
+    }
+    if let Some(portable) = file("plugin.json") {
+        let manifest = read_json(&portable)?;
+        if manifest["$schema"].as_str().is_some_and(|s| s.starts_with(AGENT_PLUGINS_SCHEMA)) {
+            return Ok(Some(agent_plugin_manifest(root, manifest)?));
+        }
+    }
+    match MANIFEST_FILES[1..].iter().find_map(|f| file(f)) {
+        Some(file) => read_json(&file).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// An Agent Plugins manifest as Claude Code's: skills in `skills/`, MCP
+/// servers in `mcp.json`, and Codex's hooks from its `com.openai` extension,
+/// else from a `.codex-plugin/plugin.json` beside it.
+fn agent_plugin_manifest(root: &Path, manifest: Value) -> Result<Value, String> {
+    let mut converted = Map::new();
+    for key in ["name", "version", "description"] {
+        if let Some(value) = manifest.get(key) {
+            converted.insert(key.into(), value.clone());
+        }
+    }
+    if root.join("mcp.json").is_file() {
+        converted.insert("mcpServers".into(), "./mcp.json".into());
+    }
+    let extension = &manifest["extensions"]["com.openai"];
+    let overlay = root.join(MANIFEST_FILES[1]);
+    let extension = match extension.is_object() || !overlay.is_file() {
+        true => extension.clone(),
+        false => read_json(&overlay)?,
+    };
+    for key in ["hooks", "apps"] {
+        if let Some(value) = extension.get(key).filter(|v| !v.is_null()) {
+            converted.insert(key.into(), value.clone());
+        }
+    }
+    Ok(Value::Object(converted))
+}
+
 fn read_json(file: &Path) -> Result<Value, String> {
     let text = std::fs::read_to_string(file).map_err(|e| format!("reading {}: {e}", file.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", file.display()))
@@ -719,7 +825,7 @@ mod tests {
         let root = tmp.path().join("kit-src");
         write(&root, FULL);
         let home = tmp.path().join("home");
-        let loaded = load_from(&Settings::default(), std::slice::from_ref(&root), &home);
+        let loaded = load_from(&Settings::default(), std::slice::from_ref(&root), &home, None);
 
         let plugin = &loaded.plugins.list[0];
         assert_eq!(plugin.id, "kit@inline");
@@ -765,7 +871,7 @@ mod tests {
             ("custom/a.md", "---\ndescription: A\n---\nprompt\n"),
             ("agents/ignored.md", "---\ndescription: B\n---\nprompt\n"),
         ]);
-        let loaded = load_from(&Settings::default(), &[root], &tmp.path().join("home"));
+        let loaded = load_from(&Settings::default(), &[root], &tmp.path().join("home"), None);
         let names: Vec<&str> = loaded.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["p:one", "p:two", "p:about"]);
         assert_eq!(loaded.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["p:a"]);
@@ -807,7 +913,7 @@ mod tests {
                 "extraKnownMarketplaces": {{"team": {{"source": {{"source": "git", "url": "file://{}"}}}}}}}}"#,
             market.display()
         ));
-        let loaded = load_from(&s, &[], &home);
+        let loaded = load_from(&s, &[], &home, None);
         let outcomes: BTreeMap<&str, Result<&Vec<String>, &String>> =
             loaded.plugins.list.iter().map(|p| (p.id.as_str(), p.outcome.as_ref())).collect();
         assert_eq!(outcomes["fmt@team"], Ok(&vec!["1 command".to_string()]));
@@ -834,9 +940,101 @@ mod tests {
                 "extraKnownMarketplaces": {{"local": {{"source": {{"source": "directory", "path": "{}"}}}}}}}}"#,
             market.display()
         ));
-        let loaded = load_from(&s, &[], &home);
+        let loaded = load_from(&s, &[], &home, None);
         assert_eq!(loaded.plugins.list[0].root.as_deref(), Some(market.join("tools/fmt").as_path()));
         assert!(loaded.plugins.checkouts.is_empty());
+    }
+
+    #[test]
+    fn loads_codex_plugins_and_marketplaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        // Codex's layout: the catalog in `.agents/plugins/`, `local` sources,
+        // a `.codex-plugin/plugin.json` manifest, and an Agent Plugins one.
+        let market = tmp.path().join("codex-market");
+        write(&market, &[
+            (
+                ".agents/plugins/marketplace.json",
+                r#"{"name": "codex-team", "plugins": [
+                    {"name": "legacy", "source": {"source": "local", "path": "./plugins/legacy"}, "policy": {"installation": "AVAILABLE"}},
+                    {"name": "portable", "source": {"source": "local", "path": "./plugins/portable"}}]}"#,
+            ),
+            (
+                "plugins/legacy/.codex-plugin/plugin.json",
+                r#"{"name": "legacy", "skills": "./skills/", "mcpServers": "./.mcp.json", "apps": "./.app.json",
+                    "hooks": "./hooks.json", "interface": {"displayName": "Legacy"}}"#,
+            ),
+            ("plugins/legacy/skills/go/SKILL.md", "---\ndescription: Go\n---\nGo.\n"),
+            (
+                "plugins/legacy/.mcp.json",
+                r#"{"mcpServers": {"api": {"type": "http", "url": "https://e.com/mcp", "note": "a comment", "description": "d"},
+                    "tool": {"command": "./bin/srv", "cwd": ".", "env_vars": ["HOME"]},
+                    "signed": {"type": "http", "url": "https://e.com/oauth", "oauth_resource": "https://e.com"}}}"#,
+            ),
+            ("plugins/legacy/.app.json", r#"{"apps": {"x": {"id": "connector_1"}}}"#),
+            (
+                "plugins/legacy/hooks.json",
+                r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "\"${PLUGIN_ROOT}/stop.sh\""}]}]}}"#,
+            ),
+            (
+                "plugins/portable/plugin.json",
+                r#"{"$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", "name": "portable", "version": "2.0.0",
+                    "extensions": {"com.openai": {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}}}}"#,
+            ),
+            ("plugins/portable/skills/hi/SKILL.md", "---\ndescription: Hi\n---\nHi from ${PLUGIN_ROOT}.\n"),
+            ("plugins/portable/mcp.json", r#"{"mcpServers": {"local": {"command": "${PLUGIN_ROOT}/srv"}}}"#),
+        ]);
+        let s = settings(&format!(
+            r#"{{"enabledPlugins": {{"legacy@codex-team": true, "portable@codex-team": true}},
+                "extraKnownMarketplaces": {{"codex-team": {{"source": {{"source": "directory", "path": "{}"}}}}}}}}"#,
+            market.display()
+        ));
+        let loaded = load_from(&s, &[], &home, None);
+        let outcomes: Vec<(&str, &Vec<String>)> =
+            loaded.plugins.list.iter().map(|p| (p.id.as_str(), p.outcome.as_ref().unwrap())).collect();
+        assert_eq!(outcomes, [
+            ("legacy@codex-team", &vec!["1 skill".to_string(), "2 MCP servers".into(), "hooks (Stop)".into()]),
+            ("portable@codex-team", &vec!["1 skill".to_string(), "1 MCP server".into(), "hooks (SessionStart)".into()]),
+        ]);
+        assert_eq!(loaded.plugins.list[1].version.as_deref(), Some("2.0.0"));
+        let servers = loaded.mcp_servers.keys().collect::<Vec<_>>();
+        assert_eq!(servers, ["plugin:legacy:api", "plugin:legacy:tool", "plugin:portable:local"]);
+        let tool = format!("{:?}", loaded.mcp_servers["plugin:legacy:tool"]);
+        let legacy = market.join("plugins/legacy");
+        assert!(tool.contains(&format!("command: Some({:?})", legacy.join("bin/srv"))), "{tool}");
+        assert!(tool.contains(&format!("cwd: Some({:?})", legacy)), "{tool}");
+        let root = market.join("plugins/portable");
+        assert_eq!(loaded.skills[1].plugin.as_ref().unwrap().expand("${PLUGIN_ROOT}"), root.display().to_string());
+        assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
+        assert!(loaded.warnings[0].contains("`signed` signs in with OAuth"), "{:?}", loaded.warnings);
+        assert!(loaded.warnings[1].contains("apps"), "{:?}", loaded.warnings);
+
+        // Codex's personal marketplace is known by its own name; its paths
+        // start from the directory holding `.agents/`.
+        let user = tmp.path().join("user");
+        write(&user, &[
+            (".agents/plugins/marketplace.json", r#"{"name": "mine", "plugins": [{"name": "p", "source": "./.codex/plugins/p"}]}"#),
+            (".codex/plugins/p/commands/c.md", "C\n"),
+        ]);
+        let personal = user.join(".agents/plugins/marketplace.json");
+        let s = settings(r#"{"enabledPlugins": {"p@mine": true}}"#);
+        let loaded = load_from(&s, &[], &home, Some(&personal));
+        assert_eq!(loaded.skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["p:c"]);
+        let loaded = load_from(&s, &[], &home, None);
+        assert!(loaded.plugins.list[0].outcome.as_ref().unwrap_err().contains("unknown marketplace `mine`"));
+    }
+
+    #[test]
+    fn catalog_places() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for layout in CATALOG_FILES {
+            assert_eq!(catalog_root(&root.join(layout)), root);
+        }
+        assert_eq!(catalog_root(&root.join("x/catalog.json")), root.join("x"));
+        assert!(catalog_file(root).unwrap_err().contains(".agents/plugins/marketplace.json"));
+        write(root, &[(".agents/plugins/marketplace.json", "{}")]);
+        assert_eq!(catalog_file(root).unwrap(), root.join(".agents/plugins/marketplace.json"));
     }
 
     #[test]

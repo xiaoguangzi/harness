@@ -884,7 +884,10 @@ fn print_usage(agent: &Agent) {
 
 fn print_skills(skills: &[Skill]) {
     if skills.is_empty() {
-        println!("no skills found (looked in .harness/skills, .claude/skills and the same under ~)");
+        println!(
+            "no skills or commands found (looked in .harness/skills, .claude/skills, .harness/commands, \
+             .claude/commands and the same under ~)"
+        );
     }
     for s in skills {
         println!("\x1b[1m{}\x1b[0m  {}\n  \x1b[90m{}\x1b[0m", s.name, s.description, s.dir.display());

@@ -252,7 +252,7 @@ Declare servers under `mcpServers` in the [settings](#settings), in the same sha
 }
 ```
 
-- Transports: `stdio` (default when `command` is set) and streamable `http` (default when `url` is set), via the official Rust SDK [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk).
+- Transports: `stdio` (default when `command` is set) and streamable `http` (default when `url` is set), via the official Rust SDK [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk). A stdio server may set `cwd`, the directory it runs in. Servers that sign in with OAuth are not supported.
 - `${VAR}` / `${VAR:-default}` are expanded from the environment in every string.
 - Servers connect concurrently at startup; a server that fails is reported and skipped.
 - Tools are exposed as `mcp__<server>__<tool>`. Text, embedded text resources and PNG/JPEG/GIF/WebP images are passed back to the model.
@@ -321,6 +321,8 @@ As in Claude Code:
 - `` !`command` `` (at the start of a line or after a space) and ```` ```! ```` blocks are run when the skill is loaded, and replaced by what they print. They run like `bash` tool commands, in the sandbox when it is on; one that fails stops the skill from loading. A read-only subagent gets the `skill` tool only while no skill the model can load has such commands.
 - `disable-model-invocation: true` keeps the model from loading a skill (only `/<name>` runs it); `user-invocable: false` keeps it out of the `/` commands.
 
+Claude Code's commands, the older form of a skill, work too: each Markdown file in `.harness/commands/`, `.claude/commands/` or the same under `~` (earlier wins) runs as `/<file name>`, and a subdirectory adds a part (`frontend/component.md` is `/frontend:component`). They take the same frontmatter (`description`, else their first line describes them) and placeholders, and the model can load them through the `skill` tool unless `disable-model-invocation` is set. A skill wins over a command of the same name.
+
 ## Subagents
 
 The main agent can delegate a self-contained task with the `agent` tool. A subagent runs in its own fresh conversation with its own system prompt and tool set, and only its final report comes back, which keeps long searches out of the main context. Several subagents started in one response run in parallel.
@@ -356,7 +358,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 
 ## Plugins
 
-Plugins are in [Claude Code's format](https://code.claude.com/docs/en/plugins-reference): a directory bundling skills, commands, subagents, hooks and MCP servers, usually installed from a marketplace (a repository listing plugins in `.claude-plugin/marketplace.json`). Enable them in the [settings](#settings) under Claude Code's keys, by `<plugin>@<marketplace>`:
+Plugins are in [Claude Code's format](https://code.claude.com/docs/en/plugins-reference): a directory bundling skills, commands, subagents, hooks and MCP servers, usually installed from a marketplace (a repository listing plugins in `.claude-plugin/marketplace.json`). [Codex's plugins](https://developers.openai.com/codex/plugins/build) load as well (see below). Enable them in the [settings](#settings) under Claude Code's keys, by `<plugin>@<marketplace>`:
 
 ```json
 {
@@ -370,7 +372,7 @@ Plugins are in [Claude Code's format](https://code.claude.com/docs/en/plugins-re
 }
 ```
 
-- `claude-plugins-official` ([anthropics/claude-plugins-official](https://github.com/anthropics/claude-plugins-official)) is known without declaring it. Other marketplaces come from `github` (`repo`, `ref`, `path`), `git` (`url`, `ref`, `path`), `directory` (`path`, read in place, so edits apply at the next start) or `file` (`path` to a `marketplace.json`).
+- `claude-plugins-official` ([anthropics/claude-plugins-official](https://github.com/anthropics/claude-plugins-official)) and Codex's `openai-curated` ([openai/plugins](https://github.com/openai/plugins)) are known without declaring them, and so is Codex's personal marketplace, `~/.agents/plugins/marketplace.json`, by the name it gives itself. Other marketplaces come from `github` (`repo`, `ref`, `path`), `git` (`url`, `ref`, `path`), `directory` (`path`, read in place, so edits apply at the next start) or `file` (`path` to a `marketplace.json`).
 - A marketplace's plugins may be in it (a relative path, or a bare name under `metadata.pluginRoot`) or in repositories of their own (`github`, `url` and `git-subdir` sources, with `ref` / `sha`). `npm`, `archive` and `command` sources are not supported.
 - What is missing is cloned (`git clone --depth 1`) into `~/.harness/plugins` at startup, once. `/plugins update` moves every marketplace and plugin to the latest commit of its branch (one pinned to a `sha` stays); the new versions apply at the next start. A plugin's data directory (`${CLAUDE_PLUGIN_DATA}`) is `~/.harness/plugins/data/<id>`.
 - `--plugin-dir DIR` loads the plugin in `DIR` for one run, as `<name>@inline`, as Claude Code's flag does.
@@ -387,9 +389,10 @@ Each part of a plugin is named after it, as in Claude Code:
 | Executables | `bin/` | on the `PATH` of the model's commands, after yours |
 
 - `.claude-plugin/plugin.json` is optional; without it a marketplace entry stands in for it, and the plugin's name is the directory's. Manifest paths must stay inside the plugin.
-- `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` are replaced in hook commands, MCP server configs, and skill, command and agent text; hooks and stdio MCP servers also get them as environment variables.
+- Codex's and Cursor's layouts are found too: catalogs in `.agents/plugins/marketplace.json` or `.cursor-plugin/marketplace.json` (their paths start from the directory holding `.agents/`), `local` sources and `url` sources with a `path`, manifests in `.codex-plugin/plugin.json` or `.cursor-plugin/plugin.json`, and an [Agent Plugins](https://agent-plugins.org) `plugin.json` at the root (skills in `skills/`, MCP servers in `mcp.json`, hooks under `extensions."com.openai"`). Hooks and MCP servers also get Codex's `PLUGIN_ROOT` / `PLUGIN_DATA`. Codex's apps (ChatGPT connectors) are left out, and of its MCP settings `cwd` is kept (inside the plugin) while comments and timeouts are dropped.
+- `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` (or `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`) are replaced in hook commands, MCP server configs, and skill, command and agent text; hooks and stdio MCP servers also get them as environment variables.
 - Plugin agents get their `tools` as in Claude Code, where that list is all an agent gets: they may write (`bash`, `edit`, `write`) unless they say `permission: read-only`, and without `tools` they get every tool but the subagent ones. Unlike your [custom agents](#subagents), which stay read-only by default: you enabled the plugin, and its agents were written for these rules. Tools the harness lacks (`WebFetch`, `WebSearch`, `TodoWrite`) are skipped.
-- What the harness cannot use is left out with a warning at startup, and the rest of the plugin loads: hook events or types it does not run, MCP bundles (`.mcpb`), MCP servers whose config it does not accept. LSP servers, output styles, monitors, `userConfig` and `dependencies` are ignored.
+- What the harness cannot use is left out with a warning at startup, and the rest of the plugin loads: hook events or types it does not run, MCP bundles (`.mcpb`), MCP servers that sign in with OAuth or whose config it does not accept. LSP servers, output styles, monitors, `userConfig` and `dependencies` are ignored.
 - `/plugins` (and the web UI's environment page) lists each plugin with what it adds, or why it was not loaded.
 - Plugins run commands (hooks, MCP servers, `!` lines in their commands), so only your settings and the command line enable them, never the project.
 

@@ -55,18 +55,22 @@ pub struct PluginDirs {
 }
 
 impl PluginDirs {
-    /// `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` in `text`
-    /// replaced by the directories.
+    /// `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` (or Codex's
+    /// `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`) in `text` replaced by the
+    /// directories.
     pub fn expand(&self, text: &str) -> String {
-        text.replace("${CLAUDE_PLUGIN_ROOT}", &self.root.display().to_string())
-            .replace("${CLAUDE_PLUGIN_DATA}", &self.data.display().to_string())
+        self.env().iter().fold(text.to_string(), |text, (name, value)| text.replace(&format!("${{{name}}}"), value))
     }
 
-    /// The variables as a plugin's processes get them.
+    /// The variables as a plugin's processes get them, under Claude Code's
+    /// names and Codex's.
     pub fn env(&self) -> Vec<(String, String)> {
+        let (root, data) = (self.root.display().to_string(), self.data.display().to_string());
         vec![
-            ("CLAUDE_PLUGIN_ROOT".into(), self.root.display().to_string()),
-            ("CLAUDE_PLUGIN_DATA".into(), self.data.display().to_string()),
+            ("CLAUDE_PLUGIN_ROOT".into(), root.clone()),
+            ("CLAUDE_PLUGIN_DATA".into(), data.clone()),
+            ("PLUGIN_ROOT".into(), root),
+            ("PLUGIN_DATA".into(), data),
         ]
     }
 }
@@ -130,6 +134,9 @@ impl Skill {
     /// A command: the Markdown `file` run as `/<name>`, which the model
     /// may load as a skill too.
     pub fn command(name: String, file: &Path, plugin: Option<PluginDirs>) -> Result<Self, String> {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_:.".contains(c)) {
+            return Err(format!("invalid command name `{name}`"));
+        }
         let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
         let dir = file.parent().map_or_else(PathBuf::new, Path::to_path_buf);
         let mut skill = Self::inline(name, &text, None, plugin);
@@ -289,13 +296,70 @@ async fn run_command(command: &str) -> Result<String, String> {
 /// Default search roots, highest precedence first: project-level
 /// `.harness/skills` and `.claude/skills`, then the same under `$HOME`.
 pub fn default_roots() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from(".harness/skills"), PathBuf::from(".claude/skills")];
+    roots_named("skills")
+}
+
+/// The same for commands: `.harness/commands`, `.claude/commands`, and the
+/// same under `$HOME`.
+pub fn default_command_roots() -> Vec<PathBuf> {
+    roots_named("commands")
+}
+
+fn roots_named(dir: &str) -> Vec<PathBuf> {
+    let mut roots = vec![Path::new(".harness").join(dir), Path::new(".claude").join(dir)];
     if let Some(home) = std::env::var_os("HOME") {
         let home = Path::new(&home);
-        roots.push(home.join(".harness/skills"));
-        roots.push(home.join(".claude/skills"));
+        roots.push(home.join(".harness").join(dir));
+        roots.push(home.join(".claude").join(dir));
     }
     roots
+}
+
+/// Claude Code's commands: the Markdown files in each root and below, run
+/// as `/<name>`; a subdirectory adds a part (`frontend/component.md` is
+/// `/frontend:component`). When two share a name, the one from the earlier
+/// root wins. Sorted by name, with warnings for files that could not be
+/// used.
+pub fn discover_commands(roots: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
+    let mut commands = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for root in roots {
+        let mut files = Vec::new();
+        markdown_files(root, "", &mut files);
+        for (file, prefix) in files {
+            match Skill::command(scoped(&prefix, &stem(&file)), &file, None) {
+                Ok(command) => {
+                    commands.entry(command.name.clone()).or_insert(command);
+                }
+                Err(e) => warnings.push(format!("{}: {e}", file.display())),
+            }
+        }
+    }
+    (commands.into_values().collect(), warnings)
+}
+
+/// The Markdown files in `dir` and below, sorted, each with `prefix` and
+/// the subdirectories it is in joined by `:`.
+pub(crate) fn markdown_files(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            markdown_files(&path, &scoped(prefix, &stem(&path)), out);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            out.push((path, prefix.to_string()));
+        }
+    }
+}
+
+/// `<prefix>:<name>`, or `name` without a prefix.
+pub(crate) fn scoped(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() { name.to_string() } else { format!("{prefix}:{name}") }
+}
+
+pub(crate) fn stem(path: &Path) -> String {
+    path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// Finds `<root>/<dir>/SKILL.md` in each root. When two skills share a name,
@@ -612,5 +676,26 @@ mod tests {
         assert!(tool.read_only());
         let inline = Skill::inline("p:status".into(), "Show !`git status`", Some("Status"), Some(plugin));
         assert!(!SkillTool::new(&[inline]).read_only(), "loading it runs a command");
+    }
+
+    #[test]
+    fn discovers_commands() {
+        let project = tempfile::tempdir().unwrap();
+        let user = tempfile::tempdir().unwrap();
+        let write = |root: &Path, file: &str, text: &str| {
+            std::fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+            std::fs::write(root.join(file), text).unwrap();
+        };
+        write(project.path(), "deploy.md", "---\ndescription: Deploy it\n---\nDeploy $ARGUMENTS\n");
+        write(project.path(), "frontend/component.md", "Make a component\n");
+        write(user.path(), "deploy.md", "the user's, which the project's overrides\n");
+        write(user.path(), "notes.txt", "not a command\n");
+        write(user.path(), "bad name.md", "x\n");
+        let (commands, warnings) = discover_commands(&[project.path().into(), user.path().into()]);
+        let names: Vec<(&str, &str)> = commands.iter().map(|c| (c.name.as_str(), c.description.as_str())).collect();
+        assert_eq!(names, [("deploy", "Deploy it"), ("frontend:component", "Make a component")]);
+        assert!(commands.iter().all(|c| c.model_invocable && c.plugin.is_none()));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("invalid command name `bad name`"), "{warnings:?}");
     }
 }

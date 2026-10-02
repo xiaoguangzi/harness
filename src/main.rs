@@ -97,6 +97,16 @@ async fn main() -> Result<ExitCode> {
     for w in warnings {
         eprintln!("\x1b[33mskill skipped: {w}\x1b[0m");
     }
+    // A skill wins over a command of the same name, as in Claude Code.
+    let (commands, warnings) = skills::discover_commands(&skills::default_command_roots());
+    for w in warnings {
+        eprintln!("\x1b[33mcommand skipped: {w}\x1b[0m");
+    }
+    for command in commands {
+        if !skills.iter().any(|s| s.name == command.name) {
+            skills.push(command);
+        }
+    }
     skills.extend(from_plugins.skills);
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     let skill_tool = SkillTool::new(&skills);
