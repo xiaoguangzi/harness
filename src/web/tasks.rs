@@ -13,13 +13,18 @@ use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
 use crate::agent::{Agent, Inbox, Observer};
+use crate::hooks::{Event, Hooks};
 use crate::llm::{Client, MAX_RETRIES};
-use crate::subagent::{AgentDef, Subagents};
+use crate::skills::Skill;
+use crate::subagent::{AgentDef, Forks, Subagents};
 use crate::tools::{FileTracker, ToolOutput};
 
 /// Tool results are cut to this many bytes in events; the model still gets
 /// the full result.
 const MAX_EVENT_RESULT_BYTES: usize = 20_000;
+/// How long a task waits idle after a turn before Notification hooks hear
+/// that it does.
+const IDLE_NOTICE: Duration = Duration::from_secs(60);
 
 /// A serialized event with its sequence number in the task's log. Events
 /// are serialized once and shared by the log and every subscriber.
@@ -51,6 +56,9 @@ pub enum Work {
     Turn(Vec<Value>),
     /// Compacting the conversation (`/compact`), with what to focus on.
     Compact(Option<String>),
+    /// A skill that runs in a subagent, with its arguments, then a turn on
+    /// its report.
+    Fork(Box<Skill>, String),
 }
 
 struct Meta {
@@ -72,6 +80,9 @@ pub struct Task {
     /// The agent's subagents and inbox, reachable while a turn holds the agent.
     pub subagents: Arc<Subagents>,
     inbox: Arc<Inbox>,
+    forks: Forks,
+    /// The agent's hooks, for telling them the task waits.
+    hooks: Hooks,
     meta: Mutex<Meta>,
     log: Mutex<Vec<Arc<str>>>,
     tx: broadcast::Sender<Sequenced>,
@@ -80,7 +91,7 @@ pub struct Task {
 impl Task {
     /// A task for `agent`. Its subagents' progress goes to the task's log,
     /// and a background subagent's report starts a turn when none runs.
-    pub fn new(id: u64, title: String, def: Option<AgentDef>, files: FileTracker, agent: Agent) -> Arc<Self> {
+    pub fn new(id: u64, title: String, def: Option<AgentDef>, files: FileTracker, agent: Agent, forks: Forks) -> Arc<Self> {
         let created = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let meta = Meta { status: Status::Idle, model: agent.model().to_string(), turns: 0, handle: None };
         Arc::new_cyclic(|task: &Weak<Task>| {
@@ -104,6 +115,8 @@ impl Task {
                 created,
                 subagents: agent.subagents().clone(),
                 inbox: agent.inbox().clone(),
+                forks,
+                hooks: agent.hooks().clone(),
                 agent: tokio::sync::Mutex::new(agent),
                 meta: Mutex::new(meta),
                 log: Mutex::new(Vec::new()),
@@ -185,6 +198,13 @@ impl Task {
             let result = match work {
                 Work::Turn(content) => agent.run_turn(content, observer).await,
                 Work::Compact(focus) => agent.compact(focus.as_deref(), observer).await,
+                Work::Fork(skill, args) => {
+                    let (subagents, client) = (agent.subagents().clone(), agent.client().clone());
+                    match task.forks.run_for_user(&skill, &args, subagents, client).await {
+                        Ok(prompt) => agent.run_turn(vec![json!({"type": "text", "text": prompt})], observer).await,
+                        Err(e) => Err(anyhow::anyhow!(e)),
+                    }
+                }
             };
             drop(agent);
             task.finish(result);
@@ -206,9 +226,24 @@ impl Task {
         }
     }
 
-    fn finish(&self, result: anyhow::Result<()>) {
+    fn finish(self: &Arc<Self>, result: anyhow::Result<()>) {
         let mut meta = self.meta.lock().unwrap();
         meta.handle = None;
+        if self.hooks.has(Event::Notification) {
+            let (task, turns) = (Arc::downgrade(self), meta.turns);
+            tokio::spawn(async move {
+                tokio::time::sleep(IDLE_NOTICE).await;
+                let Some(task) = task.upgrade() else { return };
+                let (idle, model) = {
+                    let meta = task.meta.lock().unwrap();
+                    (meta.turns == turns && meta.status != Status::Running, meta.model.clone())
+                };
+                if idle {
+                    let message = format!("The task \"{}\" is waiting for your input", task.title);
+                    task.hooks.notification("idle_prompt", &message, &model).await;
+                }
+            });
+        }
         match result {
             Ok(()) => {
                 meta.status = Status::Idle;
@@ -299,7 +334,8 @@ mod tests {
             "mock": {"protocol": "anthropic", "base_url": url, "api_key": "test"}
         }}));
         let client = Client::new(Providers::from_parts(&config, &no_env).unwrap()).unwrap();
-        let task = Task::new(1, "test".into(), None, FileTracker::default(), Agent::new(client, ToolRegistry::new(), "sys"));
+        let agent = Agent::new(client, ToolRegistry::new(), "sys");
+        let task = Task::new(1, "test".into(), None, FileTracker::default(), agent, Forks::default());
         let (_, mut events) = task.subscribe(0);
         task.inbox.push("<subagent-notification>…</subagent-notification>".into(), true);
         let mut seen = Vec::new();

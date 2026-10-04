@@ -954,8 +954,10 @@ async function showEnvPage() {
       info.plugins.length ? h("table", {}, h("tr", {}, h("th", {}, "插件"), h("th", {}, "内容 / 状态")),
         info.plugins.map(p => h("tr", {}, h("td", { class: "mono" }, p.id + (p.version ? " v" + p.version : "")),
           h("td", {}, p.error ? h("span", { style: "color:var(--err)" }, p.error) : (p.parts.join("，") || "（无可用内容）"),
-            p.description ? h("div", {}, p.description) : null, p.root ? h("div", { class: "muted mono" }, p.root) : null))))
-        : h("p", { class: "note" }, "未启用插件（~/.harness/settings.json 的 enabledPlugins，或 --plugin-dir）")));
+            p.description ? h("div", {}, p.description) : null, p.root ? h("div", { class: "muted mono" }, p.root) : null,
+            ...(p.warnings || []).map(w => h("div", { style: "color:var(--warn)" }, "! " + w)),
+            (p.ignored || []).length ? h("div", { class: "muted" }, "未使用：" + p.ignored.join("；")) : null))))
+        : h("p", { class: "note" }, "未启用插件（harness plugin install <插件>@<市场>，或 --plugin-dir）")));
 }
 
 // ---------------------------------------------------------------- start

@@ -145,7 +145,7 @@ async fn foreground_reports_come_back_as_text_and_can_be_continued() {
     // New subagents start on the conversation's current model, not on the
     // one the tool was built with.
     let current = mock.client.switch("switched").unwrap();
-    let id = scope(subagents.clone(), current, async {
+    let id = scope(subagents.clone(), current, false, async {
         let out = tools.run("agent", json!({"agent_type": "explore", "description": "find code", "prompt": "first"})).await;
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.starts_with("first report\n\n(agent_id: "), "{}", out.content);
@@ -223,7 +223,7 @@ async fn a_running_subagent_reads_messages_at_its_next_step() {
     .await;
     let tools = mock.tools();
     let (parent, subagents) = conversation();
-    scope(subagents.clone(), mock.client.clone(), async {
+    scope(subagents.clone(), mock.client.clone(), false, async {
         let started = tools
             .run("agent", json!({"agent_type": "explore", "description": "d", "prompt": "go", "run_in_background": true}))
             .await;
@@ -248,7 +248,7 @@ async fn stopped_subagents_keep_their_conversation() {
     let mut mock = Mock::new(|_| slow("slow", Duration::from_secs(60))).await;
     let tools = mock.tools();
     let (parent, subagents) = conversation();
-    scope(subagents.clone(), mock.client.clone(), async {
+    scope(subagents.clone(), mock.client.clone(), false, async {
         // Dropping a foreground call, as cancelling the parent's turn does,
         // stops its subagent.
         let call = tools.run("agent", json!({"agent_type": "explore", "description": "slow", "prompt": "go"}));
@@ -390,7 +390,7 @@ async fn a_continued_subagent_keeps_its_own_read_tracker() {
     tools.register(AgentTool::new(Arc::new(vec![general_purpose()]), tools.clone(), mock.client.clone(), silent()));
     tools.register(MessageAgentTool);
     let (_, subagents) = conversation();
-    scope(subagents.clone(), mock.client.clone(), async {
+    scope(subagents.clone(), mock.client.clone(), false, async {
         let first = tools.run("agent", json!({"agent_type": "general-purpose", "description": "d", "prompt": "read"})).await;
         assert!(!first.is_error, "{}", first.content);
         let second = tools.run("message_agent", json!({"agent_id": first_id(&subagents), "message": "now edit"})).await;

@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use super::grep::ugrep;
 use super::{Tool, ToolOutput, parse_input, truncate};
 
-const MAX_FILES: usize = 100;
+/// Paths listed unless `head_limit` says otherwise, and the most it may say.
+const DEFAULT_HEAD_LIMIT: usize = 100;
+const MAX_HEAD_LIMIT: usize = 1_000;
 const MAX_OUTPUT_BYTES: usize = 30_000;
 /// The most patterns one brace pattern expands into.
 const MAX_EXPANSIONS: usize = 64;
@@ -26,6 +28,7 @@ pub struct GlobTool;
 struct Input {
     pattern: String,
     path: Option<String>,
+    head_limit: Option<usize>,
 }
 
 impl Input {
@@ -112,9 +115,9 @@ impl Tool for GlobTool {
     fn description(&self) -> &str {
         "Find files by name with a glob pattern, such as `**/*.rs` or `src/**/*.{ts,tsx}`. Searches \
          recursively, honours .gitignore and skips hidden files; returns paths, the most recently \
-         modified first (at most 100). A pattern without `/` matches file names at any depth \
-         (`*.rs`); one with `/` matches paths relative to `path`. Use it to find files by name, and \
-         `grep` to find them by content."
+         modified first (at most `head_limit`, default 100). A pattern without `/` matches file \
+         names at any depth (`*.rs`); one with `/` matches paths relative to `path`. Use it to find \
+         files by name, and `grep` to find them by content."
     }
 
     fn input_schema(&self) -> Value {
@@ -128,6 +131,10 @@ impl Tool for GlobTool {
                 "path": {
                     "type": "string",
                     "description": "Directory to search (default: working directory)."
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "description": "List at most this many paths (default 100, at most 1000)."
                 }
             },
             "required": ["pattern"],
@@ -154,10 +161,12 @@ impl Tool for GlobTool {
         let mut files: Vec<(SystemTime, &str)> = stdout.lines().map(|p| (modified(p), p)).collect();
         files.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
         let total = files.len();
-        let mut text = files.iter().take(MAX_FILES).map(|(_, p)| *p).collect::<Vec<_>>().join("\n");
-        if total > MAX_FILES {
+        let limit = input.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT).clamp(1, MAX_HEAD_LIMIT);
+        let mut text = files.iter().take(limit).map(|(_, p)| *p).collect::<Vec<_>>().join("\n");
+        if total > limit {
             text.push_str(&format!(
-                "\n... [showing the {MAX_FILES} most recently modified of {total} files; narrow the pattern or path]"
+                "\n... [showing the {limit} most recently modified of {total} files; narrow the pattern or path, \
+                 or raise head_limit]"
             ));
         }
         ToolOutput::ok(truncate(&text, MAX_OUTPUT_BYTES))
@@ -232,6 +241,9 @@ mod tests {
         age("src/tools/bin.rs", 200);
         let found = lines(&glob(json!({"pattern": "*.rs", "path": root})).await, root);
         assert_eq!(found, ["src/tools/empty.rs", "src/tools/bin.rs", "src/main.rs"]);
+        let found = lines(&glob(json!({"pattern": "*.rs", "path": root, "head_limit": 2})).await, root);
+        assert_eq!(found[..2], ["src/tools/empty.rs", "src/tools/bin.rs"]);
+        assert!(found[2].contains("showing the 2 most recently modified of 3 files"), "{found:?}");
     }
 
     #[test]

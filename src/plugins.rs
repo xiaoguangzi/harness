@@ -12,9 +12,11 @@
 //! "extraKnownMarketplaces": { "team": { "source": { "source": "github", "repo": "org/plugins" } } }
 //! ```
 //!
-//! Marketplaces and plugins in git repositories are cloned into
-//! `~/.harness/plugins` the first time they are needed, and only move on
-//! with `/plugins update`. A plugin's components are named after it, as in
+//! Marketplaces and plugins in git repositories (or npm packages) are
+//! fetched into `~/.harness/plugins` the first time they are needed, and
+//! only move on with `/plugins update` (or in the background, for a
+//! marketplace with `autoUpdate`); see [`fetch`]. `harness plugin …`
+//! ([`manage`]) installs them and edits these settings. A plugin's components are named after it, as in
 //! Claude Code: its skill or command `review` is `/<plugin>:review`, its
 //! agents `<plugin>:<name>`, its MCP servers `plugin:<plugin>:<server>`
 //! (tools `mcp__plugin_<plugin>_<server>__<tool>`), and its hooks run with
@@ -25,6 +27,7 @@
 //! project: a plugin's hooks and MCP servers run commands.
 
 mod fetch;
+pub mod manage;
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -34,11 +37,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::hooks;
+use crate::lsp;
 use crate::mcp::ServerConfig;
 use crate::settings::Settings;
-use crate::skills::{self, PluginDirs, Skill, markdown_files, scoped, stem};
+use crate::skills::{self, PluginDirs, PluginOption, Skill, markdown_files, scoped, stem};
 use crate::subagent::{self, AgentDef};
 pub use fetch::Checkout;
+use fetch::Source;
 
 /// The marketplaces Claude Code and Codex know without being told, and
 /// their GitHub repositories; the harness knows them too.
@@ -59,6 +64,10 @@ const AGENT_PLUGINS_SCHEMA: &str = "https://agent-plugins.org/schemas/";
 #[serde(deny_unknown_fields)]
 pub struct Marketplace {
     source: MarketplaceSource,
+    /// Fetch the latest of it and its plugins in the background at
+    /// startup, to use from the next start.
+    #[serde(default, rename = "autoUpdate")]
+    auto_update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -96,9 +105,48 @@ pub struct Plugin {
     pub root: Option<PathBuf>,
     /// What it adds (`2 skills`, `hooks`, …), or why it was not loaded.
     pub outcome: Result<Vec<String>, String>,
+    /// The parts of it that were left out, and why.
+    pub warnings: Vec<String>,
+    /// What it has that the harness does not use (LSP servers, output
+    /// styles, …).
+    pub ignored: Vec<String>,
+    /// The settings it asks the user for (its `userConfig`).
+    pub options: Vec<OptionSpec>,
+    /// The keys of those the user has not set, which have no default.
+    pub unconfigured: Vec<String>,
 }
 
-/// The enabled plugins, and the git checkouts they came from.
+impl Plugin {
+    fn failed(id: String, error: String) -> Self {
+        Self {
+            id,
+            description: None,
+            version: None,
+            root: None,
+            outcome: Err(error),
+            warnings: Vec::new(),
+            ignored: Vec::new(),
+            options: Vec::new(),
+            unconfigured: Vec::new(),
+        }
+    }
+}
+
+/// A setting a plugin asks the user for, from its `userConfig`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionSpec {
+    pub key: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// `string`, `number`, `boolean`, `directory` or `file`.
+    pub kind: String,
+    /// Kept in `~/.harness/plugins/secrets.json` rather than the settings,
+    /// and out of text the model reads.
+    pub sensitive: bool,
+    pub default: Option<Value>,
+}
+
+/// The enabled plugins, and the checkouts they came from.
 #[derive(Debug, Clone, Default)]
 pub struct Plugins {
     pub list: Vec<Plugin>,
@@ -106,8 +154,9 @@ pub struct Plugins {
 }
 
 impl Plugins {
-    /// Moves every marketplace and plugin cloned from git to the latest
-    /// commit of its branch: a line on each. They apply at the next start.
+    /// Fetches the latest version of every marketplace and plugin fetched
+    /// from git or npm (one pinned to a commit stays): a line on each. They
+    /// apply at the next start, or after `/reload-plugins`.
     pub fn update(&self) -> Vec<Result<String, String>> {
         self.checkouts.iter().map(|c| c.update().map_err(|e| format!("{}: {e}", c.label))).collect()
     }
@@ -122,6 +171,9 @@ impl Plugins {
                 "root": p.root.as_ref().map(|r| r.display().to_string()),
                 "parts": p.outcome.as_ref().ok(),
                 "error": p.outcome.as_ref().err(),
+                "warnings": p.warnings,
+                "ignored": p.ignored,
+                "unconfigured": p.unconfigured,
             })
         });
         Value::Array(list.collect())
@@ -136,10 +188,15 @@ pub struct Loaded {
     pub agents: Vec<AgentDef>,
     pub hooks: hooks::Config,
     pub mcp_servers: BTreeMap<String, ServerConfig>,
+    /// Their language servers, as `plugin:<plugin>:<server>`.
+    pub lsp_servers: BTreeMap<String, lsp::ServerConfig>,
     /// Their `bin/` directories, for the model's commands' `PATH`.
     pub bin_dirs: Vec<PathBuf>,
-    /// The parts of plugins that were left out.
+    /// The parts of plugins that were left out, as each plugin's
+    /// `warnings` lists them, with the plugin's id.
     pub warnings: Vec<String>,
+    /// What marketplaces with `autoUpdate` want fetched in the background.
+    pub auto_update: Vec<Checkout>,
 }
 
 /// Takes `--plugin-dir DIR` (any number of them) out of the command line.
@@ -160,8 +217,9 @@ pub fn parse_flag(args: Vec<String>) -> Result<(Vec<PathBuf>, Vec<String>)> {
     Ok((dirs, rest))
 }
 
-/// `~/.harness/plugins`: the clones, and the plugins' data directories.
-fn home() -> PathBuf {
+/// `~/.harness/plugins`: the clones, the plugins' data directories, and
+/// the sensitive answers to their settings.
+pub fn home() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => Path::new(&home).join(".harness/plugins"),
         None => std::env::temp_dir().join("harness-plugins"),
@@ -179,6 +237,7 @@ pub fn load(settings: &Settings, dirs: &[PathBuf]) -> Loaded {
 /// `personal` is Codex's personal marketplace, known by the name it gives
 /// itself.
 fn load_from(settings: &Settings, dirs: &[PathBuf], home: &Path, personal: Option<&Path>) -> Loaded {
+    let context = Context { settings, home, personal, secrets: read_secrets(home) };
     let mut loaded = Loaded::default();
     let mut catalogs: BTreeMap<String, Result<Catalog, String>> = BTreeMap::new();
     for id in settings.enabled_plugins.iter().filter(|(_, on)| **on).map(|(id, _)| id) {
@@ -186,33 +245,60 @@ fn load_from(settings: &Settings, dirs: &[PathBuf], home: &Path, personal: Optio
             None => Err("expected `<plugin>@<marketplace>`".to_string()),
             Some((name, market)) => {
                 let catalog = catalogs.entry(market.to_string()).or_insert_with(|| {
-                    let catalog = Catalog::open(market, settings, home, personal);
+                    let catalog = Catalog::open(market, &context);
                     if let Ok(catalog) = &catalog {
                         loaded.plugins.checkouts.extend(catalog.checkout.clone());
+                        if catalog.auto_update {
+                            loaded.auto_update.extend(catalog.checkout.clone());
+                        }
                     }
                     catalog
                 });
                 match catalog {
-                    Ok(catalog) => catalog.locate(name, home),
+                    Ok(catalog) => catalog.locate(name, home).map(|found| (found, catalog.auto_update)),
                     Err(e) => Err(e.clone()),
                 }
             }
         };
-        let result = found.and_then(|(root, entry, checkout)| {
+        let result = found.and_then(|((root, entry, checkout), auto_update)| {
+            if auto_update {
+                loaded.auto_update.extend(checkout.clone());
+            }
             loaded.plugins.checkouts.extend(checkout);
-            loaded.add(Some(id), &root, Some(&entry), home)
+            loaded.add(Some(id), &root, Some(&entry), &context)
         });
         if let Err(e) = result {
-            loaded.plugins.list.push(Plugin { id: id.clone(), description: None, version: None, root: None, outcome: Err(e) });
+            loaded.plugins.list.push(Plugin::failed(id.clone(), e));
         }
     }
     for dir in dirs {
-        if let Err(e) = loaded.add(None, dir, None, home) {
-            let id = format!("{}@inline", dir.display());
-            loaded.plugins.list.push(Plugin { id, description: None, version: None, root: None, outcome: Err(e) });
+        if let Err(e) = loaded.add(None, dir, None, &context) {
+            loaded.plugins.list.push(Plugin::failed(format!("{}@inline", dir.display()), e));
         }
     }
     loaded
+}
+
+/// What loading plugins goes by.
+struct Context<'a> {
+    settings: &'a Settings,
+    home: &'a Path,
+    personal: Option<&'a Path>,
+    /// The sensitive answers to plugins' settings, by plugin id.
+    secrets: Map<String, Value>,
+}
+
+/// Where the sensitive answers to plugins' settings are kept.
+fn secrets_file(home: &Path) -> PathBuf {
+    home.join("secrets.json")
+}
+
+/// The sensitive answers to plugins' settings: `{"<id>": {"<key>": value}}`.
+fn read_secrets(home: &Path) -> Map<String, Value> {
+    match read_json(&secrets_file(home)) {
+        Ok(Value::Object(map)) => map,
+        _ => Map::new(),
+    }
 }
 
 /// A marketplace's `marketplace.json`.
@@ -225,49 +311,63 @@ struct Catalog {
     /// `metadata.pluginRoot`: where plugins named by a bare name are.
     plugin_root: Option<String>,
     checkout: Option<Checkout>,
+    auto_update: bool,
+    /// The catalog file.
+    file: PathBuf,
 }
 
-/// A plugin source that is a git repository: `github`, `url` or
-/// `git-subdir`.
-struct GitSource {
-    url: String,
-    git_ref: Option<String>,
-    sha: Option<String>,
-    /// The plugin's directory in it, for `git-subdir`.
+/// A plugin source fetched from elsewhere, and the plugin's directory in
+/// it (for `git-subdir`, or Codex's `url` with a `path`).
+struct FetchedSource {
+    source: Source,
     path: Option<String>,
 }
 
+/// Whether `name` may name a marketplace (and a directory).
+fn valid_marketplace_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
 impl Catalog {
-    fn open(name: &str, settings: &Settings, home: &Path, personal: Option<&Path>) -> Result<Self, String> {
-        if name.is_empty() || name.starts_with('.') || !name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+    fn open(name: &str, context: &Context) -> Result<Self, String> {
+        if !valid_marketplace_name(name) {
             return Err(format!("invalid marketplace name `{name}`"));
         }
         let official = OFFICIAL.iter().find(|(known, _)| *known == name);
-        let personal = personal.filter(|file| read_json(file).is_ok_and(|catalog| catalog["name"] == name));
-        let source = match (settings.extra_known_marketplaces.get(name), official, personal) {
-            (Some(market), _, _) => market.source.clone(),
-            (None, Some((_, repo)), _) => MarketplaceSource::Github { repo: repo.to_string(), git_ref: None, path: None },
-            (None, None, Some(file)) => MarketplaceSource::File { path: file.display().to_string() },
+        let personal = context.personal.filter(|file| read_json(file).is_ok_and(|catalog| catalog["name"] == name));
+        let (source, auto_update) = match (context.settings.extra_known_marketplaces.get(name), official, personal) {
+            (Some(market), _, _) => (market.source.clone(), market.auto_update),
+            (None, Some((_, repo)), _) => (MarketplaceSource::Github { repo: repo.to_string(), git_ref: None, path: None }, false),
+            (None, None, Some(file)) => (MarketplaceSource::File { path: file.display().to_string() }, false),
             (None, None, None) => {
-                return Err(format!("unknown marketplace `{name}`: declare it under `extraKnownMarketplaces`"));
+                return Err(format!(
+                    "unknown marketplace `{name}`: add it with `harness plugin marketplace add`, or declare it under \
+                     `extraKnownMarketplaces`"
+                ));
             }
         };
+        let mut catalog = Self::read(name, &format!("marketplace {name}"), &source, context.home)?;
+        catalog.auto_update = auto_update;
+        Ok(catalog)
+    }
+
+    /// The catalog of marketplace `name` from `source`, fetched into `home`
+    /// if it comes from git; `label` names it in messages.
+    fn read(name: &str, label: &str, source: &MarketplaceSource, home: &Path) -> Result<Self, String> {
         let clone = |url: String, git_ref: &Option<String>, path: &Option<String>| {
             let checkout = Checkout {
-                label: format!("marketplace {name}"),
+                label: label.to_string(),
                 dir: home.join("marketplaces").join(name),
-                url,
-                git_ref: git_ref.clone(),
-                sha: None,
+                source: Source::Git { url, git_ref: git_ref.clone(), sha: None },
             };
-            checkout.ensure()?;
+            let dir = checkout.ensure()?;
             let file = match path {
-                Some(path) => inside(&checkout.dir, path)?,
-                None => catalog_file(&checkout.dir)?,
+                Some(path) => inside(&dir, path)?,
+                None => catalog_file(&dir)?,
             };
             Ok::<_, String>((file, Some(checkout)))
         };
-        let (file, checkout) = match &source {
+        let (file, checkout) = match source {
             MarketplaceSource::Github { repo, git_ref, path } => clone(github_url(repo), git_ref, path)?,
             MarketplaceSource::Git { url, git_ref, path } => clone(url.clone(), git_ref, path)?,
             MarketplaceSource::Directory { path } => (catalog_file(&expand_home(path))?, None),
@@ -281,6 +381,8 @@ impl Catalog {
             plugins: catalog["plugins"].as_array().cloned().unwrap_or_default(),
             plugin_root: catalog["metadata"]["pluginRoot"].as_str().map(String::from),
             checkout,
+            auto_update: false,
+            file,
         })
     }
 
@@ -310,18 +412,16 @@ impl Catalog {
                 (inside(&self.root, &path)?, None)
             }
             (None, Value::Object(source)) => {
-                let source = git_source(source)?;
+                let FetchedSource { source, path } = fetched_source(source)?;
                 let checkout = Checkout {
                     label: format!("plugin {name}@{}", self.name),
                     dir: home.join("cache").join(&self.name).join(sanitize(name)),
-                    url: source.url,
-                    git_ref: source.git_ref,
-                    sha: source.sha,
+                    source,
                 };
-                checkout.ensure()?;
-                let root = match &source.path {
-                    Some(path) => inside(&checkout.dir, path)?,
-                    None => checkout.dir.clone(),
+                let dir = checkout.ensure()?;
+                let root = match &path {
+                    Some(path) => inside(&dir, path)?,
+                    None => dir,
                 };
                 (root, Some(checkout))
             }
@@ -334,10 +434,15 @@ impl Catalog {
     }
 }
 
-fn git_source(source: &Map<String, Value>) -> Result<GitSource, String> {
+fn fetched_source(source: &Map<String, Value>) -> Result<FetchedSource, String> {
     let field = |key: &str| source.get(key).and_then(Value::as_str).map(String::from);
     let required = |key: &str| field(key).ok_or_else(|| format!("plugin source needs `{key}`"));
     let (url, path) = match field("source").as_deref() {
+        Some("npm") => {
+            let package = required("package")?;
+            let source = Source::Npm { package, version: field("version"), registry: field("registry") };
+            return Ok(FetchedSource { source, path: None });
+        }
         Some("github") => (github_url(&required("repo")?), None),
         // Codex's may name a directory in it.
         Some("url") => (required("url")?, field("path")),
@@ -349,12 +454,13 @@ fn git_source(source: &Map<String, Value>) -> Result<GitSource, String> {
         }
         Some(other) => {
             return Err(format!(
-                "plugin source `{other}` is not supported (only relative paths, `local`, `github`, `url` and `git-subdir`)"
+                "plugin source `{other}` is not supported (only relative paths, `local`, `github`, `url`, \
+                 `git-subdir` and `npm`)"
             ));
         }
         None => return Err("plugin source has no `source` type".into()),
     };
-    Ok(GitSource { url, git_ref: field("ref"), sha: field("sha"), path })
+    Ok(FetchedSource { source: Source::Git { url, git_ref: field("ref"), sha: field("sha") }, path })
 }
 
 fn github_url(repo: &str) -> String {
@@ -365,7 +471,7 @@ impl Loaded {
     /// Loads the plugin in `root`, with its marketplace `entry` (which
     /// stands in for a missing `plugin.json`), as `id` (else
     /// `<name>@inline`).
-    fn add(&mut self, id: Option<&str>, root: &Path, entry: Option<&Value>, home: &Path) -> Result<(), String> {
+    fn add(&mut self, id: Option<&str>, root: &Path, entry: Option<&Value>, context: &Context) -> Result<(), String> {
         let root = std::path::absolute(root).map_err(|e| e.to_string())?;
         if !root.is_dir() {
             return Err(format!("{} is not a directory", root.display()));
@@ -391,11 +497,18 @@ impl Loaded {
             return Err(format!("invalid plugin name `{name}`"));
         }
         let id = id.map_or_else(|| format!("{name}@inline"), String::from);
-        let data = home.join("data").join(sanitize(&id));
+        let data = context.home.join("data").join(sanitize(&id));
         let _ = std::fs::create_dir_all(&data);
-        let dirs = PluginDirs { root: root.clone(), data };
+        let (options, answers, unconfigured) = user_config(&manifest, &id, context);
+        let dirs = PluginDirs { root: root.clone(), data, options: answers };
 
         let mut warnings = Vec::new();
+        if !unconfigured.is_empty() {
+            warnings.push(format!(
+                "it needs settings it does not have ({}): run `harness plugin configure {id}`",
+                unconfigured.join(", ")
+            ));
+        }
         let mut parts = Vec::new();
         let mut count = |n: usize, what: &str| {
             if n > 0 {
@@ -410,6 +523,8 @@ impl Loaded {
         count(agents, "agent");
         let servers = self.add_mcp_servers(&manifest, &name, &dirs, &mut warnings);
         count(servers, "MCP server");
+        let servers = self.add_lsp_servers(&manifest, &name, &dirs, &mut warnings);
+        count(servers, "LSP server");
         let events = self.add_hooks(&manifest, &dirs, &mut warnings);
         if !events.is_empty() {
             parts.push(format!("hooks ({})", events.join(", ")));
@@ -421,13 +536,17 @@ impl Loaded {
         if manifest.get("apps").is_some() || root.join(".app.json").is_file() {
             warnings.push("its apps (Codex's ChatGPT connectors) are not supported; left out".into());
         }
-        self.warnings.extend(warnings.into_iter().map(|w| format!("plugin {id}: {w}")));
+        self.warnings.extend(warnings.iter().map(|w| format!("plugin {id}: {w}")));
         self.plugins.list.push(Plugin {
             id,
             description: manifest["description"].as_str().map(String::from),
             version: manifest["version"].as_str().map(String::from),
+            ignored: ignored_parts(&manifest, &root),
             root: Some(root),
             outcome: Ok(parts),
+            warnings,
+            options,
+            unconfigured,
         });
         Ok(())
     }
@@ -564,7 +683,7 @@ impl Loaded {
         }
         let mut events = Vec::new();
         for set in sets {
-            for (event, groups) in hooks::plugin_config(&set, &dirs.env(), warnings) {
+            for (event, groups) in hooks::plugin_config(&set, dirs, warnings) {
                 if !events.contains(&event.as_str().to_string()) {
                     events.push(event.as_str().to_string());
                 }
@@ -637,6 +756,112 @@ impl Loaded {
                     count += 1;
                 }
                 Err(e) => warnings.push(format!("MCP server `{server}`: {e}; left out")),
+            }
+        }
+        count
+    }
+}
+
+/// The settings a plugin's manifest asks for (`userConfig`), the answers
+/// to them (the user's, else the defaults), and the keys of those with
+/// neither.
+fn user_config(manifest: &Value, id: &str, context: &Context) -> (Vec<OptionSpec>, Vec<PluginOption>, Vec<String>) {
+    let (mut specs, mut answers, mut unconfigured) = (Vec::new(), Vec::new(), Vec::new());
+    let Some(declared) = manifest["userConfig"].as_object() else { return (specs, answers, unconfigured) };
+    let saved = context.settings.plugin_configs.get(id).map(|c| &c.options);
+    let secrets = context.secrets.get(id).and_then(Value::as_object);
+    for (key, spec) in declared {
+        let text = |field: &str| spec[field].as_str().map(String::from);
+        let option = OptionSpec {
+            key: key.clone(),
+            title: text("title"),
+            description: text("description"),
+            kind: text("type").unwrap_or_else(|| "string".into()),
+            sensitive: spec["sensitive"] == true,
+            default: spec.get("default").filter(|d| !d.is_null()).cloned(),
+        };
+        let stored = if option.sensitive { secrets.and_then(|s| s.get(key)) } else { saved.and_then(|s| s.get(key)) };
+        match stored.filter(|v| !v.is_null()).or(option.default.as_ref()) {
+            Some(value) => answers.push(PluginOption { key: key.clone(), value: option_text(value), sensitive: option.sensitive }),
+            None if spec["required"] == false => {
+                answers.push(PluginOption { key: key.clone(), value: String::new(), sensitive: option.sensitive });
+            }
+            None => unconfigured.push(key.clone()),
+        }
+        specs.push(option);
+    }
+    (specs, answers, unconfigured)
+}
+
+/// A setting's value as it is put into text: a string as it is.
+fn option_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// What the plugin has that the harness does not use.
+fn ignored_parts(manifest: &Value, root: &Path) -> Vec<String> {
+    let mut ignored = Vec::new();
+    for (key, default, what) in [
+        ("outputStyles", "output-styles", "output styles"),
+        ("monitors", "monitors/monitors.json", "monitors"),
+        ("channels", "", "channels"),
+    ] {
+        if !manifest[key].is_null() || (!default.is_empty() && root.join(default).exists()) {
+            ignored.push(what.to_string());
+        }
+    }
+    if root.join("settings.json").is_file() {
+        ignored.push("default settings (settings.json)".into());
+    }
+    let dependencies: Vec<String> = match &manifest["dependencies"] {
+        Value::Object(map) => map.keys().cloned().collect(),
+        list => items(list).into_iter().filter_map(|d| d.as_str().or(d["name"].as_str()).map(String::from)).collect(),
+    };
+    if !dependencies.is_empty() {
+        ignored.push(format!("dependencies, which are not installed with it ({})", dependencies.join(", ")));
+    }
+    ignored
+}
+
+impl Loaded {
+    /// `.lsp.json` and what the manifest's `lspServers` adds (files or the
+    /// servers inline), as `plugin:<plugin>:<server>`.
+    fn add_lsp_servers(&mut self, manifest: &Value, name: &str, dirs: &PluginDirs, warnings: &mut Vec<String>) -> usize {
+        let mut servers = Map::new();
+        let default = dirs.root.join(".lsp.json");
+        if default.is_file() {
+            match read_json(&default) {
+                Ok(Value::Object(file)) => servers.extend(file),
+                Ok(_) => warnings.push(format!("{}: expected an object of servers", default.display())),
+                Err(e) => warnings.push(e),
+            }
+        }
+        for item in items(&manifest["lspServers"]) {
+            match item {
+                Value::String(path) => match inside(&dirs.root, path).and_then(|file| read_json(&file)) {
+                    Ok(Value::Object(file)) => servers.extend(file),
+                    Ok(_) => warnings.push(format!("{path}: expected an object of servers")),
+                    Err(e) => warnings.push(e),
+                },
+                Value::Object(inline) => servers.extend(inline.clone()),
+                _ => warnings.push("lspServers: expected a path or an object of servers".into()),
+            }
+        }
+        let mut count = 0;
+        for (server, mut config) in servers {
+            expand_strings(&mut config, dirs);
+            match lsp::ServerConfig::from_json(&config) {
+                Ok(mut config) => {
+                    for (key, value) in dirs.env() {
+                        config.env.entry(key).or_insert(value);
+                    }
+                    self.lsp_servers.insert(format!("plugin:{name}:{server}"), config);
+                    count += 1;
+                }
+                Err(e) => warnings.push(format!("LSP server `{server}`: {e}; left out")),
             }
         }
         count
@@ -813,9 +1038,10 @@ mod tests {
         ("agents/reviewer.md", "---\ndescription: Reviews\ntools: Read, Grep, Glob, LS\nmodel: sonnet\n---\nUse ${CLAUDE_PLUGIN_ROOT}.\n"),
         (
             "hooks/hooks.json",
-            r#"{"description": "x", "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/fmt.sh\""}]}], "Notification": []}}"#,
+            r#"{"description": "x", "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/fmt.sh\""}]}], "PermissionRequest": []}}"#,
         ),
         (".mcp.json", r#"{"db": {"command": "${CLAUDE_PLUGIN_ROOT}/server", "args": ["--data", "${CLAUDE_PLUGIN_DATA}"]}}"#),
+        (".lsp.json", r#"{"c": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/lsp", "extensionToLanguage": {".c": "c", ".h": "c"}}}"#),
         ("bin/kit-tool", "#!/bin/sh\n"),
     ];
 
@@ -832,8 +1058,12 @@ mod tests {
         assert_eq!(plugin.version.as_deref(), Some("1.2.0"));
         assert_eq!(
             plugin.outcome.as_ref().unwrap(),
-            &["1 skill", "2 commands", "1 agent", "1 MCP server", "hooks (PostToolUse)", "bin/"]
+            &["1 skill", "2 commands", "1 agent", "1 MCP server", "1 LSP server", "hooks (PostToolUse)", "bin/"]
         );
+        let lsp = &loaded.lsp_servers["plugin:kit:c"];
+        assert_eq!(lsp.command, root.join("bin/lsp").display().to_string());
+        assert_eq!(lsp.extensions.keys().collect::<Vec<_>>(), ["c", "h"]);
+        assert!(lsp.env.contains_key("CLAUDE_PLUGIN_ROOT"));
         let names: Vec<&str> = loaded.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["kit:review", "kit:commit", "kit:db:migrate"]);
         let migrate = &loaded.skills[2];
@@ -850,7 +1080,8 @@ mod tests {
         assert_eq!(loaded.mcp_servers.keys().collect::<Vec<_>>(), ["plugin:kit:db"]);
         assert_eq!(loaded.bin_dirs, [root.join("bin")]);
         assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
-        assert!(loaded.warnings[0].starts_with("plugin kit@inline: hook event `Notification`"));
+        assert!(loaded.warnings[0].starts_with("plugin kit@inline: hook event `PermissionRequest`"));
+        assert_eq!(plugin.warnings.len(), 1);
         assert!(home.join("data/kit-inline").is_dir());
     }
 
@@ -898,7 +1129,7 @@ mod tests {
                 {"name": "fmt", "source": "./tools/fmt", "description": "Formats"},
                 {"name": "bare", "source": "bare"},
                 {"name": "solo", "source": {"source": "url", "url": format!("file://{}", solo.display())}},
-                {"name": "npm-one", "source": {"source": "npm", "package": "x"}},
+                {"name": "archived", "source": {"source": "archive", "url": "https://e.com/x.zip"}},
                 {"name": "escape", "source": "./../x"}
             ]
         });
@@ -908,7 +1139,7 @@ mod tests {
             ("plugins/bare/commands/b.md", "Bare\n"),
         ]);
         let s = settings(&format!(
-            r#"{{"enabledPlugins": {{"fmt@team": true, "bare@team": true, "solo@team": true, "npm-one@team": true,
+            r#"{{"enabledPlugins": {{"fmt@team": true, "bare@team": true, "solo@team": true, "archived@team": true,
                  "escape@team": true, "off@team": false, "x@nowhere": true, "noat": true}},
                 "extraKnownMarketplaces": {{"team": {{"source": {{"source": "git", "url": "file://{}"}}}}}}}}"#,
             market.display()
@@ -919,15 +1150,20 @@ mod tests {
         assert_eq!(outcomes["fmt@team"], Ok(&vec!["1 command".to_string()]));
         assert_eq!(outcomes["bare@team"], Ok(&vec!["1 command".to_string()]));
         assert_eq!(outcomes["solo@team"], Ok(&vec!["1 skill".to_string()]));
-        assert!(outcomes["npm-one@team"].unwrap_err().contains("`npm` is not supported"));
+        assert!(outcomes["archived@team"].unwrap_err().contains("`archive` is not supported"));
         assert!(outcomes["escape@team"].unwrap_err().contains("leaves the plugin's directory"));
         assert!(outcomes["x@nowhere"].unwrap_err().contains("unknown marketplace `nowhere`"));
         assert!(outcomes["noat"].unwrap_err().contains("<plugin>@<marketplace>"));
         assert!(!outcomes.contains_key("off@team"));
         let names: Vec<&str> = loaded.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["bare:b", "fmt:go", "solo:hi"]);
-        assert!(home.join("marketplaces/team/.claude-plugin/marketplace.json").is_file());
-        assert!(home.join("cache/team/solo/skills").is_dir());
+        // Each in a directory named after its version.
+        let version = |dir: &str| {
+            let current: Value = serde_json::from_str(&std::fs::read_to_string(home.join(dir).join("current")).unwrap()).unwrap();
+            home.join(dir).join(current["version"].as_str().unwrap())
+        };
+        assert!(version("marketplaces/team").join(".claude-plugin/marketplace.json").is_file());
+        assert!(version("cache/team/solo").join("skills").is_dir());
         // The marketplace once, however many plugins come from it, and the
         // plugin in a repository of its own.
         let labels: Vec<&str> = loaded.plugins.checkouts.iter().map(|c| c.label.as_str()).collect();

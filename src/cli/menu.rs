@@ -45,7 +45,7 @@ pub enum Kind {
 }
 
 pub struct Menu {
-    commands: Vec<Command>,
+    commands: Mutex<Vec<Command>>,
     /// Relative paths are listed and searched against this directory.
     base: PathBuf,
     /// Project files and directories, built on the first `@` search.
@@ -69,7 +69,12 @@ struct State {
 
 impl Menu {
     pub fn new(commands: Vec<Command>, base: impl Into<PathBuf>) -> Self {
-        Self { commands, base: base.into(), index: Mutex::default(), state: Mutex::default() }
+        Self { commands: Mutex::new(commands), base: base.into(), index: Mutex::default(), state: Mutex::default() }
+    }
+
+    /// Offers `commands` from now on.
+    pub fn set_commands(&self, commands: Vec<Command>) {
+        *self.commands.lock().unwrap() = commands;
     }
 
     /// Drops the file index, so the next `@` search sees new files.
@@ -175,6 +180,8 @@ impl Menu {
     fn command_items(&self, line: &str) -> Vec<Item> {
         let words = line.split(' ').count();
         self.commands
+            .lock()
+            .unwrap()
             .iter()
             .filter(|c| c.name.starts_with(line) && c.name.split(' ').count() == words)
             .map(|c| Item { text: c.name.clone(), description: c.description.clone() })

@@ -112,7 +112,7 @@ pub struct ReplHelper {
     menu: Arc<Menu>,
     pasted: Arc<Mutex<Pasted>>,
     /// Command names, for Tab completion when the menu is not shown.
-    names: Vec<String>,
+    names: Mutex<Vec<String>>,
     /// Whether the line is drawn in the input box, with styles.
     styled: bool,
     wake: Option<Arc<Wake>>,
@@ -138,9 +138,15 @@ struct Pin {
 
 impl ReplHelper {
     pub fn new(commands: Vec<Command>, styled: bool, wake: Option<Arc<Wake>>) -> Self {
-        let names = commands.iter().map(|c| c.name.clone()).collect();
+        let names = Mutex::new(commands.iter().map(|c| c.name.clone()).collect());
         let menu = Arc::new(Menu::new(commands, "."));
         Self { menu, pasted: Arc::default(), names, styled, wake, shown: Mutex::default(), pin: Mutex::default() }
+    }
+
+    /// Offers `commands` from now on, e.g. after the plugins were reloaded.
+    pub fn set_commands(&self, commands: Vec<Command>) {
+        *self.names.lock().unwrap() = commands.iter().map(|c| c.name.clone()).collect();
+        self.menu.set_commands(commands);
     }
 
     /// Puts the input box of the next line read, starting with `initial`,
@@ -529,7 +535,7 @@ impl Completer for ReplHelper {
         if let Some((start, text)) = self.menu.take_pick() {
             return Ok((start, vec![Pair { display: text.clone(), replacement: text }]));
         }
-        Ok(complete(line, pos, &self.names, Path::new(".")))
+        Ok(complete(line, pos, &self.names.lock().unwrap(), Path::new(".")))
     }
 }
 

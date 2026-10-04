@@ -34,7 +34,7 @@ use crate::llm::{Client, Providers};
 use crate::mentions;
 use crate::settings::{self, Settings};
 use crate::skills::Skill;
-use crate::subagent::{AgentDef, AgentTool, MessageAgentTool, Reporter, StopAgentTool};
+use crate::subagent::{AgentDef, AgentTool, Forks, MessageAgentTool, Reporter, StopAgentTool};
 use crate::tools::{FileTracker, ToolRegistry};
 
 use tasks::{Task, Work};
@@ -57,6 +57,8 @@ pub struct Setup {
     /// The enabled plugins, as shown in the UI.
     pub plugins: Value,
     pub reporter: Reporter,
+    /// Runs skills that fork, with the current `agent` tool.
+    pub forks: Forks,
 }
 
 /// The parts that change when the providers are reloaded.
@@ -83,6 +85,7 @@ struct AppState {
     mcp: Value,
     plugins: Value,
     reporter: Reporter,
+    forks: Forks,
     live: RwLock<Live>,
     tasks: Mutex<BTreeMap<u64, Arc<Task>>>,
     next_id: AtomicU64,
@@ -115,7 +118,7 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
     let loopback = addr.ip().is_loopback();
     let token = std::env::var("HARNESS_WEB_TOKEN").ok().filter(|t| !t.is_empty()).unwrap_or_else(random_token);
 
-    let live = build_live(&setup.tools, &setup.agent_defs, &setup.reporter, setup.providers);
+    let live = build_live(&setup.tools, &setup.agent_defs, &setup.reporter, &setup.forks, setup.providers);
     if let Err(e) = &live.model {
         eprintln!("\x1b[33mno usable model yet ({e}); configure one in the web UI\x1b[0m");
     }
@@ -126,6 +129,7 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
         mcp: setup.mcp,
         plugins: setup.plugins,
         reporter: setup.reporter,
+        forks: setup.forks,
         live: RwLock::new(live),
         tasks: Mutex::new(BTreeMap::new()),
         next_id: AtomicU64::new(1),
@@ -165,10 +169,17 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
     Ok(())
 }
 
-fn build_live(base: &ToolRegistry, defs: &Arc<Vec<AgentDef>>, reporter: &Reporter, providers: Result<Providers>) -> Live {
+fn build_live(
+    base: &ToolRegistry,
+    defs: &Arc<Vec<AgentDef>>,
+    reporter: &Reporter,
+    forks: &Forks,
+    providers: Result<Providers>,
+) -> Live {
     let mut tools = base.clone();
     let model = providers.and_then(Client::new).map_err(|e| format!("{e:#}")).map(|client| {
         let agent_tool = Arc::new(AgentTool::new(defs.clone(), base.clone(), client.clone(), reporter.clone()));
+        forks.set(&agent_tool);
         tools.register_arc(agent_tool.clone());
         tools.register(MessageAgentTool);
         tools.register(StopAgentTool);
@@ -354,9 +365,9 @@ async fn save_config(State(state): State<Shared>, Json(req): Json<SaveConfig>) -
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| bad_request(format!("creating {}: {e}", dir.display())))?;
     }
-    write_private(path, &req.text).map_err(|e| bad_request(format!("writing {}: {e}", path.display())))?;
+    settings::write_private(path, &req.text).map_err(|e| bad_request(format!("writing {}: {e}", path.display())))?;
 
-    let live = build_live(&state.base_tools, &state.agent_defs, &state.reporter, Ok(providers));
+    let live = build_live(&state.base_tools, &state.agent_defs, &state.reporter, &state.forks, Ok(providers));
     // Idle tasks move to the new providers, keeping their model if it still
     // resolves; running ones keep the old config for this conversation.
     let tasks: Vec<Arc<Task>> = state.tasks.lock().unwrap().values().cloned().collect();
@@ -374,16 +385,6 @@ async fn save_config(State(state): State<Shared>, Json(req): Json<SaveConfig>) -
     *state.live.write().unwrap() = live;
     let info = info(State(state)).await.0;
     Ok(Json(json!({"info": info, "running_tasks_kept_old_config": skipped})))
-}
-
-/// Writes a file only its owner can read, as it may hold API keys; an
-/// existing file is narrowed to that too.
-fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(text.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -430,9 +431,11 @@ async fn call_tool(
 // ---------------------------------------------------------------------------
 // Tasks
 
-/// The message content for `line`: `/<skill> args` loads that skill, and
-/// `@path` mentions are attached. Also returns the user event for the log.
-async fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiResult<(Vec<Value>, Value)> {
+/// What a task does for `line`: a turn on its message, where `/<skill>
+/// args` loads that skill (or runs it in a subagent first, if it forks)
+/// and `@path` mentions are attached. Also returns the user event for the
+/// log.
+async fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiResult<(Work, Value)> {
     let prompt = match line.strip_prefix('/') {
         Some(command) => {
             let (name, args) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
@@ -441,6 +444,10 @@ async fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiR
                 .iter()
                 .find(|s| s.name == name && s.user_invocable)
                 .ok_or_else(|| bad_request(format!("unknown skill /{name}")))?;
+            if skill.fork.is_some() {
+                let user = json!({"type": "user", "text": line, "attachments": [], "warnings": []});
+                return Ok((Work::Fork(Box::new(skill.clone()), args.to_string()), user));
+            }
             skill.invocation_prompt(args).await.map_err(bad_request)?
         }
         None => line.to_string(),
@@ -452,7 +459,7 @@ async fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiR
         "attachments": expanded.attachments.iter().map(|a| a.label.clone()).collect::<Vec<_>>(),
         "warnings": expanded.warnings,
     });
-    Ok((expanded.into_content(&prompt), event))
+    Ok((Work::Turn(expanded.into_content(&prompt)), event))
 }
 
 fn title_for(prompt: &str) -> String {
@@ -524,12 +531,12 @@ async fn create_task(State(state): State<Shared>, Json(req): Json<NewTask>) -> A
         };
         Agent::new(client, tools, system)
     };
-    let (content, user) = user_message(&state, prompt, &files).await?;
+    let (work, user) = user_message(&state, prompt, &files).await?;
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let title = req.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| title_for(prompt));
-    let task = Task::new(id, title, def, files, agent);
+    let task = Task::new(id, title, def, files, agent, state.forks.clone());
     state.tasks.lock().unwrap().insert(id, task.clone());
-    task.start_turn(content, user).map_err(bad_request)?;
+    task.start(work, user).map_err(bad_request)?;
     Ok(Json(task.summary()))
 }
 
@@ -553,10 +560,7 @@ async fn send_message(
             let focus = Some(focus.trim()).filter(|f| !f.is_empty()).map(String::from);
             (Work::Compact(focus), json!({"type": "user", "text": prompt, "attachments": [], "warnings": []}))
         }
-        None => {
-            let (content, user) = user_message(&state, prompt, &task.files).await?;
-            (Work::Turn(content), user)
-        }
+        None => user_message(&state, prompt, &task.files).await?,
     };
     task.start(work, user).map_err(|e| api_error(StatusCode::CONFLICT, e))?;
     Ok(Json(task.summary()))
@@ -671,20 +675,6 @@ mod tests {
         assert_eq!(mask("sk-ant-api03-abcdefgh"), "sk-a…efgh");
     }
 
-    #[test]
-    fn private_config_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("settings.json");
-        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        write_private(&path, "{}").unwrap();
-        assert_eq!(mode(&path), 0o600);
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_private(&path, "{\"a\": 1}").unwrap();
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\": 1}");
-    }
 
     #[test]
     fn titles() {

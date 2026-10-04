@@ -25,6 +25,8 @@ harness --continue                      # resume the latest conversation here (s
 harness --web                           # web UI at http://localhost:8787 (see below)
 harness --sandbox                       # run the model's commands in an OS sandbox (see below)
 harness --plugin-dir ./my-plugin        # load a plugin from a directory for this run (see below)
+harness plugin install fmt@team         # install a plugin (see below; harness plugin help)
+harness --check-plugins                 # report what each enabled plugin loads, and what not
 harness --help                          # all options
 ```
 
@@ -62,7 +64,7 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 | `mcpServers` | [MCP servers](#mcp-servers) |
 | `sandbox` | the [sandbox](#sandbox) |
 | `hooks` | [hooks](#hooks) |
-| `enabledPlugins`, `extraKnownMarketplaces` | [plugins](#plugins) |
+| `enabledPlugins`, `extraKnownMarketplaces`, `pluginConfigs` | [plugins](#plugins) |
 
 Every key is optional, and unknown keys are an error. Nothing is read from the project directory (a project's `.mcp.json` included): a repository could otherwise send requests carrying your API keys to its own server, start MCP commands or hooks, or loosen the sandbox. The project's `.harness/agents`, `.harness/skills` and their `.claude/` counterparts are still read, as they only add prompts (a skill's `` !`command` `` lines run like the model's own `bash` commands, in the sandbox when it is on). Plugins, whose hooks and MCP servers run commands outside it, are enabled only here. Older versions read `~/.harness/providers.json`, `mcp.json` and `sandbox.json`; the harness warns while they exist, and their contents go under the keys above (`default_model` is now `model`).
 
@@ -176,7 +178,8 @@ The prompt is an input box between two rules that stays on the bottom rows of th
 | `/tasks` | list the subagents this conversation started (id, status, model, tool calls, time) and its [background commands](#background-commands) |
 | `/stop [id]` | stop a running subagent or background command (`shell_1`), or all of them (see [Subagents](#subagents)) |
 | `/mcp` | list MCP servers, their tools and log files |
-| `/plugins` | list the enabled plugins and what each adds; `/plugins update` fetches their latest versions (see [Plugins](#plugins)) |
+| `/plugins [command]` | list the enabled plugins and what each adds; `/plugins update` fetches their latest versions, and `/plugins install`, `uninstall`, `enable`, `disable`, `configure`, `marketplace …` work as `harness plugin` does (see [Plugins](#plugins)) |
+| `/reload-plugins` | load the plugins, skills, commands, agents and hooks again from the settings, for the next conversation: at once if this one is empty, else from `/clear` or `/resume` on |
 | `/sandbox` | show what the sandbox allows (see [Sandbox](#sandbox)) |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
 | `/exit`, `exit`, Ctrl-D | quit (`exit` or `quit` only when alone on the line) |
@@ -220,7 +223,7 @@ They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r
 - **Network**: loopback only (local servers and tests work; DNS and outbound connections fail), unless `"network": true`.
 - Commands run in a new session without a terminal. On Linux they also get their own PID namespace, so background jobs end with the command; on macOS, setuid programs (`sudo`, `ps`) cannot run.
 
-The `read`, `edit` and `write` tools check the same rules. `/sandbox` shows them, the REPL banner says `sandboxed`, and the system prompt tells the model the limits, so it reports a blocked action instead of working around it. MCP servers, [hooks](#hooks) and the harness itself are not sandboxed.
+The `read`, `edit`, `write` and `lsp` tools check the same rules. `/sandbox` shows them, the REPL banner says `sandboxed`, and the system prompt tells the model the limits, so it reports a blocked action instead of working around it. MCP and language servers, [hooks](#hooks) and the harness itself are not sandboxed.
 
 ```json
 {
@@ -270,6 +273,12 @@ Hooks run your own commands at points of the agent loop: to block dangerous comm
     ],
     "PostToolUse": [
       { "matcher": "Edit|Write", "hooks": [{ "type": "command", "command": "~/.harness/hooks/format.sh", "timeout": 30 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "prompt", "prompt": "Did the agent run the tests after its last change? $ARGUMENTS" }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "terminal-notifier", "args": ["-message", "harness is waiting"] }] }
     ]
   }
 }
@@ -288,14 +297,16 @@ Hooks run your own commands at points of the agent loop: to block dangerous comm
 | `PostCompact` | after it was compacted | `manual`, `auto` | nothing; it gets the summary |
 | `SessionStart` | before the first request of a conversation, and after `/clear`, `/resume` or a compaction | `startup`, `clear`, `resume`, `compact` | add context |
 | `SessionEnd` | when a conversation that sent a request ends: before `/clear` or `/resume` replaces it, when you quit the REPL, at the end of a one-shot run, when its web task is deleted | `clear`, `resume`, `prompt_input_exit`, `other` | nothing; it gets 1.5 s unless it sets `timeout` (at most 60 s) |
+| `Notification` | when the REPL's prompt, or a web task, has waited 60 s for you after a turn | `idle_prompt` | nothing; it gets `notification_type` and `message`, e.g. to show a desktop notification |
 
-- A hook runs as `sh -c <command>` in the working directory, outside the sandbox, with `$CLAUDE_PROJECT_DIR` and `$HARNESS_PROJECT_DIR` set to it. It gets the event as JSON on stdin: `session_id`, `transcript_path` (the saved session file), `cwd`, `hook_event_name`, `model`, `permission_mode` (always `bypassPermissions`: the harness never asks before running a tool), `agent_id` and `agent_type` in a subagent, and the event's own fields (`tool_name`, `tool_use_id`, `tool_input`, `tool_response` or `error`; `prompt`; `stop_hook_active`, `last_assistant_message`; `trigger`, `custom_instructions`, `compact_summary`; `source`, `reason`).
+- A hook runs as `sh -c <command>` in the working directory, outside the sandbox, with `$CLAUDE_PROJECT_DIR` and `$HARNESS_PROJECT_DIR` set to it. With `args` (a list of strings), `command` is started directly with them instead, without a shell, so nothing in them is expanded or split (a plugin's `${CLAUDE_PLUGIN_ROOT}` and the like are still replaced). It gets the event as JSON on stdin: `session_id`, `transcript_path` (the saved session file), `cwd`, `hook_event_name`, `model`, `permission_mode` (always `bypassPermissions`: the harness never asks before running a tool), `agent_id` and `agent_type` in a subagent, and the event's own fields (`tool_name`, `tool_use_id`, `tool_input`, `tool_response` or `error`; `prompt`; `stop_hook_active`, `last_assistant_message`; `trigger`, `custom_instructions`, `compact_summary`; `source`, `reason`).
 - Exit code 0: stdout is read as JSON if it starts with `{` (`continue` / `stopReason`, `systemMessage`, `decision` / `reason`, `hookSpecificOutput`), otherwise it is context for the model for `SessionStart`, `SubagentStart` and `UserPromptSubmit`, and ignored for the rest. Exit code 2 blocks, with stderr as the reason. Another exit code, a timeout (`timeout`, in seconds, default 600) or bad JSON is shown to you and changes nothing. `continue: false` ends the turn.
-- Tools also match, and appear to hooks, under their Claude Code names: `bash` is `Bash`, `read` / `edit` / `write` / `grep` / `glob` are `Read` / `Edit` / `Write` / `Grep` / `Glob`, `agent` is `Agent` (or `Task`); MCP tools keep `mcp__<server>__<tool>`. A matcher made of names (`Edit|Write`) matches them exactly, anything else is a regular expression (`mcp__fs__.*`), and an empty one or `*` matches everything. The file tools' `path` also comes as `file_path`, and an `updatedInput` may use either.
+- Tools also match, and appear to hooks, under their Claude Code names: `bash` is `Bash`, `read` / `edit` / `write` / `grep` / `glob` / `lsp` are `Read` / `Edit` / `Write` / `Grep` / `Glob` / `LSP`, `agent` is `Agent` (or `Task`); MCP tools keep `mcp__<server>__<tool>`. A matcher made of names (`Edit|Write`) matches them exactly, anything else is a regular expression (`mcp__fs__.*`), and an empty one or `*` matches everything. The file tools' `path` also comes as `file_path`, and an `updatedInput` may use either.
 - `permissionDecision: "ask"` refuses the call, as there is no one to ask.
+- A `prompt` hook (`{"type": "prompt", "prompt": "…", "model": "…", "timeout": 30}`) asks a model instead of running a command: the conversation's, or `model` when it names one the providers know (Claude Code's `haiku` and the like do not). The event's input JSON goes in place of `$ARGUMENTS` in the prompt (after it, without one), and the model answers `{"ok": true}` or `{"ok": false, "reason": "…"}`; `ok: false` acts like exit code 2 with the reason, so a Stop prompt hook sends the model back to work. It gets 30 s unless it sets `timeout`; its requests are not counted in `/usage`.
 - All the hooks matching an event run at once; a command listed twice runs once. Hooks run in subagents too (`SubagentStop` instead of `Stop`) and in web tasks.
 - What hooks tell the model arrives in `<hook-feedback>` blocks; what they have for you (a `systemMessage`, a refusal, a failure) shows as a `⚑` line.
-- Only `command` hooks and the events above are supported; other hook types (`http`, `prompt`, `agent`, `mcp_tool`), `async` and other events are an error in the settings (a [plugin](#plugins)'s are left out with a warning). Hooks come only from the settings file and the plugins it enables, so a repository cannot add any; changes apply on the next start.
+- Only `command` and `prompt` hooks and the events above are supported; other hook types (`http`, `agent`, `mcp_tool`), `async` and other events (`PermissionRequest`, …) are an error in the settings (a [plugin](#plugins)'s are left out with a warning). Hooks come only from the settings file and the plugins it enables, so a repository cannot add any; changes apply on the next start, or to the next conversation after `/reload-plugins`.
 
 ## Project notes
 
@@ -320,6 +331,7 @@ As in Claude Code:
 - `$ARGUMENTS` in the body is replaced by the arguments, `$ARGUMENTS[N]` or `$N` by the Nth (from 0, split like a shell would), and `$name` by the one at the position of `name` in the frontmatter's `arguments` list; `\$` keeps a `$`. Arguments no placeholder took are appended as `ARGUMENTS: …`. `${CLAUDE_SKILL_DIR}` and `${CLAUDE_PROJECT_DIR}` are replaced by the skill's and the working directory.
 - `` !`command` `` (at the start of a line or after a space) and ```` ```! ```` blocks are run when the skill is loaded, and replaced by what they print. They run like `bash` tool commands, in the sandbox when it is on; one that fails stops the skill from loading. A read-only subagent gets the `skill` tool only while no skill the model can load has such commands.
 - `disable-model-invocation: true` keeps the model from loading a skill (only `/<name>` runs it); `user-invocable: false` keeps it out of the `/` commands.
+- `context: fork` runs the skill in a [subagent](#subagents) of its own: loading it starts one with the skill's text as its prompt, and only its report comes back (for `/<name>`, the report goes to the model, which takes it from there). `agent` picks the subagent type (default `general-purpose`), `model` its model (`<provider>/<model>`; `sonnet`, `opus`, `haiku` and `inherit` mean the default), and `allowed-tools` (`Read, Grep, Bash(git status:*)`; what is in parentheses is ignored) leaves it only those of its agent's tools. A subagent, which starts no subagents, loads such a skill in place instead.
 
 Claude Code's commands, the older form of a skill, work too: each Markdown file in `.harness/commands/`, `.claude/commands/` or the same under `~` (earlier wins) runs as `/<file name>`, and a subdirectory adds a part (`frontend/component.md` is `/frontend:component`). They take the same frontmatter (`description`, else their first line describes them) and placeholders, and the model can load them through the `skill` tool unless `disable-model-invocation` is set. A skill wins over a command of the same name.
 
@@ -358,7 +370,18 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 
 ## Plugins
 
-Plugins are in [Claude Code's format](https://code.claude.com/docs/en/plugins-reference): a directory bundling skills, commands, subagents, hooks and MCP servers, usually installed from a marketplace (a repository listing plugins in `.claude-plugin/marketplace.json`). [Codex's plugins](https://developers.openai.com/codex/plugins/build) load as well (see below). Enable them in the [settings](#settings) under Claude Code's keys, by `<plugin>@<marketplace>`:
+Plugins are in [Claude Code's format](https://code.claude.com/docs/en/plugins-reference): a directory bundling skills, commands, subagents, hooks, MCP and language servers, usually installed from a marketplace (a repository listing plugins in `.claude-plugin/marketplace.json`). [Codex's plugins](https://developers.openai.com/codex/plugins/build) load as well (see below). `harness plugin` installs and manages them (`/plugins …` in the REPL does the same):
+
+```sh
+harness plugin marketplace add your-org/plugins   # owner/repo, a git URL (#ref for a branch or tag), a directory or a marketplace.json
+harness plugin install fmt@team                   # fetch it, enable it, and ask for the settings it needs
+harness plugin list --available                   # the installed ones, and what the known marketplaces offer
+harness plugin disable fmt@team                   # also: enable, uninstall [--keep-data], configure, update
+harness plugin marketplace remove team            # also: marketplace list; add --auto-update
+harness --check-plugins                           # load them all, say what loaded and what not, and exit
+```
+
+They edit the [settings](#settings), keeping the rest of the file as it is; plugins are enabled there under Claude Code's keys, by `<plugin>@<marketplace>`, which you may also write yourself:
 
 ```json
 {
@@ -367,14 +390,19 @@ Plugins are in [Claude Code's format](https://code.claude.com/docs/en/plugins-re
     "fmt@team": true
   },
   "extraKnownMarketplaces": {
-    "team": { "source": { "source": "github", "repo": "your-org/plugins" } }
+    "team": { "source": { "source": "github", "repo": "your-org/plugins" }, "autoUpdate": true }
+  },
+  "pluginConfigs": {
+    "fmt@team": { "options": { "line_width": 100 } }
   }
 }
 ```
 
 - `claude-plugins-official` ([anthropics/claude-plugins-official](https://github.com/anthropics/claude-plugins-official)) and Codex's `openai-curated` ([openai/plugins](https://github.com/openai/plugins)) are known without declaring them, and so is Codex's personal marketplace, `~/.agents/plugins/marketplace.json`, by the name it gives itself. Other marketplaces come from `github` (`repo`, `ref`, `path`), `git` (`url`, `ref`, `path`), `directory` (`path`, read in place, so edits apply at the next start) or `file` (`path` to a `marketplace.json`).
-- A marketplace's plugins may be in it (a relative path, or a bare name under `metadata.pluginRoot`) or in repositories of their own (`github`, `url` and `git-subdir` sources, with `ref` / `sha`). `npm`, `archive` and `command` sources are not supported.
-- What is missing is cloned (`git clone --depth 1`) into `~/.harness/plugins` at startup, once. `/plugins update` moves every marketplace and plugin to the latest commit of its branch (one pinned to a `sha` stays); the new versions apply at the next start. A plugin's data directory (`${CLAUDE_PLUGIN_DATA}`) is `~/.harness/plugins/data/<id>`.
+- A marketplace's plugins may be in it (a relative path, or a bare name under `metadata.pluginRoot`), in repositories of their own (`github`, `url` and `git-subdir` sources, with `ref` / `sha`), or npm packages (`npm` sources: `package`, `version`, `registry`; fetched with `npm pack --ignore-scripts`, so `npm` must be installed, and the package's scripts never run). `archive` and `command` sources are not supported.
+- What is missing is fetched at startup (`git clone --depth 1`, `npm pack`) into `~/.harness/plugins`, each kept by version: `marketplaces/<name>/<version>/` and `cache/<marketplace>/<plugin>/<version>/`, where the version is the commit or the package's version and `current` names the one in use. `/plugins update` (or `harness plugin update`) fetches the latest version of every marketplace and plugin (one pinned to a `sha` stays) beside the old one; it applies at the next start, or after `/reload-plugins`. Hooks and MCP servers already running keep reading the old version, which is deleted once no running harness process uses it.
+- A marketplace with `"autoUpdate": true` (`marketplace add --auto-update`) is fetched again in the background at every start, with its plugins; the new versions apply from the next start, and what happened goes to `~/.harness/plugins/auto-update.log`. Without it, versions move only when you update.
+- A plugin's data directory (`${CLAUDE_PLUGIN_DATA}`) is `~/.harness/plugins/data/<id>`; `uninstall` deletes it unless given `--keep-data`.
 - `--plugin-dir DIR` loads the plugin in `DIR` for one run, as `<name>@inline`, as Claude Code's flag does.
 
 Each part of a plugin is named after it, as in Claude Code:
@@ -386,20 +414,72 @@ Each part of a plugin is named after it, as in Claude Code:
 | Agents | `agents/**/*.md`, or the manifest's `agents` | `<plugin>:<name>` [subagents](#subagents) |
 | Hooks | `hooks/hooks.json` plus the manifest's `hooks` | run with yours (see [Hooks](#hooks)) |
 | MCP servers | `.mcp.json` plus the manifest's `mcpServers` | `plugin:<plugin>:<server>`, tools `mcp__plugin_<plugin>_<server>__<tool>` |
+| Language servers | `.lsp.json` plus the manifest's `lspServers` | the `lsp` tool (see [Language servers](#language-servers)) |
 | Executables | `bin/` | on the `PATH` of the model's commands, after yours |
 
 - `.claude-plugin/plugin.json` is optional; without it a marketplace entry stands in for it, and the plugin's name is the directory's. Manifest paths must stay inside the plugin.
 - Codex's and Cursor's layouts are found too: catalogs in `.agents/plugins/marketplace.json` or `.cursor-plugin/marketplace.json` (their paths start from the directory holding `.agents/`), `local` sources and `url` sources with a `path`, manifests in `.codex-plugin/plugin.json` or `.cursor-plugin/plugin.json`, and an [Agent Plugins](https://agent-plugins.org) `plugin.json` at the root (skills in `skills/`, MCP servers in `mcp.json`, hooks under `extensions."com.openai"`). Hooks and MCP servers also get Codex's `PLUGIN_ROOT` / `PLUGIN_DATA`. Codex's apps (ChatGPT connectors) are left out, and of its MCP settings `cwd` is kept (inside the plugin) while comments and timeouts are dropped.
-- `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` (or `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`) are replaced in hook commands, MCP server configs, and skill, command and agent text; hooks and stdio MCP servers also get them as environment variables.
+- `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` (or `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`) are replaced in hook commands, MCP and language server configs, and skill, command and agent text; hooks and stdio MCP and language servers also get them as environment variables.
+- A plugin's `userConfig` declares settings it needs (`type`: `string`, `number`, `boolean`, `directory` or `file`; `title`, `description`, `default`, `sensitive`). `install` and `configure` ask for them; the answers go under `pluginConfigs` in the settings, except `sensitive` ones, which go to `~/.harness/plugins/secrets.json` (readable only by you). They replace `${user_config.<key>}` in hook commands and MCP and language server configs, and, unless sensitive, in skill, command and agent text, which the model reads; hooks and MCP and language servers get them as `CLAUDE_PLUGIN_OPTION_<KEY>` too. A plugin missing an answer that has no default loads with a warning naming `harness plugin configure`.
 - Plugin agents get their `tools` as in Claude Code, where that list is all an agent gets: they may write (`bash`, `edit`, `write`) unless they say `permission: read-only`, and without `tools` they get every tool but the subagent ones. Unlike your [custom agents](#subagents), which stay read-only by default: you enabled the plugin, and its agents were written for these rules. Tools the harness lacks (`WebFetch`, `WebSearch`, `TodoWrite`) are skipped.
-- What the harness cannot use is left out with a warning at startup, and the rest of the plugin loads: hook events or types it does not run, MCP bundles (`.mcpb`), MCP servers that sign in with OAuth or whose config it does not accept. LSP servers, output styles, monitors, `userConfig` and `dependencies` are ignored.
-- `/plugins` (and the web UI's environment page) lists each plugin with what it adds, or why it was not loaded.
-- Plugins run commands (hooks, MCP servers, `!` lines in their commands), so only your settings and the command line enable them, never the project.
+- What the harness cannot use is left out with a warning at startup, and the rest of the plugin loads: hook events or types it does not run, MCP bundles (`.mcpb`), MCP servers that sign in with OAuth or whose config it does not accept, language servers it cannot talk to. Output styles, monitors, channels, a default `settings.json` and `dependencies` (which are not installed with it) are not used; `/plugins` and `--check-plugins` list them.
+- `/plugins` (and the web UI's environment page) lists each plugin with what it adds, what was left out, or why it was not loaded. `harness --check-plugins` (with `--plugin-dir` too, to try a plugin you are writing) loads every enabled plugin without starting a session, starts their MCP servers, checks their language servers' commands, says what loaded, what was left out and why, and exits non-zero if a plugin or a server failed.
+- `/reload-plugins` reads the settings again and loads the plugins, skills, commands, agents and hooks anew, with the plugins' MCP servers. A conversation keeps its tools and system prompt (the prompt cache's prefix), so they apply to the next one: at once if the conversation is still empty, else from `/clear` or `/resume` on. Providers, the sandbox and your own MCP servers need a restart, as does the web UI.
+- Plugins run commands (hooks, MCP and language servers, `!` lines in their commands), so only your settings and the command line enable them, never the project.
+
+### Installing a plugin from scratch
+
+A marketplace is a directory (or repository) listing plugins. Make one with a plugin that has a command, a hook and a setting:
+
+```sh
+mkdir -p ~/my-plugins/.claude-plugin ~/my-plugins/hello/.claude-plugin ~/my-plugins/hello/commands ~/my-plugins/hello/hooks
+cat > ~/my-plugins/.claude-plugin/marketplace.json <<'EOF'
+{ "name": "mine", "owner": { "name": "me" }, "plugins": [{ "name": "hello", "source": "./hello", "description": "Says hello" }] }
+EOF
+cat > ~/my-plugins/hello/.claude-plugin/plugin.json <<'EOF'
+{ "name": "hello", "version": "1.0.0",
+  "userConfig": { "name": { "type": "string", "title": "Your name", "default": "friend" } } }
+EOF
+cat > ~/my-plugins/hello/commands/greet.md <<'EOF'
+---
+description: Greet the user
+---
+Greet ${user_config.name} in one sentence, then list the files in this directory.
+EOF
+cat > ~/my-plugins/hello/hooks/hooks.json <<'EOF'
+{ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "echo 'Today is '$(date +%A)" }] }] } }
+EOF
+```
+
+Then add the marketplace, install the plugin (it asks for `name`), check it, and use it:
+
+```sh
+harness plugin marketplace add ~/my-plugins   # added marketplace mine with 1 plugins
+harness plugin install hello@mine             # Your name (string) [friend; Enter keeps it]: Ada
+harness --check-plugins                       # ✓ hello@mine v1.0.0  1 command, hooks (SessionStart)
+harness /hello:greet                          # or /hello:greet in the REPL (after /reload-plugins if it was running)
+```
+
+The settings now enable `hello@mine` and hold `"pluginConfigs": {"hello@mine": {"options": {"name": "Ada"}}}`. A marketplace in a git repository is added the same way (`harness plugin marketplace add your-org/plugins`), and is cloned rather than read in place.
+
+### Language servers
+
+A plugin's language servers (Claude Code's `.lsp.json` format) give the model an `lsp` tool:
+
+```json
+{ "go": { "command": "gopls", "args": ["serve"], "extensionToLanguage": { ".go": "go" } } }
+```
+
+- Each takes `command`, `args`, `env`, `extensionToLanguage`, `initializationOptions` and `settings` (what it gets for `workspace/configuration`); only the `stdio` transport is supported, and Claude Code's timeouts and restart settings are ignored. The command must be installed: `--check-plugins` says if it is not.
+- A server starts the first time the tool asks about a file with one of its extensions, in the working directory, and stays up until the harness exits (or `/reload-plugins` replaces it). Its stderr goes to `$TMPDIR/harness-lsp-<server>.log`.
+- The tool's operations are `definition`, `implementation`, `references`, `hover`, `symbols` (the file's outline), `workspace_symbols` (by `query`) and `diagnostics` (the errors and warnings in the file as it is on disk; the server is sent the file's new text first). Lines and columns count from 1, as `read` shows them.
+- Like MCP servers, language servers run outside the [sandbox](#sandbox); the tool checks the files it names against the sandbox's read rules. It counts as read-only, so read-only subagents get it.
 
 ## Layout
 
-- `src/main.rs` — startup: settings, plugins, tools, skills, MCP servers, agents; then the CLI or web frontend
-- `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section
+- `src/main.rs` — startup: settings, `harness plugin` and `--check-plugins`, the sandbox, then what `setup.rs` builds; then the CLI or web frontend
+- `src/setup.rs` — what a conversation is built from: the plugins with their skills, agents, hooks, MCP and language servers (rebuilt by `/reload-plugins`), the user's MCP servers, the tool set and system prompt; `--check-plugins`; background auto-updates
+- `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section, editing it in place
 - `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner, input box and turn display (`output.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with the input box's rules, menu keys, completion, multi-line input, pasting with Ctrl+V and waking the prompt for a subagent's report (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
@@ -416,10 +496,12 @@ Each part of a plugin is named after it, as in Claude Code:
 - `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
 - `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox
 - `src/mcp.rs` — MCP client: server configs, connections, `mcp__*` tool adapters
-- `src/hooks.rs` — hooks: the settings' `hooks` section, matchers, Claude Code tool names, running the commands and reading their answers
-- `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing, commands, rendering a skill (`$ARGUMENTS`, `` !`command` ``), the `skill` tool
-- `src/plugins.rs` — plugins: the settings' marketplaces, `marketplace.json` and `plugin.json`, each plugin's skills, commands, agents, hooks and MCP servers
-  - `fetch.rs` — the git clones of marketplaces and plugins under `~/.harness/plugins`, and updating them
+- `src/lsp.rs` — LSP client for plugins' language servers: configs, starting them on demand, JSON-RPC over stdio, diagnostics; the `lsp` tool
+- `src/hooks.rs` — hooks: the settings' `hooks` section, matchers, Claude Code tool names, running the commands (through `sh` or directly) and prompt hooks, and reading their answers
+- `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing (`context: fork` included), commands, rendering a skill (`$ARGUMENTS`, `` !`command` ``), the `skill` tool
+- `src/plugins.rs` — plugins: the settings' marketplaces, `marketplace.json` and `plugin.json`, each plugin's skills, commands, agents, hooks, MCP and language servers, its `userConfig` answers, and what of it is not used
+  - `fetch.rs` — marketplaces and plugins fetched from git or npm under `~/.harness/plugins`, kept by version; updating them, and deleting versions no running process uses
+  - `manage.rs` — `harness plugin` and `/plugins …`: installing, enabling, configuring and removing plugins and marketplaces by editing the settings (and the secrets file)
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/edit/write state)
   - `bash.rs` — run a command via `bash -c` (timeout, output truncation); refuses commands that change files themselves (inline Python/Node/Perl scripts that write files, `sed -i`, heredocs or `echo` into a file), which go through `edit` / `write`
   - `read.rs` — read a text file with line numbers (`offset` / `limit` paging), or an image or PDF for the model to view
@@ -428,7 +510,7 @@ Each part of a plugin is named after it, as in Claude Code:
   - `shells.rs` — background commands (`bash` `run_in_background`): each conversation's own set, the `bash_output` and `kill_shell` tools, exit reports to the inbox
   - `todo.rs` — the `todo_write` tool: the model's checklist, sent whole each time (not registered: kept for re-enabling)
   - `grep.rs` — regex search via ugrep (PCRE, honours `.gitignore`, `files_with_matches` / `content` / `count` modes)
-  - `glob.rs` — find files by glob pattern via ugrep (same `.gitignore` and sandbox rules as `grep`; `{a,b}` alternatives; newest first)
+  - `glob.rs` — find files by glob pattern via ugrep (same `.gitignore` and sandbox rules as `grep`; `{a,b}` alternatives; newest first, at most `head_limit`, default 100)
 
 On the official Anthropic API, tools are declared with `eager_input_streaming`, so large inputs (such as file contents for `write`) stream as they are generated. The API then no longer validates tool input, so each built-in tool parses its input into a strict struct (unknown fields rejected), and a call whose streamed JSON does not parse is not run: the model gets an `INVALID_JSON` error result instead. MCP tools keep input buffering on, so the API validates their input against the server-provided schema.
 

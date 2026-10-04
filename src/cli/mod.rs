@@ -20,11 +20,13 @@ use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 use serde_json::Value;
 
 use crate::agent::{Agent, Inbox};
+use crate::hooks::{Event, Hooks};
 use crate::llm;
 use crate::mcp;
 use crate::mentions;
-use crate::plugins::Plugins;
+use crate::plugins::{self, Plugins};
 use crate::session::{self, Recorder, Resume, Store};
+use crate::setup::Env;
 use crate::skills::Skill;
 use crate::subagent::AgentDef;
 use crate::tools::FileTracker;
@@ -37,7 +39,7 @@ use menu::Command;
 use repl::{ReplHelper, Wake};
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 16] = [
+const BUILTINS: [(&str, &str); 17] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
@@ -51,25 +53,21 @@ const BUILTINS: [(&str, &str); 16] = [
     ("/tasks", "list the subagents and background commands this conversation started"),
     ("/stop", "stop running subagents, or one with /stop <id>"),
     ("/mcp", "list MCP servers and their tools"),
-    ("/plugins", "list plugins; /plugins update fetches their latest versions"),
+    ("/plugins", "list plugins; /plugins install|uninstall|enable|disable|update|marketplace … manages them"),
+    ("/reload-plugins", "load plugins, skills, agents and hooks again, for the next conversation"),
     ("/sandbox", "show what the sandbox allows commands to do"),
     ("/exit", "quit (or exit, Ctrl-D)"),
 ];
 
 /// Saved conversations offered by `/resume`.
 const LISTED_SESSIONS: usize = 20;
+/// How long the prompt waits after a turn before Notification hooks hear
+/// that it does.
+const IDLE_NOTICE: std::time::Duration = std::time::Duration::from_secs(60);
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    agent: &mut Agent,
-    args: Vec<String>,
-    skills: &[Skill],
-    agent_defs: &[AgentDef],
-    mcp: &mcp::Manager,
-    plugins: &Plugins,
-    files: &FileTracker,
-    out: Output,
-) -> Result<ExitCode> {
+pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Output) -> Result<ExitCode> {
+    let files = &env.files.clone();
+    let mut skills = env.ext.skills.clone();
     let (resume, args) = session::parse_args(args)?;
     out.spawn_spinner();
     let mut term = Terminal::new(out.clone());
@@ -81,7 +79,7 @@ pub async fn run(
     let one_shot = !args.is_empty();
 
     if !one_shot {
-        print_banner(agent, skills, mcp, plugins, &out);
+        print_banner(agent, &skills, env, &out);
     }
     if let Some(resume) = resume {
         let Some(rec) = recorder.as_mut() else { anyhow::bail!("no home directory to find saved sessions in") };
@@ -102,7 +100,14 @@ pub async fn run(
     // One-shot mode: `harness "do something"` or `harness /skill args`.
     if one_shot {
         let line = args.join(" ");
-        return match render_skill(parse_input(&line, skills)).await {
+        let input = match render_skill(parse_input(&line, &skills)).await {
+            Input::Skill(skill, args) => match run_fork(agent, env, &skill, &args, &out).await {
+                Ok(prompt) => Input::Prompt(prompt),
+                Err(e) => Input::Error(e),
+            },
+            input => input,
+        };
+        return match input {
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
                 let attached = attachments(&line, &[], files);
@@ -134,15 +139,7 @@ pub async fn run(
         };
     }
 
-    let mut commands: Vec<Command> = BUILTINS.iter().map(|(name, description)| Command::new(*name, *description)).collect();
-    commands.extend(
-        skills.iter().filter(|s| s.user_invocable).map(|s| Command::new(format!("/{}", s.name), &s.description)),
-    );
-    commands.extend(
-        agent.client().providers().listed_models().iter().map(|m| Command::new(format!("/model {m}"), "switch to this model")),
-    );
-    commands.extend(llm::Effort::ALL.iter().map(|e| Command::new(format!("/effort {}", e.as_str()), effort_help(*e))));
-    commands.push(Command::new("/effort auto", "back to the configured effort"));
+    let commands = menu_commands(agent, &skills);
     let config = rustyline::Config::builder()
         .completion_type(rustyline::CompletionType::List)
         .auto_add_history(true)
@@ -176,6 +173,8 @@ pub async fn run(
 
     let mut typing = Typing::default();
     let mut interrupted = false;
+    // Whether a turn ran since the prompt last waited a while.
+    let mut answered = false;
     loop {
         // A background subagent reported back, or a message sent from the
         // input box is still on its way: the model answers first.
@@ -184,6 +183,7 @@ pub async fn run(
             let _ = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut(), input).await;
             remember_sent(&mut editor, &mut typing);
             out.line("");
+            answered = true;
             continue;
         }
         let (line, images) = match typing.next_command() {
@@ -213,7 +213,11 @@ pub async fn run(
                 {
                     helper.pin(end, &format!("{before}{after}"));
                 }
+                let idle = std::mem::take(&mut answered).then(|| notify_when_idle(agent.hooks(), agent.model()));
                 let read = tokio::task::block_in_place(|| editor.readline_with_initial(&prompt, (&before, &after)));
+                if let Some(idle) = idle {
+                    idle.abort();
+                }
                 let woken =
                     wake.as_ref().is_some_and(|w| w.finish_reading()) && matches!(read, Err(ReadlineError::Interrupted));
                 // Take the input box off the screen; a line sent shows as
@@ -274,13 +278,16 @@ pub async fn run(
                 (line, helper.take_images())
             }
         };
-        match render_skill(parse_input(&line, skills)).await {
+        match render_skill(parse_input(&line, &skills)).await {
             Input::Empty => {}
             Input::Exit => break,
-            Input::Help => print_help(skills),
+            Input::Help => print_help(&skills),
             Input::Clear => {
                 show_hook_notices(&out, agent.end_session("clear").await);
                 agent.clear();
+                if apply_reload(agent, env, &mut skills, editor.helper()).await {
+                    out.line(out.paint("2", "the reloaded plugins apply from here"));
+                }
                 if let Some(rec) = recorder.as_mut() {
                     rec.restart();
                     tell_hooks(agent, rec);
@@ -305,7 +312,13 @@ pub async fn run(
                     None => pick_session(rec, &out),
                 };
                 let resumed = match id {
-                    Ok(Some(id)) => resume_session(agent, rec, &id, &out, true).await,
+                    Ok(Some(id)) => {
+                        if env.has_pending() {
+                            show_hook_notices(&out, agent.end_session("resume").await);
+                            apply_reload(agent, env, &mut skills, editor.helper()).await;
+                        }
+                        resume_session(agent, rec, &id, &out, true).await
+                    }
                     Ok(None) => Ok(()),
                     Err(e) => Err(e),
                 };
@@ -313,12 +326,40 @@ pub async fn run(
                     out.line(out.paint("31", &format!("{e:#}")));
                 }
             }
-            Input::ListSkills => print_skills(skills),
+            Input::ListSkills => print_skills(&skills),
             Input::ListTools => print_tools(agent),
-            Input::ListMcp => print_mcp(mcp),
-            Input::Plugins { update: false } => print_plugins(plugins),
-            Input::Plugins { update: true } => update_plugins(plugins, &out).await,
-            Input::ListAgents => print_agents(agent_defs),
+            Input::ListMcp => print_mcp(env.mcp_statuses()),
+            Input::Plugins { update: false } => print_plugins(&env.ext.plugins),
+            Input::Plugins { update: true } => update_plugins(&env.ext.plugins, &out).await,
+            Input::ManagePlugins(args) => {
+                match tokio::task::block_in_place(|| plugins::manage::run(&args, &mut plugins::manage::TerminalAsk)) {
+                    Ok(lines) => out.lines(&lines),
+                    Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+                }
+                if !matches!(args.first().map(String::as_str), Some("list" | "help") | None)
+                    && !matches!(args.get(..2), Some([a, b]) if a == "marketplace" && b == "list")
+                {
+                    out.line(out.paint("2", "run /reload-plugins to use the change"));
+                }
+            }
+            Input::ReloadPlugins => match env.reload().await {
+                Ok(lines) => {
+                    for (i, line) in lines.iter().enumerate() {
+                        out.line(if i == 0 { line.clone() } else { out.paint("33", line) });
+                    }
+                    if agent.messages().is_empty() {
+                        apply_reload(agent, env, &mut skills, editor.helper()).await;
+                        if let Some(rec) = recorder.as_ref() {
+                            tell_hooks(agent, rec);
+                        }
+                        out.line(out.paint("2", "they apply from the next message"));
+                    } else {
+                        out.line(out.paint("2", "they apply to the next conversation: /clear starts one"));
+                    }
+                }
+                Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+            },
+            Input::ListAgents => print_agents(&env.ext.agent_defs),
             Input::Tasks => print_tasks(&agent.subagents().list(), &agent.shells().list()),
             Input::Stop(None) => {
                 let stopped = agent.subagents().stop_all();
@@ -358,7 +399,18 @@ pub async fn run(
                 agent.set_client(client);
             }
             Input::Error(e) => out.line(out.paint("31", &e)),
-            Input::Skill(..) => unreachable!("render_skill made it a prompt"),
+            // A skill that runs in a subagent: its report goes to the model.
+            Input::Skill(skill, args) => match run_fork(agent, env, &skill, &args, &out).await {
+                Ok(prompt) => {
+                    let input = boxed.then_some(TurnInput { typing: &mut typing, files });
+                    let attached = attachments(&line, &images, files);
+                    let _ = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut(), input).await;
+                    remember_sent(&mut editor, &mut typing);
+                    out.line("");
+                    answered = true;
+                }
+                Err(e) => out.line(out.paint("31", &e)),
+            },
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
                 let attached = attachments(&line, &images, files);
@@ -366,6 +418,7 @@ pub async fn run(
                 let _ = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut(), input).await;
                 remember_sent(&mut editor, &mut typing);
                 out.line("");
+                answered = true;
             }
         }
     }
@@ -377,6 +430,72 @@ pub async fn run(
         let _ = editor.save_history(path);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// What the menu under the prompt offers.
+fn menu_commands(agent: &Agent, skills: &[Skill]) -> Vec<Command> {
+    let mut commands: Vec<Command> = BUILTINS.iter().map(|(name, description)| Command::new(*name, *description)).collect();
+    commands.extend(
+        skills.iter().filter(|s| s.user_invocable).map(|s| Command::new(format!("/{}", s.name), &s.description)),
+    );
+    commands.extend(
+        agent.client().providers().listed_models().iter().map(|m| Command::new(format!("/model {m}"), "switch to this model")),
+    );
+    commands.extend(llm::Effort::ALL.iter().map(|e| Command::new(format!("/effort {}", e.as_str()), effort_help(*e))));
+    commands.push(Command::new("/effort auto", "back to the configured effort"));
+    commands
+}
+
+/// Gives the agent, whose conversation was just cleared or is about to be
+/// replaced, what `/reload-plugins` loaded: its tools, system prompt and
+/// hooks, and the prompt its commands. False if nothing was reloaded.
+async fn apply_reload(agent: &mut Agent, env: &mut Env, skills: &mut Arc<Vec<Skill>>, helper: Option<&ReplHelper>) -> bool {
+    if !env.apply() {
+        return false;
+    }
+    let (tools, system) = env.conversation(agent.client());
+    agent.set_tools(tools);
+    agent.set_system(system);
+    agent.set_hooks(Hooks::with_config(env.ext.hooks.clone()));
+    *skills = env.ext.skills.clone();
+    if let Some(helper) = helper {
+        helper.set_commands(menu_commands(agent, skills));
+    }
+    env.shutdown_retired().await;
+    true
+}
+
+/// Runs the Notification hooks if the prompt still waits after
+/// [`IDLE_NOTICE`]; abort the task once a line is read.
+fn notify_when_idle(hooks: &Hooks, model: &str) -> tokio::task::JoinHandle<()> {
+    let (hooks, model) = (hooks.clone(), model.to_string());
+    tokio::spawn(async move {
+        if !hooks.has(Event::Notification) {
+            return;
+        }
+        tokio::time::sleep(IDLE_NOTICE).await;
+        // On a task of its own, which reading the line does not cut short.
+        tokio::spawn(async move {
+            hooks.notification("idle_prompt", "harness is waiting for your input", &model).await;
+        });
+    })
+}
+
+/// Runs skill `skill`, which runs in a subagent, as the user typed it with
+/// `args`, until it is done or Ctrl-C or Esc interrupts it; returns the
+/// message handing its report to the model.
+async fn run_fork(agent: &Agent, env: &Env, skill: &Skill, args: &str, out: &Output) -> Result<String, String> {
+    out.set_status(Some(&format!("Running /{} in a subagent…", skill.name)));
+    let mut keys = KeyWatch::start();
+    let run = env.forks.run_for_user(skill, args, agent.subagents().clone(), agent.client().clone());
+    let result = tokio::select! {
+        result = run => result,
+        _ = tokio::signal::ctrl_c() => Err("interrupted".into()),
+        _ = keys.pressed() => Err("interrupted".into()),
+    };
+    drop(keys);
+    out.set_status(None);
+    result
 }
 
 fn history_path() -> Option<std::path::PathBuf> {
@@ -701,17 +820,21 @@ enum Input {
     Effort(Option<Option<llm::Effort>>),
     /// `/plugins` lists them; `/plugins update` fetches their latest.
     Plugins { update: bool },
+    /// `/plugins install …` and the like, as `harness plugin` takes them.
+    ManagePlugins(Vec<String>),
+    /// `/reload-plugins`.
+    ReloadPlugins,
     /// `/<skill> args`, before its text is read.
-    Skill(Skill, String),
+    Skill(Box<Skill>, String),
     Prompt(String),
     Error(String),
 }
 
-/// Reads the skill a `/<skill> args` line runs into the prompt; other
-/// input passes through.
+/// Reads the skill a `/<skill> args` line runs into the prompt; one that
+/// runs in a subagent, and other input, passes through.
 async fn render_skill(input: Input) -> Input {
     match input {
-        Input::Skill(skill, args) => match skill.invocation_prompt(&args).await {
+        Input::Skill(skill, args) if skill.fork.is_none() => match skill.invocation_prompt(&args).await {
             Ok(prompt) => Input::Prompt(prompt),
             Err(e) => Input::Error(e),
         },
@@ -743,8 +866,9 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "plugins" | "plugin" => match args.trim() {
             "" | "list" => Input::Plugins { update: false },
             "update" => Input::Plugins { update: true },
-            other => Input::Error(format!("unknown /plugins command `{other}` (try /plugins or /plugins update)")),
+            args => Input::ManagePlugins(args.split_whitespace().map(String::from).collect()),
         },
+        "reload-plugins" => Input::ReloadPlugins,
         "agents" => Input::ListAgents,
         "tasks" => Input::Tasks,
         "stop" => Input::Stop(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
@@ -760,21 +884,21 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
             },
         },
         _ => match skills.iter().find(|s| s.name == name && s.user_invocable) {
-            Some(skill) => Input::Skill(skill.clone(), args.to_string()),
+            Some(skill) => Input::Skill(Box::new(skill.clone()), args.to_string()),
             None => Input::Error(format!("unknown command /{name} (try /help)")),
         },
     }
 }
 
-fn print_banner(agent: &Agent, skills: &[Skill], mcp: &mcp::Manager, plugins: &Plugins, out: &Output) {
+fn print_banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_default();
     let cwd = match cwd.strip_prefix(&home) {
         Some(rest) if !home.is_empty() => format!("~{rest}"),
         _ => cwd,
     };
-    let servers = mcp.statuses.iter().filter(|s| s.outcome.is_ok()).count();
-    let loaded = plugins.list.iter().filter(|p| p.outcome.is_ok()).count();
+    let servers = env.mcp_statuses().filter(|s| s.outcome.is_ok()).count();
+    let loaded = env.ext.plugins.list.iter().filter(|p| p.outcome.is_ok()).count();
     let plugins = match loaded {
         0 => String::new(),
         1 => " · 1 plugin".to_string(),
@@ -977,7 +1101,14 @@ fn print_plugins(plugins: &Plugins) {
         if let Some(root) = &p.root {
             println!("    \x1b[90m{}\x1b[0m", root.display());
         }
+        for warning in &p.warnings {
+            println!("    \x1b[33m! {warning}\x1b[0m");
+        }
+        if !p.ignored.is_empty() {
+            println!("    \x1b[2mnot used: {}\x1b[0m", p.ignored.join("; "));
+        }
     }
+    println!("\x1b[90mmanage them with /plugins install|uninstall|enable|disable|configure|marketplace … (see /plugins help)\x1b[0m");
 }
 
 /// Pulls the latest of every plugin and marketplace cloned from git.
@@ -998,14 +1129,15 @@ async fn update_plugins(plugins: &Plugins, out: &Output) {
             Err(e) => out.line(out.paint("31", &e)),
         }
     }
-    out.line(out.paint("2", "restart harness to use the new versions"));
+    out.line(out.paint("2", "/reload-plugins (or a restart) uses the new versions"));
 }
 
-fn print_mcp(mcp: &mcp::Manager) {
-    if mcp.statuses.is_empty() {
+fn print_mcp<'a>(statuses: impl Iterator<Item = &'a mcp::Status>) {
+    let statuses: Vec<&mcp::Status> = statuses.collect();
+    if statuses.is_empty() {
         println!("no MCP servers configured (`mcpServers` in ~/.harness/settings.json)");
     }
-    for status in &mcp.statuses {
+    for status in statuses {
         match &status.outcome {
             Ok(tools) => {
                 println!("\x1b[32m●\x1b[0m {} ({} tools)", status.name, tools.len());
@@ -1064,7 +1196,8 @@ mod tests {
         assert!(matches!(parse_input("/effort huge", &skills), Input::Error(_)));
         assert_eq!(parse_input("/plugins", &skills), Input::Plugins { update: false });
         assert_eq!(parse_input("/plugins update", &skills), Input::Plugins { update: true });
-        assert!(matches!(parse_input("/plugins remove x", &skills), Input::Error(_)));
+        assert_eq!(parse_input("/plugins remove x@m", &skills), Input::ManagePlugins(vec!["remove".into(), "x@m".into()]));
+        assert_eq!(parse_input("/reload-plugins", &skills), Input::ReloadPlugins);
         match render_skill(parse_input("/greet  Bob ", &skills)).await {
             Input::Prompt(p) => {
                 assert!(p.starts_with("The user invoked the `greet` skill:"));

@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod hooks;
 mod llm;
+mod lsp;
 mod mcp;
 mod mentions;
 mod plugins;
@@ -9,6 +10,7 @@ mod prompt;
 mod sandbox;
 mod session;
 mod settings;
+mod setup;
 mod skills;
 mod subagent;
 mod tools;
@@ -24,12 +26,12 @@ use serde_json::Value;
 use agent::Agent;
 use llm::{Client, Providers};
 use settings::Settings;
-use skills::SkillTool;
+use setup::{Env, Extensions};
 use subagent::AgentTool;
-use tools::{FileTracker, ToolRegistry};
 
 const USAGE: &str = "\
 Usage: harness [OPTIONS] [PROMPT...]
+       harness plugin <command>   Install and manage plugins (harness plugin help)
 
 With no PROMPT, starts the interactive REPL; with one, runs it and exits.
 
@@ -41,6 +43,7 @@ Options:
       --no-sandbox    Turn the sandbox off even if configured
       --settings FILE Read settings from FILE instead
       --plugin-dir DIR Load the plugin in DIR as well (repeatable)
+      --check-plugins Load the plugins, report what loaded and what not, and exit
   -h, --help          Print this help
   -V, --version       Print the version
 
@@ -60,29 +63,32 @@ async fn main() -> Result<ExitCode> {
     }
     let (settings_path, args) = settings::parse_flag(args)?;
     settings::set_path(settings_path);
+    if matches!(args.first().map(String::as_str), Some("plugin" | "plugins")) {
+        let lines = tokio::task::block_in_place(|| plugins::manage::run(&args[1..], &mut plugins::manage::TerminalAsk))?;
+        for line in lines {
+            println!("{line}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let (plugin_dirs, args) = plugins::parse_flag(args)?;
     let mut settings = Settings::load()?;
     for file in settings::legacy_files() {
         eprintln!("\x1b[33m{} is no longer read; move its settings into ~/.harness/settings.json\x1b[0m", file.display());
     }
+    if args.iter().any(|a| a == "--check-plugins") {
+        if args.len() > 1 {
+            anyhow::bail!("--check-plugins takes no other arguments");
+        }
+        return Ok(setup::check_plugins(&settings, &plugin_dirs).await);
+    }
     let (sandbox_flag, args) = sandbox::parse_flag(args);
     sandbox::init(sandbox_flag, &settings.sandbox).await?;
-    let from_plugins = plugins::load(&settings, &plugin_dirs);
-    for w in &from_plugins.warnings {
+    let mut ext = Extensions::load(&mut settings, &plugin_dirs).await;
+    for w in &ext.warnings {
         eprintln!("\x1b[33m{w}\x1b[0m");
     }
-    let plugins = from_plugins.plugins;
-    for plugin in &plugins.list {
-        if let Err(e) = &plugin.outcome {
-            eprintln!("\x1b[33mplugin {} not loaded: {e}\x1b[0m", plugin.id);
-        }
-    }
-    for (event, groups) in from_plugins.hooks {
-        settings.hooks.entry(event).or_default().extend(groups);
-    }
-    settings.mcp_servers.extend(from_plugins.mcp_servers);
-    tools::bash::add_to_path(from_plugins.bin_dirs);
-    hooks::init(std::mem::take(&mut settings.hooks));
+    ext.activate();
+    setup::auto_update(std::mem::take(&mut ext.auto_update));
     let web_addr = web::parse_flag(&args)?;
     // The web UI can fix a missing or broken provider setup, so it starts
     // without one.
@@ -90,45 +96,12 @@ async fn main() -> Result<ExitCode> {
         Err(e) if web_addr.is_none() => return Err(e),
         loaded => loaded,
     };
-    let files = FileTracker::default();
-    let mut registry = ToolRegistry::with_defaults(files.clone());
-
-    let (mut skills, warnings) = skills::discover(&skills::default_roots());
-    for w in warnings {
-        eprintln!("\x1b[33mskill skipped: {w}\x1b[0m");
-    }
-    // A skill wins over a command of the same name, as in Claude Code.
-    let (commands, warnings) = skills::discover_commands(&skills::default_command_roots());
-    for w in warnings {
-        eprintln!("\x1b[33mcommand skipped: {w}\x1b[0m");
-    }
-    for command in commands {
-        if !skills.iter().any(|s| s.name == command.name) {
-            skills.push(command);
-        }
-    }
-    skills.extend(from_plugins.skills);
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-    let skill_tool = SkillTool::new(&skills);
-    if !skill_tool.is_empty() {
-        registry.register(skill_tool);
-    }
-    let skills = Arc::new(skills);
-
-    let mcp = mcp::Manager::start(&settings.mcp_servers, &mut registry).await;
-    for status in &mcp.statuses {
+    let user_mcp = mcp::Manager::start(&settings.mcp_servers).await;
+    for status in &user_mcp.statuses {
         if let Err(e) = &status.outcome {
             eprintln!("\x1b[33mMCP server `{}` failed: {e}\x1b[0m", status.name);
         }
     }
-
-    let (mut agent_defs, warnings) = subagent::discover(&subagent::default_roots());
-    for w in warnings {
-        eprintln!("\x1b[33magent skipped: {w}\x1b[0m");
-    }
-    agent_defs.extend(from_plugins.agents);
-    agent_defs.sort_by(|a, b| a.name.cmp(&b.name));
-    let agent_defs = Arc::new(agent_defs);
     let out = cli::Output::stdout();
     // Web tasks show their subagents' progress themselves; this is for the
     // terminal, and for subagents started from the web UI's tool page.
@@ -136,11 +109,11 @@ async fn main() -> Result<ExitCode> {
         let out = out.clone();
         Arc::new(move |event: &Value| out.subagent_event(event))
     };
+    let mut env = Env::new(ext, user_mcp, reporter, plugin_dirs);
 
     if let Some(addr) = web_addr {
-        let mcp_status = mcp
-            .statuses
-            .iter()
+        let mcp_status = env
+            .mcp_statuses()
             .map(|s| match &s.outcome {
                 Ok(tools) => serde_json::json!({"name": s.name, "tools": tools}),
                 Err(e) => serde_json::json!({"name": s.name, "error": e}),
@@ -148,34 +121,30 @@ async fn main() -> Result<ExitCode> {
             .collect();
         let setup = web::Setup {
             providers,
-            tools: registry,
-            skills,
-            agent_defs,
+            tools: env.base_tools(),
+            skills: env.ext.skills.clone(),
+            agent_defs: env.ext.agent_defs.clone(),
             mcp: Value::Array(mcp_status),
-            plugins: plugins.to_json(),
-            reporter,
+            plugins: env.ext.plugins.to_json(),
+            reporter: env.reporter.clone(),
+            forks: env.forks.clone(),
         };
         let result = web::serve(&addr, setup).await;
-        mcp.shutdown().await;
+        env.shutdown().await;
         return result.map(|()| ExitCode::SUCCESS);
     }
 
     let client = Client::new(providers?)?;
-    // Subagents choose from the tools registered so far, so they never get
-    // the `agent` tool itself.
-    let agent_tool = AgentTool::new(agent_defs.clone(), registry.clone(), client.clone(), reporter);
-    for (agent, tool) in agent_tool.unknown_tools() {
+    let probe = AgentTool::new(env.ext.agent_defs.clone(), env.base_tools(), client.clone(), env.reporter.clone());
+    for (agent, tool) in probe.unknown_tools() {
         eprintln!("\x1b[33magent `{agent}` lists unknown tool `{tool}`\x1b[0m");
     }
-    registry.register(agent_tool);
-    registry.register(subagent::MessageAgentTool);
-    registry.register(subagent::StopAgentTool);
-
-    let system = prompt::main(&registry);
+    drop(probe);
+    let (registry, system) = env.conversation(&client);
     let mut agent = Agent::new(client, registry, system);
-    let result = cli::run(&mut agent, args, &skills, &agent_defs, &mcp, &plugins, &files, out).await;
+    let result = cli::run(&mut agent, args, &mut env, out).await;
     // The agent's tools hold the MCP connections; release them first.
     drop(agent);
-    mcp.shutdown().await;
+    env.shutdown().await;
     result
 }

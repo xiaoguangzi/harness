@@ -14,6 +14,8 @@
 //! ```
 //!
 //! `--settings FILE` or `$HARNESS_SETTINGS` reads another file instead.
+//! `harness plugin …` changes it through [`edit`], which keeps the rest of
+//! the file as it is.
 //! Nothing is read from the project: a repository could otherwise send
 //! requests carrying your API keys to its own server, start MCP commands or
 //! hooks, or loosen the sandbox.
@@ -24,6 +26,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use crate::llm::Effort;
 use crate::llm::config::ProviderConfig;
@@ -52,6 +55,17 @@ pub struct Settings {
     /// Marketplaces to find plugins in, by name, besides the official one.
     #[serde(default, rename = "extraKnownMarketplaces")]
     pub extra_known_marketplaces: BTreeMap<String, plugins::Marketplace>,
+    /// Each plugin's answers to its `userConfig`, by plugin id; the
+    /// sensitive ones are kept elsewhere.
+    #[serde(default, rename = "pluginConfigs")]
+    pub plugin_configs: BTreeMap<String, PluginConfig>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginConfig {
+    #[serde(default)]
+    pub options: Map<String, Value>,
 }
 
 static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -106,6 +120,58 @@ impl Settings {
     }
 }
 
+/// Changes the settings file with `change`, which gets it as JSON (an
+/// empty object if there is none). Keys keep their order and the ones
+/// `change` leaves alone stay as they are; the result must still be valid
+/// settings, or nothing is written.
+pub fn edit<T>(change: impl FnOnce(&mut Map<String, Value>) -> Result<T>) -> Result<T> {
+    let path = path().context("no settings file: HOME is not set")?;
+    edit_file(path, change)
+}
+
+pub(crate) fn edit_file<T>(path: &Path, change: impl FnOnce(&mut Map<String, Value>) -> Result<T>) -> Result<T> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut value = match text.trim() {
+        "" => Map::new(),
+        text => match serde_json::from_str(text).with_context(|| format!("parsing {}", path.display()))? {
+            Value::Object(map) => map,
+            _ => bail!("{} does not hold a JSON object", path.display()),
+        },
+    };
+    let result = change(&mut value)?;
+    let text = serde_json::to_string_pretty(&value)? + "\n";
+    Settings::parse(&text).with_context(|| format!("the change would make {} invalid", path.display()))?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    write_private(path, &text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(result)
+}
+
+/// The object at `key` in `map`, made one if it is missing or something
+/// else.
+pub fn object<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
+    let value = map.entry(key).or_insert_with(|| Value::Object(Map::new()));
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
+    }
+    value.as_object_mut().unwrap()
+}
+
+/// Writes a file only its owner can read, as it may hold API keys; an
+/// existing file is narrowed to that too.
+pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(text.as_bytes())
+}
+
 /// Config files earlier versions read and this one ignores, so their
 /// settings don't silently stop applying.
 pub fn legacy_files() -> Vec<PathBuf> {
@@ -132,7 +198,8 @@ mod tests {
               "sandbox": {"enabled": true, "allow_write": ["~/.cache"]},
               "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "true"}]}]},
               "enabledPlugins": {"fmt@team": true, "old@team": false},
-              "extraKnownMarketplaces": {"team": {"source": {"source": "github", "repo": "org/plugins"}}}
+              "extraKnownMarketplaces": {"team": {"source": {"source": "github", "repo": "org/plugins"}, "autoUpdate": true}},
+              "pluginConfigs": {"fmt@team": {"options": {"width": 100}}}
             }"#,
         )
         .unwrap();
@@ -145,6 +212,7 @@ mod tests {
         assert_eq!(s.hooks.len(), 1);
         assert_eq!(s.enabled_plugins.len(), 2);
         assert_eq!(s.extra_known_marketplaces.keys().collect::<Vec<_>>(), ["team"]);
+        assert_eq!(s.plugin_configs["fmt@team"].options["width"], 100);
 
         assert!(Settings::parse("  ").unwrap().providers.is_empty());
         assert!(Settings::parse(r#"{"default_model": "gw/m"}"#).is_err(), "unknown keys are rejected");
@@ -155,6 +223,39 @@ mod tests {
         assert!(Settings::parse(&market(r#"{"source": "directory", "path": "~/m"}"#)).is_ok());
         assert!(Settings::parse(&market(r#"{"source": "npm", "package": "p"}"#)).is_err());
         assert!(Settings::parse(&market(r#"{"source": "github", "repo": "o/r", "rev": "x"}"#)).is_err());
+    }
+
+    #[test]
+    fn edits_keep_the_rest_of_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/settings.json");
+        edit_file(&path, |s| {
+            object(s, "enabledPlugins").insert("a@m".into(), true.into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::write(&path, r#"{"model": "gw/m", "providers": {"gw": {"protocol": "anthropic", "base_url": "u"}}, "enabledPlugins": {"a@m": true}}"#)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        edit_file(&path, |s| {
+            object(s, "enabledPlugins").insert("b@m".into(), false.into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600, "narrowed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let keys: Vec<String> = serde_json::from_str::<Map<String, Value>>(&text).unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["model", "providers", "enabledPlugins"]);
+        assert!(text.contains(r#""b@m": false"#), "{text}");
+        let err = edit_file(&path, |s| {
+            s.insert("nonsense".into(), 1.into());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("unknown field"), "{err:#}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("nonsense"), "nothing written");
     }
 
     #[test]

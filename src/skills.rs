@@ -25,6 +25,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::subagent::Forks;
 use crate::tools::{Tool, ToolOutput, parse_input};
 
 /// What a `!`command`` in a skill may print before it is cut.
@@ -46,25 +47,76 @@ pub struct Skill {
     /// For a plugin's skill or command: the plugin's root and data
     /// directories, for `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}`.
     pub plugin: Option<PluginDirs>,
+    /// With `context: fork`: it runs in a subagent of its own, whose report
+    /// is what comes back.
+    pub fork: Option<Fork>,
+}
+
+/// How a `context: fork` skill runs.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Fork {
+    /// `agent`: the subagent type; `general-purpose` without one.
+    pub agent: Option<String>,
+    /// `model`: instead of the agent's.
+    pub model: Option<String>,
+    /// `allowed-tools`: the most the subagent gets of its agent's tools.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginDirs {
     pub root: PathBuf,
     pub data: PathBuf,
+    /// The user's answers to the plugin's `userConfig`.
+    pub options: Vec<PluginOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginOption {
+    pub key: String,
+    pub value: String,
+    /// Kept out of the settings file and out of text the model reads.
+    pub sensitive: bool,
+}
+
+impl PluginOption {
+    /// The environment variable it is passed in: `CLAUDE_PLUGIN_OPTION_<KEY>`.
+    pub fn env_name(&self) -> String {
+        let key: String = self.key.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
+        format!("CLAUDE_PLUGIN_OPTION_{key}")
+    }
 }
 
 impl PluginDirs {
-    /// `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` (or Codex's
-    /// `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`) in `text` replaced by the
-    /// directories.
-    pub fn expand(&self, text: &str) -> String {
-        self.env().iter().fold(text.to_string(), |text, (name, value)| text.replace(&format!("${{{name}}}"), value))
+    #[cfg(test)]
+    pub fn new(root: PathBuf, data: PathBuf) -> Self {
+        Self { root, data, options: Vec::new() }
     }
 
-    /// The variables as a plugin's processes get them, under Claude Code's
-    /// names and Codex's.
-    pub fn env(&self) -> Vec<(String, String)> {
+    /// `text` with `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` (or
+    /// Codex's `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`) replaced by the
+    /// directories, and `${user_config.<key>}` by the user's answers: for
+    /// commands and configs.
+    pub fn expand(&self, text: &str) -> String {
+        self.vars(true).iter().fold(text.to_string(), |text, (name, value)| text.replace(&format!("${{{name}}}"), value))
+    }
+
+    /// The same for text the model reads, which sensitive answers stay out
+    /// of.
+    pub fn expand_prompt(&self, text: &str) -> String {
+        self.vars(false).iter().fold(text.to_string(), |text, (name, value)| text.replace(&format!("${{{name}}}"), value))
+    }
+
+    fn vars(&self, sensitive: bool) -> Vec<(String, String)> {
+        let mut vars = self.dir_vars();
+        for option in self.options.iter().filter(|o| sensitive || !o.sensitive) {
+            vars.push((format!("user_config.{}", option.key), option.value.clone()));
+            vars.push((option.env_name(), option.value.clone()));
+        }
+        vars
+    }
+
+    fn dir_vars(&self) -> Vec<(String, String)> {
         let (root, data) = (self.root.display().to_string(), self.data.display().to_string());
         vec![
             ("CLAUDE_PLUGIN_ROOT".into(), root.clone()),
@@ -72,6 +124,15 @@ impl PluginDirs {
             ("PLUGIN_ROOT".into(), root),
             ("PLUGIN_DATA".into(), data),
         ]
+    }
+
+    /// The variables as a plugin's processes get them: the directories
+    /// under Claude Code's names and Codex's, and the user's answers as
+    /// `CLAUDE_PLUGIN_OPTION_<KEY>`.
+    pub fn env(&self) -> Vec<(String, String)> {
+        let mut env = self.dir_vars();
+        env.extend(self.options.iter().map(|o| (o.env_name(), o.value.clone())));
+        env
     }
 }
 
@@ -107,7 +168,7 @@ impl Skill {
             body = body.replace("${CLAUDE_PROJECT_DIR}", &cwd.display().to_string());
         }
         if let Some(plugin) = &self.plugin {
-            body = plugin.expand(&body);
+            body = plugin.expand_prompt(&body);
         }
         let names = fields.get("arguments").map_or_else(Vec::new, |a| list_field(a));
         let (body, taken) = substitute_arguments(&body, arguments, &names);
@@ -164,8 +225,22 @@ impl Skill {
             .unwrap_or_else(first_line);
         let dir = plugin.as_ref().map_or_else(PathBuf::new, |p| p.root.clone());
         let (model_invocable, user_invocable) = invocable(&fields);
-        Self { name, description, dir, body: Body::Inline(text.to_string()), model_invocable, user_invocable, plugin }
+        let body = Body::Inline(text.to_string());
+        Self { name, description, dir, body, model_invocable, user_invocable, plugin, fork: fork(&fields) }
     }
+}
+
+/// How the skill with these frontmatter `fields` runs in a subagent, if it
+/// says `context: fork`.
+fn fork(fields: &BTreeMap<String, String>) -> Option<Fork> {
+    if !fields.get("context").is_some_and(|c| c.trim().eq_ignore_ascii_case("fork")) {
+        return None;
+    }
+    Some(Fork {
+        agent: fields.get("agent").map(|a| a.trim().to_string()).filter(|a| !a.is_empty()),
+        model: crate::subagent::model_field(fields.get("model")),
+        allowed_tools: fields.get("allowed-tools").map(|t| crate::subagent::tool_list(t)),
+    })
 }
 
 /// Who may run a skill with these frontmatter `fields`: the model, the user.
@@ -179,7 +254,7 @@ fn invocable(fields: &BTreeMap<String, String>) -> (bool, bool) {
 
 /// The items of a frontmatter list: `a b`, `a, b`, `[a, b]`, or a YAML
 /// list (which [`parse_frontmatter`] joins into `- a - b`).
-pub(crate) fn list_field(value: &str) -> Vec<String> {
+fn list_field(value: &str) -> Vec<String> {
     value
         .split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']')
         .map(|n| n.trim_matches(['"', '\'']))
@@ -426,7 +501,8 @@ fn parse_skill(text: &str, dir: &Path) -> Result<Skill, String> {
     let description = fields.get("description").cloned().filter(|d| !d.is_empty()).ok_or("missing `description`")?;
     let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     let (model_invocable, user_invocable) = invocable(&fields);
-    Ok(Skill { name, description, dir, body: Body::Skill, model_invocable, user_invocable, plugin: None })
+    let fork = fork(&fields);
+    Ok(Skill { name, description, dir, body: Body::Skill, model_invocable, user_invocable, plugin: None, fork })
 }
 
 /// Splits `---\n<frontmatter>\n---\n<body>`.
@@ -482,17 +558,20 @@ pub(crate) fn parse_frontmatter(front: &str) -> BTreeMap<String, String> {
     fields
 }
 
-/// The `skill` tool: loads a skill's instructions into the conversation.
+/// The `skill` tool: loads a skill's instructions into the conversation,
+/// or runs a `context: fork` skill in a subagent.
 pub struct SkillTool {
     /// The skills the model may load.
     skills: Vec<Skill>,
     description: String,
-    /// Whether none of them runs shell commands.
+    /// Whether none of them runs shell commands or a subagent.
     read_only: bool,
+    forks: Forks,
 }
 
 impl SkillTool {
-    pub fn new(skills: &[Skill]) -> Self {
+    /// The tool for `skills`; `forks` runs those that fork.
+    pub fn new(skills: &[Skill], forks: Forks) -> Self {
         let skills: Vec<Skill> = skills.iter().filter(|s| s.model_invocable).cloned().collect();
         let mut description = String::from(
             "Load a skill: a set of instructions (and possibly scripts or reference files) for a \
@@ -502,10 +581,11 @@ impl SkillTool {
              Available skills:",
         );
         for s in &skills {
-            description.push_str(&format!("\n- {}: {}", s.name, s.description));
+            let forks = if s.fork.is_some() { " (runs in a subagent of its own, which reports back)" } else { "" };
+            description.push_str(&format!("\n- {}: {}{forks}", s.name, s.description));
         }
-        let read_only = !skills.iter().any(Skill::runs_commands);
-        Self { skills, description, read_only }
+        let read_only = !skills.iter().any(|s| s.fork.is_some() || s.runs_commands());
+        Self { skills, description, read_only, forks }
     }
 
     /// Whether any skill is offered to the model.
@@ -570,7 +650,10 @@ impl Tool for SkillTool {
             return ToolOutput::error(format!("Unknown skill: {}", input.name));
         };
         match skill.render(input.arguments.as_deref().unwrap_or("")).await {
-            Ok(text) => ToolOutput::ok(text),
+            Ok(text) => match &skill.fork {
+                Some(fork) => self.forks.run(&skill.name, fork, text).await,
+                None => ToolOutput::ok(text),
+            },
             Err(e) => ToolOutput::error(e),
         }
     }
@@ -616,7 +699,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_skill(root.path(), "greet", "---\nname: greet\ndescription: Say hi\n---\n\nSay hi to the user.\n");
         let (skills, _) = discover(&[root.path().into()]);
-        let tool = SkillTool::new(&skills);
+        let tool = SkillTool::new(&skills, Forks::default());
         assert!(tool.description().contains("- greet: Say hi"));
 
         let out = tool.run(json!({"name": "greet", "arguments": "Bob"})).await;
@@ -654,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn commands_and_plugin_skills() {
         let root = tempfile::tempdir().unwrap();
-        let plugin = PluginDirs { root: root.path().into(), data: root.path().join("data") };
+        let plugin = PluginDirs::new(root.path().into(), root.path().join("data"));
         let file = root.path().join("commit.md");
         std::fs::write(&file, "---\ndisable-model-invocation: true\n---\n# Commit the work\nRun ${CLAUDE_PLUGIN_ROOT}/x $1\n")
             .unwrap();
@@ -670,12 +753,25 @@ mod tests {
         assert_eq!(skills[0].name, "p:review");
         assert!(skills[0].model_invocable && !skills[0].user_invocable);
 
-        let tool = SkillTool::new(&[command.clone(), skills[0].clone()]);
+        let tool = SkillTool::new(&[command.clone(), skills[0].clone()], Forks::default());
         assert!(tool.description().contains("p:review") && !tool.description().contains("p:commit"));
         assert!(tool.run(json!({"name": "p:commit"})).await.is_error, "the model cannot run it");
         assert!(tool.read_only());
         let inline = Skill::inline("p:status".into(), "Show !`git status`", Some("Status"), Some(plugin));
-        assert!(!SkillTool::new(&[inline]).read_only(), "loading it runs a command");
+        assert!(!SkillTool::new(&[inline], Forks::default()).read_only(), "loading it runs a command");
+    }
+
+    #[test]
+    fn fork_frontmatter() {
+        let dir = Path::new("/s/check");
+        let text = "---\ndescription: d\ncontext: fork\nagent: explore\nmodel: sonnet\nallowed-tools: Bash(git status:*), Read\n---\nx\n";
+        let skill = parse_skill(text, dir).unwrap();
+        let fork = Fork { agent: Some("explore".into()), model: None, allowed_tools: Some(vec!["bash".into(), "read".into()]) };
+        assert_eq!(skill.fork, Some(fork));
+        assert!(!SkillTool::new(&[skill], Forks::default()).read_only(), "it starts a subagent");
+        let inline = Skill::inline("c".into(), "---\ncontext: fork\nmodel: gw/small\n---\nDo it", None, None);
+        assert_eq!(inline.fork, Some(Fork { model: Some("gw/small".into()), ..Fork::default() }));
+        assert_eq!(parse_skill("---\ndescription: d\n---\nx", dir).unwrap().fork, None);
     }
 
     #[test]

@@ -261,13 +261,15 @@ pub struct Status {
 #[derive(Default)]
 pub struct Manager {
     servers: Vec<Arc<Server>>,
+    /// Their tools, for each tool set made.
+    tools: Vec<Arc<dyn Tool>>,
     pub statuses: Vec<Status>,
 }
 
 impl Manager {
-    /// Connects to every configured server concurrently and registers their
+    /// Connects to every configured server concurrently and lists their
     /// tools. A server that fails to start is reported, not fatal.
-    pub async fn start(configs: &BTreeMap<String, ServerConfig>, registry: &mut ToolRegistry) -> Self {
+    pub async fn start(configs: &BTreeMap<String, ServerConfig>) -> Self {
         let connections = futures::future::join_all(configs.iter().map(|(name, cfg)| async move {
             let server = Server::connect(name, cfg).await?;
             // Every page counts: a server that keeps returning cursors must
@@ -289,14 +291,14 @@ impl Manager {
                     for t in tools {
                         let exposed = exposed_name(&server.name, &t.name);
                         let description = t.description.as_deref().unwrap_or("").to_string();
-                        registry.register(McpTool {
+                        manager.tools.push(Arc::new(McpTool {
                             server: server.clone(),
                             tool: t.name.to_string(),
                             exposed: exposed.clone(),
                             description: format!("[MCP server `{}`] {description}", server.name),
                             schema: Value::Object((*t.input_schema).clone()),
                             read_only: t.annotations.as_ref().and_then(|a| a.read_only_hint).unwrap_or(false),
-                        });
+                        }));
                         names.push(exposed);
                     }
                     manager.servers.push(server);
@@ -309,10 +311,18 @@ impl Manager {
         manager
     }
 
+    /// Adds the servers' tools to `registry`.
+    pub fn register(&self, registry: &mut ToolRegistry) {
+        for tool in &self.tools {
+            registry.register_arc(tool.clone());
+        }
+    }
+
     /// Closes every connection and waits for stdio servers to exit. Call it
-    /// after the tool registry is dropped: a server still referenced by a
+    /// after the tool registries are dropped: a server still referenced by a
     /// registered tool is left to rmcp's drop-time cleanup instead.
     pub async fn shutdown(self) {
+        drop(self.tools);
         for server in self.servers {
             if let Ok(server) = Arc::try_unwrap(server) {
                 let _ = server.service.cancel().await;

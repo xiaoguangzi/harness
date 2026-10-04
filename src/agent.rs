@@ -19,6 +19,8 @@ use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
 
 pub use compact::is_compacted;
+#[cfg(test)]
+pub(crate) use compact::tests as mock;
 pub use usage::UsageLog;
 
 /// Told to the model about a turn the user cancelled.
@@ -198,7 +200,8 @@ impl Agent {
     pub fn new(client: Client, tools: ToolRegistry, system: impl Into<String>) -> Self {
         let inbox = Arc::new(Inbox::default());
         let usage = Arc::new(UsageLog::default());
-        let hooks = Hooks::default();
+        let mut hooks = Hooks::default();
+        hooks.set_client(client.clone());
         let subagents = Arc::new(Subagents::new(inbox.clone(), usage.clone(), hooks.clone()));
         let shells = Arc::new(Shells::new(inbox.clone()));
         Self {
@@ -231,6 +234,7 @@ impl Agent {
 
     /// Switches models; the conversation continues on the new one.
     pub fn set_client(&mut self, client: Client) {
+        self.hooks.set_client(client.clone());
         self.client = client;
     }
 
@@ -241,6 +245,12 @@ impl Agent {
     /// Replaces the tool set, e.g. after the providers were reloaded.
     pub fn set_tools(&mut self, tools: ToolRegistry) {
         self.tools = tools;
+    }
+
+    /// Replaces the system prompt, for a new conversation after the
+    /// plugins were reloaded.
+    pub fn set_system(&mut self, system: String) {
+        self.system = system;
     }
 
     pub fn inbox(&self) -> &Arc<Inbox> {
@@ -261,7 +271,8 @@ impl Agent {
     }
 
     /// Runs `hooks` instead, e.g. a subagent's; its subagents get them too.
-    pub fn set_hooks(&mut self, hooks: Hooks) {
+    pub fn set_hooks(&mut self, mut hooks: Hooks) {
+        hooks.set_client(self.client.clone());
         self.subagents.set_hooks(hooks.clone());
         self.hooks = hooks;
     }
@@ -350,7 +361,8 @@ impl Agent {
         (self.compactions, self.turn_compacted) = (0, false);
         self.messages.push(Message::user(arrived.iter().cloned().chain(content).collect()));
         let (subagents, client, shells) = (self.subagents.clone(), self.client.clone(), self.shells.clone());
-        let turn = crate::subagent::scope(subagents, client, self.run_loop(observer));
+        let nested = self.hooks.is_subagent();
+        let turn = crate::subagent::scope(subagents, client, nested, self.run_loop(observer));
         let result = crate::tools::shells::scope(shells, turn).await;
         if result.is_err() {
             // A compaction moves the turn's start.

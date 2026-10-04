@@ -43,6 +43,12 @@ const GUIDANCE: &[(&str, &str)] = &[
     ("grep", "search file contents by regular expression. Use it instead of running grep or rg through `bash`."),
     ("glob", "find files by name or path pattern. Use it instead of running find or ls -R through `bash`."),
     (
+        "lsp",
+        "ask the language server where a symbol is defined or used, its type, a file's outline, or the \
+         errors in a file. More precise than `grep` for following code; check `diagnostics` after \
+         changing a file it covers.",
+    ),
+    (
         "bash",
         "builds, tests, git and other shell work. Every call is a fresh process, so \
          `cd` does not persist: use absolute paths or `cd dir && command`. Do not use it to read or \

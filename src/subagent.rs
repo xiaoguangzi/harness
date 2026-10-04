@@ -32,7 +32,7 @@ pub mod runtime;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, Weak};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use crate::agent::Agent;
 use crate::hooks::{self, Hooks};
 use crate::llm::Client;
-use crate::skills::{PluginDirs, list_field, parse_frontmatter, split_frontmatter};
+use crate::skills::{Fork, PluginDirs, Skill, parse_frontmatter, split_frontmatter};
 use crate::tools::{FileTracker, Tool, ToolOutput, ToolRegistry, parse_input};
 pub use runtime::{Subagents, scope};
 
@@ -193,8 +193,49 @@ pub fn plugin_def(file: &Path, prefix: &str, plugin: &PluginDirs) -> Result<Agen
     let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
     let mut def = parse_def(&text, file, Permission::Write)?;
     def.name = format!("{prefix}:{}", def.name);
-    def.prompt = plugin.expand(&def.prompt);
+    def.prompt = plugin.expand_prompt(&def.prompt);
     Ok(def)
+}
+
+/// The tools a `tools` or `allowed-tools` field names: `read, grep`,
+/// `[read, grep]` or a YAML list (joined by the frontmatter parser into
+/// `- read - grep`). Claude Code names such as `Read` or `KillShell` become
+/// the harness's, and what follows a name in parentheses
+/// (`Bash(git add:*)`) is dropped; MCP names keep their case.
+pub(crate) fn tool_list(value: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let (mut item, mut depth) = (String::new(), 0);
+    for c in value.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth > 0 => {}
+            ',' | '[' | ']' => items.push(std::mem::take(&mut item)),
+            c if c.is_whitespace() => items.push(std::mem::take(&mut item)),
+            c => item.push(c),
+        }
+    }
+    items.push(item);
+    let mut tools: Vec<String> = Vec::new();
+    for name in items.iter().map(|n| n.trim_matches(['"', '\''])).filter(|n| !n.is_empty() && *n != "-") {
+        let name = match hooks::tool_named(name) {
+            Some(tool) => tool.to_string(),
+            None if name.starts_with("mcp__") => name.to_string(),
+            None => name.to_ascii_lowercase(),
+        };
+        // `Glob` and `LS` are both `glob`.
+        if !tools.contains(&name) {
+            tools.push(name);
+        }
+    }
+    tools
+}
+
+/// A `model` field: Claude Code's model aliases name no model a gateway
+/// knows, so they mean the default, as `inherit` does.
+pub(crate) fn model_field(model: Option<&String>) -> Option<String> {
+    let model = model?.trim();
+    (!model.is_empty() && !matches!(model, "inherit" | "sonnet" | "opus" | "haiku")).then(|| model.to_string())
 }
 
 /// The agent defined in `text`, with `default` permission unless it gives
@@ -214,36 +255,69 @@ fn parse_def(text: &str, file: &Path, default: Permission) -> Result<AgentDef, S
         Some("write") => Permission::Write,
         Some(other) => return Err(format!("unknown permission `{other}` (use `read-only` or `write`)")),
     };
-    // Accepts `read, grep`, `[read, grep]` and YAML lists (joined by the
-    // frontmatter parser into `- read - grep`). Claude Code names such as
-    // `Read` or `KillShell` become the harness's; MCP names keep their case.
-    let tools = fields.get("tools").map(|t| {
-        let mut tools: Vec<String> = Vec::new();
-        for name in list_field(t) {
-            let name = match hooks::tool_named(&name) {
-                Some(tool) => tool.to_string(),
-                None if name.starts_with("mcp__") => name,
-                None => name.to_ascii_lowercase(),
-            };
-            // `Glob` and `LS` are both `glob`.
-            if !tools.contains(&name) {
-                tools.push(name);
-            }
-        }
-        tools
-    });
-    // Claude Code's model aliases name no model a gateway knows: they get
-    // the default, as `inherit` does.
-    let model = fields
-        .get("model")
-        .cloned()
-        .filter(|m| !m.is_empty() && !matches!(m.as_str(), "inherit" | "sonnet" | "opus" | "haiku"));
+    let tools = fields.get("tools").map(|t| tool_list(t));
+    let model = model_field(fields.get("model"));
     let prompt = body.trim().to_string();
     if prompt.is_empty() {
         return Err("empty system prompt".into());
     }
     let path = std::path::absolute(file).ok();
     Ok(AgentDef { name, description, prompt, permission, tools, model, path })
+}
+
+/// Runs `context: fork` skills for the `skill` tool and the frontends,
+/// through the `agent` tool, which is built after the `skill` tool it
+/// starts subagents with.
+#[derive(Clone, Default)]
+pub struct Forks(Arc<RwLock<Weak<AgentTool>>>);
+
+impl Forks {
+    /// Runs forks with `tool` from now on.
+    pub fn set(&self, tool: &Arc<AgentTool>) {
+        *self.0.write().unwrap() = Arc::downgrade(tool);
+    }
+
+    /// Runs skill `skill`, whose instructions are `prompt`, in a subagent,
+    /// and returns its report. Where no subagent can start (in a subagent,
+    /// or without the `agent` tool), the instructions come back to follow
+    /// in place.
+    pub async fn run(&self, skill: &str, fork: &Fork, prompt: String) -> ToolOutput {
+        let tool = self.0.read().unwrap().upgrade();
+        match tool {
+            Some(tool) if !runtime::nested() => tool.fork(skill, fork, prompt).await,
+            _ => ToolOutput::ok(format!(
+                "(The `{skill}` skill would run in a subagent of its own, which cannot start here; follow it \
+                 yourself.)\n\n{prompt}"
+            )),
+        }
+    }
+}
+
+impl Forks {
+    /// Runs the fork skill `skill` the user typed (`/<name> arguments`) in
+    /// a subagent of the conversation that owns `subagents`, on `client`;
+    /// returns the message that hands its report to that conversation's
+    /// model.
+    pub async fn run_for_user(
+        &self,
+        skill: &Skill,
+        arguments: &str,
+        subagents: Arc<Subagents>,
+        client: Client,
+    ) -> Result<String, String> {
+        let fork = skill.fork.as_ref().ok_or_else(|| format!("{} does not run in a subagent", skill.name))?;
+        let prompt = skill.render(arguments).await?;
+        let output = scope(subagents, client, false, self.run(&skill.name, fork, prompt)).await;
+        if output.is_error {
+            return Err(output.content);
+        }
+        let arguments = arguments.trim();
+        let with = if arguments.is_empty() { String::new() } else { format!(" ({arguments})") };
+        Ok(format!(
+            "The user ran the `{}` skill{with}, which ran in a subagent of its own. Its report:\n\n{}",
+            skill.name, output.content
+        ))
+    }
 }
 
 /// Receives subagent progress as JSON events: a tool call (`subagent`) or a
@@ -383,11 +457,20 @@ impl Tool for AgentTool {
         let Some(def) = self.defs.iter().find(|d| d.name == input.agent_type) else {
             return ToolOutput::error(format!("Unknown agent type: {}", input.agent_type));
         };
+        let tools = self.registry_for(def);
+        self.launch(def, tools, &input.description, input.prompt, input.run_in_background).await
+    }
+}
+
+impl AgentTool {
+    /// Starts a subagent of type `def` with `tools` on `prompt`; returns its
+    /// report, or with `background` that it started.
+    async fn launch(&self, def: &AgentDef, tools: ToolRegistry, description: &str, prompt: String, background: bool) -> ToolOutput {
         // Outside a conversation (the web UI's tool page) a subagent can
         // only run in the foreground, on the tool's own model.
         let (subagents, parent) = match runtime::current() {
             Some((subagents, client)) => (subagents, client),
-            None if input.run_in_background => {
+            None if background => {
                 return ToolOutput::error("run_in_background needs a conversation to report back to");
             }
             None => (Arc::new(Subagents::new(Arc::default(), Arc::default(), Hooks::default())), self.client.clone()),
@@ -396,9 +479,8 @@ impl Tool for AgentTool {
             Ok(c) => c,
             Err(e) => return ToolOutput::error(format!("Agent `{}` has an unusable model: {e:#}", def.name)),
         };
-        let agent = Agent::new(client, self.registry_for(def), crate::prompt::subagent(def));
-        let background = input.run_in_background;
-        let run = match subagents.spawn(agent, &def.name, &input.description, input.prompt, background, &self.reporter) {
+        let agent = Agent::new(client, tools, crate::prompt::subagent(def));
+        let run = match subagents.spawn(agent, &def.name, description, prompt, background, &self.reporter) {
             Ok(run) => run,
             Err(e) => return ToolOutput::error(format!("{e:#}")),
         };
@@ -411,6 +493,25 @@ impl Tool for AgentTool {
              there is nothing else to do.",
             def.name, run.child.id
         ))
+    }
+
+    /// Runs skill `skill` in a subagent of the type its `fork` names (with
+    /// at most its `allowed-tools`), on the skill's instructions `prompt`.
+    async fn fork(&self, skill: &str, fork: &Fork, prompt: String) -> ToolOutput {
+        let name = fork.agent.as_deref().unwrap_or("general-purpose");
+        let Some(def) = self.defs.iter().find(|d| d.name == name) else {
+            return ToolOutput::error(format!("Skill `{skill}` runs in agent `{name}`, which does not exist"));
+        };
+        let mut def = def.clone();
+        if fork.model.is_some() {
+            def.model = fork.model.clone();
+        }
+        let mut tools = self.registry_for(&def);
+        if let Some(allowed) = &fork.allowed_tools {
+            let allowed = AgentDef { tools: Some(allowed.clone()), ..def.clone() };
+            tools.retain(|t| allowed.allows(t.name()));
+        }
+        self.launch(&def, tools, &format!("/{skill}"), prompt, false).await
     }
 }
 
@@ -567,7 +668,7 @@ mod tests {
     #[test]
     fn plugin_agents_get_the_tools_they_list() {
         let dir = tempfile::tempdir().unwrap();
-        let plugin = PluginDirs { root: dir.path().into(), data: dir.path().into() };
+        let plugin = PluginDirs::new(dir.path().into(), dir.path().into());
         let def = |name: &str, front: &str| {
             let file = dir.path().join(format!("{name}.md"));
             std::fs::write(&file, format!("---\ndescription: d\n{front}---\nprompt\n")).unwrap();
@@ -649,6 +750,50 @@ mod tests {
         assert_eq!(by_name["fixer"].tools.as_deref(), Some(&["bash".to_string(), "write".into()][..]));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("unknown permission"));
+    }
+
+    #[test]
+    fn tool_lists() {
+        assert_eq!(tool_list("Bash(git add:*), Read Grep(*), mcp__gh__*"), ["bash", "read", "grep", "mcp__gh__*"]);
+        assert_eq!(tool_list("[Glob, LS]"), ["glob"]);
+        assert_eq!(tool_list("- read - 'write'"), ["read", "write"]);
+        assert_eq!(model_field(Some(&"opus".to_string())), None);
+        assert_eq!(model_field(Some(&" gw/m ".to_string())).as_deref(), Some("gw/m"));
+    }
+
+    #[tokio::test]
+    async fn fork_skills_run_in_a_subagent() {
+        use crate::agent::mock::{gateway, texts};
+        let (client, mut requests) = gateway(|_| (vec![json!({"type": "text", "text": "all done"})], "end_turn", 10)).await;
+        let base = ToolRegistry::with_defaults(FileTracker::default());
+        let defs = Arc::new(vec![explore(), general_purpose()]);
+        let tool = Arc::new(AgentTool::new(defs, base, client.clone(), Arc::new(|_: &Value| {})));
+        let forks = Forks::default();
+        let fork = Fork { allowed_tools: Some(vec!["read".into(), "bash".into(), "write".into()]), ..Fork::default() };
+        let out = forks.run("p:check", &fork, "Check it".into()).await;
+        assert!(out.content.contains("follow it yourself") && out.content.ends_with("Check it"), "no `agent` tool yet");
+
+        forks.set(&tool);
+        let out = forks.run("p:check", &fork, "Check it".into()).await;
+        assert!(!out.is_error && out.content.starts_with("all done"), "{}", out.content);
+        let request = requests.recv().await.unwrap();
+        let tools: Vec<&str> = request["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(tools, ["bash", "read", "write"], "general-purpose's tools, as far as allowed-tools goes");
+        assert_eq!(texts(&request["messages"][0]), ["Check it"]);
+
+        // An explore fork gets only what both allow.
+        let explore_fork = Fork { agent: Some("explore".into()), allowed_tools: Some(vec!["grep".into(), "bash".into()]), ..Fork::default() };
+        forks.run("p:find", &explore_fork, "Find it".into()).await;
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+        let missing = Fork { agent: Some("nope".into()), ..Fork::default() };
+        assert!(forks.run("p:x", &missing, "x".into()).await.is_error);
+
+        // A subagent runs it in place.
+        let subagents = Arc::new(Subagents::new(Arc::default(), Arc::default(), Hooks::default()));
+        let out = scope(subagents, client, true, forks.run("p:check", &fork, "Check it".into())).await;
+        assert!(out.content.contains("follow it yourself"), "{}", out.content);
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]

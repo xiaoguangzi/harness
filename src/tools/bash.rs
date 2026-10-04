@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -164,21 +164,18 @@ impl Tool for BashTool {
     }
 }
 
-/// Directories added to the end of commands' `PATH`: the enabled plugins'
-/// `bin/`. Set once, at startup.
-static EXTRA_PATH: OnceLock<OsString> = OnceLock::new();
+/// The `PATH` of the commands the model runs, when the enabled plugins'
+/// `bin/` directories add to it.
+static EXTRA_PATH: RwLock<Option<OsString>> = RwLock::new(None);
 
 /// Puts `dirs` on the `PATH` of the commands the model runs, after the
-/// directories already there, so they cannot shadow a system command.
+/// directories already there, so they cannot shadow a system command; they
+/// replace the ones given before.
 pub fn add_to_path(dirs: Vec<PathBuf>) {
-    if dirs.is_empty() {
-        return;
-    }
     let current = std::env::var_os("PATH").unwrap_or_default();
-    let paths = std::env::split_paths(&current).chain(dirs);
-    if let Ok(path) = std::env::join_paths(paths) {
-        let _ = EXTRA_PATH.set(path);
-    }
+    let paths = std::env::split_paths(&current).chain(dirs.iter().cloned());
+    let path = std::env::join_paths(paths).ok().filter(|_| !dirs.is_empty());
+    *EXTRA_PATH.write().unwrap() = path;
 }
 
 /// Starts `bash -c command` with its output piped, in the sandbox when it
@@ -196,7 +193,7 @@ pub(super) fn spawn(command: &str) -> Result<(Child, Option<sandbox::Guard>), St
             (cmd, None)
         }
     };
-    if let Some(path) = EXTRA_PATH.get() {
+    if let Some(path) = EXTRA_PATH.read().unwrap().as_ref() {
         cmd.env("PATH", path);
     }
     let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn();

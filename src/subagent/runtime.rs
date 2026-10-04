@@ -30,19 +30,25 @@ const MAX_KEPT: usize = 32;
 const MAX_EVENT_REPORT_BYTES: usize = 20_000;
 
 tokio::task_local! {
-    static CONTEXT: (Arc<Subagents>, Client);
+    static CONTEXT: (Arc<Subagents>, Client, bool);
 }
 
 /// Runs `future`, a turn of the conversation that owns `subagents`, so the
 /// subagent tools it calls act on that conversation and new subagents start
-/// from its current `client`.
-pub async fn scope<F: Future>(subagents: Arc<Subagents>, client: Client, future: F) -> F::Output {
-    CONTEXT.scope((subagents, client), future).await
+/// from its current `client`. `nested` says the conversation is a
+/// subagent's, which starts none.
+pub async fn scope<F: Future>(subagents: Arc<Subagents>, client: Client, nested: bool, future: F) -> F::Output {
+    CONTEXT.scope((subagents, client, nested), future).await
 }
 
 /// The subagents and model of the conversation whose turn is running.
 pub fn current() -> Option<(Arc<Subagents>, Client)> {
-    CONTEXT.try_with(Clone::clone).ok()
+    CONTEXT.try_with(|(subagents, client, _)| (subagents.clone(), client.clone())).ok()
+}
+
+/// Whether the running turn is a subagent's.
+pub fn nested() -> bool {
+    CONTEXT.try_with(|(_, _, nested)| *nested).unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

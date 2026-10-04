@@ -1,24 +1,28 @@
-//! Hooks: shell commands from the settings file (and the plugins it
-//! enables) that run at points of the agent loop, in the format of Claude Code's (which Codex shares), so
-//! scripts written for those work here too.
+//! Hooks: commands from the settings file (and the plugins it enables) that
+//! run at points of the agent loop, in the format of Claude Code's (which
+//! Codex shares), so scripts written for those work here too.
 //!
 //! ```json
 //! "hooks": {
 //!   "PreToolUse": [
 //!     { "matcher": "Bash", "hooks": [{ "type": "command", "command": "~/bin/guard.sh", "timeout": 30 }] }
-//!   ]
+//!   ],
+//!   "Stop": [{ "hooks": [{ "type": "prompt", "prompt": "Did it run the tests? $ARGUMENTS" }] }]
 //! }
 //! ```
 //!
-//! A hook gets the event as JSON on stdin and answers with its exit code (2
-//! blocks, with stderr as the reason) or JSON on stdout. Tools are matched
-//! by their Claude Code names as well (`Bash`, `Edit|Write`), hooks see them
-//! under those names, and the file tools' `path` also comes as `file_path`.
+//! A command hook gets the event as JSON on stdin and answers with its exit
+//! code (2 blocks, with stderr as the reason) or JSON on stdout; it runs
+//! through `sh -c`, or with `args` directly. A prompt hook asks the
+//! conversation's model instead, which answers `{"ok": false, "reason": …}`
+//! to block. Tools are matched by their Claude Code names as well (`Bash`,
+//! `Edit|Write`), hooks see them under those names, and the file tools'
+//! `path` also comes as `file_path`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -28,6 +32,8 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::llm::{Client, Message};
+use crate::skills::PluginDirs;
 use crate::tools::{KillGroup, ToolOutput};
 
 /// How long a hook may run unless it sets `timeout`.
@@ -36,8 +42,15 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// may set.
 const SESSION_END_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_SESSION_END_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a prompt hook may take unless it sets `timeout`.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Text a hook gives the model is cut to this many bytes.
 const MAX_CONTEXT_BYTES: usize = 10_000;
+/// What a prompt hook's model is told.
+const PROMPT_SYSTEM: &str = "You evaluate a hook of a coding agent: you get an instruction and the input of \
+    the event the hook runs for, and decide. Answer with only a JSON object: {\"ok\": true} to let the agent \
+    go ahead, or {\"ok\": false, \"reason\": \"...\"} to stop it, where the reason tells the agent what to do \
+    instead.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 pub enum Event {
@@ -52,6 +65,7 @@ pub enum Event {
     PostCompact,
     SessionStart,
     SessionEnd,
+    Notification,
 }
 
 impl Event {
@@ -68,6 +82,7 @@ impl Event {
             Event::PostCompact => "PostCompact",
             Event::SessionStart => "SessionStart",
             Event::SessionEnd => "SessionEnd",
+            Event::Notification => "Notification",
         }
     }
 
@@ -95,23 +110,72 @@ pub struct Group {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawHandler")]
 struct Handler {
-    #[serde(rename = "type")]
-    _kind: Kind,
-    command: String,
+    action: Action,
     /// Seconds.
     timeout: Option<u64>,
     /// Set for a plugin's hooks: `CLAUDE_PLUGIN_ROOT` and the like.
-    #[serde(skip)]
     env: Vec<(String, String)>,
 }
 
-/// Only command hooks are supported.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Kind {
-    Command,
+/// A handler as the settings give it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHandler {
+    #[serde(rename = "type")]
+    kind: String,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    prompt: Option<String>,
+    model: Option<String>,
+    timeout: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Action {
+    /// `sh -c command`, or with `args`, `command` started with them
+    /// directly.
+    Command { command: String, args: Option<Vec<String>> },
+    /// A question for the model (`model`, else the conversation's), with
+    /// the event's input in place of `$ARGUMENTS`.
+    Prompt { prompt: String, model: Option<String> },
+}
+
+impl TryFrom<RawHandler> for Handler {
+    type Error = String;
+
+    fn try_from(raw: RawHandler) -> Result<Self, String> {
+        let action = Action::new(&raw.kind, raw.command, raw.args, raw.prompt, raw.model)?;
+        Ok(Handler { action, timeout: raw.timeout, env: Vec::new() })
+    }
+}
+
+impl Action {
+    fn new(
+        kind: &str,
+        command: Option<String>,
+        args: Option<Vec<String>>,
+        prompt: Option<String>,
+        model: Option<String>,
+    ) -> Result<Self, String> {
+        match kind {
+            "command" if prompt.is_some() || model.is_some() => Err("`prompt` and `model` are for prompt hooks".into()),
+            "command" => Ok(Action::Command { command: command.ok_or("a command hook needs `command`")?, args }),
+            "prompt" if command.is_some() || args.is_some() => Err("`command` and `args` are for command hooks".into()),
+            "prompt" => Ok(Action::Prompt { prompt: prompt.ok_or("a prompt hook needs `prompt`")?, model }),
+            other => Err(format!("hook type `{other}` is not supported (only `command` and `prompt`)")),
+        }
+    }
+
+    /// The hook, for messages.
+    fn label(&self) -> String {
+        match self {
+            Action::Command { command, args: None } => command.clone(),
+            Action::Command { command, args: Some(args) } => format!("{command} {}", args.join(" ")),
+            Action::Prompt { prompt, .. } => format!("prompt: {prompt}"),
+        }
+    }
 }
 
 /// Which tools (or session sources, agent types) a group applies to: all
@@ -164,6 +228,7 @@ const ALIASES: &[(&str, &[&str])] = &[
     ("glob", &["Glob", "LS"]),
     ("grep", &["Grep"]),
     ("kill_shell", &["KillShell"]),
+    ("lsp", &["LSP"]),
     ("message_agent", &["SendMessage"]),
     ("read", &["Read"]),
     ("skill", &["Skill"]),
@@ -224,11 +289,13 @@ pub fn feedback(event: Event, text: &str) -> String {
 }
 
 /// A plugin's hooks, from its `hooks/hooks.json` or manifest: the event map
-/// `events` with `vars` (`${CLAUDE_PLUGIN_ROOT}` and the like) replaced in
-/// the commands and set in their environment. What the harness cannot run
-/// (another event, another type of hook) is left out with a warning rather
-/// than failing the plugin, which is not the user's to fix.
-pub fn plugin_config(events: &Value, vars: &[(String, String)], warnings: &mut Vec<String>) -> Config {
+/// `events` with the plugin's variables (`${CLAUDE_PLUGIN_ROOT}`,
+/// `${user_config.<key>}` and the like) replaced in the commands and
+/// prompts, and set in the commands' environment. What the harness cannot
+/// run (another event, another type of hook) is left out with a warning
+/// rather than failing the plugin, which is not the user's to fix; fields
+/// it does not know are ignored.
+pub fn plugin_config(events: &Value, plugin: &PluginDirs, warnings: &mut Vec<String>) -> Config {
     let mut config = Config::new();
     let Some(events) = events.as_object() else {
         warnings.push("hooks: expected an object of events".into());
@@ -249,14 +316,20 @@ pub fn plugin_config(events: &Value, vars: &[(String, String)], warnings: &mut V
             };
             let mut hooks = Vec::new();
             for handler in group["hooks"].as_array().into_iter().flatten() {
+                let text = |key: &str| handler[key].as_str().map(String::from);
+                let args = handler["args"].as_array().map(|args| {
+                    args.iter().map(|a| plugin.expand(a.as_str().map_or(&a.to_string(), |a| a))).collect()
+                });
                 let kind = handler["type"].as_str().unwrap_or_default();
-                let Some(command) = handler["command"].as_str().filter(|_| kind == "command") else {
-                    warnings.push(format!("{name} hook of type `{kind}` is not supported; left out"));
-                    continue;
+                let action = match Action::new(kind, text("command"), args, text("prompt"), text("model")) {
+                    Ok(Action::Command { command, args }) => Action::Command { command: plugin.expand(&command), args },
+                    Ok(Action::Prompt { prompt, model }) => Action::Prompt { prompt: plugin.expand_prompt(&prompt), model },
+                    Err(e) => {
+                        warnings.push(format!("{name} hook: {e}; left out"));
+                        continue;
+                    }
                 };
-                let command = vars.iter().fold(command.to_string(), |c, (k, v)| c.replace(&format!("${{{k}}}"), v));
-                let timeout = handler["timeout"].as_u64();
-                hooks.push(Handler { _kind: Kind::Command, command, timeout, env: vars.to_vec() });
+                hooks.push(Handler { action, timeout: handler["timeout"].as_u64(), env: plugin.env() });
             }
             if !hooks.is_empty() {
                 config.entry(event).or_default().push(Group { matcher, hooks });
@@ -266,11 +339,12 @@ pub fn plugin_config(events: &Value, vars: &[(String, String)], warnings: &mut V
     config
 }
 
-static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
+static CONFIG: RwLock<Option<Arc<Config>>> = RwLock::new(None);
 
-/// Sets the hooks of every conversation from here on, from the settings.
-pub fn init(config: Config) {
-    let _ = CONFIG.set(Arc::new(config));
+/// Sets the hooks of every conversation started from here on, from the
+/// settings and plugins.
+pub fn set(config: Arc<Config>) {
+    *CONFIG.write().unwrap() = Some(config);
 }
 
 struct Session {
@@ -286,12 +360,14 @@ pub struct Hooks {
     session: Arc<Mutex<Session>>,
     /// The subagent's id and type, for a subagent's hooks.
     subagent: Option<(String, String)>,
+    /// The conversation's model, which prompt hooks ask.
+    client: Option<Client>,
 }
 
 impl Default for Hooks {
     /// The hooks from the settings.
     fn default() -> Self {
-        Self::with_config(CONFIG.get().cloned().unwrap_or_default())
+        Self::with_config(CONFIG.read().unwrap().clone().unwrap_or_default())
     }
 }
 
@@ -324,7 +400,12 @@ struct Reply {
 impl Hooks {
     pub fn with_config(config: Arc<Config>) -> Self {
         let session = Session { id: crate::session::new_id(), transcript: None };
-        Self { config, session: Arc::new(Mutex::new(session)), subagent: None }
+        Self { config, session: Arc::new(Mutex::new(session)), subagent: None, client: None }
+    }
+
+    /// Has prompt hooks ask `client`'s model.
+    pub fn set_client(&mut self, client: Client) {
+        self.client = Some(client);
     }
 
     /// Tells the hooks which saved conversation they run for.
@@ -407,6 +488,18 @@ impl Hooks {
         self.run(Event::SessionEnd, &[reason], json!({"reason": reason}), model).await
     }
 
+    /// Something for the user to notice, such as the prompt waiting for
+    /// them (`idle_prompt`).
+    pub async fn notification(&self, kind: &str, message: &str, model: &str) -> Outcome {
+        let fields = json!({"notification_type": kind, "message": message, "title": "harness"});
+        self.run(Event::Notification, &[kind], fields, model).await
+    }
+
+    /// Whether any hook runs for `event`.
+    pub fn has(&self, event: Event) -> bool {
+        self.config.get(&event).is_some_and(|groups| !groups.is_empty())
+    }
+
     /// A subagent starts its first run.
     pub async fn subagent_start(&self, model: &str) -> Outcome {
         let agent_type = self.subagent.as_ref().map_or("", |(_, t)| t.as_str());
@@ -434,7 +527,7 @@ impl Hooks {
         let groups = self.config.get(&event).map_or(&[][..], Vec::as_slice);
         for group in groups.iter().filter(|g| !event.uses_matcher() || g.matcher.matches(names)) {
             for handler in &group.hooks {
-                if !handlers.iter().any(|h| h.command == handler.command) {
+                if !handlers.iter().any(|h| h.action == handler.action) {
                     handlers.push(handler);
                 }
             }
@@ -444,18 +537,32 @@ impl Hooks {
             return outcome;
         }
         let input = self.input(event, fields, model).to_string();
-        let replies = join_all(handlers.iter().map(|h| {
+        let replies = join_all(handlers.iter().map(|h| async {
+            let default = match &h.action {
+                Action::Prompt { .. } => PROMPT_TIMEOUT,
+                Action::Command { .. } => DEFAULT_TIMEOUT,
+            };
             let timeout = match event {
                 Event::SessionEnd => {
                     h.timeout.map_or(SESSION_END_TIMEOUT, Duration::from_secs).min(MAX_SESSION_END_TIMEOUT)
                 }
-                _ => h.timeout.map_or(DEFAULT_TIMEOUT, Duration::from_secs),
+                _ => h.timeout.map_or(default, Duration::from_secs),
             };
-            run_command(&h.command, &h.env, &input, timeout)
+            match &h.action {
+                Action::Command { command, args } => run_command(command, args.as_deref(), &h.env, &input, timeout).await,
+                Action::Prompt { prompt, model } => match &self.client {
+                    Some(client) => {
+                        let asked = ask_model(client, prompt, model.as_deref(), &input);
+                        let timed_out = || format!("timed out after {:.1}s", timeout.as_secs_f64());
+                        tokio::time::timeout(timeout, asked).await.unwrap_or_else(|_| Err(timed_out()))
+                    }
+                    None => Err("there is no model to ask here".into()),
+                },
+            }
         }))
         .await;
         for (handler, reply) in handlers.iter().zip(replies) {
-            outcome.add(event, &handler.command, reply);
+            outcome.add(event, &handler.action.label(), reply);
         }
         outcome
     }
@@ -565,16 +672,54 @@ impl Outcome {
     }
 }
 
-/// Runs `sh -c command` with `input` on stdin, in a process group of its
-/// own that is killed if it times out or the call is dropped.
+/// Asks `client`'s model (or `model`, if it resolves) whether to go ahead,
+/// with the hook's `input` in place of `$ARGUMENTS` in `prompt`; its answer
+/// as a command hook's: `ok: false` as exit code 2, other JSON as output.
+async fn ask_model(client: &Client, prompt: &str, model: Option<&str>, input: &str) -> Result<Reply, String> {
+    let client = model.and_then(|m| client.switch(m).ok()).unwrap_or_else(|| client.clone());
+    let text = match prompt.contains("$ARGUMENTS") {
+        true => prompt.replace("$ARGUMENTS", input),
+        false => format!("{prompt}\n\nThe input of the event:\n{input}"),
+    };
+    let messages = [Message::user(vec![json!({"type": "text", "text": text})])];
+    let response = client.create(PROMPT_SYSTEM, &[], &messages, &mut |_| {}).await.map_err(|e| format!("{e:#}"))?;
+    let answer: String = response.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+    let json = match (answer.find('{'), answer.rfind('}')) {
+        (Some(start), Some(end)) if start < end => serde_json::from_str::<Value>(&answer[start..=end]).ok(),
+        _ => None,
+    };
+    let reply = |code, stdout: String, stderr: &str| Ok(Reply { code: Some(code), stdout, stderr: stderr.to_string() });
+    match json {
+        Some(json) if json["ok"] == true => reply(0, String::new(), ""),
+        Some(json) if json["ok"] == false => reply(2, String::new(), json["reason"].as_str().unwrap_or_default()),
+        Some(json) if json.is_object() => reply(0, json.to_string(), ""),
+        _ => Err(format!("the model answered without the JSON asked for: {}", crate::util::ellipsize(answer.trim(), 200))),
+    }
+}
+
+/// Runs `sh -c command`, or with `args` `command` itself, with `input` on
+/// stdin, in a process group of its own that is killed if it times out or
+/// the call is dropped.
 async fn run_command(
     command: &str,
+    args: Option<&[String]>,
     env: &[(String, String)],
     input: &str,
     timeout: Duration,
 ) -> Result<Reply, String> {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command).process_group(0).envs(env.iter().map(|(k, v)| (k, v)));
+    let mut cmd = match args {
+        Some(args) => {
+            let mut cmd = Command::new(command);
+            cmd.args(args);
+            cmd
+        }
+        None => {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(command);
+            cmd
+        }
+    };
+    cmd.process_group(0).envs(env.iter().map(|(k, v)| (k, v)));
     if let Ok(dir) = std::env::current_dir() {
         cmd.env("CLAUDE_PROJECT_DIR", &dir).env("HARNESS_PROJECT_DIR", &dir);
     }
@@ -632,9 +777,10 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(config.len(), 2);
         let bad = [
-            json!({"Notification": []}),
+            json!({"PermissionRequest": []}),
             json!({"PreCompact": [{"hooks": [{"type": "command", "command": "y", "statusMessage": "z"}]}]}),
             json!({"Stop": [{"hooks": [{"type": "prompt", "command": "y"}]}]}),
+            json!({"Stop": [{"hooks": [{"type": "http", "url": "y"}]}]}),
             json!({"Stop": [{"hooks": [{"type": "command", "command": "y", "async": true}]}]}),
             json!({"PreToolUse": [{"matcher": "(", "hooks": []}]}),
         ];
@@ -815,24 +961,71 @@ pub(crate) mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn plugin_hooks() {
         let _guard = crate::util::lock_cwd();
-        let vars = vec![("CLAUDE_PLUGIN_ROOT".to_string(), "/p/root".to_string())];
+        let mut plugin = PluginDirs::new("/p/root".into(), "/p/data".into());
+        plugin.options.push(crate::skills::PluginOption { key: "token".into(), value: "t0k".into(), sensitive: true });
         let events = json!({
             "UserPromptSubmit": [{"hooks": [
-                {"type": "command", "command": "echo \"${CLAUDE_PLUGIN_ROOT}/x $CLAUDE_PLUGIN_ROOT\"", "timeout": 5},
-                {"type": "prompt", "prompt": "is this ok?"}
+                {"type": "command", "command": "echo \"${CLAUDE_PLUGIN_ROOT}/x $CLAUDE_PLUGIN_ROOT ${user_config.token}\"", "timeout": 5},
+                {"type": "command", "command": "printf", "args": ["%s|%s", "${CLAUDE_PLUGIN_ROOT}", "$CLAUDE_PLUGIN_OPTION_TOKEN"]},
+                {"type": "agent", "prompt": "is this ok?"}
             ]}],
-            "Notification": [{"hooks": [{"type": "command", "command": "true"}]}]
+            "PermissionRequest": [{"hooks": [{"type": "command", "command": "true"}]}],
+            "Notification": [{"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "cat >&2; exit 1"}]}]
         });
         let mut warnings = Vec::new();
-        let config = plugin_config(&events, &vars, &mut warnings);
+        let config = plugin_config(&events, &plugin, &mut warnings);
         assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("`Notification`")) && warnings.iter().any(|w| w.contains("`prompt`")));
-        let outcome = Hooks::with_config(Arc::new(config)).user_prompt_submit("hi", "m").await;
-        assert_eq!(outcome.context, ["/p/root/x /p/root"]);
+        assert!(warnings.iter().any(|w| w.contains("`PermissionRequest`")) && warnings.iter().any(|w| w.contains("`agent`")));
+        let hooks = Hooks::with_config(Arc::new(config));
+        let mut context = hooks.user_prompt_submit("hi", "m").await.context;
+        context.sort();
+        // The exec form passes `$…` on as it is.
+        assert_eq!(context, ["/p/root/x /p/root t0k", "/p/root|$CLAUDE_PLUGIN_OPTION_TOKEN"]);
+        let outcome = hooks.notification("idle_prompt", "waiting", "m").await;
+        let input: Value = serde_json::from_str(outcome.notices[0].split_once(": ").unwrap().1).unwrap();
+        assert_eq!((input["notification_type"].as_str(), input["message"].as_str()), (Some("idle_prompt"), Some("waiting")));
+        assert!(hooks.notification("other", "x", "m").await.notices.is_empty(), "the matcher picks the type");
+        assert!(hooks.has(Event::Notification) && !hooks.has(Event::Stop));
         assert_eq!(tool_named("Bash"), Some("bash"));
         assert_eq!(tool_named("KillShell"), Some("kill_shell"));
         assert_eq!(tool_named("Glob"), Some("glob"));
         assert_eq!(tool_named("LS"), Some("glob"));
         assert_eq!(tool_named("WebFetch"), None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn exec_form_in_the_settings() {
+        let _guard = crate::util::lock_cwd();
+        let h = hooks(json!({"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "echo", "args": ["a b", "$HOME"]}]}]}));
+        assert_eq!(h.user_prompt_submit("hi", "m").await.context, ["a b $HOME"]);
+        let bad = json!({"Stop": [{"hooks": [{"type": "command", "args": ["x"]}]}]});
+        assert!(serde_json::from_value::<Config>(bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn prompt_hooks_ask_the_model() {
+        use crate::agent::mock::{gateway, texts};
+        let (client, mut requests) = gateway(|n| {
+            let answer = match n {
+                0 => r#"{"ok": false, "reason": "the tests were not run"}"#,
+                1 => "Sure: {\"ok\": true}",
+                _ => "no idea",
+            };
+            (vec![json!({"type": "text", "text": answer})], "end_turn", 10)
+        })
+        .await;
+        let mut h = hooks(json!({"Stop": [{"hooks": [{"type": "prompt", "prompt": "Check this: $ARGUMENTS", "model": "haiku"}]}]}));
+        assert!(h.stop(false, "done", "m").await.notices[0].contains("no model to ask"));
+        h.set_client(client);
+        let outcome = h.stop(false, "done", "m").await;
+        assert_eq!(outcome.block.as_deref(), Some("the tests were not run"));
+        let request = requests.recv().await.unwrap();
+        let asked = &texts(&request["messages"][0])[0];
+        assert!(asked.starts_with("Check this: {") && asked.contains(r#""last_assistant_message":"done""#), "{asked}");
+        assert!(request["system"].to_string().contains("evaluate a hook"));
+        assert!(h.stop(false, "done", "m").await.block.is_none());
+        let outcome = h.stop(false, "done", "m").await;
+        assert!(outcome.notices[0].contains("without the JSON asked for: no idea"), "{:?}", outcome.notices);
     }
 }
