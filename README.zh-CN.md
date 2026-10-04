@@ -67,7 +67,7 @@ harness --help                          # 查看全部选项
 | `hooks` | [Hooks](#hooks) |
 | `enabledPlugins`、`extraKnownMarketplaces`、`pluginConfigs` | [插件](#插件plugins) |
 
-所有键都可省略，未知的键会报错。项目目录中的配置一概不读（包括项目的 `.mcp.json`）：否则仓库可以把带着你 API key 的请求发到它自己的服务器、启动 MCP 命令或 hook，或放宽沙箱。项目中的 `.harness/agents`、`.harness/skills` 及 `.claude/` 下的同名目录仍会读取，因为它们只增加提示词（技能中的 `` !`command` `` 行与模型自己的 `bash` 命令一样运行，开启沙箱时在沙箱内）。插件的 hook 和 MCP 服务器会在沙箱外运行命令，因此只能在这里启用。旧版本读取 `~/.harness/providers.json`、`mcp.json` 和 `sandbox.json`；这些文件存在时 harness 会给出警告，其内容应移到上面对应的键下（`default_model` 改名为 `model`）。
+所有键都可省略，未知的键会报错。项目目录中的配置一概不读（包括项目的 `.mcp.json`）：否则仓库可以把带着你 API key 的请求发到它自己的服务器、启动 MCP 命令或 hook，或放宽沙箱。项目中的 `.harness/agents`、`.harness/skills`、`.claude/` 下的同名目录及 `.agents/skills` 仍会读取，因为它们只增加提示词（技能中的 `` !`command` `` 行与模型自己的 `bash` 命令一样运行，开启沙箱时在沙箱内）。插件的 hook 和 MCP 服务器会在沙箱外运行命令，因此只能在这里启用。旧版本读取 `~/.harness/providers.json`、`mcp.json` 和 `sandbox.json`；这些文件存在时 harness 会给出警告，其内容应移到上面对应的键下（`default_model` 改名为 `model`）。
 
 ## Web UI
 
@@ -326,7 +326,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 1. Run `git log --oneline <last-tag>..HEAD` ...
 ```
 
-技能在 `.harness/skills/`、`.claude/skills/`、`~/.harness/skills/` 和 `~/.claude/skills/` 中发现（名称冲突时靠前的优先），[插件](#插件plugins)也可以带来技能。预先提供给模型的只有每个技能的名称和描述（截断到 300 个字符），列在 `skill` 工具里；正文在模型调用该工具或你输入 `/<name>` 时才加载。技能自带的脚本和参考文件通过普通工具使用，路径相对于技能的基准目录（加载的技能会说明该目录）。
+技能在 `.harness/skills/`、`.claude/skills/`、`.agents/skills/`（Codex 等 agent 共用的位置）、`~/.harness/skills/`、`~/.claude/skills/` 和 `~/.agents/skills/` 中发现（名称冲突时靠前的优先），[插件](#插件plugins)也可以带来技能。预先提供给模型的只有每个技能的名称和描述（截断到 300 个字符），列在 `skill` 工具里；正文在模型调用该工具或你输入 `/<name>` 时才加载。技能自带的脚本和参考文件通过普通工具使用，路径相对于技能的基准目录（加载的技能会说明该目录）。
 
 与 Claude Code 相同：
 

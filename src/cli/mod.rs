@@ -1009,8 +1009,8 @@ fn print_usage(agent: &Agent) {
 fn print_skills(skills: &[Skill]) {
     if skills.is_empty() {
         println!(
-            "no skills or commands found (looked in .harness/skills, .claude/skills, .harness/commands, \
-             .claude/commands and the same under ~)"
+            "no skills or commands found (looked in .harness/skills, .claude/skills, .agents/skills, \
+             .harness/commands, .claude/commands and the same under ~)"
         );
     }
     for s in skills {

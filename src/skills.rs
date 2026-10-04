@@ -371,23 +371,22 @@ async fn run_command(command: &str) -> Result<String, String> {
 }
 
 /// Default search roots, highest precedence first: project-level
-/// `.harness/skills` and `.claude/skills`, then the same under `$HOME`.
+/// `.harness/skills`, `.claude/skills` and `.agents/skills` (the shared
+/// location Codex and other agents use), then the same under `$HOME`.
 pub fn default_roots() -> Vec<PathBuf> {
-    roots_named("skills")
+    roots_named("skills", &[".harness", ".claude", ".agents"])
 }
 
 /// The same for commands: `.harness/commands`, `.claude/commands`, and the
 /// same under `$HOME`.
 pub fn default_command_roots() -> Vec<PathBuf> {
-    roots_named("commands")
+    roots_named("commands", &[".harness", ".claude"])
 }
 
-fn roots_named(dir: &str) -> Vec<PathBuf> {
-    let mut roots = vec![Path::new(".harness").join(dir), Path::new(".claude").join(dir)];
+fn roots_named(dir: &str, parents: &[&str]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = parents.iter().map(|parent| Path::new(parent).join(dir)).collect();
     if let Some(home) = std::env::var_os("HOME") {
-        let home = Path::new(&home);
-        roots.push(home.join(".harness").join(dir));
-        roots.push(home.join(".claude").join(dir));
+        roots.extend(parents.iter().map(|parent| Path::new(&home).join(parent).join(dir)));
     }
     roots
 }
@@ -679,6 +678,13 @@ mod tests {
         assert_eq!(fields["name"], "quoted");
         assert_eq!(fields["description"], "folded line one line two");
         assert_eq!(fields["license"], "MIT");
+    }
+
+    #[test]
+    fn default_roots_include_agents_skills() {
+        let roots = default_roots();
+        assert_eq!(roots[..3], [".harness/skills", ".claude/skills", ".agents/skills"].map(PathBuf::from));
+        assert!(!default_command_roots().contains(&PathBuf::from(".agents/commands")));
     }
 
     #[test]

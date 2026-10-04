@@ -66,7 +66,7 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 | `hooks` | [hooks](#hooks) |
 | `enabledPlugins`, `extraKnownMarketplaces`, `pluginConfigs` | [plugins](#plugins) |
 
-Every key is optional, and unknown keys are an error. Nothing is read from the project directory (a project's `.mcp.json` included): a repository could otherwise send requests carrying your API keys to its own server, start MCP commands or hooks, or loosen the sandbox. The project's `.harness/agents`, `.harness/skills` and their `.claude/` counterparts are still read, as they only add prompts (a skill's `` !`command` `` lines run like the model's own `bash` commands, in the sandbox when it is on). Plugins, whose hooks and MCP servers run commands outside it, are enabled only here. Older versions read `~/.harness/providers.json`, `mcp.json` and `sandbox.json`; the harness warns while they exist, and their contents go under the keys above (`default_model` is now `model`).
+Every key is optional, and unknown keys are an error. Nothing is read from the project directory (a project's `.mcp.json` included): a repository could otherwise send requests carrying your API keys to its own server, start MCP commands or hooks, or loosen the sandbox. The project's `.harness/agents`, `.harness/skills`, their `.claude/` counterparts and `.agents/skills` are still read, as they only add prompts (a skill's `` !`command` `` lines run like the model's own `bash` commands, in the sandbox when it is on). Plugins, whose hooks and MCP servers run commands outside it, are enabled only here. Older versions read `~/.harness/providers.json`, `mcp.json` and `sandbox.json`; the harness warns while they exist, and their contents go under the keys above (`default_model` is now `model`).
 
 ## Web UI
 
@@ -325,7 +325,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 1. Run `git log --oneline <last-tag>..HEAD` ...
 ```
 
-Skills are discovered in `.harness/skills/`, `.claude/skills/`, `~/.harness/skills/` and `~/.claude/skills/` (earlier wins on name clashes), and come with [plugins](#plugins). Only each skill's name and description (cut to 300 characters) go to the model up front, listed in the `skill` tool; the body is loaded when the model calls that tool or when you type `/<name>`. Bundled scripts and reference files are used through the normal tools, relative to the skill's base directory, which the loaded skill states.
+Skills are discovered in `.harness/skills/`, `.claude/skills/`, `.agents/skills/` (the location Codex and other agents share), `~/.harness/skills/`, `~/.claude/skills/` and `~/.agents/skills/` (earlier wins on name clashes), and come with [plugins](#plugins). Only each skill's name and description (cut to 300 characters) go to the model up front, listed in the `skill` tool; the body is loaded when the model calls that tool or when you type `/<name>`. Bundled scripts and reference files are used through the normal tools, relative to the skill's base directory, which the loaded skill states.
 
 As in Claude Code:
 

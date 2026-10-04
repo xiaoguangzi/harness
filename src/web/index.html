@@ -944,7 +944,7 @@ async function showEnvPage() {
     h("div", { class: "card" }, h("h2", {}, "Skills"),
       info.skills.length ? h("table", {}, h("tr", {}, h("th", {}, "名称"), h("th", {}, "说明")),
         info.skills.map(s => h("tr", {}, h("td", { class: "mono" }, "/" + s.name), h("td", {}, s.description, h("div", { class: "muted mono" }, s.dir)))))
-        : h("p", { class: "note" }, "未发现 skill 或命令（.harness/skills、.claude/skills、.harness/commands、.claude/commands 及 ~ 下同名目录）")),
+        : h("p", { class: "note" }, "未发现 skill 或命令（.harness/skills、.claude/skills、.agents/skills、.harness/commands、.claude/commands 及 ~ 下同名目录）")),
     h("div", { class: "card" }, h("h2", {}, "MCP 服务器"),
       info.mcp.length ? h("table", {}, h("tr", {}, h("th", {}, "服务器"), h("th", {}, "状态 / 工具")),
         info.mcp.map(m => h("tr", {}, h("td", { class: "mono" }, m.name),
