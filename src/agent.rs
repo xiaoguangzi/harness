@@ -202,6 +202,7 @@ impl Agent {
         let usage = Arc::new(UsageLog::default());
         let mut hooks = Hooks::default();
         hooks.set_client(client.clone());
+        hooks.set_inbox(inbox.clone());
         let subagents = Arc::new(Subagents::new(inbox.clone(), usage.clone(), hooks.clone()));
         let shells = Arc::new(Shells::new(inbox.clone()));
         Self {
@@ -273,6 +274,7 @@ impl Agent {
     /// Runs `hooks` instead, e.g. a subagent's; its subagents get them too.
     pub fn set_hooks(&mut self, mut hooks: Hooks) {
         hooks.set_client(self.client.clone());
+        hooks.set_inbox(self.inbox.clone());
         self.subagents.set_hooks(hooks.clone());
         self.hooks = hooks;
     }

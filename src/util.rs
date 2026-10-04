@@ -21,6 +21,13 @@ pub fn ellipsize(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// `text` on one line (runs of whitespace, and `\n` written out, as one
+/// space), cut to at most `max_chars` characters: a description in a list.
+pub fn one_line(text: &str, max_chars: usize) -> String {
+    let text = text.replace("\\n", " ");
+    ellipsize(&text.split_whitespace().collect::<Vec<_>>().join(" "), max_chars)
+}
+
 /// Expands `${VAR}` and `${VAR:-default}`; unset variables become "".
 pub fn expand_env(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

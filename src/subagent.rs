@@ -46,6 +46,8 @@ use crate::tools::{FileTracker, Tool, ToolOutput, ToolRegistry, parse_input};
 pub use runtime::{Subagents, scope};
 
 const MAX_RESULT_BYTES: usize = 50_000;
+/// Characters of an agent's description the `agent` tool lists.
+const MAX_LISTED_DESCRIPTION: usize = 400;
 
 /// The tools that start and steer subagents. Subagents never get them, so
 /// they cannot start subagents of their own.
@@ -351,14 +353,20 @@ impl AgentTool {
              it with its context intact, `stop_agent` stops it. The report comes to you, not the \
              user; relay what matters.\n\nAvailable agents:",
         );
-        for d in defs.iter() {
-            let access = match d.permission {
-                Permission::ReadOnly => "read-only",
-                Permission::Write => "can modify files",
-            };
-            description.push_str(&format!("\n- {} ({access}): {}", d.name, d.description));
+        let mut tool = Self { defs, base, client, reporter, description: String::new() };
+        for d in tool.defs.iter() {
+            let access = if tool.only_reads(d) { "read-only" } else { "can modify files" };
+            let text = crate::util::one_line(&d.description, MAX_LISTED_DESCRIPTION);
+            description.push_str(&format!("\n- {} ({access}): {text}", d.name));
         }
-        Self { defs, base, client, reporter, description }
+        tool.description = description;
+        tool
+    }
+
+    /// Whether every tool agent `def` gets only reads.
+    fn only_reads(&self, def: &AgentDef) -> bool {
+        let registry = self.registry_for(def);
+        registry.names().all(|name| registry.get(name).is_some_and(|t| t.read_only()))
     }
 
     /// Tool names in `defs` that no available tool matches.
@@ -388,6 +396,10 @@ impl AgentTool {
             registry.retain(|t| t.read_only());
         }
         registry.retain(|t| !TOOLS.contains(&t.name()) && def.allows(t.name()));
+        // Without `bash` there are no background commands to read or stop.
+        if registry.get("bash").is_none() {
+            registry.retain(|t| !matches!(t.name(), "bash_output" | "kill_shell"));
+        }
         registry
     }
 
@@ -446,7 +458,7 @@ impl Tool for AgentTool {
 
     /// Only as read-only as the agents it can start.
     fn read_only(&self) -> bool {
-        self.defs.iter().all(|d| d.permission == Permission::ReadOnly)
+        self.defs.iter().all(|d| self.only_reads(d))
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
@@ -685,6 +697,13 @@ mod tests {
         // It can still ask for less.
         let reader = def("reader", "tools: Read, Bash\npermission: read-only\n");
         assert_eq!(names(&tool.registry_for(&reader)), vec!["read"]);
+        // Labelled by what its tools can do, not by its permission.
+        let explorer = def("explorer", "tools: Glob, Grep, LS, Read, NotebookRead, WebFetch, KillShell, BashOutput\n");
+        assert_eq!(names(&tool.registry_for(&explorer)), vec!["glob", "grep", "read"], "no shell helpers without bash");
+        let listed = agent_tool(vec![explorer, fixer.clone()]);
+        assert!(listed.description().contains("p:explorer (read-only)"), "{}", listed.description());
+        assert!(listed.description().contains("p:fixer (can modify files)"));
+        assert!(agent_tool(vec![def("long", &format!("description: {}\\n<example>\n", "x ".repeat(500)))]).description().len() < 2_000);
         // The user's own agents stay read-only by default.
         let own = "---\ndescription: d\ntools: Read, Bash\n---\np\n";
         let own = parse_def(own, Path::new("own.md"), Permission::ReadOnly);

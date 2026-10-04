@@ -76,6 +76,15 @@ impl Extensions {
         agent_defs.extend(loaded.agents);
         agent_defs.sort_by(|a, b| a.name.cmp(&b.name));
 
+        // A language server that is not installed would only fail the tool.
+        let mut lsp_servers = loaded.lsp_servers;
+        lsp_servers.retain(|name, server| {
+            let installed = lsp::command_exists(&server.command);
+            if !installed {
+                warnings.push(format!("LSP server `{name}`: `{}` is not installed or not on PATH; left out", server.command));
+            }
+            installed
+        });
         let mcp = mcp::Manager::start(&loaded.mcp_servers).await;
         for status in &mcp.statuses {
             if let Err(e) = &status.outcome {
@@ -88,7 +97,7 @@ impl Extensions {
             agent_defs: Arc::new(agent_defs),
             hooks: Arc::new(hooks),
             mcp,
-            lsp: Arc::new(lsp::Manager::new(loaded.lsp_servers)),
+            lsp: Arc::new(lsp::Manager::new(lsp_servers)),
             bin_dirs: loaded.bin_dirs,
             warnings,
             auto_update: loaded.auto_update,

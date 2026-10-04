@@ -32,6 +32,8 @@ use crate::tools::{Tool, ToolOutput, parse_input};
 const MAX_SHELL_OUTPUT: usize = 30_000;
 /// How long it may run.
 const SHELL_TIMEOUT_MS: u64 = 120_000;
+/// Characters of a skill's description the `skill` tool lists.
+const MAX_LISTED_DESCRIPTION: usize = 300;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skill {
@@ -582,7 +584,8 @@ impl SkillTool {
         );
         for s in &skills {
             let forks = if s.fork.is_some() { " (runs in a subagent of its own, which reports back)" } else { "" };
-            description.push_str(&format!("\n- {}: {}{forks}", s.name, s.description));
+            let text = crate::util::one_line(&s.description, MAX_LISTED_DESCRIPTION);
+            description.push_str(&format!("\n- {}: {text}{forks}", s.name));
         }
         let read_only = !skills.iter().any(|s| s.fork.is_some() || s.runs_commands());
         Self { skills, description, read_only, forks }

@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::agent::Inbox;
 use crate::llm::{Client, Message};
 use crate::skills::PluginDirs;
 use crate::tools::{KillGroup, ToolOutput};
@@ -113,10 +114,36 @@ pub struct Group {
 #[serde(try_from = "RawHandler")]
 struct Handler {
     action: Action,
+    /// `if`: the tool calls it runs for, past the group's matcher.
+    condition: Option<Condition>,
+    mode: Mode,
     /// Seconds.
     timeout: Option<u64>,
     /// Set for a plugin's hooks: `CLAUDE_PLUGIN_ROOT` and the like.
     env: Vec<(String, String)>,
+}
+
+/// Whether the agent waits for a hook.
+#[derive(Debug, Clone, PartialEq)]
+enum Mode {
+    /// It waits, and the hook's answer counts.
+    Wait,
+    /// `async`: the hook runs in the background; what it has for the model
+    /// goes with the next request.
+    Background,
+    /// `asyncRewake`: the same, and exit code 2 wakes the model with
+    /// `rewakeMessage` and the hook's reason.
+    Rewake(Option<String>),
+}
+
+impl Mode {
+    fn new(background: bool, rewake: bool, message: Option<String>) -> Self {
+        match (background, rewake) {
+            (_, true) => Mode::Rewake(message),
+            (true, false) => Mode::Background,
+            (false, false) => Mode::Wait,
+        }
+    }
 }
 
 /// A handler as the settings give it.
@@ -130,6 +157,97 @@ struct RawHandler {
     prompt: Option<String>,
     model: Option<String>,
     timeout: Option<u64>,
+    #[serde(rename = "if")]
+    condition: Option<String>,
+    #[serde(default, rename = "async")]
+    background: bool,
+    #[serde(default, rename = "asyncRewake")]
+    rewake: bool,
+    #[serde(rename = "rewakeMessage")]
+    rewake_message: Option<String>,
+    /// Claude Code's line for its UI; unused.
+    #[serde(rename = "rewakeSummary")]
+    _rewake_summary: Option<String>,
+}
+
+/// An `if` rule, in Claude Code's permission syntax: `Bash(git commit:*)`,
+/// `Edit(src/**/*.ts)`, or a tool's name alone.
+#[derive(Debug, Clone)]
+struct Condition {
+    tool: String,
+    /// What the command (for `Bash`) or the file path (for the file tools)
+    /// must match.
+    pattern: Option<Regex>,
+}
+
+impl Condition {
+    fn parse(rule: &str) -> Result<Self, String> {
+        let rule = rule.trim();
+        let (tool, pattern) = match rule.split_once('(') {
+            None => (rule, None),
+            Some((tool, rest)) => match rest.strip_suffix(')') {
+                Some(pattern) => (tool.trim(), Some(pattern.trim())),
+                None => return Err(format!("`if` rule `{rule}` lacks its closing parenthesis")),
+            },
+        };
+        if tool.is_empty() || !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("`if` rule `{rule}` names no tool"));
+        }
+        let is_command = tool_named(tool) == Some("bash");
+        let pattern = pattern.filter(|p| !p.is_empty() && *p != "*").map(|p| rule_regex(p, is_command)).transpose()?;
+        Ok(Self { tool: tool.to_string(), pattern })
+    }
+
+    /// Whether the call of the tool named `names` (with its aliases) with
+    /// `input` (as hooks see it) is one the rule is for.
+    fn matches(&self, names: &[&str], input: &Value) -> bool {
+        if !names.iter().any(|n| *n == self.tool) {
+            return false;
+        }
+        let Some(pattern) = &self.pattern else { return true };
+        match names.first().copied() {
+            // Each part of a compound command counts.
+            Some("bash") => input["command"]
+                .as_str()
+                .unwrap_or_default()
+                .split(['\n', ';', '|', '&'])
+                .map(str::trim)
+                .any(|part| !part.is_empty() && pattern.is_match(part)),
+            Some("read" | "edit" | "write" | "grep" | "glob") => {
+                let Some(path) = input["file_path"].as_str().or(input["path"].as_str()) else { return false };
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let relative = std::path::Path::new(path).strip_prefix(&cwd).map(|p| p.display().to_string());
+                pattern.is_match(path) || relative.is_ok_and(|r| pattern.is_match(&r))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A rule's pattern as a regular expression for a whole command (`*` is
+/// anything; `prefix:*` and a trailing ` *` take any arguments, or none) or
+/// a whole path (`*` stays within a directory, `**` does not).
+fn rule_regex(pattern: &str, command: bool) -> Result<Regex, String> {
+    let (body, args) = match pattern.strip_suffix(":*").or_else(|| pattern.strip_suffix(" *")) {
+        Some(body) if command => (body, r"(\s.*)?"),
+        _ => (pattern, ""),
+    };
+    let mut regex = String::from("^");
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' if command => regex.push_str(".*"),
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next();
+                regex.push_str(".*");
+            }
+            '*' => regex.push_str("[^/]*"),
+            c => regex.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    regex.push_str(args);
+    regex.push('$');
+    Regex::new(&regex).map_err(|e| format!("`if` pattern `{pattern}`: {e}"))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,7 +265,9 @@ impl TryFrom<RawHandler> for Handler {
 
     fn try_from(raw: RawHandler) -> Result<Self, String> {
         let action = Action::new(&raw.kind, raw.command, raw.args, raw.prompt, raw.model)?;
-        Ok(Handler { action, timeout: raw.timeout, env: Vec::new() })
+        let condition = raw.condition.as_deref().map(Condition::parse).transpose()?;
+        let mode = Mode::new(raw.background, raw.rewake, raw.rewake_message);
+        Ok(Handler { action, condition, mode, timeout: raw.timeout, env: Vec::new() })
     }
 }
 
@@ -219,7 +339,7 @@ impl Matcher {
 
 /// Claude Code's names for the built-in tools; the first is the one hooks
 /// see in `tool_name`.
-const ALIASES: &[(&str, &[&str])] = &[
+pub(crate) const ALIASES: &[(&str, &[&str])] = &[
     ("agent", &["Agent", "Task"]),
     ("bash", &["Bash"]),
     ("bash_output", &["BashOutput"]),
@@ -329,7 +449,17 @@ pub fn plugin_config(events: &Value, plugin: &PluginDirs, warnings: &mut Vec<Str
                         continue;
                     }
                 };
-                hooks.push(Handler { action, timeout: handler["timeout"].as_u64(), env: plugin.env() });
+                // A hook whose `if` cannot be read would run for more than it
+                // should; it is left out.
+                let condition = match text("if").as_deref().map(Condition::parse).transpose() {
+                    Ok(condition) => condition,
+                    Err(e) => {
+                        warnings.push(format!("{name} hook: {e}; left out"));
+                        continue;
+                    }
+                };
+                let mode = Mode::new(handler["async"] == true, handler["asyncRewake"] == true, text("rewakeMessage"));
+                hooks.push(Handler { action, condition, mode, timeout: handler["timeout"].as_u64(), env: plugin.env() });
             }
             if !hooks.is_empty() {
                 config.entry(event).or_default().push(Group { matcher, hooks });
@@ -362,6 +492,8 @@ pub struct Hooks {
     subagent: Option<(String, String)>,
     /// The conversation's model, which prompt hooks ask.
     client: Option<Client>,
+    /// The conversation's inbox, where background hooks' answers go.
+    inbox: Option<Arc<Inbox>>,
 }
 
 impl Default for Hooks {
@@ -400,12 +532,17 @@ struct Reply {
 impl Hooks {
     pub fn with_config(config: Arc<Config>) -> Self {
         let session = Session { id: crate::session::new_id(), transcript: None };
-        Self { config, session: Arc::new(Mutex::new(session)), subagent: None, client: None }
+        Self { config, session: Arc::new(Mutex::new(session)), subagent: None, client: None, inbox: None }
     }
 
     /// Has prompt hooks ask `client`'s model.
     pub fn set_client(&mut self, client: Client) {
         self.client = Some(client);
+    }
+
+    /// Sends what background hooks have for the model to `inbox`.
+    pub fn set_inbox(&mut self, inbox: Arc<Inbox>) {
+        self.inbox = Some(inbox);
     }
 
     /// Tells the hooks which saved conversation they run for.
@@ -525,9 +662,15 @@ impl Hooks {
     async fn run(&self, event: Event, names: &[&str], fields: Value, model: &str) -> Outcome {
         let mut handlers: Vec<&Handler> = Vec::new();
         let groups = self.config.get(&event).map_or(&[][..], Vec::as_slice);
+        // `if` rules only apply to tool calls.
+        let tool_input = fields.get("tool_input");
         for group in groups.iter().filter(|g| !event.uses_matcher() || g.matcher.matches(names)) {
             for handler in &group.hooks {
-                if !handlers.iter().any(|h| h.action == handler.action) {
+                let applies = match (&handler.condition, tool_input) {
+                    (Some(condition), Some(input)) => condition.matches(names, input),
+                    _ => true,
+                };
+                if applies && !handlers.iter().any(|h| h.action == handler.action) {
                     handlers.push(handler);
                 }
             }
@@ -537,34 +680,78 @@ impl Hooks {
             return outcome;
         }
         let input = self.input(event, fields, model).to_string();
-        let replies = join_all(handlers.iter().map(|h| async {
-            let default = match &h.action {
-                Action::Prompt { .. } => PROMPT_TIMEOUT,
-                Action::Command { .. } => DEFAULT_TIMEOUT,
-            };
-            let timeout = match event {
-                Event::SessionEnd => {
-                    h.timeout.map_or(SESSION_END_TIMEOUT, Duration::from_secs).min(MAX_SESSION_END_TIMEOUT)
-                }
-                _ => h.timeout.map_or(default, Duration::from_secs),
-            };
-            match &h.action {
-                Action::Command { command, args } => run_command(command, args.as_deref(), &h.env, &input, timeout).await,
-                Action::Prompt { prompt, model } => match &self.client {
-                    Some(client) => {
-                        let asked = ask_model(client, prompt, model.as_deref(), &input);
-                        let timed_out = || format!("timed out after {:.1}s", timeout.as_secs_f64());
-                        tokio::time::timeout(timeout, asked).await.unwrap_or_else(|_| Err(timed_out()))
-                    }
-                    None => Err("there is no model to ask here".into()),
-                },
-            }
-        }))
-        .await;
+        // Background hooks report on their own.
+        let (background, handlers): (Vec<&Handler>, Vec<&Handler>) =
+            handlers.into_iter().partition(|h| h.mode != Mode::Wait);
+        for handler in background {
+            self.run_in_background(event, handler, input.clone());
+        }
+        let replies = join_all(handlers.iter().map(|h| self.call(event, h, &input))).await;
         for (handler, reply) in handlers.iter().zip(replies) {
             outcome.add(event, &handler.action.label(), reply);
         }
         outcome
+    }
+
+    /// Runs one hook with `input` and returns its answer.
+    async fn call(&self, event: Event, h: &Handler, input: &str) -> Result<Reply, String> {
+        let default = match &h.action {
+            Action::Prompt { .. } => PROMPT_TIMEOUT,
+            Action::Command { .. } => DEFAULT_TIMEOUT,
+        };
+        let timeout = match event {
+            Event::SessionEnd => h.timeout.map_or(SESSION_END_TIMEOUT, Duration::from_secs).min(MAX_SESSION_END_TIMEOUT),
+            _ => h.timeout.map_or(default, Duration::from_secs),
+        };
+        match &h.action {
+            Action::Command { command, args } => run_command(command, args.as_deref(), &h.env, input, timeout).await,
+            Action::Prompt { prompt, model } => match &self.client {
+                Some(client) => {
+                    let asked = ask_model(client, prompt, model.as_deref(), input);
+                    let timed_out = || format!("timed out after {:.1}s", timeout.as_secs_f64());
+                    tokio::time::timeout(timeout, asked).await.unwrap_or_else(|_| Err(timed_out()))
+                }
+                None => Err("there is no model to ask here".into()),
+            },
+        }
+    }
+
+    /// Runs `handler` without waiting for it. When it ends, what it has for
+    /// the model goes to the inbox: with the next request, or, for an
+    /// `asyncRewake` hook that blocked (exit code 2), in a turn of its own.
+    fn run_in_background(&self, event: Event, handler: &Handler, input: String) {
+        let hooks = self.clone();
+        let handler = Handler {
+            action: handler.action.clone(),
+            condition: None,
+            mode: handler.mode.clone(),
+            timeout: handler.timeout,
+            env: handler.env.clone(),
+        };
+        tokio::spawn(async move {
+            let reply = hooks.call(event, &handler, &input).await;
+            let mut outcome = Outcome::default();
+            outcome.add(event, &handler.action.label(), reply);
+            let Some(inbox) = &hooks.inbox else { return };
+            let mut texts: Vec<String> = outcome.context;
+            let wake = match (&handler.mode, outcome.block) {
+                (Mode::Rewake(message), Some(reason)) => {
+                    texts.push(match message {
+                        Some(message) => format!("{message}\n\n{reason}"),
+                        None => reason,
+                    });
+                    true
+                }
+                (_, Some(reason)) => {
+                    texts.push(reason);
+                    false
+                }
+                _ => false,
+            };
+            for text in texts {
+                inbox.push(feedback(event, &text), wake);
+            }
+        });
     }
 
     fn input(&self, event: Event, fields: Value, model: &str) -> Value {
@@ -781,7 +968,8 @@ pub(crate) mod tests {
             json!({"PreCompact": [{"hooks": [{"type": "command", "command": "y", "statusMessage": "z"}]}]}),
             json!({"Stop": [{"hooks": [{"type": "prompt", "command": "y"}]}]}),
             json!({"Stop": [{"hooks": [{"type": "http", "url": "y"}]}]}),
-            json!({"Stop": [{"hooks": [{"type": "command", "command": "y", "async": true}]}]}),
+            json!({"Stop": [{"hooks": [{"type": "command", "command": "y", "once": true}]}]}),
+            json!({"PreToolUse": [{"hooks": [{"type": "command", "command": "y", "if": "Bash(git"}]}]}),
             json!({"PreToolUse": [{"matcher": "(", "hooks": []}]}),
         ];
         for config in bad {
@@ -991,6 +1179,64 @@ pub(crate) mod tests {
         assert_eq!(tool_named("Glob"), Some("glob"));
         assert_eq!(tool_named("LS"), Some("glob"));
         assert_eq!(tool_named("WebFetch"), None);
+    }
+
+    #[test]
+    fn if_rules() {
+        let rule = |r: &str| Condition::parse(r).unwrap();
+        let bash = |c: &str| json!({"command": c});
+        let names = tool_names("bash");
+        assert!(rule("Bash(git commit:*)").matches(&names, &bash("git commit -m x")));
+        assert!(rule("Bash(git commit:*)").matches(&names, &bash("git add . && git commit")));
+        assert!(!rule("Bash(git commit:*)").matches(&names, &bash("git commits")));
+        assert!(rule("Bash(git push *)").matches(&names, &bash("git push")));
+        assert!(rule("Bash(git push *)").matches(&names, &bash("cd x; git push origin main")));
+        assert!(!rule("Bash(git push *)").matches(&names, &bash("echo git push")));
+        assert!(rule("Bash(git -C * commit *)").matches(&names, &bash("git -C /r commit -m x")));
+        assert!(rule("Bash(py* *claude-security*scripts/*.py *)").matches(&names, &bash("python3 /p/claude-security/scripts/a.py --x")));
+        assert!(rule("Bash").matches(&names, &bash("ls")) && !rule("Bash").matches(&tool_names("read"), &json!({})));
+        let file = |p: &str| json!({"file_path": p});
+        assert!(rule("Edit(src/**/*.rs)").matches(&tool_names("edit"), &file("src/a/b.rs")));
+        assert!(!rule("Edit(src/*.rs)").matches(&tool_names("edit"), &file("src/a/b.rs")));
+        assert!(!rule("Edit(src/*.rs)").matches(&tool_names("write"), &file("src/a.rs")), "another tool");
+        assert!(Condition::parse("Bash(x").is_err() && Condition::parse("(x)").is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn if_rules_pick_the_calls() {
+        let _guard = crate::util::lock_cwd();
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen");
+        let h = hooks(json!({"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": format!("echo commit >> {}", seen.display()), "if": "Bash(git commit:*)"},
+            {"type": "command", "command": format!("echo commit >> {}", seen.display()), "if": "Bash(git push:*)"}
+        ]}]}));
+        h.pre_tool_use("bash", "t", &json!({"command": "ls"}), "m").await;
+        assert!(!seen.exists());
+        h.pre_tool_use("bash", "t", &json!({"command": "git push"}), "m").await;
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "commit\n", "the second, though its command is the first's");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn background_hooks_report_through_the_inbox() {
+        let _guard = crate::util::lock_cwd();
+        let mut h = hooks(json!({"PostToolUse": [{"hooks": [
+            {"type": "command", "command": "sleep 0.2; echo 'found a leak' >&2; exit 2", "asyncRewake": true, "rewakeMessage": "Review:"},
+            {"type": "command", "command": "echo '{\"hookSpecificOutput\": {\"additionalContext\": \"noted\"}}'", "async": true}
+        ]}]}));
+        let inbox = Arc::new(Inbox::default());
+        h.set_inbox(inbox.clone());
+        let started = std::time::Instant::now();
+        let outcome = h.post_tool_use("bash", "t", &json!({}), &ToolOutput::ok("x"), "m").await;
+        assert!(started.elapsed() < Duration::from_millis(150), "not waited for");
+        assert!(outcome.block.is_none() && outcome.context.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), inbox.wanted()).await.unwrap();
+        let texts: Vec<String> = inbox.take().iter().map(|b| b["text"].as_str().unwrap().to_string()).collect();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("noted")));
+        assert!(texts.iter().any(|t| t.contains("Review:\n\nfound a leak") && t.contains("PostToolUse")), "{texts:?}");
     }
 
     #[tokio::test]

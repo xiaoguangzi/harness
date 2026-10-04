@@ -87,18 +87,52 @@ const GUIDANCE: &[(&str, &str)] = &[
     ("stop_agent", "stop a subagent whose work is no longer needed."),
 ];
 
+/// Claude Code tools the harness has no counterpart of.
+const MISSING: &str = "`WebFetch`, `WebSearch`, `TodoWrite`, `NotebookEdit`, `AskUserQuestion`";
+
 /// The main agent's system prompt, for the tools in `tools`.
 pub fn main(tools: &ToolRegistry) -> String {
-    TEMPLATE.replace("{{tools}}", &tools_section(tools)).replace("{{environment}}", &environment())
+    let mut section = tools_section(tools);
+    if tools.get("skill").is_some() || tools.get("agent").is_some() {
+        section.push_str("\n\n");
+        section.push_str(&claude_code_names(tools.names().collect()));
+    }
+    TEMPLATE.replace("{{tools}}", &section).replace("{{environment}}", &environment())
 }
 
-/// A subagent's system prompt: its definition's prompt plus the environment.
+/// A subagent's system prompt: its definition's prompt plus the
+/// environment, and for a plugin's agent, written for Claude Code, what its
+/// tools are called here.
 pub fn subagent(def: &AgentDef) -> String {
+    let names = if def.name.contains(':') {
+        let tools: Vec<&str> = crate::hooks::ALIASES.iter().map(|(name, _)| *name).collect();
+        format!("\n\n{}", claude_code_names(tools))
+    } else {
+        String::new()
+    };
     format!(
         "{}\n\nYou were started by another agent, which sees only your final message; the user does \
-         not see it directly.\n\n# Environment\n\n{}",
+         not see it directly.{names}\n\n# Environment\n\n{}",
         def.prompt,
         environment()
+    )
+}
+
+/// How the tool names Claude Code uses, which skills, commands and agents
+/// written for it mention, map onto `tools`.
+fn claude_code_names(tools: Vec<&str>) -> String {
+    let pairs: Vec<String> = crate::hooks::ALIASES
+        .iter()
+        .filter(|(name, _)| tools.contains(name))
+        .map(|(name, aliases)| {
+            let aliases: Vec<String> = aliases.iter().map(|a| format!("`{a}`")).collect();
+            format!("{} is `{name}`", aliases.join(" or "))
+        })
+        .collect();
+    format!(
+        "Skills, commands and agents written for Claude Code name its tools; here {}. {MISSING} have no \
+         counterpart: do without them, and ask the user in your reply rather than through a tool.",
+        pairs.join(", ")
     )
 }
 
@@ -147,6 +181,12 @@ fn environment() -> String {
     }
     if let Some(note) = agents_md(&cwd) {
         lines.push(note);
+    }
+    let commands = crate::tools::bash::added_commands();
+    if !commands.is_empty() {
+        let shown: Vec<String> = commands.iter().take(30).map(|c| format!("`{c}`")).collect();
+        let more = if commands.len() > 30 { format!(" and {} more", commands.len() - 30) } else { String::new() };
+        lines.push(format!("- Commands the enabled plugins add, on the `bash` tool's PATH: {}{more}", shown.join(", ")));
     }
     if let Some(sandbox) = crate::sandbox::active() {
         lines.push(format!("- Sandbox: {}", sandbox.prompt_note()));
@@ -234,6 +274,21 @@ mod tests {
         async fn run(&self, _: serde_json::Value) -> crate::tools::ToolOutput {
             crate::tools::ToolOutput::ok("")
         }
+    }
+
+    #[test]
+    fn maps_claude_code_tool_names() {
+        let mut tools = ToolRegistry::with_defaults(FileTracker::default());
+        assert!(!main(&tools).contains("written for Claude Code"), "nothing written for it to load");
+        tools.register(crate::skills::SkillTool::new(&[], crate::subagent::Forks::default()));
+        let prompt = main(&tools);
+        assert!(prompt.contains("`Bash` is `bash`") && prompt.contains("`Glob` or `LS` is `glob`"), "{prompt}");
+        assert!(prompt.contains("`Skill` is `skill`") && !prompt.contains("`Task` is"), "only registered tools");
+        assert!(prompt.contains("`WebFetch`"));
+        let mut def = crate::subagent::explore();
+        assert!(!subagent(&def).contains("Claude Code"));
+        def.name = "p:x".into();
+        assert!(subagent(&def).contains("`Agent` or `Task` is `agent`"));
     }
 
     #[test]

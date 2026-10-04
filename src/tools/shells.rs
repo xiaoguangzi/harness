@@ -329,6 +329,11 @@ impl Tool for BashOutputTool {
         shell_schema("The shell id bash returned, e.g. shell_1.")
     }
 
+    /// It only reads what a command printed.
+    fn read_only(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value) -> ToolOutput {
         let input: ShellInput = match parse_input(input) {
             Ok(i) => i,
@@ -361,6 +366,12 @@ impl Tool for KillShellTool {
 
     fn input_schema(&self) -> Value {
         shell_schema("The shell id of the command to stop.")
+    }
+
+    /// It only stops commands its own conversation started, which an agent
+    /// without `bash` has none of.
+    fn read_only(&self) -> bool {
+        true
     }
 
     async fn run(&self, input: Value) -> ToolOutput {

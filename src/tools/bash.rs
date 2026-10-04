@@ -165,8 +165,9 @@ impl Tool for BashTool {
 }
 
 /// The `PATH` of the commands the model runs, when the enabled plugins'
-/// `bin/` directories add to it.
+/// `bin/` directories add to it, and those directories.
 static EXTRA_PATH: RwLock<Option<OsString>> = RwLock::new(None);
+static EXTRA_DIRS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
 /// Puts `dirs` on the `PATH` of the commands the model runs, after the
 /// directories already there, so they cannot shadow a system command; they
@@ -176,6 +177,25 @@ pub fn add_to_path(dirs: Vec<PathBuf>) {
     let paths = std::env::split_paths(&current).chain(dirs.iter().cloned());
     let path = std::env::join_paths(paths).ok().filter(|_| !dirs.is_empty());
     *EXTRA_PATH.write().unwrap() = path;
+    *EXTRA_DIRS.write().unwrap() = dirs;
+}
+
+/// The commands the directories [`add_to_path`] added hold, sorted.
+pub fn added_commands() -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut names: Vec<String> = EXTRA_DIRS
+        .read()
+        .unwrap()
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .flatten()
+        .filter(|e| e.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Starts `bash -c command` with its output piped, in the sandbox when it
