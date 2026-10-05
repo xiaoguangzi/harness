@@ -199,7 +199,7 @@ impl Menu {
             paths.retain(|p| index.set.contains(p));
         }
         if !partial.is_empty() {
-            for path in rank_paths(&index.paths, partial) {
+            for path in rank_paths(&index.paths, &index.lower, partial) {
                 if paths.len() >= MAX_FILE_ITEMS {
                     break;
                 }
@@ -262,12 +262,13 @@ pub fn list_dir(partial: &str, base: &Path) -> Vec<String> {
 /// Paths matching `query`, best first: those starting with it, then those
 /// whose file name starts with or contains it, then those containing it,
 /// then those containing its characters in order. Shorter paths win ties.
-fn rank_paths<'a>(paths: &'a [String], query: &str) -> Vec<&'a String> {
+/// `lower` holds `paths` lowercased, in the same order.
+fn rank_paths<'a>(paths: &'a [String], lower: &[String], query: &str) -> Vec<&'a String> {
     let query = query.to_lowercase();
     let mut scored: Vec<(u8, usize, &String)> = paths
         .iter()
-        .filter_map(|path| {
-            let lower = path.to_lowercase();
+        .zip(lower)
+        .filter_map(|(path, lower)| {
             let trimmed = lower.trim_end_matches('/');
             let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
             let tier = if lower.starts_with(&query) {
@@ -278,7 +279,7 @@ fn rank_paths<'a>(paths: &'a [String], query: &str) -> Vec<&'a String> {
                 2
             } else if lower.contains(&query) {
                 3
-            } else if is_subsequence(&query, &lower) {
+            } else if is_subsequence(&query, lower) {
                 4
             } else {
                 return None;
@@ -299,6 +300,8 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 /// relative to the base directory.
 struct Index {
     paths: Vec<String>,
+    /// `paths` lowercased once, for matching as the user types.
+    lower: Vec<String>,
     set: HashSet<String>,
     /// Whether git listed the files, so what is missing is ignored.
     from_git: bool,
@@ -331,7 +334,8 @@ impl Index {
             .collect();
         paths.extend(dirs);
         let set = paths.iter().cloned().collect();
-        Self { paths, set, from_git }
+        let lower = paths.iter().map(|p| p.to_lowercase()).collect();
+        Self { paths, lower, set, from_git }
     }
 }
 
@@ -448,7 +452,8 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-        let rank = |q: &str| rank_paths(&paths, q).into_iter().map(String::as_str).collect::<Vec<_>>();
+        let lower: Vec<String> = paths.iter().map(|p| p.to_lowercase()).collect();
+        let rank = |q: &str| rank_paths(&paths, &lower, q).into_iter().map(String::as_str).collect::<Vec<_>>();
         assert_eq!(rank("src/c"), vec!["src/cli/", "src/cli/mod.rs", "src/cli/markdown.rs"]);
         assert_eq!(rank("ma"), vec!["src/main.rs", "src/cli/markdown.rs", "docs/domain.md"]);
         assert_eq!(rank("cli"), vec!["src/cli/", "src/cli/mod.rs", "src/cli/markdown.rs"]);

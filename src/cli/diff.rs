@@ -64,7 +64,7 @@ pub fn render(change: &FileChange, width: usize, paint: impl Fn(&str, &str) -> S
 
 fn created(change: &FileChange) -> (String, Vec<Row>, usize) {
     let total = change.after.lines().count();
-    let summary = format!("Created {} ({} {})", change.path, total, plural(total, "line"));
+    let summary = format!("Created {} ({} {})", change.path, total, text::plural(total, "line"));
     let rows = change.after.lines().take(NEW_FILE_LINES).enumerate().map(|(i, l)| Row::Added(i + 1, clean(l))).collect();
     (summary, rows, total.saturating_sub(NEW_FILE_LINES))
 }
@@ -74,33 +74,41 @@ fn updated(path: &str, before: &str, after: &str) -> (String, Vec<Row>, usize) {
     let diff = TextDiff::configure().timeout(Duration::from_millis(200)).diff_lines(before, after);
     let (mut added, mut removed) = (0, 0);
     let mut rows = Vec::new();
+    // Only the first `MAX_LINES` rows are shown, so later ones are just
+    // counted, without cleaning their text.
+    let mut hidden = 0;
+    let mut push = |row: &dyn Fn() -> Row| {
+        if rows.len() < MAX_LINES {
+            rows.push(row());
+        } else {
+            hidden += 1;
+        }
+    };
     for (i, group) in diff.grouped_ops(CONTEXT).iter().enumerate() {
         if i > 0 {
-            rows.push(Row::Gap);
+            push(&|| Row::Gap);
         }
         for op in group {
             for change in diff.iter_changes(op) {
-                let line = clean(change.value());
+                let line = || clean(change.value());
                 match change.tag() {
-                    ChangeTag::Equal => rows.push(Row::Context(change.new_index().unwrap_or(0) + 1, line)),
+                    ChangeTag::Equal => push(&|| Row::Context(change.new_index().unwrap_or(0) + 1, line())),
                     ChangeTag::Delete => {
                         removed += 1;
-                        rows.push(Row::Removed(change.old_index().unwrap_or(0) + 1, line));
+                        push(&|| Row::Removed(change.old_index().unwrap_or(0) + 1, line()));
                     }
                     ChangeTag::Insert => {
                         added += 1;
-                        rows.push(Row::Added(change.new_index().unwrap_or(0) + 1, line));
+                        push(&|| Row::Added(change.new_index().unwrap_or(0) + 1, line()));
                     }
                 }
             }
         }
     }
-    let hidden = rows.len().saturating_sub(MAX_LINES);
-    rows.truncate(MAX_LINES);
     let summary = format!(
         "Updated {path} with {added} {} and {removed} {}",
-        plural(added, "addition"),
-        plural(removed, "removal")
+        text::plural(added, "addition"),
+        text::plural(removed, "removal")
     );
     (summary, rows, hidden)
 }
@@ -108,10 +116,6 @@ fn updated(path: &str, before: &str, after: &str) -> (String, Vec<Row>, usize) {
 /// A file line made safe for the terminal.
 fn clean(line: &str) -> String {
     text::printable(line.trim_end_matches(['\n', '\r']))
-}
-
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 { word.to_string() } else { format!("{word}s") }
 }
 
 #[cfg(test)]
