@@ -124,7 +124,7 @@ impl Draft {
                 let start = word_start(text, cursor);
                 self.remove(start, cursor);
             }
-            Key::Enter | Key::PasteImage => {}
+            Key::Enter | Key::PasteImage | Key::Position(_) => {}
         }
     }
 

@@ -24,6 +24,8 @@ const MAX_SEQUENCE: usize = 32;
 const REPORT_WAIT: Duration = Duration::from_millis(500);
 /// Set once the terminal didn't answer, so it isn't asked again.
 static NO_REPORT: AtomicBool = AtomicBool::new(false);
+/// Asks the terminal where the cursor is; the answer comes as input.
+pub const ASK_POSITION: &str = "\x1b[6n";
 
 /// A key that edits the input box.
 #[derive(Debug, PartialEq)]
@@ -51,6 +53,9 @@ pub enum Key {
     KillWord,
     /// Ctrl+V: pastes an image from the clipboard.
     PasteImage,
+    /// Not a key: the terminal's answer to where the cursor is (see
+    /// [`ASK_POSITION`]), its screen row from 0.
+    Position(usize),
 }
 
 type OnKey = Box<dyn FnMut(Key) + Send>;
@@ -298,6 +303,11 @@ fn parse_csi(buf: &[u8]) -> Parsed {
         (_, b'H') | (b"1" | b"7", b'~') => Key::Home,
         (_, b'F') | (b"4" | b"8", b'~') => Key::End,
         (b"3", b'~') => Key::Delete,
+        // A cursor position report, `row;col R`.
+        (_, b'R') if modified => match report_row(&buf[..=end]) {
+            Some(row) => Key::Position(row),
+            None => return Parsed::Skip(end + 1),
+        },
         _ => return Parsed::Skip(end + 1),
     };
     Parsed::Key(key, end + 1)
@@ -332,7 +342,7 @@ fn ask_row() -> Option<usize> {
     if readable(0) {
         return None;
     }
-    io::stdout().write_all(b"\x1b[6n").and_then(|()| io::stdout().flush()).ok()?;
+    io::stdout().write_all(ASK_POSITION.as_bytes()).and_then(|()| io::stdout().flush()).ok()?;
     let deadline = Instant::now() + REPORT_WAIT;
     let mut reply = Vec::new();
     let mut buf = [0u8; MAX_SEQUENCE];
@@ -385,6 +395,9 @@ mod tests {
         assert_eq!(report_row(b"\x1b[12;1R"), Some(11));
         assert_eq!(report_row(b"x\x1b[1;80R"), Some(0));
         assert_eq!(report_row(b"\x1b[;1R"), None);
+        // Read with the keys while a turn runs.
+        assert_eq!(parse(b"\x1b[12;5Rx"), Parsed::Key(Key::Position(11), 7));
+        assert_eq!(parse(b"\x1b[12;5"), Parsed::Incomplete);
     }
 
     #[test]

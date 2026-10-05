@@ -2,6 +2,7 @@
 //! observer that shows an agent turn as it runs (Markdown text, tool calls
 //! and results, token counts).
 
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use serde_json::Value;
 
 use super::diff;
 use super::input::{self, Queued, Typing};
+use super::keys;
 use super::markdown::Markdown;
 use super::repl;
 use super::text;
@@ -34,6 +36,8 @@ const PROMPT_LINES: usize = 4;
 /// Wrap a redraw, so terminals that support it show it all at once.
 const SYNC_START: &str = "\x1b[?2026h\x1b[?25l";
 const SYNC_END: &str = "\x1b[?25h\x1b[?2026l";
+/// How long the end of a turn waits for the terminal's last answers.
+const ANSWER_WAIT: Duration = Duration::from_millis(300);
 
 /// Shared handle on stdout. Output printed while an agent runs goes through
 /// it, so the status lines and input box are cleared first and redrawn
@@ -60,6 +64,15 @@ struct State {
     /// output fills the screen. Otherwise it goes right under the output.
     end: Option<usize>,
     size: (usize, Option<usize>),
+    /// The screen row the cursor was left on, when drawn on the bottom
+    /// rows.
+    at: Option<usize>,
+    /// Whether each drawing first asks the terminal where the cursor is,
+    /// while the input box's keys are read; where it was left, for each
+    /// question not answered yet, and how many answers to ignore.
+    asking: bool,
+    asked: VecDeque<usize>,
+    ignored: usize,
     frame: usize,
     /// Lines printed while the line editor reads, shown once it is done:
     /// printing then would tear up the line being edited.
@@ -92,6 +105,10 @@ impl Output {
             cursor_row: 0,
             end: None,
             size: (0, None),
+            at: None,
+            asking: false,
+            asked: VecDeque::new(),
+            ignored: 0,
             frame: 0,
             held: None,
         };
@@ -103,6 +120,62 @@ impl Output {
     pub fn open_input(&self, typing: Typing, inbox: Arc<Inbox>) {
         let mut state = self.state.lock().unwrap();
         state.input = Some(InputBox { typing, inbox });
+        self.show(&mut state, "");
+    }
+
+    /// Has each drawing first ask the terminal where the cursor is, to
+    /// tell when the terminal cleared the screen; the answers come as
+    /// [`Key::Position`](keys::Key::Position). Only while keys are read
+    /// without echo.
+    pub fn start_asking(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.asking = self.styled;
+        // Answers that didn't come in time last turn won't now.
+        state.asked.clear();
+        state.ignored = 0;
+    }
+
+    /// Stops asking the terminal where the cursor is, and waits a little
+    /// for the answers on their way, before the input box's keys stop
+    /// being read: the line editor would take them for keys.
+    pub async fn stop_asking(&self) {
+        self.state.lock().unwrap().asking = false;
+        let deadline = Instant::now() + ANSWER_WAIT;
+        while Instant::now() < deadline {
+            {
+                let state = self.state.lock().unwrap();
+                if state.asked.is_empty() && state.ignored == 0 {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The terminal's answer to where the cursor is: on another row than
+    /// it was left on, the terminal cleared the screen (iTerm's Reset or
+    /// Clear Buffer, say), keeping maybe the cursor's row. The output then
+    /// goes on from the top of a blank screen.
+    pub fn cursor_at(&self, row: usize) {
+        let mut state = self.state.lock().unwrap();
+        if state.ignored > 0 {
+            state.ignored -= 1;
+            return;
+        }
+        let Some(left) = state.asked.pop_front() else { return };
+        if row == left || state.end.is_none() {
+            return;
+        }
+        // Answers to the questions since were about the screen as it was.
+        state.ignored = std::mem::take(&mut state.asked).len();
+        state.end = Some(0);
+        state.drawn = false;
+        state.at = None;
+        // A reset also turns bracketed paste off.
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(b"\x1b[H\x1b[J\x1b[?2004h");
+        let _ = stdout.flush();
+        drop(stdout);
         self.show(&mut state, "");
     }
 
@@ -272,7 +345,17 @@ impl Output {
         if size != state.size {
             // Rows moved about as the terminal reflowed them.
             state.end = None;
+            state.at = None;
             state.size = size;
+        }
+        // Asked before anything moves the cursor, the answer says where the
+        // last drawing left it, unless the terminal moved it since.
+        if let Some(at) = state.at
+            && state.asking
+            && state.end.is_some()
+        {
+            screen.insert_str(0, keys::ASK_POSITION);
+            state.asked.push_back(at);
         }
         match (state.end, size.1) {
             (Some(end), Some(height)) => self.draw_pinned(state, &mut screen, printed, end, height),
@@ -289,6 +372,7 @@ impl Output {
     /// Draws right under the output: the status and input box follow it
     /// down, and are redrawn from the cursor's row in them.
     fn draw_under(&self, state: &mut State, screen: &mut String, printed: &str) {
+        state.at = None;
         if std::mem::take(&mut state.drawn) {
             screen.push_str(&clear_sequence(state.cursor_row));
         }
@@ -345,8 +429,10 @@ impl Output {
             state.drawn = true;
             state.rows = rows.len();
             state.cursor_row = row;
+            state.at = Some(top + row);
         } else {
             screen.push_str(&input::goto(end));
+            state.at = Some(end);
         }
         state.end = Some(end);
     }

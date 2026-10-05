@@ -223,20 +223,25 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 // Take the input box off the screen; a line sent shows as
                 // a plain prompt instead.
                 if boxed && let Some(helper) = editor.helper() {
+                    let shown = match &read {
+                        Ok(line) => Some(line.as_str()),
+                        Err(ReadlineError::Eof) => Some(""),
+                        Err(_) => None,
+                    };
+                    let used = helper.rows_used(&prompt, shown);
                     match helper.unpin() {
-                        // The box, and the blank rows above it.
+                        // The box, and the blank rows above it. The terminal
+                        // may have cleared the screen meanwhile (iTerm's
+                        // Reset or Clear Buffer), taking the box to the top
+                        // with nothing above it: the output then ends where
+                        // the box starts.
                         Some(end) => {
+                            let top = keys::cursor_row().and_then(|row| row.checked_sub(used));
+                            let end = top.map_or(end, |top| end.min(top));
                             print!("{}\x1b[J", input::goto(end));
                             out.set_end(end);
                         }
-                        None => {
-                            let shown = match &read {
-                                Ok(line) => Some(line.as_str()),
-                                Err(ReadlineError::Eof) => Some(""),
-                                Err(_) => None,
-                            };
-                            print!("\x1b[{}A\r\x1b[J", helper.rows_used(&prompt, shown));
-                        }
+                        None => print!("\x1b[{used}A\r\x1b[J"),
                     }
                     let _ = std::io::stdout().flush();
                 }
@@ -654,8 +659,10 @@ async fn run_shown(
     let mut keys = match input.as_mut() {
         Some(input) => {
             out.open_input(std::mem::take(input.typing), inbox.clone());
-            let out = out.clone();
-            KeyWatch::with_keys(move |key| type_key(&out, key, &tx))
+            let typed = out.clone();
+            let keys = KeyWatch::with_keys(move |key| type_key(&typed, key, &tx));
+            out.start_asking();
+            keys
         }
         None => KeyWatch::start(),
     };
@@ -677,6 +684,7 @@ async fn run_shown(
         }
     };
     drop(turn);
+    out.stop_asking().await;
     drop(keys);
     if let Some(input) = input {
         *input.typing = out.close_input();
@@ -735,6 +743,7 @@ fn type_key(out: &Output, key: Key, tx: &tokio::sync::mpsc::UnboundedSender<(Str
             }
         }
         Key::Up if out.edit_queued() => {}
+        Key::Position(row) => out.cursor_at(row),
         Key::PasteImage => match clipboard::read() {
             Ok(Some(Clip::Image(image))) => {
                 out.edit_input(|typing| typing.draft.paste_image(image));
