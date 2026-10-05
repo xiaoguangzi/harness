@@ -281,7 +281,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
         match render_skill(parse_input(&line, &skills)).await {
             Input::Empty => {}
             Input::Exit => break,
-            Input::Help => print_help(&skills),
+            Input::Help => print_help(&out, &skills),
             Input::Clear => {
                 show_hook_notices(&out, agent.end_session("clear").await);
                 agent.clear();
@@ -326,10 +326,10 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                     out.line(out.paint("31", &format!("{e:#}")));
                 }
             }
-            Input::ListSkills => print_skills(&skills),
-            Input::ListTools => print_tools(agent),
-            Input::ListMcp => print_mcp(env.mcp_statuses()),
-            Input::Plugins { update: false } => print_plugins(&env.ext.plugins),
+            Input::ListSkills => print_skills(&out, &skills),
+            Input::ListTools => print_tools(&out, agent),
+            Input::ListMcp => print_mcp(&out, env.mcp_statuses()),
+            Input::Plugins { update: false } => print_plugins(&out, &env.ext.plugins),
             Input::Plugins { update: true } => update_plugins(&env.ext.plugins, &out).await,
             Input::ManagePlugins(args) => {
                 match tokio::task::block_in_place(|| plugins::manage::run(&args, &mut plugins::manage::TerminalAsk)) {
@@ -359,13 +359,16 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 }
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
-            Input::ListAgents => print_agents(&env.ext.agent_defs),
-            Input::Tasks => print_tasks(&agent.subagents().list(), &agent.shells().list()),
+            Input::ListAgents => print_agents(&out, &env.ext.agent_defs),
+            Input::Tasks => print_tasks(&out, &agent.subagents().list(), &agent.shells().list()),
             Input::Stop(None) => {
                 let stopped = agent.subagents().stop_all();
                 let killed = agent.shells().stop_all();
-                let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
-                let note = format!("stopped {} and {}", plural(stopped, "subagent"), plural(killed, "background command"));
+                let note = format!(
+                    "stopped {stopped} {} and {killed} {}",
+                    text::plural(stopped, "subagent"),
+                    text::plural(killed, "background command")
+                );
                 out.line(out.paint("2", &note));
             }
             Input::Stop(Some(id)) if id.starts_with("shell_") => match agent.shells().stop(&id) {
@@ -378,9 +381,9 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
-            Input::Sandbox => print_sandbox(),
-            Input::Usage => print_usage(agent),
-            Input::Model(None) => print_models(agent),
+            Input::Sandbox => print_sandbox(&out),
+            Input::Usage => print_usage(&out, agent),
+            Input::Model(None) => print_models(&out, agent),
             Input::Model(Some(spec)) => match agent.client().switch(&spec) {
                 Ok(client) => {
                     out.line(format!("model: {}", out.paint("1", client.spec())));
@@ -778,8 +781,7 @@ fn remember_sent(editor: &mut rustyline::Editor<ReplHelper, rustyline::history::
 /// Shows that `running` background subagents are still at work until one
 /// reports back; false if the user interrupted the wait.
 async fn wait_for_reports(agent: &Agent, running: usize, out: &Output) -> bool {
-    let plural = if running == 1 { "" } else { "s" };
-    out.set_status(Some(&format!("Waiting for {running} background subagent{plural}…")));
+    out.set_status(Some(&format!("Waiting for {running} background {}…", text::plural(running, "subagent"))));
     let mut esc = KeyWatch::start();
     let reported = tokio::select! {
         _ = agent.inbox().wanted() => true,
@@ -929,7 +931,7 @@ fn effort_help(effort: llm::Effort) -> &'static str {
     }
 }
 
-fn print_help(skills: &[Skill]) {
+fn print_help(out: &Output, skills: &[Skill]) {
     let keys = [
         ("/<skill> [args]", "run a skill"),
         ("@path", "attach a file, directory, image or PDF; @ opens a file menu (@file#L10-20 for lines)"),
@@ -941,59 +943,66 @@ fn print_help(skills: &[Skill]) {
         ("Ctrl-C", "interrupt the running turn; twice at the prompt to quit"),
     ];
     for (key, what) in BUILTINS.iter().chain(&keys) {
-        println!("  \x1b[1m{key:<16}\x1b[0m {what}");
+        out.line(format!("  {} {what}", out.paint("1", &text::pad(key, 16))));
     }
     let names: Vec<String> = skills.iter().filter(|s| s.user_invocable).map(|s| format!("/{}", s.name)).collect();
     if !names.is_empty() {
-        println!("  \x1b[2mskills: {}\x1b[0m", names.join(" "));
+        out.line(format!("  {}", out.paint("2", &format!("skills: {}", names.join(" ")))));
     }
 }
 
-fn print_tools(agent: &Agent) {
+fn print_tools(out: &Output, agent: &Agent) {
     let tools = agent.tools().definitions();
-    let name_width = tools.iter().map(|t| t.name.len()).max().unwrap_or(0);
+    let name_width = tools.iter().map(|t| text::width(&t.name)).max().unwrap_or(0);
     let room = text::terminal_width().saturating_sub(name_width + 5);
     for tool in tools {
         let summary = tool.description.split(". ").next().unwrap_or("").trim_end_matches('.');
-        println!("  \x1b[1m{:<name_width$}\x1b[0m  \x1b[2m{}\x1b[0m", tool.name, text::fit(summary, room));
+        out.line(format!("  {}  {}", out.paint("1", &text::pad(&tool.name, name_width)), out.paint("2", &text::fit(summary, room))));
     }
 }
 
-fn print_sandbox() {
+fn print_sandbox(out: &Output) {
     let Some(sandbox) = crate::sandbox::active() else {
-        println!("the sandbox is off; start with --sandbox, HARNESS_SANDBOX=1 or \"sandbox\": {{\"enabled\": true}} in ~/.harness/settings.json");
+        out.line("the sandbox is off; start with --sandbox, HARNESS_SANDBOX=1 or \"sandbox\": {\"enabled\": true} in ~/.harness/settings.json");
         return;
     };
     for (label, value) in sandbox.describe() {
-        println!("  \x1b[1m{label:<10}\x1b[0m {value}");
+        out.line(format!("  {} {value}", out.paint("1", &text::pad(label, 10))));
     }
 }
 
-fn print_usage(agent: &Agent) {
+fn print_usage(out: &Output, agent: &Agent) {
     let models = agent.usage().models();
     if models.is_empty() {
-        println!("no requests yet");
+        out.line("no requests yet");
     } else {
-        let width = models.iter().map(|(m, _)| m.len()).max().unwrap_or(0).max("model".len());
-        println!(
-            "  \x1b[2m{:<width$}  {:>8}  {:>9}  {:>10}  {:>11}  {:>9}\x1b[0m",
-            "model", "requests", "input", "cache read", "cache write", "output"
+        let width = models.iter().map(|(m, _)| text::width(m)).max().unwrap_or(0).max("model".len());
+        let header = format!(
+            "{}  {:>8}  {:>9}  {:>10}  {:>11}  {:>9}",
+            text::pad("model", width),
+            "requests",
+            "input",
+            "cache read",
+            "cache write",
+            "output"
         );
+        out.line(format!("  {}", out.paint("2", &header)));
         for (model, t) in &models {
             let u = &t.usage;
-            println!(
-                "  \x1b[1m{model:<width$}\x1b[0m  {:>8}  {:>9}  {:>10}  {:>11}  {:>9}",
+            out.line(format!(
+                "  {}  {:>8}  {:>9}  {:>10}  {:>11}  {:>9}",
+                out.paint("1", &text::pad(model, width)),
                 t.requests,
                 output::tokens(u.input_tokens),
                 output::tokens(u.cache_read_tokens),
                 output::tokens(u.cache_write_tokens),
                 output::tokens(u.output_tokens)
-            );
+            ));
         }
         let input: u64 = models.iter().map(|(_, t)| t.usage.input_tokens).sum();
         let cached: u64 = models.iter().map(|(_, t)| t.usage.cache_read_tokens).sum();
         if let Some(percent) = (cached * 100).checked_div(input) {
-            println!("  \x1b[2m{percent}% of input tokens came from the prompt cache\x1b[0m");
+            out.line(format!("  {}", out.paint("2", &format!("{percent}% of input tokens came from the prompt cache"))));
         }
     }
     let used = agent.context_tokens();
@@ -1003,52 +1012,54 @@ fn print_usage(agent: &Agent) {
         w if w >= u64::from(u32::MAX) => String::new(),
         w => format!(" of {} ({}%)", output::tokens(w), used * 100 / w.max(1)),
     };
-    println!("context: about {} tokens{size}", output::tokens(used));
+    out.line(format!("context: about {} tokens{size}", output::tokens(used)));
 }
 
-fn print_skills(skills: &[Skill]) {
+fn print_skills(out: &Output, skills: &[Skill]) {
     if skills.is_empty() {
-        println!(
+        out.line(
             "no skills or commands found (looked in .harness/skills, .claude/skills, .agents/skills, \
-             .harness/commands, .claude/commands and the same under ~)"
+             .harness/commands, .claude/commands and the same under ~)",
         );
     }
     for s in skills {
-        println!("\x1b[1m{}\x1b[0m  {}\n  \x1b[90m{}\x1b[0m", s.name, s.description, s.dir.display());
+        out.line(format!("{}  {}", out.paint("1", &s.name), s.description));
+        out.line(format!("  {}", out.paint("90", &s.dir.display().to_string())));
     }
 }
 
-fn print_models(agent: &Agent) {
+fn print_models(out: &Output, agent: &Agent) {
     let providers = agent.client().providers();
-    println!("current: \x1b[1m{}\x1b[0m", agent.model());
+    out.line(format!("current: {}", out.paint("1", agent.model())));
     if let Some(sub) = &providers.subagent_model {
-        println!("subagents: {sub}");
+        out.line(format!("subagents: {sub}"));
     }
     for name in providers.names() {
         let protocol = providers.protocol_of(name).map_or("?", llm::Protocol::as_str);
-        println!("provider \x1b[1m{name}\x1b[0m ({protocol})");
+        out.line(format!("provider {} ({protocol})", out.paint("1", name)));
     }
     for m in providers.listed_models() {
-        let mark = if m == agent.model() { "\x1b[32m●\x1b[0m" } else { " " };
-        println!(" {mark} {m}");
+        let mark = if m == agent.model() { out.paint("32", "●") } else { " ".to_string() };
+        out.line(format!(" {mark} {m}"));
     }
-    println!("\x1b[90mswitch with /model <provider>/<model>; any model name the gateway accepts works\x1b[0m");
+    out.line(out.paint("90", "switch with /model <provider>/<model>; any model name the gateway accepts works"));
 }
 
-fn print_agents(defs: &[AgentDef]) {
+fn print_agents(out: &Output, defs: &[AgentDef]) {
     for d in defs {
         let access = d.permission.as_str();
         let tools = d.tools.as_ref().map_or("all permitted".to_string(), |t| t.join(", "));
         let source = d.path.as_ref().map_or("built-in".to_string(), |p| p.display().to_string());
-        println!("\x1b[1m{}\x1b[0m  [{access}; tools: {tools}]", d.name);
-        println!("  {}", d.description);
-        println!("  \x1b[90m{source}{}\x1b[0m", d.model.as_ref().map_or(String::new(), |m| format!(" · model {m}")));
+        let model = d.model.as_ref().map_or(String::new(), |m| format!(" · model {m}"));
+        out.line(format!("{}  [{access}; tools: {tools}]", out.paint("1", &d.name)));
+        out.line(format!("  {}", d.description));
+        out.line(format!("  {}", out.paint("90", &format!("{source}{model}"))));
     }
 }
 
-fn print_tasks(subagents: &[Value], shells: &[(String, String, bool)]) {
+fn print_tasks(out: &Output, subagents: &[Value], shells: &[(String, String, bool)]) {
     if subagents.is_empty() && shells.is_empty() {
-        println!("no subagents or background commands in this conversation");
+        out.line("no subagents or background commands in this conversation");
         return;
     }
     for s in subagents {
@@ -1067,48 +1078,49 @@ fn print_tasks(subagents: &[Value], shells: &[(String, String, bool)]) {
         if s["background"] == true {
             info.push("background".into());
         }
-        println!(
-            "  \x1b[1m{}\x1b[0m  \x1b[{color}m{status:<9}\x1b[0m  {}  \x1b[2m{}\x1b[0m",
-            s["id"].as_str().unwrap_or(""),
+        out.line(format!(
+            "  {}  {}  {}  {}",
+            out.paint("1", s["id"].as_str().unwrap_or("")),
+            out.paint(color, &text::pad(status, 9)),
             text::printable(s["label"].as_str().unwrap_or("")),
-            info.join(" · ")
-        );
+            out.paint("2", &info.join(" · "))
+        ));
     }
     for (id, command, running) in shells {
         let (color, status) = if *running { ("36", "running") } else { ("2", "ended") };
         let command = text::fit(&text::printable(command.lines().next().unwrap_or("")), 80);
-        println!("  \x1b[1m{id}\x1b[0m  \x1b[{color}m{status:<9}\x1b[0m  \x1b[2m$ {command}\x1b[0m");
+        out.line(format!("  {}  {}  {}", out.paint("1", id), out.paint(color, &text::pad(status, 9)), out.paint("2", &format!("$ {command}"))));
     }
-    println!("\x1b[90mstop one with /stop <id>, or every running one with /stop\x1b[0m");
+    out.line(out.paint("90", "stop one with /stop <id>, or every running one with /stop"));
 }
 
-fn print_plugins(plugins: &Plugins) {
+fn print_plugins(out: &Output, plugins: &Plugins) {
     if plugins.list.is_empty() {
-        println!("no plugins enabled (`enabledPlugins` in ~/.harness/settings.json, or --plugin-dir)");
+        out.line("no plugins enabled (`enabledPlugins` in ~/.harness/settings.json, or --plugin-dir)");
     }
     for p in &plugins.list {
-        let version = p.version.as_ref().map_or(String::new(), |v| format!(" \x1b[2mv{v}\x1b[0m"));
+        let version = p.version.as_ref().map_or(String::new(), |v| format!(" {}", out.paint("2", &format!("v{v}"))));
         match &p.outcome {
             Ok(parts) => {
                 let parts = if parts.is_empty() { "nothing the harness can use".to_string() } else { parts.join(", ") };
-                println!("\x1b[32m●\x1b[0m \x1b[1m{}\x1b[0m{version}  {parts}", p.id);
+                out.line(format!("{} {}{version}  {parts}", out.paint("32", "●"), out.paint("1", &p.id)));
             }
-            Err(e) => println!("\x1b[31m●\x1b[0m \x1b[1m{}\x1b[0m  {e}", p.id),
+            Err(e) => out.line(format!("{} {}  {e}", out.paint("31", "●"), out.paint("1", &p.id))),
         }
         if let Some(description) = &p.description {
-            println!("    {description}");
+            out.line(format!("    {description}"));
         }
         if let Some(root) = &p.root {
-            println!("    \x1b[90m{}\x1b[0m", root.display());
+            out.line(format!("    {}", out.paint("90", &root.display().to_string())));
         }
         for warning in &p.warnings {
-            println!("    \x1b[33m! {warning}\x1b[0m");
+            out.line(format!("    {}", out.paint("33", &format!("! {warning}"))));
         }
         if !p.ignored.is_empty() {
-            println!("    \x1b[2mnot used: {}\x1b[0m", p.ignored.join("; "));
+            out.line(format!("    {}", out.paint("2", &format!("not used: {}", p.ignored.join("; ")))));
         }
     }
-    println!("\x1b[90mmanage them with /plugins install|uninstall|enable|disable|configure|marketplace … (see /plugins help)\x1b[0m");
+    out.line(out.paint("90", "manage them with /plugins install|uninstall|enable|disable|configure|marketplace … (see /plugins help)"));
 }
 
 /// Pulls the latest of every plugin and marketplace cloned from git.
@@ -1132,22 +1144,22 @@ async fn update_plugins(plugins: &Plugins, out: &Output) {
     out.line(out.paint("2", "/reload-plugins (or a restart) uses the new versions"));
 }
 
-fn print_mcp<'a>(statuses: impl Iterator<Item = &'a mcp::Status>) {
+fn print_mcp<'a>(out: &Output, statuses: impl Iterator<Item = &'a mcp::Status>) {
     let statuses: Vec<&mcp::Status> = statuses.collect();
     if statuses.is_empty() {
-        println!("no MCP servers configured (`mcpServers` in ~/.harness/settings.json)");
+        out.line("no MCP servers configured (`mcpServers` in ~/.harness/settings.json)");
     }
     for status in statuses {
         match &status.outcome {
             Ok(tools) => {
-                println!("\x1b[32m●\x1b[0m {} ({} tools)", status.name, tools.len());
+                out.line(format!("{} {} ({} tools)", out.paint("32", "●"), status.name, tools.len()));
                 for t in tools {
-                    println!("    {t}");
+                    out.line(format!("    {t}"));
                 }
             }
-            Err(e) => println!("\x1b[31m●\x1b[0m {} failed: {e}", status.name),
+            Err(e) => out.line(format!("{} {} failed: {e}", out.paint("31", "●"), status.name)),
         }
-        println!("    \x1b[90mlog: {}\x1b[0m", mcp::log_path(&status.name).display());
+        out.line(format!("    {}", out.paint("90", &format!("log: {}", mcp::log_path(&status.name).display()))));
     }
 }
 

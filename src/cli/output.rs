@@ -424,18 +424,19 @@ pub fn replay(out: &Output, messages: &[Message]) {
     let mut names = std::collections::HashMap::new();
     // Tool lines were the last shown, so text needs a blank line first.
     let mut tools = false;
+    let gap = |tools: &mut bool| {
+        if std::mem::take(tools) {
+            out.line("");
+        }
+    };
     for m in &messages[starts.get(first).copied().unwrap_or(messages.len())..] {
         if m.content.iter().any(|b| b["type"] == "text" && b["text"] == INTERRUPTED) {
-            if std::mem::take(&mut tools) {
-                out.line("");
-            }
+            gap(&mut tools);
             out.line(out.paint("33", "■ Interrupted"));
             out.line("");
         }
         if crate::agent::is_compacted(m) {
-            if std::mem::take(&mut tools) {
-                out.line("");
-            }
+            gap(&mut tools);
             out.line(out.paint("2", "✻ Conversation compacted"));
             out.line("");
             continue;
@@ -443,12 +444,10 @@ pub fn replay(out: &Output, messages: &[Message]) {
         if m.role == "user" {
             let prompt = m.content.iter().rev().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).find(|t| *t != INTERRUPTED);
             if let Some(prompt) = prompt.filter(|_| !m.content.iter().any(|b| b["type"] == "tool_result")) {
-                if std::mem::take(&mut tools) {
-                    out.line("");
-                }
+                gap(&mut tools);
                 let lines: Vec<&str> = prompt.lines().collect();
                 for (i, line) in lines.iter().take(PROMPT_LINES).enumerate() {
-                    let lead = if i == 0 { out.paint("1;35", "❯ ") } else { "  ".to_string() };
+                    let lead = if i == 0 { out.paint(input::PROMPT_SGR, input::PROMPT) } else { "  ".to_string() };
                     out.line(format!("{lead}{}", text::fit(&text::printable(line), width.saturating_sub(3))));
                 }
                 if lines.len() > PROMPT_LINES {
@@ -459,28 +458,19 @@ pub fn replay(out: &Output, messages: &[Message]) {
             for b in m.content.iter().filter(|b| b["type"] == "tool_result") {
                 let name = b["tool_use_id"].as_str().and_then(|id| names.get(id)).map_or("", String::as_str);
                 let is_error = b["is_error"].as_bool().unwrap_or(false);
-                if name == "todo_write" && !is_error {
-                    continue;
-                }
                 let content = match &b["content"] {
                     Value::String(s) => s.clone(),
                     Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
                     _ => String::new(),
                 };
-                let color = if is_error { "31" } else { "2" };
-                for (i, line) in result_lines(name, &content, is_error, width.saturating_sub(6)).iter().enumerate() {
-                    let lead = if i == 0 { "  ⎿ " } else { "    " };
-                    out.line(out.paint(color, &text::fit(&format!("{lead}{line}"), width.saturating_sub(2))));
-                }
+                out.lines(&result_block(out, name, &content, is_error, "", width));
             }
             continue;
         }
         for b in &m.content {
             match b["type"].as_str() {
                 Some("text") => {
-                    if std::mem::take(&mut tools) {
-                        out.line("");
-                    }
+                    gap(&mut tools);
                     let text = b["text"].as_str().unwrap_or("");
                     if out.styled() {
                         let mut md = Markdown::new(width);
@@ -492,19 +482,12 @@ pub fn replay(out: &Output, messages: &[Message]) {
                     }
                     out.line("");
                 }
-                Some("tool_use") if b["name"] == "todo_write" => {
-                    if let Some(id) = b["id"].as_str() {
-                        names.insert(id.to_string(), "todo_write".to_string());
-                    }
-                    out.lines(&todo_lines(out, &b["input"]));
-                    tools = true;
-                }
                 Some("tool_use") => {
                     let name = b["name"].as_str().unwrap_or("");
                     if let Some(id) = b["id"].as_str() {
                         names.insert(id.to_string(), name.to_string());
                     }
-                    out.line(format!("{} {}", out.paint("32", "●"), call_label(name, &b["input"], width.saturating_sub(4))));
+                    out.lines(&call_lines(out, name, &b["input"], width));
                     tools = true;
                 }
                 _ => {}
@@ -835,38 +818,21 @@ impl Observer for Terminal {
         let status = if self.calls == 1 { format!("Running {name}…") } else { format!("Running {} tools…", self.calls) };
         self.enter(Phase::Running, &status);
         self.separate(Block::Tools);
-        if name == "todo_write" {
-            self.out.lines(&todo_lines(&self.out, input));
-            return;
-        }
-        let width = text::terminal_width();
-        self.out.line(format!("{} {}", self.out.paint("32", "●"), call_label(name, input, width.saturating_sub(4))));
+        self.out.lines(&call_lines(&self.out, name, input, text::terminal_width()));
     }
 
     fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
         self.results += 1;
         // With several calls in flight, say which one each result is for.
         let prefix = if self.calls > 1 { format!("{name}: ") } else { String::new() };
-        let width = text::terminal_width().saturating_sub(6);
+        let width = text::terminal_width();
         let shown: Vec<String> = match &output.change {
-            // The list itself was shown with the call.
-            _ if name == "todo_write" && !output.is_error => Vec::new(),
-            Some(change) if !output.is_error => diff::render(change, width, |sgr, s| self.out.paint(sgr, s))
+            Some(change) if !output.is_error => diff::render(change, width.saturating_sub(6), |sgr, s| self.out.paint(sgr, s))
                 .into_iter()
                 .enumerate()
                 .map(|(i, line)| if i == 0 { self.out.paint("2", &format!("  ⎿ {prefix}{line}")) } else { format!("    {line}") })
                 .collect(),
-            _ => {
-                let color = if output.is_error { "31" } else { "2" };
-                result_lines(name, &output.content, output.is_error, width)
-                    .iter()
-                    .enumerate()
-                    .map(|(i, line)| {
-                        let lead = if i == 0 { format!("  ⎿ {prefix}") } else { "    ".to_string() };
-                        self.out.paint(color, &text::fit(&format!("{lead}{line}"), width + 4))
-                    })
-                    .collect()
-            }
+            _ => result_block(&self.out, name, &output.content, output.is_error, &prefix, width),
         };
         self.out.lines(&shown);
         if self.results == self.calls {
@@ -1002,10 +968,35 @@ fn call_label(name: &str, input: &Value, max: usize) -> String {
     }
 }
 
+/// How a tool call is shown: `● label`, or the todo list itself.
+fn call_lines(out: &Output, name: &str, input: &Value, width: usize) -> Vec<String> {
+    if name == "todo_write" {
+        return todo_lines(out, input);
+    }
+    vec![format!("{} {}", out.paint("32", "●"), call_label(name, input, width.saturating_sub(4)))]
+}
+
+/// A tool result under its call, `⎿ ` then indented, red when it failed.
+/// A todo list was already shown with its call, so its result is not.
+fn result_block(out: &Output, name: &str, content: &str, is_error: bool, prefix: &str, width: usize) -> Vec<String> {
+    if name == "todo_write" && !is_error {
+        return Vec::new();
+    }
+    let color = if is_error { "31" } else { "2" };
+    result_lines(name, content, is_error, width.saturating_sub(6))
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let lead = if i == 0 { format!("  ⎿ {prefix}") } else { "    ".to_string() };
+            out.paint(color, &text::fit(&format!("{lead}{line}"), width.saturating_sub(2)))
+        })
+        .collect()
+}
+
 /// The first few lines of a tool result, or a summary of it.
 fn result_lines(name: &str, content: &str, is_error: bool, width: usize) -> Vec<String> {
-    let clean = text::strip_ansi(content).replace('\t', "  ");
-    let lines: Vec<&str> = clean.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    let clean: Vec<String> = content.lines().map(text::printable).collect();
+    let lines: Vec<&str> = clean.iter().map(|l| l.trim_end()).filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
         return vec!["(no output)".to_string()];
     }

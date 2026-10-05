@@ -72,14 +72,15 @@ pub fn fit_tail(s: &str, max: usize) -> String {
 /// `s` on one line, safe to print: style sequences removed, tabs expanded,
 /// and other control characters replaced.
 pub fn printable(s: &str) -> String {
-    strip_ansi(s)
-        .chars()
-        .flat_map(|c| match c {
-            '\t' => vec![' '; 4],
-            c if c.is_control() => vec!['�'],
-            c => vec![c],
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for c in tokens(s).filter(|(_, esc)| !esc).flat_map(|(t, _)| t.chars()) {
+        match c {
+            '\t' => out.push_str("    "),
+            c if c.is_control() => out.push('�'),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Wraps styled `s` into lines of at most `max` columns, breaking at spaces
@@ -131,35 +132,41 @@ pub fn wrap(s: &str, max: usize) -> Vec<String> {
     lines
 }
 
+/// `word`, or its plural when `n` is not 1.
+pub fn plural(n: usize, word: &str) -> String {
+    if n == 1 { word.to_string() } else { format!("{word}s") }
+}
+
 /// Pads styled `s` with spaces to `cols` columns.
 pub fn pad(s: &str, cols: usize) -> String {
     format!("{s}{}", " ".repeat(cols.saturating_sub(width(s))))
 }
 
-/// The terminal's width in columns, or 80 when unknown.
-pub fn terminal_width() -> usize {
+/// The terminal's size in columns and rows, when stdout is one.
+fn winsize() -> Option<(usize, usize)> {
     #[cfg(unix)]
     {
         // SAFETY: TIOCGWINSZ only writes a `winsize` into the given struct.
         let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_col > 0 {
-            return size.ws_col as usize;
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0 {
+            return Some((size.ws_col as usize, size.ws_row as usize));
         }
     }
-    std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()).unwrap_or(80)
+    None
+}
+
+/// The terminal's width in columns, or 80 when unknown.
+pub fn terminal_width() -> usize {
+    winsize()
+        .map(|(cols, _)| cols)
+        .filter(|&cols| cols > 0)
+        .or_else(|| std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()))
+        .unwrap_or(80)
 }
 
 /// The terminal's height in rows, when stdout is one.
 pub fn terminal_height() -> Option<usize> {
-    #[cfg(unix)]
-    {
-        // SAFETY: TIOCGWINSZ only writes a `winsize` into the given struct.
-        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_row > 0 {
-            return Some(size.ws_row as usize);
-        }
-    }
-    None
+    winsize().map(|(_, rows)| rows).filter(|&rows| rows > 0)
 }
 
 #[cfg(test)]
