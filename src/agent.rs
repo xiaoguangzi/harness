@@ -248,8 +248,7 @@ impl Agent {
         self.tools = tools;
     }
 
-    /// Replaces the system prompt, for a new conversation after the
-    /// plugins were reloaded.
+    /// Replaces the system prompt, for a new conversation.
     pub fn set_system(&mut self, system: String) {
         self.system = system;
     }

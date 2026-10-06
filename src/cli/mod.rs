@@ -39,13 +39,14 @@ use menu::Command;
 use repl::{ReplHelper, Wake};
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 17] = [
+const BUILTINS: [(&str, &str); 18] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
     ("/clear", "start a new conversation"),
     ("/compact", "summarize the conversation to free context; /compact <focus> says what to keep"),
     ("/resume", "pick up an earlier conversation from this directory"),
+    ("/init", "have the model write AGENTS.md, or improve it; /init <notes> says what else to cover"),
     ("/usage", "show the tokens used so far and how full the context is"),
     ("/tools", "list the tools the model can call"),
     ("/skills", "list available skills"),
@@ -292,6 +293,8 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 agent.clear();
                 if apply_reload(agent, env, &mut skills, editor.helper()).await {
                     out.line(out.paint("2", "the reloaded plugins apply from here"));
+                } else {
+                    refresh_system(agent);
                 }
                 if let Some(rec) = recorder.as_mut() {
                     rec.restart();
@@ -321,6 +324,8 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                         if env.has_pending() {
                             show_hook_notices(&out, agent.end_session("resume").await);
                             apply_reload(agent, env, &mut skills, editor.helper()).await;
+                        } else {
+                            refresh_system(agent);
                         }
                         resume_session(agent, rec, &id, &out, true).await
                     }
@@ -471,6 +476,13 @@ async fn apply_reload(agent: &mut Agent, env: &mut Env, skills: &mut Arc<Vec<Ski
     }
     env.shutdown_retired().await;
     true
+}
+
+/// Builds the system prompt again for a new conversation, so it has the
+/// `AGENTS.md` as it is now (`/init` may have written it).
+fn refresh_system(agent: &mut Agent) {
+    let system = crate::prompt::main(agent.tools());
+    agent.set_system(system);
 }
 
 /// Runs the Notification hooks if the prompt still waits after
@@ -871,6 +883,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "clear" => Input::Clear,
         "compact" => Input::Compact(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "resume" => Input::Resume(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
+        "init" => Input::Prompt(crate::prompt::init(args)),
         "skills" => Input::ListSkills,
         "tools" => Input::ListTools,
         "mcp" => Input::ListMcp,
@@ -1201,6 +1214,8 @@ mod tests {
         assert_eq!(parse_input("how do I exit vim", &skills), Input::Prompt("how do I exit vim".into()));
         assert_eq!(parse_input("/clear", &skills), Input::Clear);
         assert_eq!(parse_input("/compact", &skills), Input::Compact(None));
+        assert_eq!(parse_input("/init", &skills), Input::Prompt(crate::prompt::init("")));
+        assert_eq!(parse_input("/init cover the web UI", &skills), Input::Prompt(crate::prompt::init("cover the web UI")));
         assert_eq!(parse_input("/compact keep the API notes", &skills), Input::Compact(Some("keep the API notes".into())));
         assert_eq!(parse_input("/tools", &skills), Input::ListTools);
         assert_eq!(parse_input("/tasks", &skills), Input::Tasks);

@@ -1,9 +1,9 @@
 //! System prompts.
 //!
 //! The main agent's prompt is the template in `system.md`, with a section
-//! describing the tools actually registered and one describing the
-//! environment. It is built once per conversation, so it stays a stable
-//! prompt-cache prefix.
+//! describing the tools actually registered, one describing the environment
+//! and the project's `AGENTS.md`. It is built once per conversation, so it
+//! stays a stable prompt-cache prefix.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -12,6 +12,11 @@ use crate::subagent::AgentDef;
 use crate::tools::ToolRegistry;
 
 const TEMPLATE: &str = include_str!("system.md");
+/// What `/init` asks the model to do.
+const INIT: &str = include_str!("init.md");
+/// How much of `AGENTS.md` goes into the prompt, in bytes; the model reads
+/// the rest itself.
+const NOTES_LIMIT: usize = 40_000;
 
 /// How to use each built-in tool, in the order they are listed.
 const GUIDANCE: &[(&str, &str)] = &[
@@ -97,12 +102,23 @@ pub fn main(tools: &ToolRegistry) -> String {
         section.push_str("\n\n");
         section.push_str(&claude_code_names(tools.names().collect()));
     }
-    TEMPLATE.replace("{{tools}}", &section).replace("{{environment}}", &environment())
+    let prompt = TEMPLATE.replace("{{tools}}", &section).replace("{{environment}}", &environment());
+    prompt + &project_notes(&std::env::current_dir().unwrap_or_default())
+}
+
+/// The prompt `/init` sends: write or improve `AGENTS.md`, with what the
+/// user added after the command.
+pub fn init(args: &str) -> String {
+    match args.trim() {
+        "" => INIT.to_string(),
+        args => format!("{INIT}\nAlso: {args}\n"),
+    }
 }
 
 /// A subagent's system prompt: its definition's prompt plus the
-/// environment, and for a plugin's agent, written for Claude Code, what its
-/// tools are called here.
+/// environment and the project's `AGENTS.md`, and for a plugin's agent,
+/// written for Claude Code, what its tools are called here. The built-in
+/// `explore` only searches, and goes without the notes.
 pub fn subagent(def: &AgentDef) -> String {
     let names = if def.name.contains(':') {
         let tools: Vec<&str> = crate::hooks::ALIASES.iter().map(|(name, _)| *name).collect();
@@ -110,9 +126,14 @@ pub fn subagent(def: &AgentDef) -> String {
     } else {
         String::new()
     };
+    let notes = if def.path.is_none() && def.name == "explore" {
+        String::new()
+    } else {
+        project_notes(&std::env::current_dir().unwrap_or_default())
+    };
     format!(
         "{}\n\nYou were started by another agent, which sees only your final message; the user does \
-         not see it directly.{names}\n\n# Environment\n\n{}",
+         not see it directly.{names}\n\n# Environment\n\n{}{notes}",
         def.prompt,
         environment()
     )
@@ -179,9 +200,6 @@ fn environment() -> String {
     if let Some(shell) = shell {
         lines.push(format!("- User's shell: {shell} (the `bash` tool always runs bash)"));
     }
-    if let Some(note) = agents_md(&cwd) {
-        lines.push(note);
-    }
     let commands = crate::tools::bash::added_commands();
     if !commands.is_empty() {
         let shown: Vec<String> = commands.iter().take(30).map(|c| format!("`{c}`")).collect();
@@ -197,14 +215,33 @@ fn environment() -> String {
     lines.join("\n")
 }
 
-/// Points the model at the project's `AGENTS.md`, if there is one. Its
-/// contents stay out of the prompt; the model reads it when it needs to.
-fn agents_md(dir: &Path) -> Option<String> {
-    dir.join("AGENTS.md").is_file().then(|| {
-        "- Project notes: `AGENTS.md` in the working directory has the project's conventions and \
-         commands; read it before changing code here."
-            .to_string()
-    })
+/// The section with `dir`'s `AGENTS.md`, empty when there is none (or it is
+/// blank). Past [`NOTES_LIMIT`] it is cut at a line, and the model is told
+/// where to read on.
+fn project_notes(dir: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(dir.join("AGENTS.md")) else { return String::new() };
+    // Only the end is trimmed, so the line the model reads on from is right.
+    let text = text.trim_end();
+    if text.trim_start().is_empty() {
+        return String::new();
+    }
+    let (shown, rest) = if text.len() > NOTES_LIMIT {
+        let mut end = NOTES_LIMIT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let end = text[..end].rfind('\n').unwrap_or(end);
+        let line = text[..end].lines().count() + 1;
+        let rest = format!("\n\n[`AGENTS.md` goes on; read it with `read` from line {line} on.]");
+        (&text[..end], rest)
+    } else {
+        (text, String::new())
+    };
+    format!(
+        "\n\n# Project notes\n\n`AGENTS.md` in the working directory holds this project's conventions and \
+         commands, written for the agents that work on it. Follow it; the user's own instructions come \
+         first.\n\n<agents-md>\n{shown}\n</agents-md>{rest}"
+    )
 }
 
 /// The local date as `YYYY-MM-DD`.
@@ -292,12 +329,36 @@ mod tests {
     }
 
     #[test]
-    fn mentions_agents_md_only_when_present() {
+    fn carries_agents_md_when_present() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(agents_md(dir.path()), None);
-        std::fs::write(dir.path().join("AGENTS.md"), "# notes").unwrap();
-        let note = agents_md(dir.path()).unwrap();
-        assert!(note.contains("`AGENTS.md`") && !note.contains("# notes"), "{note}");
+        assert_eq!(project_notes(dir.path()), "");
+        std::fs::write(dir.path().join("AGENTS.md"), " \n").unwrap();
+        assert_eq!(project_notes(dir.path()), "", "a blank file adds nothing");
+        std::fs::write(dir.path().join("AGENTS.md"), "# notes\n\nRun `make test`.\n").unwrap();
+        let notes = project_notes(dir.path());
+        assert!(notes.starts_with("\n\n# Project notes\n"), "{notes}");
+        assert!(notes.contains("<agents-md>\n# notes\n\nRun `make test`.\n</agents-md>"), "{notes}");
+        assert!(!notes.contains("goes on"), "{notes}");
+    }
+
+    #[test]
+    fn cuts_a_long_agents_md_at_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = "é".repeat(99);
+        let text: Vec<&str> = std::iter::repeat_n(line.as_str(), 300).collect();
+        std::fs::write(dir.path().join("AGENTS.md"), text.join("\n")).unwrap();
+        let notes = project_notes(dir.path());
+        let shown = notes.split("<agents-md>\n").nth(1).unwrap().split("\n</agents-md>").next().unwrap();
+        assert!(shown.len() <= NOTES_LIMIT && shown.ends_with(&line), "cut at a line");
+        let lines = shown.lines().count();
+        assert!(notes.ends_with(&format!("read it with `read` from line {} on.]", lines + 1)), "{notes}");
+    }
+
+    #[test]
+    fn init_adds_what_the_user_asked() {
+        assert_eq!(init(" "), INIT);
+        let prompt = init(" focus on the tests ");
+        assert!(prompt.starts_with(INIT) && prompt.ends_with("\nAlso: focus on the tests\n"), "{prompt}");
     }
 
     #[test]

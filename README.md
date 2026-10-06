@@ -72,7 +72,7 @@ Every key is optional, and unknown keys are an error. Nothing is read from the p
 
 `harness --web` (or `--web=ADDR`, default `127.0.0.1:8787`) starts a browser UI instead of the REPL:
 
-- **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore`, `general-purpose` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results. Each subagent gets a card with its tool calls, status, report and a Stop button, and a background subagent's report starts a turn by itself when the task is idle. Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands and foreground subagents are stopped; background subagents carry on) or delete it (which stops its subagents too). `@path` mentions, `/<skill> args` and `/compact` work as in the REPL.
+- **任务 (Tasks)**: dispatch a task to the main agent or straight to a subagent type (`explore`, `general-purpose` or a custom agent), optionally on a specific model. Tasks run in the background, several at once; each is its own conversation that streams text, tool calls and results. Each subagent gets a card with its tool calls, status, report and a Stop button, and a background subagent's report starts a turn by itself when the task is idle. Continue a task with follow-up messages, switch its model, cancel it (running `bash` commands and foreground subagents are stopped; background subagents carry on) or delete it (which stops its subagents too). `@path` mentions, `/<skill> args`, `/init` and `/compact` work as in the REPL.
 - Assistant text is rendered as Markdown as it streams (code blocks, lists, tables, links); a tool call's summary line shows what it is about (the `bash` command, the file path, the `grep` pattern). Model switching and deletion sit under the `⋯` menu of the task header.
 - **工具 (Tools)**: every registered tool (built-in, skill, MCP, `agent`) with its description and schema; fill in JSON input and call it directly.
 - **模型配置 (Models)**: the active providers and models, and a form or raw-JSON editor for the settings file. A save is validated with the environment first; the model setup then applies without a restart, and idle tasks move to it (`mcpServers`, `sandbox` and `hooks` changes apply on the next start).
@@ -171,6 +171,7 @@ The prompt is an input box between two rules that stays on the bottom rows of th
 | `/clear` | start a new conversation |
 | `/compact [focus]` | summarize the conversation to free context (see [Compaction](#compaction)); `focus` says what the summary should keep |
 | `/resume [id]` | pick up an earlier conversation from this directory (see [Resuming](#resuming-conversations)) |
+| `/init [notes]` | have the model write the project's `AGENTS.md`, or improve it (see [Project notes](#project-notes)) |
 | `/usage` | show the tokens used since the REPL started, per model (requests, input, cache reads and writes, output; subagents and compaction included, kept across `/clear` and `/resume`), and about how much of the context window the conversation takes |
 | `/tools` | list the tools the model can call |
 | `/skills` | list discovered skills |
@@ -311,7 +312,9 @@ Hooks run your own commands at points of the agent loop: to block dangerous comm
 
 ## Project notes
 
-If the working directory has an `AGENTS.md`, the system prompt tells the model it is there, and the model reads it with `read` when it needs the project's conventions. Its contents are not put into the prompt, and no other file (a `CLAUDE.md`, one in a parent directory or in `~`) is looked for.
+If the working directory has an `AGENTS.md`, its contents go into the system prompt, for the main agent and for subagents (except the built-in `explore`, which only searches). Past 40,000 bytes it is cut at a line, and the model is told to read the rest. No other file (a `CLAUDE.md`, one in a parent directory or in `~`) is looked for.
+
+The file is read when a conversation starts: the REPL's first one, after `/clear` or `/resume`, and each new web task. `/init` has the model write it, or improve the one there is, from the code, the `README.md` and notes written for other agents (`CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`), which it leaves in place; `/init <notes>` says what else to cover. It also works one-shot (`harness /init`) and in the web UI.
 
 ## Skills
 
@@ -491,6 +494,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST with retries, SSE reader; marks the stream failures (a dropped connection, an overload) after which `llm::Client` requests the response again
+- `src/prompt/` — system prompts: the main agent's template (`system.md`) with its tools, environment and `AGENTS.md`, and subagents' (`mod.rs`); what `/init` asks for (`init.md`)
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks; pasted images' blocks
 - `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read`, `edit` and `write` check

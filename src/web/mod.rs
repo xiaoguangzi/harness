@@ -431,24 +431,28 @@ async fn call_tool(
 // ---------------------------------------------------------------------------
 // Tasks
 
-/// What a task does for `line`: a turn on its message, where `/<skill>
-/// args` loads that skill (or runs it in a subagent first, if it forks)
-/// and `@path` mentions are attached. Also returns the user event for the
-/// log.
+/// What a task does for `line`: a turn on its message, where `/init` asks
+/// for `AGENTS.md`, `/<skill> args` loads that skill (or runs it in a
+/// subagent first, if it forks) and `@path` mentions are attached. Also
+/// returns the user event for the log.
 async fn user_message(state: &AppState, line: &str, files: &FileTracker) -> ApiResult<(Work, Value)> {
     let prompt = match line.strip_prefix('/') {
         Some(command) => {
             let (name, args) = command.split_once(char::is_whitespace).unwrap_or((command, ""));
-            let skill = state
-                .skills
-                .iter()
-                .find(|s| s.name == name && s.user_invocable)
-                .ok_or_else(|| bad_request(format!("unknown skill /{name}")))?;
-            if skill.fork.is_some() {
-                let user = json!({"type": "user", "text": line, "attachments": [], "warnings": []});
-                return Ok((Work::Fork(Box::new(skill.clone()), args.to_string()), user));
+            if name == "init" {
+                crate::prompt::init(args)
+            } else {
+                let skill = state
+                    .skills
+                    .iter()
+                    .find(|s| s.name == name && s.user_invocable)
+                    .ok_or_else(|| bad_request(format!("unknown skill /{name}")))?;
+                if skill.fork.is_some() {
+                    let user = json!({"type": "user", "text": line, "attachments": [], "warnings": []});
+                    return Ok((Work::Fork(Box::new(skill.clone()), args.to_string()), user));
+                }
+                skill.invocation_prompt(args).await.map_err(bad_request)?
             }
-            skill.invocation_prompt(args).await.map_err(bad_request)?
         }
         None => line.to_string(),
     };
