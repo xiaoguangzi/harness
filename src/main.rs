@@ -1,4 +1,5 @@
 mod agent;
+mod checkpoint;
 mod cli;
 mod hooks;
 mod llm;

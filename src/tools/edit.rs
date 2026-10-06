@@ -132,6 +132,7 @@ impl Tool for EditTool {
                 ));
             }
         };
+        crate::checkpoint::before_change(path).await;
         if let Err(e) = tokio::fs::write(path, &after).await {
             return ToolOutput::error(format!("Cannot write {}: {e}", input.path));
         }

@@ -234,6 +234,11 @@ impl Agent {
                 content.extend(blocks);
             }
         }
+        // Only a prompt not answered yet, kept after the summary, can still
+        // be rewound to.
+        if self.checkpoints {
+            self.history.rebase((pending == 1).then(|| self.messages.len() - 1), 1);
+        }
         let pending = self.messages.pop().filter(|_| pending == 1);
         self.messages = vec![Message::user(content)];
         self.messages.extend(pending);

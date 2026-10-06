@@ -485,7 +485,10 @@ impl AgentTool {
             None if background => {
                 return ToolOutput::error("run_in_background needs a conversation to report back to");
             }
-            None => (Arc::new(Subagents::new(Arc::default(), Arc::default(), Hooks::default())), self.client.clone()),
+            None => {
+                let subagents = Subagents::new(Arc::default(), Arc::default(), Arc::default(), Hooks::default());
+                (Arc::new(subagents), self.client.clone())
+            }
         };
         let client = match client_from(def, &parent) {
             Ok(c) => c,
@@ -809,7 +812,7 @@ mod tests {
         assert!(forks.run("p:x", &missing, "x".into()).await.is_error);
 
         // A subagent runs it in place.
-        let subagents = Arc::new(Subagents::new(Arc::default(), Arc::default(), Hooks::default()));
+        let subagents = Arc::new(Subagents::new(Arc::default(), Arc::default(), Arc::default(), Hooks::default()));
         let out = scope(subagents, client, true, forks.run("p:check", &fork, "Check it".into())).await;
         assert!(out.content.contains("follow it yourself"), "{}", out.content);
         assert!(requests.try_recv().is_err());

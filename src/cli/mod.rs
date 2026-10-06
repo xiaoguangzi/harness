@@ -8,6 +8,7 @@ mod markdown;
 mod menu;
 mod output;
 mod repl;
+mod rewind;
 mod text;
 
 use std::io::{IsTerminal, Write};
@@ -20,6 +21,7 @@ use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 use serde_json::Value;
 
 use crate::agent::{Agent, Inbox};
+use crate::checkpoint;
 use crate::hooks::{Event, Hooks};
 use crate::llm;
 use crate::mcp;
@@ -39,13 +41,14 @@ use menu::Command;
 use repl::{ReplHelper, Wake};
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 18] = [
+const BUILTINS: [(&str, &str); 19] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
     ("/clear", "start a new conversation"),
     ("/compact", "summarize the conversation to free context; /compact <focus> says what to keep"),
     ("/resume", "pick up an earlier conversation from this directory"),
+    ("/rewind", "go back to before an earlier prompt, with the code, the conversation or both (or Esc Esc)"),
     ("/init", "have the model write AGENTS.md, or improve it; /init <notes> says what else to cover"),
     ("/usage", "show the tokens used so far and how full the context is"),
     ("/tools", "list the tools the model can call"),
@@ -75,7 +78,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     let mut recorder = Store::default_location().map(|store| Recorder::new(store, cwd));
     if let Some(rec) = &recorder {
-        tell_hooks(agent, rec);
+        attach_session(agent, rec);
     }
     let one_shot = !args.is_empty();
 
@@ -144,6 +147,8 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
     let config = rustyline::Config::builder()
         .completion_type(rustyline::CompletionType::List)
         .auto_add_history(true)
+        // Otherwise a lone Esc waits for the next key, and Esc Esc is one.
+        .keyseq_timeout(Some(50))
         .build();
     let mut editor: rustyline::Editor<ReplHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(config)?;
@@ -298,7 +303,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 }
                 if let Some(rec) = recorder.as_mut() {
                     rec.restart();
-                    tell_hooks(agent, rec);
+                    attach_session(agent, rec);
                 }
                 out.line(out.paint("2", "conversation cleared"));
             }
@@ -336,6 +341,15 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                     out.line(out.paint("31", &format!("{e:#}")));
                 }
             }
+            Input::Rewind => match rewind::run(agent, &out, &mut typing) {
+                Ok(true) => {
+                    if let Some(rec) = recorder.as_mut() {
+                        save_session(agent, rec, &out);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+            },
             Input::ListSkills => print_skills(&out, &skills),
             Input::ListTools => print_tools(&out, agent),
             Input::ListMcp => print_mcp(&out, env.mcp_statuses()),
@@ -360,7 +374,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                     if agent.messages().is_empty() {
                         apply_reload(agent, env, &mut skills, editor.helper()).await;
                         if let Some(rec) = recorder.as_ref() {
-                            tell_hooks(agent, rec);
+                            attach_session(agent, rec);
                         }
                         out.line(out.paint("2", "they apply from the next message"));
                     } else {
@@ -572,6 +586,11 @@ async fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &O
     show_hook_notices(out, agent.end_session("resume").await);
     agent.restore(messages);
     let mut notes = Vec::new();
+    if let Some(dir) = checkpoint::session_dir(&meta.id)
+        && let Err(e) = agent.file_history().load(dir, agent.messages())
+    {
+        notes.push(format!("its checkpoints were not loaded: {e:#}"));
+    }
     if !meta.model.is_empty() && meta.model != agent.model() {
         match agent.client().switch(&meta.model) {
             Ok(client) => agent.set_client(client),
@@ -579,7 +598,7 @@ async fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &O
         }
     }
     rec.resume(meta);
-    tell_hooks(agent, rec);
+    attach_session(agent, rec);
     if show {
         output::replay(out, agent.messages());
         let title = if rec.meta().title.is_empty() { "conversation" } else { rec.meta().title.as_str() };
@@ -599,9 +618,18 @@ fn show_hook_notices(out: &Output, notices: Vec<String>) {
     }
 }
 
-/// Tells the agent's hooks which saved conversation they run for.
-fn tell_hooks(agent: &Agent, rec: &Recorder) {
+/// Tells the agent which saved conversation it is: its hooks run for it,
+/// and its checkpoints are saved with it.
+fn attach_session(agent: &Agent, rec: &Recorder) {
     agent.hooks().set_session(&rec.meta().id, Some(rec.file()));
+    agent.file_history().set_dir(checkpoint::session_dir(&rec.meta().id));
+}
+
+/// Saves the conversation and its checkpoints.
+fn save_session(agent: &Agent, rec: &mut Recorder, out: &Output) {
+    if let Err(e) = rec.save(agent.messages(), agent.model()).and_then(|()| agent.file_history().save()) {
+        out.line(out.paint("33", &format!("conversation not saved: {e:#}")));
+    }
 }
 
 /// The files `@`-mentioned in `line`, and the pasted `images` whose
@@ -640,6 +668,7 @@ async fn submit(
     input: Option<TurnInput<'_>>,
 ) -> Result<(), TurnEnd> {
     let first = agent.messages().is_empty();
+    agent.set_prompt_label(line);
     out.lines(&attachment_lines(out, &expanded));
     run_shown(agent, expanded.into_content(prompt), first.then_some(line), out, term, recorder, input).await
 }
@@ -712,9 +741,7 @@ async fn run_shown(
             rec.set_title(title);
         }
         agent.settle();
-        if let Err(e) = rec.save(agent.messages(), agent.model()) {
-            out.line(out.paint("33", &format!("conversation not saved: {e:#}")));
-        }
+        save_session(agent, rec, out);
     }
     result
 }
@@ -739,9 +766,8 @@ async fn compact_shown(
     term.end_turn(&result);
     if let Some(rec) = recorder
         && result.is_ok()
-        && let Err(e) = rec.save(agent.messages(), agent.model())
     {
-        out.line(out.paint("33", &format!("conversation not saved: {e:#}")));
+        save_session(agent, rec, out);
     }
     result
 }
@@ -838,6 +864,8 @@ enum Input {
     /// `/resume` lists saved conversations to pick from; `/resume <id>`
     /// resumes that one.
     Resume(Option<String>),
+    /// `/rewind` goes back to before an earlier prompt.
+    Rewind,
     /// `/effort` shows the effort; `/effort <level>` sets it for this
     /// session, and `/effort auto` restores the configured one.
     Effort(Option<Option<llm::Effort>>),
@@ -883,6 +911,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "clear" => Input::Clear,
         "compact" => Input::Compact(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "resume" => Input::Resume(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
+        "rewind" => Input::Rewind,
         "init" => Input::Prompt(crate::prompt::init(args)),
         "skills" => Input::ListSkills,
         "tools" => Input::ListTools,
@@ -962,6 +991,7 @@ fn print_help(out: &Output, skills: &[Skill]) {
         ("↑ ↓ Tab Enter", "pick from the menu shown while typing / or @"),
         ("↑", "while the model works: edit the messages queued for it"),
         ("Esc", "interrupt the running turn"),
+        ("Esc Esc", "at an empty prompt: go back to before an earlier prompt (/rewind)"),
         ("Ctrl-C", "interrupt the running turn; twice at the prompt to quit"),
     ];
     for (key, what) in BUILTINS.iter().chain(&keys) {

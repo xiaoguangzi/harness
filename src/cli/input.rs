@@ -68,6 +68,12 @@ impl Draft {
         (std::mem::take(&mut self.text), after, std::mem::take(&mut self.images))
     }
 
+    /// Replaces the text, with the cursor at its end.
+    pub fn set_text(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.cursor = self.text.len();
+    }
+
     /// Makes sure images pasted from now on are numbered after `n`.
     pub fn note_image(&mut self, n: usize) {
         self.last_image = self.last_image.max(n);

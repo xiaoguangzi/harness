@@ -171,6 +171,7 @@ The prompt is an input box between two rules that stays on the bottom rows of th
 | `/clear` | start a new conversation |
 | `/compact [focus]` | summarize the conversation to free context (see [Compaction](#compaction)); `focus` says what the summary should keep |
 | `/resume [id]` | pick up an earlier conversation from this directory (see [Resuming](#resuming-conversations)) |
+| `/rewind` | go back to before an earlier prompt, with the code, the conversation or both (see [Rewinding](#rewinding)) |
 | `/init [notes]` | have the model write the project's `AGENTS.md`, or improve it (see [Project notes](#project-notes)) |
 | `/usage` | show the tokens used since the REPL started, per model (requests, input, cache reads and writes, output; subagents and compaction included, kept across `/clear` and `/resume`), and about how much of the context window the conversation takes |
 | `/tools` | list the tools the model can call |
@@ -185,6 +186,7 @@ The prompt is an input box between two rules that stays on the bottom rows of th
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
 | `/exit`, `exit`, Ctrl-D | quit (`exit` or `quit` only when alone on the line) |
 | Esc | interrupt the running turn, like Ctrl-C |
+| Esc Esc | at an empty prompt: `/rewind` |
 | ↑ while a turn runs | take the queued messages the model has not got yet back into the input box, to edit |
 | Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted. At the prompt, press it twice to quit |
 | `\` at line end, Alt+Enter | continue the message on a new line |
@@ -214,6 +216,22 @@ Every REPL and one-shot conversation is saved after each turn to `~/.harness/ses
 | `/resume`, `/resume <id>` | the same from inside the REPL |
 
 They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r <id> "..."` (a one-shot `--resume` needs the id). A resumed conversation continues under its id, on the model it last used if that is still configured, and in the REPL its last turns are shown again. Reasoning blocks are kept, so they are sent back to the model that produced them. The read tracking of `edit` and `write` is not saved: the model reads a file again before changing it. Web UI tasks are not saved.
+
+## Rewinding
+
+As in Claude Code, every prompt you send in the REPL is a checkpoint: before `edit` or `write` first changes a file after it, the file is kept as it was (or noted as not there yet). `/rewind`, or Esc twice at an empty prompt, lists the conversation's prompts, the most recent first, with how many files each changed. Pick one by its number, see which files going back to before it would change (`+3 -1`, `removed`, `recreated`), and choose what to restore:
+
+| | |
+|---|---|
+| code and conversation | both of the below |
+| conversation | that prompt and everything after it leave the conversation, and the prompt goes back into the input box to edit and send again; the files stay as they are |
+| code | every file changed since is put back the way it was before that prompt, and files created since are removed; the conversation stays |
+
+- Only changes made with `edit` and `write`, a subagent's too, are tracked. What `bash` commands, MCP tools or your editor change is not, and restoring the code overwrites what you changed since in the files it puts back: it does not replace version control.
+- Messages sent from the input box while a turn runs belong to that turn's prompt; a turn for a background subagent's report makes no checkpoint.
+- A compaction removes the earlier checkpoints with the conversation they belong to: only prompts after it can be rewound to.
+- After rewinding the conversation, the model reads files again before changing them.
+- Checkpoints are saved with the session, the kept versions in `~/.harness/file-history/<id>/` (readable by their owner only), so they still work after `--continue` or `/resume`. A conversation rewound to its first prompt is no longer saved. The web UI has no rewind.
 
 ## Sandbox
 
@@ -484,7 +502,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/main.rs` — startup: settings, `harness plugin` and `--check-plugins`, the sandbox, then what `setup.rs` builds; then the CLI or web frontend
 - `src/setup.rs` — what a conversation is built from: the plugins with their skills, agents, hooks, MCP and language servers (rebuilt by `/reload-plugins`), the user's MCP servers, the tool set and system prompt; `--check-plugins`; background auto-updates
 - `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section, editing it in place
-- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), the spinner, input box and turn display (`output.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with the input box's rules, menu keys, completion, multi-line input, pasting with Ctrl+V and waking the prompt for a subagent's report (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), `/rewind` (`rewind.rs`), the spinner, input box and turn display (`output.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with the input box's rules, menu keys, completion, multi-line input, pasting with Ctrl+V, Esc Esc and waking the prompt for a subagent's report (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
 - `src/agent/usage.rs` — the per-model token counts `/usage` shows, shared with the subagents
@@ -496,6 +514,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
   - `http.rs` — POST with retries, SSE reader; marks the stream failures (a dropped connection, an overload) after which `llm::Client` requests the response again
 - `src/prompt/` — system prompts: the main agent's template (`system.md`) with its tools, environment and `AGENTS.md`, and subagents' (`mod.rs`); what `/init` asks for (`init.md`)
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
+- `src/checkpoint.rs` — checkpoints for `/rewind`: the files `edit` and `write` change, kept as they were before each prompt, saved with the session; restoring them
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks; pasted images' blocks
 - `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read`, `edit` and `write` check
 - `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools

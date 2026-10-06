@@ -172,6 +172,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/clear` | 开始新会话 |
 | `/compact [重点]` | 总结会话以腾出上下文（见[上下文压缩](#上下文压缩)）；`重点` 指定摘要要特别保留的内容 |
 | `/resume [id]` | 继续当前目录下之前的会话（见[恢复会话](#恢复会话)） |
+| `/rewind` | 回到之前某条提示之前，恢复代码、对话或两者（见[回退](#回退)） |
 | `/init [说明]` | 让模型编写项目的 `AGENTS.md`，已有时改进它（见[项目说明](#项目说明)） |
 | `/usage` | 按模型显示 REPL 启动以来用掉的 token（请求数、输入、缓存读取与写入、输出；包括子代理和上下文压缩，`/clear` 和 `/resume` 后不清零），以及当前会话大约占用了多少上下文窗口 |
 | `/tools` | 列出模型可调用的工具 |
@@ -186,6 +187,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/<skill> [args]` | 直接运行一个技能（一次性模式同样可用：`harness /greet Bob`） |
 | `/exit`、`exit`、Ctrl-D | 退出（`exit` 或 `quit` 仅在单独占一行时生效） |
 | Esc | 中断运行中的轮次，同 Ctrl-C |
+| Esc Esc | 在空的提示符下：`/rewind` |
 | 一轮运行期间按 ↑ | 把模型尚未拿到的排队消息取回输入框，以便修改 |
 | Ctrl-C | 中断运行中的轮次：运行中的命令被终止，并告知模型请求已被中断。在提示符处连按两次退出 |
 | 行尾 `\`、Alt+Enter | 在新行继续这条消息 |
@@ -215,6 +217,22 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 | `/resume`、`/resume <id>` | 在 REPL 内做同样的事 |
 
 它们可以与一次性模式组合：`harness -c "now run the tests"` 或 `harness -r <id> "..."`（一次性模式下 `--resume` 需要给出 id）。恢复的会话沿用原来的 id；若上次使用的模型仍在配置中，则切换回该模型；在 REPL 中会重新显示最后几轮。推理块会被保留，因此仍会发回给产生它的模型。`edit` 和 `write` 的已读记录不会保存：模型在修改文件前需要重新读取。Web UI 的任务不会保存。
+
+## 回退
+
+与 Claude Code 一样，你在 REPL 中发送的每条提示都是一个检查点：在它之后 `edit` 或 `write` 第一次修改某个文件之前，该文件原来的内容会被保留（若文件尚不存在，则记下这一点）。`/rewind`，或在空的提示符下按两次 Esc，会列出会话中的提示（最近的在前），以及每条提示改动了几个文件。按编号选择一条，查看回到它之前会改动哪些文件（`+3 -1`、`removed`、`recreated`），然后选择恢复什么：
+
+| | |
+|---|---|
+| 代码和对话 | 以下两项都做 |
+| 对话 | 这条提示及其之后的内容从对话中移除，提示放回输入框，可以修改后重新发送；文件保持现状 |
+| 代码 | 之后改动过的每个文件都恢复到这条提示之前的样子，之后新建的文件被删除；对话保持不变 |
+
+- 只跟踪 `edit` 和 `write`（包括子代理的）做的修改。`bash` 命令、MCP 工具或你的编辑器所做的修改不会被跟踪，恢复代码时会覆盖你之后对这些文件做的修改：它不能替代版本控制。
+- 一轮运行期间从输入框发送的消息属于这一轮的提示；为后台子代理的报告运行的一轮不产生检查点。
+- 上下文压缩会连同之前的对话一起移除更早的检查点：只能回退到压缩之后的提示。
+- 回退对话之后，模型在修改文件前需要重新读取。
+- 检查点随会话一起保存，保留的文件版本在 `~/.harness/file-history/<id>/`（仅所有者可读），因此 `--continue` 或 `/resume` 之后仍然可用。回退到第一条提示的会话不再保存。Web UI 不支持回退。
 
 ## 沙箱
 
@@ -485,7 +503,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/main.rs` — 启动：配置、`harness plugin` 和 `--check-plugins`、沙箱，然后是 `setup.rs` 构建的内容；最后进入 CLI 或 web 前端
 - `src/setup.rs` — 会话由什么构成：插件及其技能、代理、hook、MCP 与语言服务器（由 `/reload-plugins` 重建）、用户的 MCP 服务器、工具集和系统提示词；`--check-plugins`；后台自动更新
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
-- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、带输入框横线、菜单按键、补全、多行输入、Ctrl+V 粘贴以及为子代理报告唤醒提示符的 rustyline 辅助（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
+- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`/rewind`（`rewind.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、带输入框横线、菜单按键、补全、多行输入、Ctrl+V 粘贴、Esc Esc 以及为子代理报告唤醒提示符的 rustyline 辅助（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
 - `src/agent/usage.rs` — `/usage` 显示的按模型统计的 token 数，与子代理共享
@@ -497,6 +515,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
   - `http.rs` — 带重试的 POST、SSE 读取器；标记哪些流式失败（连接断开、过载）之后 `llm::Client` 会重新请求回复
 - `src/prompt/` — 系统提示词：主代理的模板（`system.md`）及其工具、环境和 `AGENTS.md`，子代理的提示词（`mod.rs`）；`/init` 的要求（`init.md`）
 - `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
+- `src/checkpoint.rs` — `/rewind` 的检查点：`edit` 和 `write` 修改的文件在每条提示之前的版本，随会话保存；恢复它们
 - `src/mentions.rs` — `@路径` 的解析与展开为附件块；粘贴图片的附件块
 - `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read`、`edit` 和 `write` 检查的路径规则
 - `src/subagent.rs` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具

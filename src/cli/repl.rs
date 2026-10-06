@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -207,7 +208,7 @@ impl ReplHelper {
         self.pasted.lock().unwrap().last
     }
 
-    /// Binds the keys that drive the menu, and Ctrl+V.
+    /// Binds the keys that drive the menu, Ctrl+V, and Esc.
     pub fn bind_keys<H: Helper, I: rustyline::history::History>(&self, editor: &mut Editor<H, I>) {
         let keys = [(KeyCode::Up, MenuKey::Up), (KeyCode::Down, MenuKey::Down), (KeyCode::Tab, MenuKey::Tab), (KeyCode::Enter, MenuKey::Enter)];
         for (code, key) in keys {
@@ -216,6 +217,8 @@ impl ReplHelper {
         }
         let paste = PasteHandler { pasted: self.pasted.clone() };
         editor.bind_sequence(KeyEvent::ctrl('V'), EventHandler::Conditional(Box::new(paste)));
+        let esc = EscHandler { menu: self.menu.clone(), last: Mutex::new(None) };
+        editor.bind_sequence(KeyEvent(KeyCode::Esc, Modifiers::NONE), EventHandler::Conditional(Box::new(esc)));
     }
 
     /// Call before reading a line: files are searched afresh, and images
@@ -285,6 +288,36 @@ impl ConditionalEventHandler for MenuKeyHandler {
             }
         }
         Some(Cmd::Repaint)
+    }
+}
+
+/// How soon a second Esc must follow the first to count as Esc Esc.
+const DOUBLE_ESC: Duration = Duration::from_millis(800);
+
+/// Esc twice at an empty prompt runs `/rewind`.
+struct EscHandler {
+    menu: Arc<Menu>,
+    /// When Esc was last pressed at an empty prompt.
+    last: Mutex<Option<Instant>>,
+}
+
+impl ConditionalEventHandler for EscHandler {
+    fn handle(&self, _evt: &Event, _n: RepeatCount, _positive: bool, ctx: &EventContext) -> Option<Cmd> {
+        let mut last = self.last.lock().unwrap();
+        if !ctx.line().is_empty() {
+            *last = None;
+            return None;
+        }
+        match last.take() {
+            Some(at) if at.elapsed() < DOUBLE_ESC => {
+                self.menu.set_accepted("/rewind".to_string());
+                Some(Cmd::AcceptLine)
+            }
+            _ => {
+                *last = Some(Instant::now());
+                Some(Cmd::Noop)
+            }
+        }
     }
 }
 

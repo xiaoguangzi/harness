@@ -80,6 +80,7 @@ impl Tool for WriteTool {
             Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
             Err(_) => None,
         };
+        crate::checkpoint::before_change(path).await;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {

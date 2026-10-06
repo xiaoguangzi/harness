@@ -12,6 +12,7 @@ use futures::future::join_all;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
+use crate::checkpoint::FileHistory;
 use crate::hooks::{self, Event, Hooks, Outcome};
 use crate::llm::{Client, Message, StreamEvent, Usage};
 use crate::subagent::Subagents;
@@ -178,6 +179,15 @@ pub struct Agent {
     shells: Arc<Shells>,
     /// Tokens used so far, shared with the subagents.
     usage: Arc<UsageLog>,
+    /// The files changed since each prompt, as they were before, shared
+    /// with the subagents.
+    history: Arc<FileHistory>,
+    /// Whether `history` is this conversation's, so its prompts start
+    /// checkpoints; a subagent's changes go to its parent's.
+    checkpoints: bool,
+    /// How the next prompt is listed among the checkpoints, if not as its
+    /// text.
+    next_prompt: Option<String>,
     /// The history length after the last response, and the tokens that
     /// response reported for everything up to it; `None` once the history
     /// changed otherwise.
@@ -200,10 +210,11 @@ impl Agent {
     pub fn new(client: Client, tools: ToolRegistry, system: impl Into<String>) -> Self {
         let inbox = Arc::new(Inbox::default());
         let usage = Arc::new(UsageLog::default());
+        let history = Arc::new(FileHistory::default());
         let mut hooks = Hooks::default();
         hooks.set_client(client.clone());
         hooks.set_inbox(inbox.clone());
-        let subagents = Arc::new(Subagents::new(inbox.clone(), usage.clone(), hooks.clone()));
+        let subagents = Arc::new(Subagents::new(inbox.clone(), usage.clone(), history.clone(), hooks.clone()));
         let shells = Arc::new(Shells::new(inbox.clone()));
         Self {
             client,
@@ -215,6 +226,9 @@ impl Agent {
             subagents,
             shells,
             usage,
+            history,
+            checkpoints: true,
+            next_prompt: None,
             context: None,
             compactions: 0,
             turn_compacted: false,
@@ -289,6 +303,24 @@ impl Agent {
         self.usage = log;
     }
 
+    /// The checkpoints of this conversation's prompts.
+    pub fn file_history(&self) -> &Arc<FileHistory> {
+        &self.history
+    }
+
+    /// Keeps the files this agent changes in `history`, a parent's; its
+    /// own prompts start no checkpoints there.
+    pub fn set_file_history(&mut self, history: Arc<FileHistory>) {
+        self.history = history;
+        self.checkpoints = false;
+    }
+
+    /// Lists the next prompt among the checkpoints as `text`, e.g. the
+    /// `/command` it was made from, rather than as the prompt itself.
+    pub fn set_prompt_label(&mut self, text: &str) {
+        self.next_prompt = Some(text.to_string());
+    }
+
     /// About how many tokens the next request would take of the context
     /// window.
     pub fn context_tokens(&self) -> u64 {
@@ -305,6 +337,9 @@ impl Agent {
         self.turn_start = None;
         self.context = None;
         self.session_start = Some("clear");
+        if self.checkpoints {
+            self.history.clear();
+        }
     }
 
     /// The conversation so far.
@@ -318,6 +353,22 @@ impl Agent {
         self.clear();
         self.messages = messages;
         self.session_start = Some("resume");
+    }
+
+    /// Takes the conversation back to just before the prompt whose
+    /// checkpoint is at `message`, and returns that prompt. The code stays
+    /// as it is (see [`FileHistory::changes`]); the model must read files
+    /// again before changing them.
+    pub fn rewind(&mut self, message: usize) -> Option<String> {
+        self.settle();
+        let checkpoint = self.history.checkpoints().into_iter().find(|c| c.message == message)?;
+        self.messages.truncate(message);
+        self.history.truncate(message);
+        self.context = None;
+        if let Some(files) = self.tools.files() {
+            files.retain(&[]);
+        }
+        Some(checkpoint.prompt)
     }
 
     /// Repairs the history after a cancelled turn now, rather than when the
@@ -350,6 +401,8 @@ impl Agent {
     /// up (see `compact`).
     pub async fn run_turn(&mut self, mut content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
         self.settle();
+        let label = self.next_prompt.take();
+        let prompt = (!content.is_empty()).then(|| label.unwrap_or_else(|| prompt_text(&content)));
         if !content.is_empty() && !self.hooks.is_subagent() {
             self.prompt_hooks(&mut content, observer).await?;
         }
@@ -358,17 +411,24 @@ impl Agent {
             return Ok(());
         }
         let session_start = self.session_start;
+        if let Some(prompt) = prompt.filter(|_| self.checkpoints) {
+            self.history.begin(self.messages.len(), prompt);
+        }
         self.turn_start = Some(self.messages.len());
         (self.compactions, self.turn_compacted) = (0, false);
         self.messages.push(Message::user(arrived.iter().cloned().chain(content).collect()));
         let (subagents, client, shells) = (self.subagents.clone(), self.client.clone(), self.shells.clone());
         let nested = self.hooks.is_subagent();
+        let history = self.history.clone();
         let turn = crate::subagent::scope(subagents, client, nested, self.run_loop(observer));
-        let result = crate::tools::shells::scope(shells, turn).await;
+        let result = crate::checkpoint::scope(history, crate::tools::shells::scope(shells, turn)).await;
         if result.is_err() {
             // A compaction moves the turn's start.
             let turn_start = self.turn_start.unwrap_or_default();
             self.repair_after_error(turn_start);
+            if self.checkpoints {
+                self.history.truncate(self.messages.len());
+            }
             // A turn that got nowhere is removed, but what had arrived for
             // the model stays: it can't be sent again.
             if self.messages.len() == turn_start && !arrived.is_empty() && !self.turn_compacted {
@@ -386,8 +446,7 @@ impl Agent {
     /// Runs the UserPromptSubmit hooks on the prompt in `content` (its last
     /// text block): they may refuse it, or add to it.
     async fn prompt_hooks(&mut self, content: &mut Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
-        let prompt = content.iter().rev().find(|b| b["type"] == "text").and_then(|b| b["text"].as_str());
-        let outcome = self.hooks.user_prompt_submit(prompt.unwrap_or_default(), self.client.spec()).await;
+        let outcome = self.hooks.user_prompt_submit(&prompt_text(content), self.client.spec()).await;
         show_notices(&outcome, observer);
         if let Some(reason) = outcome.block.or(outcome.halt) {
             let reason = if reason.is_empty() { String::new() } else { format!(": {reason}") };
@@ -645,6 +704,12 @@ impl Agent {
     }
 }
 
+/// The prompt in a user message's `content`: its last text block.
+fn prompt_text(content: &[Value]) -> String {
+    let text = content.iter().rev().find(|b| b["type"] == "text").and_then(|b| b["text"].as_str());
+    text.unwrap_or_default().to_string()
+}
+
 /// Passes what hooks had for the user on to the frontend.
 fn show_notices(outcome: &Outcome, observer: &mut dyn Observer) {
     for notice in &outcome.notices {
@@ -774,6 +839,42 @@ mod tests {
         assert!(error.to_string().contains("has a secret"), "{error}");
         assert!(agent.messages().is_empty());
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rewinds_to_before_a_prompt() {
+        let _guard = crate::util::lock_cwd();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "v0").unwrap();
+        let path = file.display().to_string();
+        let write = move |content: &str| {
+            json!({"type": "tool_use", "id": content, "name": "write", "input": {"path": path, "content": content}})
+        };
+        let (client, _requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![write("v1")], "tool_use", 100),
+            2 => (vec![write("v2")], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let files = crate::tools::FileTracker::default();
+        files.record(&file);
+        let mut agent = Agent::new(client, ToolRegistry::with_defaults(files.clone()), "sys");
+        agent.set_prompt_label("/first");
+        agent.run_turn(vec![text("one")], &mut Notices::default()).await.unwrap();
+        agent.run_turn(vec![text("two")], &mut Notices::default()).await.unwrap();
+        let listed: Vec<(usize, String)> =
+            agent.file_history().checkpoints().into_iter().map(|c| (c.message, c.prompt)).collect();
+        assert_eq!(listed, [(0, "/first".to_string()), (4, "two".to_string())]);
+
+        crate::checkpoint::restore(&agent.file_history().changes(4).unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
+        assert_eq!(agent.rewind(4).as_deref(), Some("two"));
+        assert_eq!(agent.messages().len(), 4);
+        assert_eq!(agent.file_history().checkpoints().len(), 1);
+        assert!(agent.rewind(4).is_none(), "gone with its messages");
+        assert!(files.check_writable(&file).is_err(), "the model must read the file again");
     }
 
     #[tokio::test]

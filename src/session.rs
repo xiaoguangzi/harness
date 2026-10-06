@@ -191,10 +191,13 @@ impl Recorder {
     }
 
     /// Saves the conversation as it is now. Nothing is written until it
-    /// has a message.
+    /// has a message; one rewound to its start is no longer saved.
     pub fn save(&mut self, messages: &[Message], model: &str) -> Result<()> {
         if messages.is_empty() {
-            return Ok(());
+            return match std::fs::remove_file(self.file()) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context("removing the saved conversation"),
+                _ => Ok(()),
+            };
         }
         self.meta.model = model.to_string();
         self.meta.updated = now();

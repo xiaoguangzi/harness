@@ -113,6 +113,13 @@ fn updated(path: &str, before: &str, after: &str) -> (String, Vec<Row>, usize) {
     (summary, rows, hidden)
 }
 
+/// How many lines going from `before` to `after` adds and removes.
+pub fn line_counts(before: &str, after: &str) -> (usize, usize) {
+    let diff = TextDiff::configure().timeout(Duration::from_millis(200)).diff_lines(before, after);
+    let count = |tag| diff.iter_all_changes().filter(|c| c.tag() == tag).count();
+    (count(ChangeTag::Insert), count(ChangeTag::Delete))
+}
+
 /// A file line made safe for the terminal.
 fn clean(line: &str) -> String {
     text::printable(line.trim_end_matches(['\n', '\r']))
