@@ -9,9 +9,10 @@ mod menu;
 mod output;
 mod repl;
 mod rewind;
+mod screen;
 mod text;
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -38,7 +39,7 @@ use keys::{Key, KeyWatch};
 pub use output::Output;
 use output::{Terminal, TurnEnd};
 use menu::Command;
-use repl::{ReplHelper, Wake};
+use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
 const BUILTINS: [(&str, &str); 20] = [
@@ -83,6 +84,8 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
     }
     let one_shot = !args.is_empty();
 
+    let boxed = !one_shot && std::io::stdin().is_terminal() && out.interactive();
+    let _screen = boxed.then(|| out.enter_screen());
     if !one_shot {
         print_banner(agent, &skills, env, &out);
     }
@@ -153,22 +156,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
         .build();
     let mut editor: rustyline::Editor<ReplHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(config)?;
-    // A background subagent's report may come in while the prompt waits.
-    // The editor handles SIGINT only when both ends are a terminal.
-    let wake = (std::io::stdin().is_terminal() && out.styled()).then(|| {
-        let wake = Arc::new(Wake::new(agent.inbox()));
-        let poke = wake.clone();
-        agent.inbox().on_wake(move || poke.poke());
-        wake
-    });
-    // A wake that lands just after the editor returns meets Tokio's SIGINT
-    // handler, installed from here on, instead of ending the process.
-    let _sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
-    // On a terminal, the prompt is drawn as an input box, which stays under
-    // the output while a turn runs, on the bottom rows of the screen; what
-    // is typed there carries over to the prompt after it.
-    let boxed = std::io::stdin().is_terminal() && out.styled();
-    let helper = ReplHelper::new(commands, boxed, wake.clone());
+    let helper = ReplHelper::new(commands);
     helper.bind_keys(&mut editor);
     editor.set_helper(Some(helper));
     // Alt+Enter inserts a newline, like a trailing `\`.
@@ -199,6 +187,32 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 out.lines(&prompt_lines(&out, &command));
                 (command, Vec::new())
             }
+            None if boxed => {
+                let last = mentions::last_pasted_image(agent.messages()).max(typing.draft.last_image());
+                typing.draft.note_image(last);
+                let idle = std::mem::take(&mut answered).then(|| notify_when_idle(agent.hooks(), agent.model()));
+                let past = editor.history().iter().cloned().collect();
+                let read = editor.helper().unwrap().read_box(&out, &mut typing, agent.inbox().clone(), past).await;
+                if let Some(idle) = idle { idle.abort(); }
+                let (line, images) = match read {
+                    Ok(Some(message)) => message,
+                    Ok(None) => { interrupted = false; continue; }
+                    Err(ReadlineError::Interrupted) if !interrupted => {
+                        interrupted = true;
+                        out.line(out.paint("2", "(press Ctrl-C again or Ctrl-D to exit)"));
+                        continue;
+                    }
+                    Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+                    Err(e) => return Err(e.into()),
+                };
+                interrupted = false;
+                let line = repl::join_continuations(line.trim());
+                if !line.is_empty() {
+                    let _ = editor.add_history_entry(&line);
+                    out.lines(&prompt_lines(&out, &line));
+                }
+                (line, images)
+            }
             None => {
                 let (before, after, carried) = typing.draft.take();
                 let prompt = match editor.helper() {
@@ -212,55 +226,15 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 // Reading a line blocks; let the runtime move other tasks
                 // (such as MCP connections) off this worker meanwhile.
                 out.hold(true);
-                // Where the output ends is asked afresh, as commands print
-                // without `out`.
-                if boxed
-                    && let Some(helper) = editor.helper()
-                    && let Some(end) = keys::cursor_row().or_else(|| out.end())
-                {
-                    helper.pin(end, &format!("{before}{after}"));
-                }
                 let idle = std::mem::take(&mut answered).then(|| notify_when_idle(agent.hooks(), agent.model()));
                 let read = tokio::task::block_in_place(|| editor.readline_with_initial(&prompt, (&before, &after)));
                 if let Some(idle) = idle {
                     idle.abort();
                 }
-                let woken =
-                    wake.as_ref().is_some_and(|w| w.finish_reading()) && matches!(read, Err(ReadlineError::Interrupted));
-                // Take the input box off the screen; a line sent shows as
-                // a plain prompt instead.
-                if boxed && let Some(helper) = editor.helper() {
-                    let shown = match &read {
-                        Ok(line) => Some(line.as_str()),
-                        Err(ReadlineError::Eof) => Some(""),
-                        Err(_) => None,
-                    };
-                    let used = helper.rows_used(&prompt, shown);
-                    match helper.unpin() {
-                        // The box, and the blank rows above it. The terminal
-                        // may have cleared the screen meanwhile (iTerm's
-                        // Reset or Clear Buffer), taking the box to the top
-                        // with nothing above it: the output then ends where
-                        // the box starts.
-                        Some(end) => {
-                            let top = keys::cursor_row().and_then(|row| row.checked_sub(used));
-                            let end = top.map_or(end, |top| end.min(top));
-                            print!("{}\x1b[J", input::goto(end));
-                            out.set_end(end);
-                        }
-                        None => print!("\x1b[{used}A\r\x1b[J"),
-                    }
-                    let _ = std::io::stdout().flush();
-                }
                 // What subagents printed meanwhile.
                 out.hold(false);
                 let line = match read {
                     Ok(line) => line,
-                    // Interrupted for a subagent's report.
-                    Err(ReadlineError::Interrupted) if woken => {
-                        interrupted = false;
-                        continue;
-                    }
                     Err(ReadlineError::Interrupted) if !interrupted => {
                         interrupted = true;
                         let running = agent.subagents().running_in_background();
@@ -283,9 +257,6 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 // the prefix typed.
                 if let Some(command) = helper.take_accepted() {
                     line = command;
-                }
-                if boxed && !line.is_empty() {
-                    out.lines(&prompt_lines(&out, &line));
                 }
                 (line, helper.take_images())
             }
@@ -357,7 +328,10 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
             Input::Plugins { update: false } => print_plugins(&out, &env.ext.plugins),
             Input::Plugins { update: true } => update_plugins(&env.ext.plugins, &out).await,
             Input::ManagePlugins(args) => {
-                match tokio::task::block_in_place(|| plugins::manage::run(&args, &mut plugins::manage::TerminalAsk)) {
+                let handoff = out.handoff();
+                let managed = tokio::task::block_in_place(|| plugins::manage::run(&args, &mut plugins::manage::TerminalAsk));
+                drop(handoff);
+                match managed {
                     Ok(lines) => out.lines(&lines),
                     Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
                 }
@@ -417,7 +391,10 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
             Input::Providers(args) => {
-                match tokio::task::block_in_place(|| llm::manage::run(&args, &mut plugins::manage::TerminalAsk)) {
+                let handoff = out.handoff();
+                let managed = tokio::task::block_in_place(|| llm::manage::run(&args, &mut plugins::manage::TerminalAsk));
+                drop(handoff);
+                match managed {
                     Ok(lines) => {
                         out.lines(&lines);
                         if llm::manage::changes(&args) {
@@ -591,7 +568,10 @@ fn pick_session(rec: &Recorder, out: &Output) -> Result<Option<String>> {
         ));
     }
     let mut editor = rustyline::DefaultEditor::new()?;
-    let answer = match tokio::task::block_in_place(|| editor.readline("resume which? (number, Enter to cancel) ")) {
+    let handoff = out.handoff();
+    let read = tokio::task::block_in_place(|| editor.readline("resume which? (number, Enter to cancel) "));
+    drop(handoff);
+    let answer = match read {
         Ok(answer) => answer,
         Err(ReadlineError::Interrupted | ReadlineError::Eof) => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -731,9 +711,7 @@ async fn run_shown(
         Some(input) => {
             out.open_input(std::mem::take(input.typing), inbox.clone());
             let typed = out.clone();
-            let keys = KeyWatch::with_keys(move |key| type_key(&typed, key, &tx));
-            out.start_asking();
-            keys
+            KeyWatch::with_keys(move |key| type_key(&typed, key, &tx))
         }
         None => KeyWatch::start(),
     };
@@ -755,7 +733,6 @@ async fn run_shown(
         }
     };
     drop(turn);
-    out.stop_asking().await;
     drop(keys);
     if let Some(input) = input {
         *input.typing = out.close_input();
@@ -811,20 +788,26 @@ fn type_key(out: &Output, key: Key, tx: &tokio::sync::mpsc::UnboundedSender<(Str
             }
         }
         Key::Up if out.edit_queued() => {}
-        Key::Position(row) => out.cursor_at(row),
-        Key::PasteImage => match clipboard::read() {
-            Ok(Some(Clip::Image(image))) => {
-                out.edit_input(|typing| typing.draft.paste_image(image));
-            }
-            Ok(Some(Clip::Files(paths))) => {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                out.edit_input(|typing| typing.draft.paste(&repl::file_mentions(&paths, &cwd)));
-            }
-            Ok(None) | Err(_) => {}
-        },
+        Key::Position(_) => {},
+        Key::PasteImage => paste_clipboard(out),
         key => {
             out.edit_input(|typing| typing.draft.edit(key));
         }
+    }
+}
+
+fn paste_clipboard(out: &Output) {
+    match clipboard::read() {
+        Ok(Some(Clip::Image(image))) => { out.edit_input(|typing| typing.draft.paste_image(image)); }
+        Ok(Some(Clip::Files(paths))) => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            out.edit_input(|typing| typing.draft.paste(&repl::file_mentions(&paths, &cwd)));
+        }
+        Ok(None) => {
+            let key = if cfg!(target_os = "macos") { "Cmd+V" } else { "Ctrl+Shift+V" };
+            out.input_notice(format!("no image in the clipboard (text pastes with {key})"));
+        }
+        Err(e) => out.input_notice(format!("! {e}")),
     }
 }
 

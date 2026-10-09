@@ -6,7 +6,6 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
@@ -20,12 +19,6 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 /// Longest escape sequence taken apart; anything longer is dropped.
 const MAX_SEQUENCE: usize = 32;
-/// How long to wait for the terminal to say where the cursor is.
-const REPORT_WAIT: Duration = Duration::from_millis(500);
-/// Set once the terminal didn't answer, so it isn't asked again.
-static NO_REPORT: AtomicBool = AtomicBool::new(false);
-/// Asks the terminal where the cursor is; the answer comes as input.
-pub const ASK_POSITION: &str = "\x1b[6n";
 
 /// A key that edits the input box.
 #[derive(Debug, PartialEq)]
@@ -33,6 +26,9 @@ pub enum Key {
     /// Text typed, or pasted.
     Text(String),
     Enter,
+    Tab,
+    Esc,
+    Eof,
     /// Alt+Enter: a line break in the text.
     Newline,
     Backspace,
@@ -53,8 +49,7 @@ pub enum Key {
     KillWord,
     /// Ctrl+V: pastes an image from the clipboard.
     PasteImage,
-    /// Not a key: the terminal's answer to where the cursor is (see
-    /// [`ASK_POSITION`]), its screen row from 0.
+    /// A terminal position report, ignored by the owned viewport.
     Position(usize),
 }
 
@@ -75,16 +70,20 @@ impl KeyWatch {
     /// Starts watching for Esc, if stdin is a terminal; otherwise Esc never
     /// comes. Other keys are discarded.
     pub fn start() -> Self {
-        Self::watch(None)
+        Self::watch(None, false)
     }
 
     /// Like [`KeyWatch::start`], handing every other key to `on_key` (on
     /// the reading thread). Pasted text arrives as one `Key::Text`.
     pub fn with_keys(on_key: impl FnMut(Key) + Send + 'static) -> Self {
-        Self::watch(Some(Box::new(on_key)))
+        Self::watch(Some(Box::new(on_key)), false)
     }
 
-    fn watch(on_key: Option<OnKey>) -> Self {
+    pub fn for_prompt(on_key: impl FnMut(Key) + Send + 'static) -> Self {
+        Self::watch(Some(Box::new(on_key)), true)
+    }
+
+    fn watch(on_key: Option<OnKey>, prompt: bool) -> Self {
         let mut watch = Self { pressed: None, reader: None, saved: None, paste: false };
         if !io::stdin().is_terminal() {
             return watch;
@@ -112,7 +111,7 @@ impl KeyWatch {
         let stop = Arc::new(AtomicBool::new(false));
         let reader = {
             let stop = stop.clone();
-            std::thread::spawn(move || read_keys(&stop, tx, on_key))
+            std::thread::spawn(move || read_keys(&stop, tx, on_key, prompt))
         };
         watch.pressed = Some(rx);
         watch.reader = Some((stop, reader));
@@ -146,7 +145,7 @@ impl Drop for KeyWatch {
     }
 }
 
-fn read_keys(stop: &AtomicBool, esc: oneshot::Sender<()>, mut on_key: Option<OnKey>) {
+fn read_keys(stop: &AtomicBool, esc: oneshot::Sender<()>, mut on_key: Option<OnKey>, prompt: bool) {
     let mut buf = [0u8; 4096];
     // Bytes read and not yet taken apart.
     let mut pending: Vec<u8> = Vec::new();
@@ -165,6 +164,11 @@ fn read_keys(stop: &AtomicBool, esc: oneshot::Sender<()>, mut on_key: Option<OnK
                 }
                 // A lone Esc with nothing behind it is the key.
                 if pending == [ESC] {
+                    if prompt {
+                        pending.clear();
+                        if let Some(on_key) = on_key.as_mut() { on_key(Key::Esc); }
+                        continue;
+                    }
                     let _ = esc.send(());
                     return;
                 }
@@ -180,6 +184,11 @@ fn read_keys(stop: &AtomicBool, esc: oneshot::Sender<()>, mut on_key: Option<OnK
         loop {
             match parse(&pending) {
                 Parsed::Esc => {
+                    if prompt {
+                        pending.drain(..1);
+                        if let Some(on_key) = on_key.as_mut() { on_key(Key::Esc); }
+                        continue;
+                    }
                     let _ = esc.send(());
                     return;
                 }
@@ -223,7 +232,8 @@ fn parse(buf: &[u8]) -> Parsed {
         0x06 => Key::Right,
         0x10 => Key::Up,
         0x0e => Key::Down,
-        0x04 => Key::Delete,
+        0x04 => Key::Eof,
+        b'\t' => Key::Tab,
         0x15 => Key::KillToStart,
         0x0b => Key::KillToEnd,
         0x17 => Key::KillWord,
@@ -294,6 +304,9 @@ fn parse_csi(buf: &[u8]) -> Parsed {
     // With a modifier (`1;5D` is Ctrl+Left), the arrows move by words.
     let modified = params.contains(&b';');
     let key = match (params, last) {
+        (b"13", b'u') => Key::Enter,
+        (b"13;2" | b"13;3" | b"13;5" | b"13;6", b'u')
+        | (b"27;2;13" | b"27;3;13" | b"27;5;13", b'~') => Key::Newline,
         (_, b'A') => Key::Up,
         (_, b'B') => Key::Down,
         (_, b'C') if modified => Key::WordRight,
@@ -311,51 +324,6 @@ fn parse_csi(buf: &[u8]) -> Parsed {
         _ => return Parsed::Skip(end + 1),
     };
     Parsed::Key(key, end + 1)
-}
-
-/// The screen row the cursor is on, from 0 at the top, as the terminal
-/// reports it. `None` when stdin or stdout isn't a terminal, when input is
-/// waiting (it would come before the answer, and be lost), or when no
-/// answer comes. Only while nothing else reads stdin.
-pub fn cursor_row() -> Option<usize> {
-    if NO_REPORT.load(Ordering::Relaxed) || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return None;
-    }
-    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) } != 0 {
-        return None;
-    }
-    // The answer comes as input: read it byte by byte, without echoing it.
-    let mut raw = saved;
-    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
-    raw.c_cc[libc::VMIN] = 1;
-    raw.c_cc[libc::VTIME] = 0;
-    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-        return None;
-    }
-    let row = ask_row();
-    unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved) };
-    row
-}
-
-fn ask_row() -> Option<usize> {
-    if readable(0) {
-        return None;
-    }
-    io::stdout().write_all(ASK_POSITION.as_bytes()).and_then(|()| io::stdout().flush()).ok()?;
-    let deadline = Instant::now() + REPORT_WAIT;
-    let mut reply = Vec::new();
-    let mut buf = [0u8; MAX_SEQUENCE];
-    while !reply.ends_with(b"R") {
-        let left = deadline.saturating_duration_since(Instant::now()).as_millis() as libc::c_int;
-        if left == 0 || !readable(left) || reply.len() > MAX_SEQUENCE {
-            NO_REPORT.store(true, Ordering::Relaxed);
-            return None;
-        }
-        let n = read(&mut buf)?;
-        reply.extend_from_slice(&buf[..n]);
-    }
-    report_row(&reply)
 }
 
 /// The row in a cursor position report, `ESC [ row ; col R`, from 0.
@@ -413,6 +381,15 @@ mod tests {
         assert_eq!(parse(b"\x1b\x1b"), Parsed::Esc);
         assert_eq!(parse(b"\x1b[5~"), Parsed::Skip(4));
         assert_eq!(parse(b"\x07"), Parsed::Skip(1));
+    }
+
+    #[test]
+    fn distinguishes_submit_linebreak_tab_and_eof() {
+        assert_eq!(parse(b"\t"), Parsed::Key(Key::Tab, 1));
+        assert_eq!(parse(b"\x04"), Parsed::Key(Key::Eof, 1));
+        assert_eq!(parse(b"\x1b[13u"), Parsed::Key(Key::Enter, 5));
+        assert_eq!(parse(b"\x1b[13;2u"), Parsed::Key(Key::Newline, 7));
+        assert_eq!(parse(b"\x1b[27;2;13~"), Parsed::Key(Key::Newline, 10));
     }
 
     #[test]

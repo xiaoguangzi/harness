@@ -2,7 +2,6 @@
 //! observer that shows an agent turn as it runs (Markdown text, tool calls
 //! and results, token counts).
 
-use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,9 +10,9 @@ use serde_json::Value;
 
 use super::diff;
 use super::input::{self, Queued, Typing};
-use super::keys;
 use super::markdown::Markdown;
-use super::repl;
+use super::menu::Menu;
+use super::screen::Screen;
 use super::text;
 use crate::agent::{INTERRUPTED, Inbox, Observer};
 use crate::llm::{MAX_RETRIES, Message, Usage, retry_reason};
@@ -36,8 +35,6 @@ const PROMPT_LINES: usize = 4;
 /// Wrap a redraw, so terminals that support it show it all at once.
 const SYNC_START: &str = "\x1b[?2026h\x1b[?25l";
 const SYNC_END: &str = "\x1b[?25h\x1b[?2026l";
-/// How long the end of a turn waits for the terminal's last answers.
-const ANSWER_WAIT: Duration = Duration::from_millis(300);
 
 /// Shared handle on stdout. Output printed while an agent runs goes through
 /// it, so the status lines and input box are cleared first and redrawn
@@ -50,6 +47,8 @@ pub struct Output {
 }
 
 struct State {
+    screen: Option<Screen>,
+    menu: Option<Arc<Menu>>,
     status: Option<Status>,
     /// The input box, while a turn runs in the REPL.
     input: Option<InputBox>,
@@ -58,25 +57,31 @@ struct State {
     drawn: bool,
     rows: usize,
     cursor_row: usize,
-    /// In the REPL, the screen row the next output goes on, while the
-    /// terminal keeps `size`: what is drawn then goes on the screen's
-    /// bottom rows, with blank rows between it and the output until the
-    /// output fills the screen. Otherwise it goes right under the output.
-    end: Option<usize>,
     size: (usize, Option<usize>),
-    /// The screen row the cursor was left on, when drawn on the bottom
-    /// rows.
-    at: Option<usize>,
-    /// Whether each drawing first asks the terminal where the cursor is,
-    /// while the input box's keys are read; where it was left, for each
-    /// question not answered yet, and how many answers to ignore.
-    asking: bool,
-    asked: VecDeque<usize>,
-    ignored: usize,
     frame: usize,
     /// Lines printed while the line editor reads, shown once it is done:
     /// printing then would tear up the line being edited.
     held: Option<Vec<String>>,
+}
+
+/// Restores a usable shell cursor on normal exit and error unwinding.
+pub struct ScreenGuard(Output);
+
+pub struct ScreenHandoff {
+    out: Output,
+    active: bool,
+}
+
+impl Drop for ScreenHandoff {
+    fn drop(&mut self) {
+        if self.active { self.out.claim_screen(); }
+    }
+}
+
+impl Drop for ScreenGuard {
+    fn drop(&mut self) {
+        self.0.leave_screen();
+    }
 }
 
 struct Status {
@@ -92,90 +97,79 @@ struct InputBox {
     typing: Typing,
     /// Where the messages sent from it go.
     inbox: Arc<Inbox>,
+    notice: Option<String>,
 }
 
 impl Output {
     pub fn stdout() -> Self {
         let styled = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         let state = State {
+            screen: None,
+            menu: None,
             status: None,
             input: None,
             drawn: false,
             rows: 0,
             cursor_row: 0,
-            end: None,
             size: (0, None),
-            at: None,
-            asking: false,
-            asked: VecDeque::new(),
-            ignored: 0,
             frame: 0,
             held: None,
         };
         Self { state: Arc::new(Mutex::new(state)), styled }
     }
 
+    /// Claims the current screen, pushing the shell contents into native
+    /// scrollback without using the alternate screen or clearing history.
+    pub fn enter_screen(&self) -> ScreenGuard {
+        self.claim_screen();
+        ScreenGuard(self.clone())
+    }
+
+    fn claim_screen(&self) {
+        let mut state = self.state.lock().unwrap();
+        let height = text::terminal_height().unwrap_or(24);
+        let mut stdout = io::stdout().lock();
+        let _ = write!(stdout, "{}\x1b[H\x1b[J", "\r\n".repeat(height));
+        let _ = stdout.flush();
+        state.screen = Some(Screen::default());
+    }
+
+    pub fn handoff(&self) -> ScreenHandoff {
+        let active = self.state.lock().unwrap().screen.is_some();
+        self.leave_screen();
+        ScreenHandoff { out: self.clone(), active }
+    }
+
+    pub fn interactive(&self) -> bool {
+        io::stdout().is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb")
+    }
+
+    pub fn input_is_empty(&self) -> bool {
+        self.state.lock().unwrap().input.as_ref().is_some_and(|input| input.typing.draft.is_empty())
+    }
+
+    pub fn set_menu(&self, menu: Option<Arc<Menu>>) {
+        let mut state = self.state.lock().unwrap();
+        state.menu = menu;
+        self.show(&mut state, "");
+    }
+
+    /// Hands the terminal to a conventional line-based command prompt.
+    pub fn leave_screen(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.screen.take().is_some() {
+            let row = text::terminal_height().unwrap_or(24).saturating_sub(1);
+            let mut stdout = io::stdout().lock();
+            let _ = write!(stdout, "{}\x1b[0m\x1b[?25h\r\n", input::goto(row));
+            let _ = stdout.flush();
+        }
+    }
+
     /// Shows the input box under the status, holding `typing`, until
     /// [`Output::close_input`]. Messages sent from it go to `inbox`.
     pub fn open_input(&self, typing: Typing, inbox: Arc<Inbox>) {
         let mut state = self.state.lock().unwrap();
-        state.input = Some(InputBox { typing, inbox });
-        self.show(&mut state, "");
-    }
-
-    /// Has each drawing first ask the terminal where the cursor is, to
-    /// tell when the terminal cleared the screen; the answers come as
-    /// [`Key::Position`](keys::Key::Position). Only while keys are read
-    /// without echo.
-    pub fn start_asking(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.asking = self.styled;
-        // Answers that didn't come in time last turn won't now.
-        state.asked.clear();
-        state.ignored = 0;
-    }
-
-    /// Stops asking the terminal where the cursor is, and waits a little
-    /// for the answers on their way, before the input box's keys stop
-    /// being read: the line editor would take them for keys.
-    pub async fn stop_asking(&self) {
-        self.state.lock().unwrap().asking = false;
-        let deadline = Instant::now() + ANSWER_WAIT;
-        while Instant::now() < deadline {
-            {
-                let state = self.state.lock().unwrap();
-                if state.asked.is_empty() && state.ignored == 0 {
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    /// The terminal's answer to where the cursor is: on another row than
-    /// it was left on, the terminal cleared the screen (iTerm's Reset or
-    /// Clear Buffer, say), keeping maybe the cursor's row. The output then
-    /// goes on from the top of a blank screen.
-    pub fn cursor_at(&self, row: usize) {
-        let mut state = self.state.lock().unwrap();
-        if state.ignored > 0 {
-            state.ignored -= 1;
-            return;
-        }
-        let Some(left) = state.asked.pop_front() else { return };
-        if row == left || state.end.is_none() {
-            return;
-        }
-        // Answers to the questions since were about the screen as it was.
-        state.ignored = std::mem::take(&mut state.asked).len();
-        state.end = Some(0);
-        state.drawn = false;
-        state.at = None;
-        // A reset also turns bracketed paste off.
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(b"\x1b[H\x1b[J\x1b[?2004h");
-        let _ = stdout.flush();
-        drop(stdout);
+        state.input = Some(InputBox { typing, inbox, notice: None });
         self.show(&mut state, "");
     }
 
@@ -192,9 +186,16 @@ impl Output {
     pub fn edit_input<R>(&self, edit: impl FnOnce(&mut Typing) -> R) -> Option<R> {
         let mut state = self.state.lock().unwrap();
         let input = state.input.as_mut()?;
+        input.notice = None;
         let result = edit(&mut input.typing);
         self.show(&mut state, "");
         Some(result)
+    }
+
+    pub fn input_notice(&self, notice: String) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(input) = state.input.as_mut() { input.notice = Some(notice); }
+        self.show(&mut state, "");
     }
 
     /// Puts the queued messages the model hasn't got yet back into the input
@@ -239,23 +240,8 @@ impl Output {
         self.styled
     }
 
-    /// Notes that the output goes on from the start of screen row `row`,
-    /// where the cursor is, with nothing drawn under it: from then on, the
-    /// status and input box are drawn on the bottom rows.
-    pub fn set_end(&self, row: usize) {
-        let mut state = self.state.lock().unwrap();
-        if self.styled && !state.drawn {
-            state.end = Some(row);
-            state.size = (text::terminal_width(), text::terminal_height());
-        }
-    }
-
-    /// The screen row the output goes on from, if known, with nothing
-    /// drawn under it.
-    pub fn end(&self) -> Option<usize> {
-        let state = self.state.lock().unwrap();
-        let size = (text::terminal_width(), text::terminal_height());
-        state.end.filter(|_| !state.drawn && state.size == size)
+    fn presented(&self) -> bool {
+        self.styled || self.state.lock().unwrap().screen.is_some()
     }
 
     /// Wraps `s` in an SGR color, when styled.
@@ -265,7 +251,7 @@ impl Output {
 
     /// Animates the spinner while a status is set. Needs a Tokio runtime.
     pub fn spawn_spinner(&self) {
-        if !self.styled {
+        if !self.interactive() {
             return;
         }
         let this = self.clone();
@@ -274,7 +260,8 @@ impl Output {
             loop {
                 tick.tick().await;
                 let mut state = this.state.lock().unwrap();
-                if state.status.is_some() {
+                let resized = state.size != (text::terminal_width(), text::terminal_height());
+                if state.status.is_some() || (state.input.is_some() && resized) {
                     state.frame += 1;
                     this.show(&mut state, "");
                 }
@@ -334,34 +321,30 @@ impl Output {
     /// Prints `printed` above the status and input box, and redraws them,
     /// in one write.
     fn show(&self, state: &mut State, printed: &str) {
-        if printed.is_empty() && !self.redraws(state) && !state.drawn {
+        if printed.is_empty() && !self.redraws(state) && !state.drawn && state.screen.is_none() {
             return;
         }
         let mut screen = String::new();
-        if self.styled {
+        if self.interactive() {
             screen.push_str(SYNC_START);
         }
         let size = (text::terminal_width(), text::terminal_height());
         if size != state.size {
-            // Rows moved about as the terminal reflowed them.
-            state.end = None;
-            state.at = None;
             state.size = size;
         }
-        // Asked before anything moves the cursor, the answer says where the
-        // last drawing left it, unless the terminal moved it since.
-        if let Some(at) = state.at
-            && state.asking
-            && state.end.is_some()
-        {
-            screen.insert_str(0, keys::ASK_POSITION);
-            state.asked.push_back(at);
+        let (mut rows, cursor) = render(state, |sgr, s| self.paint(sgr, s));
+        if let Some(viewport) = state.screen.as_mut() {
+            if !self.styled { rows = rows.iter().map(|row| text::strip_ansi(row)).collect(); }
+            let plain = (!self.styled).then(|| text::strip_ansi(printed));
+            screen.push_str(&viewport.draw(plain.as_deref().unwrap_or(printed), rows, cursor, size.0, size.1.unwrap_or(24)));
+            screen.push_str(SYNC_END);
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(screen.as_bytes());
+            let _ = stdout.flush();
+            return;
         }
-        match (state.end, size.1) {
-            (Some(end), Some(height)) => self.draw_pinned(state, &mut screen, printed, end, height),
-            _ => self.draw_under(state, &mut screen, printed),
-        }
-        if self.styled {
+        self.draw_under(state, &mut screen, printed);
+        if self.interactive() {
             screen.push_str(SYNC_END);
         }
         let mut stdout = io::stdout().lock();
@@ -372,7 +355,6 @@ impl Output {
     /// Draws right under the output: the status and input box follow it
     /// down, and are redrawn from the cursor's row in them.
     fn draw_under(&self, state: &mut State, screen: &mut String, printed: &str) {
-        state.at = None;
         if std::mem::take(&mut state.drawn) {
             screen.push_str(&clear_sequence(state.cursor_row));
         }
@@ -396,50 +378,9 @@ impl Output {
         state.cursor_row = row;
     }
 
-    /// Draws the status and input box on the screen's `height` rows' last
-    /// ones, and the output from row `end` on, scrolling once it reaches
-    /// them.
-    fn draw_pinned(&self, state: &mut State, screen: &mut String, printed: &str, mut end: usize, height: usize) {
-        if std::mem::take(&mut state.drawn) {
-            screen.push_str(&input::goto(height.saturating_sub(state.rows)));
-            screen.push_str("\x1b[J");
-        }
-        if !printed.is_empty() {
-            screen.push_str(&input::goto(end));
-            screen.push_str(printed);
-            end = (end + repl::layout(&text::strip_ansi(printed), text::terminal_width()).0).min(height - 1);
-        }
-        if self.redraws(state) {
-            let (rows, cursor) = render(state, |sgr, s| self.paint(sgr, s));
-            let top = height.saturating_sub(rows.len());
-            if end > top {
-                // Scroll the output up to make room.
-                screen.push_str(&input::goto(height - 1));
-                screen.push_str(&"\n".repeat(end - top));
-                end = top;
-            }
-            screen.push_str(&input::goto(top));
-            screen.push_str(&rows.join("\n"));
-            let last = rows.len() - 1;
-            let (row, col) = cursor.unwrap_or((last, text::width(&rows[last])));
-            screen.push_str(&input::goto(top + row));
-            if col > 0 {
-                screen.push_str(&format!("\x1b[{col}C"));
-            }
-            state.drawn = true;
-            state.rows = rows.len();
-            state.cursor_row = row;
-            state.at = Some(top + row);
-        } else {
-            screen.push_str(&input::goto(end));
-            state.at = Some(end);
-        }
-        state.end = Some(end);
-    }
-
     /// Whether the status or input box is to be drawn.
     fn redraws(&self, state: &State) -> bool {
-        self.styled && (state.status.is_some() || state.input.is_some())
+        (self.styled || state.screen.is_some()) && (state.status.is_some() || state.input.is_some())
     }
 
     pub fn line(&self, line: impl AsRef<str>) {
@@ -613,10 +554,24 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
     rows.extend(input.typing.queued_rows(width, &paint));
     let rule = paint("2", &input::rule(width));
     rows.push(rule.clone());
-    let (draft, (row, col)) = input.typing.render(width, &paint);
+    let (draft, (row, col)) = if state.menu.is_some() {
+        input.typing.draft.render(width, "Type a message · / commands · @ files", &paint)
+    } else {
+        input.typing.render(width, &paint)
+    };
     let cursor = (rows.len() + row, col);
     rows.extend(draft);
     rows.push(rule);
+    if let Some(notice) = &input.notice {
+        rows.push(paint("33", &format!("  {}", text::printable(notice))));
+    }
+    if let Some(menu) = &state.menu
+        && let Some(line) = input.typing.draft.at_end()
+        && let Some(plain) = menu.render(line, width.saturating_sub(1))
+    {
+        let shown = menu.styled(&plain).unwrap_or(plain);
+        rows.extend(shown.trim_start_matches('\n').split('\n').map(str::to_string));
+    }
     (rows, Some(cursor))
 }
 
@@ -735,7 +690,7 @@ impl Terminal {
         self.end_text();
         self.out.set_status(None);
         // Piped output gets just the text; problems go to stderr.
-        if !self.out.styled() {
+        if !self.out.presented() {
             match result {
                 Ok(()) => {}
                 Err(TurnEnd::Interrupted) => eprintln!("interrupted"),
@@ -774,7 +729,7 @@ impl Terminal {
         self.thinking.clear();
         let Some(since) = self.thinking_since.take() else { return };
         let took = since.elapsed();
-        if took >= NOTABLE_THINKING && self.out.styled() {
+        if took >= NOTABLE_THINKING && self.out.presented() {
             self.separate(Block::Tools);
             self.out.line(self.out.paint("2", &format!("∴ Thought for {}", elapsed(took.as_secs()))));
         }
@@ -790,7 +745,7 @@ impl Terminal {
     /// Puts a blank line between text and tool calls, and after the prompt.
     fn separate(&mut self, block: Block) {
         if self.last != block {
-            if self.last != Block::None || self.out.styled() {
+            if self.last != Block::None || self.out.presented() {
                 self.out.line("");
             }
             self.last = block;
@@ -798,7 +753,7 @@ impl Terminal {
     }
 
     fn end_text(&mut self) {
-        if self.out.styled() {
+        if self.out.presented() {
             let lines = self.markdown.finish();
             self.out.lines(&lines);
         } else if std::mem::take(&mut self.raw_open) {
@@ -860,7 +815,7 @@ impl Observer for Terminal {
             self.enter(Phase::Responding, "Responding…");
             self.separate(Block::Text);
         }
-        if self.out.styled() {
+        if self.out.presented() {
             let lines = self.markdown.push(delta);
             self.out.lines(&lines);
         } else {
@@ -933,7 +888,7 @@ impl Observer for Terminal {
         self.enter(Phase::Waiting, WAITING);
         self.streamed = 0;
         let detail = format!("({}); retrying in {}s ({attempt}/{MAX_RETRIES})", retry_reason(error), wait.as_secs());
-        if !self.out.styled() {
+        if !self.out.presented() {
             eprintln!("warning: response broke off {detail}");
             return;
         }
@@ -947,7 +902,7 @@ impl Observer for Terminal {
     }
 
     fn on_hook(&mut self, message: &str) {
-        if !self.out.styled() {
+        if !self.out.presented() {
             eprintln!("hook: {message}");
             return;
         }
@@ -961,7 +916,7 @@ impl Observer for Terminal {
     fn on_compact_end(&mut self, before: u64, after: u64) {
         self.context_tokens = after;
         let note = format!("✻ Compacted the conversation: context {} → about {}", tokens(before), tokens(after));
-        if !self.out.styled() {
+        if !self.out.presented() {
             eprintln!("{note}");
         } else {
             self.separate(Block::Tools);

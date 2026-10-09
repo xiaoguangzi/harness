@@ -1,22 +1,9 @@
-//! Line editing for the REPL: history, a menu under the prompt (commands
-//! while a `/command` is typed, files while an `@path` is), Tab completion,
-//! multi-line input (a line ending in `\` continues) and pasting images with
-//! Ctrl+V.
-//!
-//! On a terminal the line is drawn in the input box: the prompt carries the
-//! rule above it, and the hint the rule below. The menu is drawn as more of
-//! the hint. The box sits on the screen's bottom rows, with blank rows
-//! between it and the output until the output fills the screen; as the box
-//! grows (the menu opens, say) it takes those rows before the screen
-//! scrolls, and as it shrinks it moves back down. Up/Down move the menu's
-//! selection and Tab fills it in; Enter runs a command, or fills in a file.
-//! A choice is typed through the completer, which puts the cursor after it.
+//! Command/file completion and input history. Interactive input is drawn
+//! by Output for both idle prompts and running turns; rustyline remains
+//! the fallback for redirected input and conventional command prompts.
 
-use std::borrow::Cow;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustyline::completion::{Completer, Pair};
@@ -34,65 +21,6 @@ use super::menu::{Command, Kind, Menu, list_dir, mention_at_end};
 use super::text;
 use crate::agent::Inbox;
 use crate::mentions;
-
-/// Lets a background subagent's report start a turn while the prompt waits
-/// for input. The line editor can't be told to stop reading, so this sends
-/// its thread a SIGINT: the editor's handler cuts the read short and it
-/// returns as for Ctrl-C. Only while it shows an empty line, so nothing
-/// typed is lost.
-pub struct Wake {
-    inbox: Weak<Inbox>,
-    /// Set from the editor's first redraw on, when its SIGINT handler is in
-    /// place.
-    reading: AtomicBool,
-    /// The thread reading, as a `pthread_t`.
-    reader: AtomicUsize,
-    empty: AtomicBool,
-    raised: AtomicBool,
-}
-
-impl Wake {
-    pub fn new(inbox: &Arc<Inbox>) -> Self {
-        Self {
-            inbox: Arc::downgrade(inbox),
-            reading: AtomicBool::new(false),
-            reader: AtomicUsize::new(0),
-            empty: AtomicBool::new(false),
-            raised: AtomicBool::new(false),
-        }
-    }
-
-    /// Interrupts the line editor if it shows an empty line and something
-    /// in the inbox wants a turn.
-    pub fn poke(&self) {
-        let wanted = self.inbox.upgrade().is_some_and(|inbox| inbox.wants_turn());
-        if wanted
-            && self.reading.load(Ordering::SeqCst)
-            && self.empty.load(Ordering::SeqCst)
-            && !self.raised.swap(true, Ordering::SeqCst)
-        {
-            // SAFETY: only sends a signal to a thread of this process, one
-            // that is still running (the REPL's).
-            unsafe { libc::pthread_kill(self.reader.load(Ordering::SeqCst) as libc::pthread_t, libc::SIGINT) };
-        }
-    }
-
-    /// Called on each redraw of the line being edited, on its thread.
-    fn edited(&self, line: &str) {
-        self.empty.store(line.is_empty(), Ordering::SeqCst);
-        self.reader.store(unsafe { libc::pthread_self() } as usize, Ordering::SeqCst);
-        self.reading.store(true, Ordering::SeqCst);
-        if line.is_empty() {
-            self.poke();
-        }
-    }
-
-    /// Called when the line editor returns: whether this interrupted it.
-    pub fn finish_reading(&self) -> bool {
-        self.reading.store(false, Ordering::SeqCst);
-        self.raised.swap(false, Ordering::SeqCst)
-    }
-}
 
 /// The menu, shown below the line being edited.
 pub struct MenuHint(String);
@@ -114,34 +42,118 @@ pub struct ReplHelper {
     pasted: Arc<Mutex<Pasted>>,
     /// Command names, for Tab completion when the menu is not shown.
     names: Mutex<Vec<String>>,
-    /// Whether the line is drawn in the input box, with styles.
-    styled: bool,
-    wake: Option<Arc<Wake>>,
-    /// The line and hint last drawn.
-    shown: Mutex<(String, String)>,
-    /// Keeps the box on the bottom rows, while a line is read.
-    pin: Mutex<Option<Pin>>,
-}
-
-/// Where the input box is, to keep it on the screen's bottom rows.
-struct Pin {
-    /// The screen row the output goes on from: the rows from there to the
-    /// box are blank.
-    end: usize,
-    /// Rows the line editor last drew, from the prompt's first row down to
-    /// the screen's last.
-    rows: usize,
-    /// Rows to move the box down by once it is drawn.
-    lower: usize,
-    /// The terminal's size; after a resize nothing is known.
-    size: (usize, usize),
 }
 
 impl ReplHelper {
-    pub fn new(commands: Vec<Command>, styled: bool, wake: Option<Arc<Wake>>) -> Self {
+    pub fn new(commands: Vec<Command>) -> Self {
         let names = Mutex::new(commands.iter().map(|c| c.name.clone()).collect());
         let menu = Arc::new(Menu::new(commands, "."));
-        Self { menu, pasted: Arc::default(), names, styled, wake, shown: Mutex::default(), pin: Mutex::default() }
+        Self { menu, pasted: Arc::default(), names }
+    }
+
+    /// Reads the interactive composer through the same renderer used by a
+    /// running turn. No cursor reports or line-editor layout guesses.
+    pub async fn read_box(
+        &self,
+        out: &super::output::Output,
+        typing: &mut super::input::Typing,
+        inbox: Arc<Inbox>,
+        history: Vec<String>,
+    ) -> Result<Option<(String, Vec<(usize, Image)>)>, rustyline::error::ReadlineError> {
+        use super::keys::{Key, KeyWatch};
+        use rustyline::error::ReadlineError;
+        self.menu.forget_files();
+        out.open_input(std::mem::take(typing), inbox.clone());
+        out.set_menu(Some(self.menu.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let watch = KeyWatch::for_prompt(move |key| { let _ = tx.send(key); });
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        let mut history_at = history.len();
+        let mut saved = String::new();
+        let mut last_esc: Option<Instant> = None;
+        let result = loop {
+            let key = tokio::select! {
+                _ = tokio::signal::ctrl_c() => break Err(ReadlineError::Interrupted),
+                key = rx.recv() => match key { Some(key) => key, None => break Err(ReadlineError::Eof) },
+                _ = tick.tick() => {
+                    if inbox.wants_turn() && out.input_is_empty() {
+                        break Ok(None);
+                    }
+                    continue;
+                }
+            };
+            if key == Key::PasteImage {
+                super::paste_clipboard(out);
+                continue;
+            }
+            let action = out.edit_input(|t| {
+                let draft = &mut t.draft;
+                if key == Key::Eof && draft.is_empty() {
+                    return Some(Err(ReadlineError::Eof));
+                }
+                if key == Key::Esc {
+                    if draft.is_empty() {
+                        if last_esc.take().is_some_and(|at| at.elapsed() < DOUBLE_ESC) {
+                            return Some(Ok(Some(("/rewind".into(), Vec::new()))));
+                        }
+                        last_esc = Some(Instant::now());
+                    }
+                    return None;
+                }
+                last_esc = None;
+                if let Some(line) = draft.at_end()
+                    && let Some((kind, items, selected)) = self.menu.selection(line)
+                {
+                    let choice = items[selected].text.clone();
+                    match (&key, kind) {
+                        (Key::Up | Key::Down, _) if items.len() > 1 => {
+                            self.menu.step(line, if key == Key::Up { -1 } else { 1 });
+                            return None;
+                        }
+                        (Key::Tab, Kind::Command) => {
+                            draft.complete(0, &format!("{choice} "));
+                            return None;
+                        }
+                        (Key::Enter, Kind::Command) => {
+                            draft.set_text(&choice);
+                        }
+                        (Key::Tab | Key::Enter, Kind::File { start }) if key == Key::Tab || line[start..] != choice => {
+                            draft.complete(start, &file_text(&choice));
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                match key {
+                    Key::Enter => draft.submit().map(|message| Ok(Some(message))),
+                    Key::Tab => {
+                        let (start, choices) = complete(draft.text(), draft.position(), &self.names.lock().unwrap(), Path::new("."));
+                        if let [choice] = choices.as_slice() { draft.complete(start, &choice.replacement); }
+                        None
+                    }
+                    Key::Up if draft.on_first_line() && history_at > 0 => {
+                        if history_at == history.len() { saved = draft.text().to_string(); }
+                        history_at -= 1;
+                        draft.set_text(&history[history_at]);
+                        None
+                    }
+                    Key::Down if draft.on_last_line() && history_at < history.len() => {
+                        history_at += 1;
+                        draft.set_text(if history_at == history.len() { &saved } else { &history[history_at] });
+                        None
+                    }
+                    key => { draft.edit(key); None }
+                }
+            }).flatten();
+            if let Some(action) = action { break action; }
+        };
+        drop(watch);
+        out.set_menu(None);
+        *typing = out.close_input();
+        if result.is_err() {
+            typing.draft = super::input::Draft::default();
+        }
+        result
     }
 
     /// Offers `commands` from now on, e.g. after the plugins were reloaded.
@@ -150,57 +162,7 @@ impl ReplHelper {
         self.menu.set_commands(commands);
     }
 
-    /// Puts the input box of the next line read, starting with `initial`,
-    /// on the screen's bottom rows, given that the output goes on from the
-    /// start of screen row `end`, where the cursor is. The output scrolls up
-    /// if there isn't room.
-    pub fn pin(&self, end: usize, initial: &str) {
-        let (width, Some(height)) = (text::terminal_width(), text::terminal_height()) else { return };
-        if !self.styled {
-            return;
-        }
-        let shown = format!("{}{initial}\n{}", self.prompt(), input::rule(width));
-        let rows = rows(&shown, width).min(height);
-        let top = height - rows;
-        let mut end = end.min(height - 1);
-        let mut screen = String::new();
-        if end > top {
-            screen.push_str(&input::goto(height - 1));
-            screen.push_str(&"\n".repeat(end - top));
-            end = top;
-        }
-        screen.push_str(&input::goto(top));
-        print!("{screen}");
-        let _ = std::io::stdout().flush();
-        *self.pin.lock().unwrap() = Some(Pin { end, rows, lower: 0, size: (width, height) });
-    }
-
-    /// Once the line editor returns: the screen row the output goes on
-    /// from, if the box was kept on the bottom rows (and the terminal kept
-    /// its size).
-    pub fn unpin(&self) -> Option<usize> {
-        self.pin.lock().unwrap().take().map(|pin| pin.end)
-    }
-
-    /// The prompt. On a terminal, it starts with a row for the input box's
-    /// top rule, which the highlighter draws at the terminal's width as it
-    /// is when the line is redrawn, so the rule follows a resized window.
-    pub fn prompt(&self) -> String {
-        if self.styled { format!("\n{}", input::PROMPT) } else { input::PROMPT.to_string() }
-    }
-
-    /// Rows from the top of `prompt` to where the cursor is once the line
-    /// editor returns, with `line` accepted (hint gone) or cut short
-    /// (`None`; hint left on screen). They are laid out the way the editor
-    /// does, at the terminal's width.
-    pub fn rows_used(&self, prompt: &str, line: Option<&str>) -> usize {
-        let shown = self.shown.lock().unwrap();
-        let (line, hint) = match line {
-            Some(line) => (line, ""),
-            None => (shown.0.as_str(), shown.1.as_str()),
-        };
-        rows(&format!("{prompt}{line}{hint}"), text::terminal_width())
-    }
+    pub fn prompt(&self) -> String { input::PROMPT.to_string() }
 
     /// The images pasted into the line being edited are numbered after
     /// this.
@@ -424,95 +386,12 @@ impl Hinter for ReplHelper {
     type Hint = MenuHint;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<MenuHint> {
-        // Called on every redraw, so it also tells `wake` what is typed.
-        if let Some(wake) = &self.wake {
-            wake.edited(line);
-        }
-        let below = self.below(line, pos);
-        // The input box's bottom rule comes first, on a row of its own. A
-        // line that fills its last row leaves the cursor there, waiting to
-        // wrap: the editor counts a newline for that, and the rule's own
-        // newline would be one too many.
-        let hint = if self.styled {
-            let width = text::terminal_width();
-            let full = fills_last_row(&format!("{}{line}", input::PROMPT), width);
-            Some(format!("{}{}{}", if full { "" } else { "\n" }, input::rule(width), below.unwrap_or_default()))
-        } else {
-            below
-        };
-        let shown = hint.clone().unwrap_or_default();
-        self.keep_pinned(&format!("{}{line}{shown}", self.prompt()));
-        *self.shown.lock().unwrap() = (line.to_string(), shown);
-        hint.map(MenuHint)
-    }
-}
-
-impl ReplHelper {
-    /// Before the line editor draws `shown` in place of what it drew last:
-    /// a taller box first moves up into the blank rows above it, as far as
-    /// they go (the screen scrolls for the rest); a shorter one moves down
-    /// once drawn.
-    fn keep_pinned(&self, shown: &str) {
-        let mut pin = self.pin.lock().unwrap();
-        let Some(p) = pin.as_mut() else { return };
-        let (width, Some(height)) = (text::terminal_width(), text::terminal_height()) else { return };
-        if (width, height) != p.size {
-            *pin = None;
-            return;
-        }
-        let rows = rows(shown, width).min(height);
-        if rows > p.rows {
-            let grow = rows - p.rows;
-            let up = grow.min((height - p.rows).saturating_sub(p.end));
-            print!("{}", input::close_gap(p.end, up));
-            let _ = std::io::stdout().flush();
-            p.end -= grow - up;
-        } else {
-            p.lower = p.rows - rows;
-        }
-        p.rows = rows;
+        self.below(line, pos).map(MenuHint)
     }
 }
 
 impl Highlighter for ReplHelper {
-    /// The editor lays the prompt out as given; the rule drawn into its
-    /// first row fits that row whatever its length.
-    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, default: bool) -> Cow<'b, str> {
-        if !self.styled || !default || prompt != self.prompt() {
-            return Cow::Borrowed(prompt);
-        }
-        let rule = input::rule(text::terminal_width());
-        Cow::Owned(format!("\x1b[2m{rule}\x1b[0m\n\x1b[{}m❯\x1b[0m ", input::PROMPT_SGR))
-    }
-
-    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        if !self.styled {
-            return Cow::Borrowed(hint);
-        }
-        // The rule, then what `below` gave.
-        let body = hint.strip_prefix('\n').unwrap_or(hint);
-        let (rule, below) = body.split_at(body.find('\n').unwrap_or(body.len()));
-        let below = if below.is_empty() {
-            String::new()
-        } else if let Some(styled) = self.menu.styled(below) {
-            styled
-        } else if self.pasted.lock().unwrap().notice.as_ref().is_some_and(|(_, shown)| shown == below) {
-            format!("\x1b[33m{below}\x1b[0m")
-        } else {
-            below.to_string()
-        };
-        // The line editor moves the cursor from the drawing's end
-        // relatively, so it follows the box moving down.
-        let lower = match self.pin.lock().unwrap().as_mut() {
-            Some(pin) => input::open_gap(pin.end, std::mem::take(&mut pin.lower)),
-            None => String::new(),
-        };
-        Cow::Owned(format!("\n\x1b[2m{rule}\x1b[0m{below}{lower}"))
-    }
-
-    fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
-        false
-    }
+    fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool { false }
 }
 
 impl Validator for ReplHelper {
@@ -520,39 +399,6 @@ impl Validator for ReplHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
         Ok(if ctx.input().ends_with('\\') { ValidationResult::Incomplete } else { ValidationResult::Valid(None) })
     }
-}
-
-/// Rows `shown` takes when the line editor draws it at `cols` columns, from
-/// its first row to the one under its end.
-fn rows(shown: &str, cols: usize) -> usize {
-    let (row, col) = layout(shown, cols);
-    // A full last row puts the end at the start of the next.
-    row + usize::from(col == cols) + 1
-}
-
-/// Whether `shown` ends exactly at the end of a row.
-fn fills_last_row(shown: &str, cols: usize) -> bool {
-    layout(shown, cols).1 == cols
-}
-
-/// The row and column where `shown` ends at `cols` columns, by the line
-/// editor's own layout rules.
-pub(super) fn layout(shown: &str, cols: usize) -> (usize, usize) {
-    let (mut row, mut col) = (0, 0);
-    for c in shown.chars() {
-        if c == '\n' {
-            row += 1;
-            col = 0;
-            continue;
-        }
-        let w = if c == '\t' { 8 - col % 8 } else { text::char_width(c) };
-        col += w;
-        if col > cols {
-            row += 1;
-            col = w;
-        }
-    }
-    (row, col)
 }
 
 /// Joins continued lines: `a\` + newline + `b` -> `a` + newline + `b`.
@@ -629,18 +475,6 @@ mod tests {
 
         let (_, pairs) = complete("mail me@sr", 10, &[]);
         assert!(pairs.is_empty());
-    }
-
-    #[test]
-    fn counts_rows_the_way_the_editor_lays_them_out() {
-        assert_eq!(rows("───\n❯ hi", 10), 2);
-        assert_eq!(rows("───\n❯ hi\n───", 10), 3);
-        // 8 columns fill a row exactly; the end moves to the next.
-        assert_eq!(rows("❯ 看看看", 8), 2);
-        assert_eq!(rows("❯ 看看看看", 8), 2);
-        assert_eq!(rows("❯ ab\ncd", 8), 2);
-        assert!(fills_last_row("❯ 看看看", 8));
-        assert!(!fills_last_row("❯ 看看看\n", 8));
     }
 
     #[test]

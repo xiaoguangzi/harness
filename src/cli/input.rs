@@ -34,19 +34,6 @@ pub fn goto(row: usize) -> String {
     format!("\x1b[{};1H", row + 1)
 }
 
-/// Closes `rows` blank rows from screen row `at` on: what is under them
-/// moves up, the cursor with it.
-pub fn close_gap(at: usize, rows: usize) -> String {
-    if rows == 0 { String::new() } else { format!("\x1b7{}\x1b[{rows}M\x1b8\x1b[{rows}A", goto(at)) }
-}
-
-/// Opens `rows` blank rows at screen row `at`: what is under it moves down,
-/// the cursor with it, and the screen's last `rows`, which must be blank,
-/// drop off.
-pub fn open_gap(at: usize, rows: usize) -> String {
-    if rows == 0 { String::new() } else { format!("\x1b7{}\x1b[{rows}L\x1b8\x1b[{rows}B", goto(at)) }
-}
-
 /// Text typed into the box while a turn runs.
 #[derive(Default)]
 pub struct Draft {
@@ -83,6 +70,33 @@ impl Draft {
         self.last_image
     }
 
+    pub fn at_end(&self) -> Option<&str> {
+        (self.cursor == self.text.len()).then_some(self.text.as_str())
+    }
+
+    pub fn position(&self) -> usize { self.cursor }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn on_first_line(&self) -> bool {
+        !self.text[..self.cursor].contains('\n')
+    }
+
+    pub fn on_last_line(&self) -> bool {
+        !self.text[self.cursor..].contains('\n')
+    }
+
+    pub fn complete(&mut self, start: usize, replacement: &str) {
+        self.text.replace_range(start..self.cursor, replacement);
+        self.cursor = start + replacement.len();
+    }
+
     pub fn edit(&mut self, key: Key) {
         let (text, cursor) = (&self.text, self.cursor);
         let line_start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
@@ -94,7 +108,7 @@ impl Draft {
                 let start = prev_char(text, cursor);
                 self.remove(start, cursor);
             }
-            Key::Delete => {
+            Key::Delete | Key::Eof => {
                 let end = next_char(text, cursor);
                 self.remove(cursor, end);
             }
@@ -130,7 +144,7 @@ impl Draft {
                 let start = word_start(text, cursor);
                 self.remove(start, cursor);
             }
-            Key::Enter | Key::PasteImage | Key::Position(_) => {}
+            Key::Enter | Key::PasteImage | Key::Position(_) | Key::Tab | Key::Esc => {}
         }
     }
 

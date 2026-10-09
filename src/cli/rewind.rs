@@ -95,7 +95,10 @@ pub(super) fn run(agent: &mut Agent, out: &Output, typing: &mut Typing) -> Resul
 /// Asks for a number from 1 to `max`; `None` if none was given.
 fn ask(out: &Output, question: &str, max: usize) -> Result<Option<usize>> {
     let mut editor = rustyline::DefaultEditor::new()?;
-    let answer = match tokio::task::block_in_place(|| editor.readline(&out.paint("2", question))) {
+    let handoff = out.handoff();
+    let read = tokio::task::block_in_place(|| editor.readline(&out.paint("2", question)));
+    drop(handoff);
+    let answer = match read {
         Ok(answer) => answer,
         Err(ReadlineError::Interrupted | ReadlineError::Eof) => return Ok(None),
         Err(e) => return Err(e.into()),

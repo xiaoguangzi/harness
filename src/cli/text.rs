@@ -32,6 +32,22 @@ pub fn strip_ansi(s: &str) -> String {
     tokens(s).filter(|(_, esc)| !esc).map(|(t, _)| t).collect()
 }
 
+/// Clips styled text without breaking escape sequences or wide characters.
+pub fn clip(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for (token, esc) in tokens(s) {
+        if !esc {
+            let w = char_width(token.chars().next().unwrap());
+            if used + w > max { break; }
+            used += w;
+        }
+        out.push_str(token);
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
 /// Cuts plain `s` to at most `max` columns, marking a cut with "…".
 pub fn fit(s: &str, max: usize) -> String {
     if width(s) <= max {
@@ -179,6 +195,15 @@ mod tests {
         assert_eq!(width("你好"), 4);
         assert_eq!(width("\x1b[1mhi\x1b[22m"), 2);
         assert_eq!(strip_ansi("\x1b[36mx\x1b[39m y"), "x y");
+    }
+
+    #[test]
+    fn clips_styles_and_wide_characters_without_overflow() {
+        let clipped = clip("\x1b[35m你好abcdef\x1b[0m", 5);
+        assert_eq!(strip_ansi(&clipped), "你好a");
+        assert!(clipped.starts_with("\x1b[35m"));
+        assert!(clipped.ends_with("\x1b[0m"));
+        assert_eq!(strip_ansi(&clip("你好", 1)), "");
     }
 
     #[test]
