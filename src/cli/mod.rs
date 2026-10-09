@@ -14,6 +14,7 @@ mod repl;
 mod rewind;
 mod screen;
 mod text;
+mod tool_output;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -45,7 +46,7 @@ use menu::Command;
 use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 20] = [
+const BUILTINS: [(&str, &str); 21] = [
     ("/help", "browse commands; Enter inserts one into the prompt"),
     ("/model", "choose main/subagent models and effort; /model <provider>/<model> switches directly"),
     ("/effort", "choose reasoning effort, or set it with /effort <level>"),
@@ -57,6 +58,7 @@ const BUILTINS: [(&str, &str); 20] = [
     ("/init", "have the model write AGENTS.md, or improve it; /init <notes> says what else to cover"),
     ("/usage", "show the tokens used so far and how full the context is"),
     ("/tools", "browse tool descriptions and input schemas"),
+    ("/output", "inspect full tool inputs and returned output (or Ctrl+O, including while running)"),
     ("/skills", "browse skills; Enter inserts an invocation into the prompt"),
     ("/agents", "browse subagent types, models, permissions and tools"),
     ("/tasks", "browse this conversation's tasks and task actions"),
@@ -276,6 +278,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
             Input::Clear => {
                 show_hook_notices(&out, agent.end_session("clear").await);
                 agent.clear();
+                out.restore_tool_output(agent.messages());
                 if apply_reload(agent, env, &mut skills, editor.helper()).await {
                     out.line(out.paint("2", "the reloaded plugins apply from here"));
                 } else {
@@ -323,6 +326,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
             }
             Input::Rewind => match rewind::run(agent, &out, &mut typing, boxed).await {
                 Ok(true) => {
+                    out.restore_tool_output(agent.messages());
                     if let Some(rec) = recorder.as_mut() {
                         save_session(agent, rec, &out);
                     }
@@ -332,6 +336,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
             },
             Input::ListSkills => print_skills(&out, &skills),
             Input::ListTools => print_tools(&out, agent),
+            Input::ToolOutput => out.show_tool_output(boxed),
             Input::ListMcp => print_mcp(&out, env.mcp_statuses()),
             Input::Plugins { update: false } => print_plugins(&out, &env.ext.plugins),
             Input::Plugins { update: true } => update_plugins(&env.ext.plugins, &out).await,
@@ -627,6 +632,7 @@ async fn resume_session(agent: &mut Agent, rec: &mut Recorder, id: &str, out: &O
     let (meta, messages) = rec.store().load(id)?;
     show_hook_notices(out, agent.end_session("resume").await);
     agent.restore(messages);
+    out.restore_tool_output(agent.messages());
     let mut notes = Vec::new();
     if let Some(dir) = checkpoint::session_dir(&meta.id)
         && let Err(e) = agent.file_history().load(dir, agent.messages())
@@ -739,11 +745,16 @@ async fn run_shown(
     term.begin_turn();
     let inbox = agent.inbox().clone();
     let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+    let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut keys = match input.as_mut() {
         Some(input) => {
             out.open_input(std::mem::take(input.typing), inbox.clone());
             let typed = out.clone();
-            KeyWatch::with_keys(move |key| type_key(&typed, key, &tx))
+            KeyWatch::for_prompt(move |key| {
+                if typed.tool_output_key(&key) { return; }
+                if key == Key::Esc { let _ = interrupt_tx.send(()); }
+                else { type_key(&typed, key, &tx); }
+            })
         }
         None => KeyWatch::start(),
     };
@@ -757,6 +768,7 @@ async fn run_shown(
             result = &mut turn => break result.map_err(TurnEnd::Failed),
             _ = &mut ctrl_c => break Err(TurnEnd::Interrupted),
             _ = keys.pressed() => break Err(TurnEnd::Interrupted),
+            Some(()) = interrupt_rx.recv() => break Err(TurnEnd::Interrupted),
             Some((text, images)) = sent.recv() => {
                 if let Some(input) = &input {
                     send(out, &inbox, input.files, text, images);
@@ -813,6 +825,7 @@ async fn compact_shown(
 
 /// Types `key` into the input box. Enter hands what it holds to `tx`.
 fn type_key(out: &Output, key: Key, tx: &tokio::sync::mpsc::UnboundedSender<(String, Vec<(usize, Image)>)>) {
+    if out.tool_output_key(&key) { return; }
     match key {
         Key::Enter => {
             if let Some(Some(message)) = out.edit_input(|typing| typing.draft.submit()) {
@@ -913,6 +926,7 @@ enum Input {
     Compact(Option<String>),
     ListSkills,
     ListTools,
+    ToolOutput,
     ListMcp,
     ListAgents,
     /// `/tasks` lists this conversation's subagents.
@@ -980,6 +994,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "init" => Input::Prompt(crate::prompt::init(args)),
         "skills" => Input::ListSkills,
         "tools" => Input::ListTools,
+        "output" => Input::ToolOutput,
         "mcp" => Input::ListMcp,
         "plugins" | "plugin" => match args.trim() {
             "" | "list" => Input::Plugins { update: false },
@@ -1034,7 +1049,7 @@ fn print_banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {
             if crate::sandbox::active().is_some() { " · sandboxed" } else { "" }
         ),
     ));
-    out.line(out.paint("2", "  / for commands · @ for files · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt"));
+    out.line(out.paint("2", "  / for commands · @ for files · Ctrl+O for tool output · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt"));
     out.line("");
 }
 
@@ -1048,10 +1063,11 @@ fn effort_help(effort: llm::Effort) -> &'static str {
     }
 }
 
-fn help_keys() -> [(&'static str, &'static str); 9] {
+fn help_keys() -> [(&'static str, &'static str); 10] {
     [
         ("/<skill> [args]", "run a skill"),
         ("@path", "attach a file, directory, image or PDF; @ opens a file menu (@file#L10-20 for lines)"),
+        ("Ctrl+O", "inspect full tool output; Tab returns to the call list, Esc goes back/closes"),
         ("Ctrl+V", "paste an image from the clipboard (files copied in Finder or a file manager become @ mentions)"),
         ("\\ or Alt+Enter", "continue on a new line"),
         ("↑ ↓ Tab Enter", "pick from the menu shown while typing / or @"),
@@ -1321,6 +1337,7 @@ mod tests {
         assert_eq!(parse_input("/init cover the web UI", &skills), Input::Prompt(crate::prompt::init("cover the web UI")));
         assert_eq!(parse_input("/compact keep the API notes", &skills), Input::Compact(Some("keep the API notes".into())));
         assert_eq!(parse_input("/tools", &skills), Input::ListTools);
+        assert_eq!(parse_input("/output", &skills), Input::ToolOutput);
         assert_eq!(parse_input("/tasks", &skills), Input::Tasks);
         assert_eq!(parse_input("/usage", &skills), Input::Usage);
         assert_eq!(parse_input("/stop", &skills), Input::Stop(None));

@@ -44,6 +44,14 @@ pub trait Observer: Send {
     fn on_tool_input_delta(&mut self, _json: &str) {}
     fn on_tool_call(&mut self, name: &str, input: &Value);
     fn on_tool_result(&mut self, name: &str, output: &ToolOutput);
+    /// Identifies calls independently of their tool name, including repeated
+    /// calls to the same tool in one batch. Existing observers keep working.
+    fn on_tool_call_id(&mut self, _id: &str, name: &str, input: &Value) {
+        self.on_tool_call(name, input);
+    }
+    fn on_tool_result_id(&mut self, _id: &str, name: &str, output: &ToolOutput) {
+        self.on_tool_result(name, output);
+    }
     /// Token counts of a request: a finished one, or one that failed
     /// partway (counted as far as its stream got).
     fn on_usage(&mut self, _usage: &Usage) {}
@@ -640,7 +648,7 @@ impl Agent {
             .await;
             for (t, check) in tool_uses.iter().zip(&checks) {
                 let input = check.updated_input.as_ref().unwrap_or(&t["input"]);
-                observer.on_tool_call(t["name"].as_str().unwrap_or(""), input);
+                observer.on_tool_call_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), input);
                 show_notices(check, observer);
             }
             // Run all tool calls from this response concurrently, then send
@@ -679,7 +687,7 @@ impl Agent {
             let mut results = Vec::with_capacity(outputs.len());
             let mut halt = None;
             for (t, (out, check, post)) in tool_uses.iter().zip(outputs) {
-                observer.on_tool_result(t["name"].as_str().unwrap_or(""), &out);
+                observer.on_tool_result_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), &out);
                 if let Some(post) = &post {
                     show_notices(post, observer);
                 }

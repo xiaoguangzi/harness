@@ -59,7 +59,7 @@ pub(super) async fn run<P: Panel + 'static, R>(
 pub async fn choose(out: &Output, title: &str, subtitle: &str, items: Vec<Item>, initial: usize) -> Option<usize> {
     let panel = List {
         title: title.into(), subtitle: subtitle.into(), items, query: Draft::default(),
-        selected: initial, detail: false, offset: 0,
+        selected: initial, detail: false, inspect_only: false, offset: 0,
     };
     run(out, panel, List::handle).await
 }
@@ -72,7 +72,7 @@ pub async fn document(out: &Output, title: &str, lines: Vec<String>) {
     let panel = List {
         title: title.into(), subtitle: "Read-only details".into(),
         items: vec![Item::new(title, "").details(lines)], query: Draft::default(), selected: 0,
-        detail: true, offset: 0,
+        detail: true, inspect_only: false, offset: 0,
     };
     let _ = run(out, panel, |panel, key| {
         if matches!(key, Key::Enter | Key::Esc | Key::Eof | Key::Tab) { Some(Some(())) }
@@ -116,7 +116,7 @@ impl Panel for TextInput {
     }
 }
 
-struct List {
+pub(super) struct List {
     title: String,
     subtitle: String,
     items: Vec<Item>,
@@ -124,10 +124,29 @@ struct List {
     /// Position within the filtered list; chosen values use the original index.
     selected: usize,
     detail: bool,
+    inspect_only: bool,
     offset: usize,
 }
 
 impl List {
+    pub(super) fn tool_output(items: Vec<Item>) -> Self {
+        let selected = items.len().saturating_sub(1);
+        let detail = !items.is_empty();
+        Self { title: "Tool output".into(), subtitle: "Full returned text and input · Ctrl+O closes".into(),
+            items, query: Draft::default(), selected, detail, inspect_only: true, offset: 0 }
+    }
+
+    pub(super) fn set_items(&mut self, items: Vec<Item>) { self.items = items; }
+
+    pub(super) fn inspect_key(&mut self, key: Key) -> bool {
+        if key == Key::Enter && !self.detail {
+            self.detail = self.current().is_some();
+            self.offset = 0;
+            return false;
+        }
+        self.handle(key).is_some()
+    }
+
     fn filtered(&self) -> Vec<usize> {
         let query = self.query.text().trim().to_lowercase();
         let mut matches: Vec<_> = self.items.iter().enumerate().filter_map(|(i, item)| {
@@ -165,6 +184,8 @@ impl List {
                 Key::Enter => return self.current().map(Some),
                 Key::Up => self.offset = self.offset.saturating_sub(1),
                 Key::Down => self.offset = (self.offset + 1).min(last),
+                Key::PageUp => self.offset = self.offset.saturating_sub(count),
+                Key::PageDown => self.offset = (self.offset + count).min(last),
                 Key::Home => self.offset = 0,
                 Key::End => self.offset = last,
                 _ => {}
@@ -205,7 +226,8 @@ impl Panel for List {
             for line in lines.iter().skip(start).take(count) { rows.push(row(line.clone())); }
             if lines.is_empty() { rows.push(row(paint("2", "No details"))); }
             rows.push(row(paint("2", &format!("{}–{} of {} lines", start + 1, (start + count).min(lines.len()), lines.len()))));
-            rows.push(row(paint("2", "↑/↓ scroll · Tab/Esc back · Enter select")));
+            rows.push(row(paint("2", if self.inspect_only { "↑/↓ PgUp/PgDn scroll · Tab/Esc list · Enter/Ctrl+O close" }
+                else { "↑/↓ scroll · Tab/Esc back · Enter select" })));
             return (rows, None);
         }
         let query = if self.query.is_empty() { paint("2", "type to filter") } else { text::printable(self.query.text()) };
@@ -220,7 +242,7 @@ impl Panel for List {
             let mark = if position == selected { "❯" } else { " " };
             rows.push(row(paint(if position == selected { "1;35" } else { "0" }, &format!("{mark} {}", text::fit(&text::printable(&item.label), room.saturating_sub(2))))));
         }
-        if filtered.is_empty() { rows.push(row(paint("2", if self.items.is_empty() { "No items available" } else { "No matching items" }))); }
+        if filtered.is_empty() { rows.push(row(paint("2", if self.items.is_empty() { if self.inspect_only { "No tool calls in this conversation" } else { "No items available" } } else { "No matching items" }))); }
         rows.push(String::new());
         if let Some(i) = self.current() {
             let item = &self.items[i];
@@ -228,7 +250,7 @@ impl Panel for List {
             for line in summary { rows.push(row(paint("2", &line))); }
         }
         rows.push(row(paint("2", &format!("{} matching · ↑/↓ select · Tab details", filtered.len()))));
-        rows.push(row(paint("2", "Enter select · Esc cancel")));
+        rows.push(row(paint("2", if self.inspect_only { "Enter/Tab details · Esc/Ctrl+O close" } else { "Enter select · Esc cancel" })));
         (rows, Some(cursor))
     }
 }
@@ -240,7 +262,29 @@ mod tests {
     fn list() -> List {
         List { title: "Test".into(), subtitle: "Choose".into(), items: vec![
             Item::new("alpha", "mentions beta").details(vec!["Long details".repeat(100)]), Item::new("beta", "second"),
-        ], query: Draft::default(), selected: 0, detail: false, offset: 0 }
+        ], query: Draft::default(), selected: 0, detail: false, inspect_only: false, offset: 0 }
+    }
+
+    #[test]
+    fn tool_inspector_opens_latest_and_can_browse_full_wrapped_output() {
+        let mut panel = List::tool_output(vec![Item::new("first", "done"),
+            Item::new("second", "done").details(vec!["0123456789".repeat(1000), "last output line".into()])]);
+        assert_eq!(panel.current(), Some(1));
+        assert!(panel.detail);
+        let (rows, _) = panel.render(36, 18, &|_, s| s.into());
+        assert!(rows.len() < 18);
+        assert!(rows.iter().all(|r| text::width(r) < 36));
+        panel.inspect_key(Key::End);
+        assert!(panel.offset > 0);
+        panel.inspect_key(Key::Home);
+        assert_eq!(panel.offset, 0);
+        assert!(!panel.inspect_key(Key::Esc));
+        assert!(!panel.detail);
+        panel.inspect_key(Key::Up);
+        assert_eq!(panel.current(), Some(0));
+        assert!(!panel.inspect_key(Key::Enter));
+        assert!(panel.detail);
+        assert!(panel.inspect_key(Key::Enter));
     }
 
     #[test]

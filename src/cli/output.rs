@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::diff;
+use super::dialog::{List, Panel};
+use super::keys::Key;
+use super::tool_output::{self, Record};
 use super::input::{self, Queued, Typing};
 use super::markdown::Markdown;
 use super::menu::Menu;
@@ -48,9 +51,13 @@ pub struct Output {
 
 struct State {
     screen: Option<Screen>,
+    /// Keep Ctrl+O available across key-reader handoffs; restored on exit.
+    screen_termios: Option<libc::termios>,
     menu: Option<Arc<Menu>>,
     panel: Option<Arc<Mutex<dyn super::dialog::Panel>>>,
     status: Option<Status>,
+    tool_records: Vec<Record>,
+    tool_panel: Option<List>,
     /// The input box, while a turn runs in the REPL.
     input: Option<InputBox>,
     /// Whether the status or input box is on screen, on the last `rows`;
@@ -106,9 +113,12 @@ impl Output {
         let styled = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
         let state = State {
             screen: None,
+            screen_termios: None,
             menu: None,
             panel: None,
             status: None,
+            tool_records: Vec::new(),
+            tool_panel: None,
             input: None,
             drawn: false,
             rows: 0,
@@ -129,6 +139,18 @@ impl Output {
 
     fn claim_screen(&self) {
         let mut state = self.state.lock().unwrap();
+        if state.screen_termios.is_none() {
+            let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) } == 0 {
+                let mut mode = saved;
+                // Otherwise macOS can consume Ctrl+O as VDISCARD between
+                // a running turn's key reader and the next prompt's reader.
+                mode.c_lflag &= !libc::IEXTEN;
+                if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &mode) } == 0 {
+                    state.screen_termios = Some(saved);
+                }
+            }
+        }
         let height = text::terminal_height().unwrap_or(24);
         let mut stdout = io::stdout().lock();
         let _ = write!(stdout, "{}\x1b[H\x1b[J", "\r\n".repeat(height));
@@ -162,6 +184,63 @@ impl Output {
         self.show(&mut state, "");
     }
 
+    pub fn restore_tool_output(&self, messages: &[Message]) {
+        let mut state = self.state.lock().unwrap();
+        state.tool_records = tool_output::restore(messages);
+        state.tool_panel = None;
+    }
+
+    pub fn show_tool_output(&self, interactive: bool) {
+        if interactive { self.tool_output_key(&Key::ToolOutput); }
+        else {
+            let items = tool_output::items(&self.state.lock().unwrap().tool_records);
+            if items.is_empty() { self.line("No tool calls in this conversation"); }
+            for item in items {
+                self.line(item.label);
+                self.line(item.description);
+                self.lines(&item.details.iter().flat_map(|line| line.split('\n')).map(text::printable).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    /// Routes inspector keys before composer editing or turn interruption.
+    /// Uses the existing key reader, so opening it never pauses the agent.
+    pub fn tool_output_key(&self, key: &Key) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if key == &Key::ToolOutput && state.panel.is_none() {
+            state.tool_panel = if state.tool_panel.is_some() { None }
+                else { Some(List::tool_output(tool_output::items(&state.tool_records))) };
+        } else if let Some(panel) = &mut state.tool_panel {
+            if panel.inspect_key(key.clone()) { state.tool_panel = None; }
+        } else { return false; }
+        self.show(&mut state, "");
+        true
+    }
+
+    fn refresh_tool_panel(state: &mut State) {
+        if let Some(panel) = &mut state.tool_panel {
+            panel.set_items(tool_output::items(&state.tool_records));
+        }
+    }
+
+    fn record_call(&self, id: &str, name: &str, input: &Value) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let index = state.tool_records.len();
+        state.tool_records.push(Record::pending(id, name, input));
+        Self::refresh_tool_panel(&mut state);
+        self.show(&mut state, "");
+        index
+    }
+
+    fn record_result(&self, index: usize, output: Option<&ToolOutput>) -> (String, Value) {
+        let mut state = self.state.lock().unwrap();
+        let record = &mut state.tool_records[index];
+        if let Some(output) = output { record.complete(output); } else { record.interrupt(); }
+        let call = (record.name.clone(), record.input.clone());
+        Self::refresh_tool_panel(&mut state);
+        call
+    }
+
     /// Hands the terminal to a conventional line-based command prompt.
     pub fn leave_screen(&self) {
         let mut state = self.state.lock().unwrap();
@@ -170,6 +249,9 @@ impl Output {
             let mut stdout = io::stdout().lock();
             let _ = write!(stdout, "{SYNC_START}{frame}\x1b[0m\x1b[?2004l{SYNC_END}");
             let _ = stdout.flush();
+        }
+        if let Some(saved) = state.screen_termios.take() {
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved) };
         }
     }
 
@@ -269,7 +351,7 @@ impl Output {
                 tick.tick().await;
                 let mut state = this.state.lock().unwrap();
                 let resized = state.size != (text::terminal_width(), text::terminal_height());
-                if state.status.is_some() || ((state.input.is_some() || state.panel.is_some()) && resized) {
+                if state.status.is_some() || ((state.input.is_some() || state.panel.is_some() || state.tool_panel.is_some()) && resized) {
                     state.frame += 1;
                     this.show(&mut state, "");
                 }
@@ -344,7 +426,11 @@ impl Output {
         if let Some(viewport) = state.screen.as_mut() {
             if !self.styled { rows = rows.iter().map(|row| text::strip_ansi(row)).collect(); }
             let plain = (!self.styled).then(|| text::strip_ansi(printed));
-            screen.push_str(&viewport.draw(plain.as_deref().unwrap_or(printed), rows, cursor, size.0, size.1.unwrap_or(24)));
+            let printed = plain.as_deref().unwrap_or(printed);
+            let height = size.1.unwrap_or(24);
+            let frame = if state.tool_panel.is_some() { viewport.overlay(printed, rows, cursor, size.0, height) }
+                else { viewport.draw(printed, rows, cursor, size.0, height) };
+            screen.push_str(&frame);
             screen.push_str(SYNC_END);
             let mut stdout = io::stdout().lock();
             let _ = stdout.write_all(screen.as_bytes());
@@ -388,7 +474,7 @@ impl Output {
 
     /// Whether the status or input box is to be drawn.
     fn redraws(&self, state: &State) -> bool {
-        (self.styled || state.screen.is_some()) && (state.status.is_some() || state.input.is_some() || state.panel.is_some())
+        (self.styled || state.screen.is_some()) && (state.status.is_some() || state.input.is_some() || state.panel.is_some() || state.tool_panel.is_some())
     }
 
     pub fn line(&self, line: impl AsRef<str>) {
@@ -456,7 +542,7 @@ pub fn replay(out: &Output, messages: &[Message]) {
         out.line("");
     }
     let width = text::terminal_width();
-    let mut names = std::collections::HashMap::new();
+    let mut calls: std::collections::HashMap<&str, &Value> = std::collections::HashMap::new();
     // Tool lines were the last shown, so text needs a blank line first.
     let mut tools = false;
     let gap = |tools: &mut bool| {
@@ -491,7 +577,9 @@ pub fn replay(out: &Output, messages: &[Message]) {
                 out.line("");
             }
             for b in m.content.iter().filter(|b| b["type"] == "tool_result") {
-                let name = b["tool_use_id"].as_str().and_then(|id| names.get(id)).map_or("", String::as_str);
+                let call = b["tool_use_id"].as_str().and_then(|id| calls.remove(id));
+                let name = call.and_then(|call| call["name"].as_str()).unwrap_or("");
+                if let Some(call) = call { out.lines(&call_lines(out, name, &call["input"], width)); }
                 let is_error = b["is_error"].as_bool().unwrap_or(false);
                 let content = match &b["content"] {
                     Value::String(s) => s.clone(),
@@ -518,14 +606,18 @@ pub fn replay(out: &Output, messages: &[Message]) {
                     out.line("");
                 }
                 Some("tool_use") => {
-                    let name = b["name"].as_str().unwrap_or("");
-                    if let Some(id) = b["id"].as_str() {
-                        names.insert(id.to_string(), name.to_string());
-                    }
-                    out.lines(&call_lines(out, name, &b["input"], width));
+                    if let Some(id) = b["id"].as_str() { calls.insert(id, b); }
                     tools = true;
                 }
                 _ => {}
+            }
+        }
+    }
+    for m in messages {
+        for call in m.content.iter().filter(|b| b["type"] == "tool_use") {
+            if call["id"].as_str().is_some_and(|id| calls.contains_key(id)) {
+                out.lines(&call_lines(out, call["name"].as_str().unwrap_or(""), &call["input"], width));
+                out.line(out.paint("33", "  ⎿ No saved result"));
             }
         }
     }
@@ -536,6 +628,9 @@ pub fn replay(out: &Output, messages: &[Message]) {
 /// input box also says where the cursor goes: (row, column).
 fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, Option<(usize, usize)>) {
     let width = text::terminal_width();
+    if let Some(panel) = &state.tool_panel {
+        return panel.render(width, text::terminal_height().unwrap_or(24), &paint);
+    }
     if let Some(panel) = &state.panel {
         return panel.lock().unwrap().render(width, text::terminal_height().unwrap_or(24), &paint);
     }
@@ -545,7 +640,7 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
         if status.tokens > 0 {
             hint.push(format!("↓ {} tokens", tokens(status.tokens)));
         }
-        hint.push("esc to interrupt".to_string());
+        hint.push("esc to interrupt · ctrl+o output".to_string());
         let hint = format!(" ({})", hint.join(" · "));
         let label = text::fit(&status.label, width.saturating_sub(text::width(&hint) + 3));
         // Forward then back through the glyphs, without repeating the ends.
@@ -650,6 +745,8 @@ pub struct Terminal {
     /// Tool calls in the current batch, and how many results came back.
     calls: usize,
     results: usize,
+    /// Call IDs and retained output indexes awaiting results.
+    pending: Vec<(String, usize)>,
     started: Instant,
     requests: usize,
     output_tokens: u64,
@@ -677,6 +774,7 @@ impl Terminal {
             raw_open: false,
             calls: 0,
             results: 0,
+            pending: Vec::new(),
             started: Instant::now(),
             requests: 0,
             output_tokens: 0,
@@ -699,6 +797,12 @@ impl Terminal {
     /// Flushes pending text and prints how the turn went.
     pub fn end_turn(&mut self, result: &Result<(), TurnEnd>) {
         self.end_text();
+        for (_, index) in std::mem::take(&mut self.pending) {
+            let (name, input) = self.out.record_result(index, None);
+            let mut lines = call_lines(&self.out, &name, &input, text::terminal_width());
+            lines.push(self.out.paint("33", "  ⎿ Interrupted · no result received"));
+            self.out.lines(&lines);
+        }
         self.out.set_status(None);
         // Piped output gets just the text; problems go to stderr.
         if !self.out.presented() {
@@ -863,6 +967,15 @@ impl Observer for Terminal {
     }
 
     fn on_tool_call(&mut self, name: &str, input: &Value) {
+        self.on_tool_call_id("", name, input);
+    }
+
+    fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
+        let id = self.pending.first().map(|(id, _)| id.clone()).unwrap_or_default();
+        self.on_tool_result_id(&id, name, output);
+    }
+
+    fn on_tool_call_id(&mut self, id: &str, name: &str, input: &Value) {
         if self.results > 0 {
             (self.calls, self.results) = (0, 0);
         }
@@ -870,22 +983,29 @@ impl Observer for Terminal {
         let status = if self.calls == 1 { format!("Running {name}…") } else { format!("Running {} tools…", self.calls) };
         self.enter(Phase::Running, &status);
         self.separate(Block::Tools);
-        self.out.lines(&call_lines(&self.out, name, input, text::terminal_width()));
+        let index = self.out.record_call(id, name, input);
+        self.pending.push((id.to_string(), index));
+        self.out.set_status_detail(&call_label(name, input, text::terminal_width().saturating_sub(6)));
     }
 
-    fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
+    fn on_tool_result_id(&mut self, id: &str, name: &str, output: &ToolOutput) {
         self.results += 1;
-        // With several calls in flight, say which one each result is for.
-        let prefix = if self.calls > 1 { format!("{name}: ") } else { String::new() };
         let width = text::terminal_width();
-        let shown: Vec<String> = match &output.change {
+        let mut shown = Vec::new();
+        if let Some(position) = self.pending.iter().position(|(call_id, _)| call_id == id) {
+            let (_, index) = self.pending.remove(position);
+            let (name, input) = self.out.record_result(index, Some(output));
+            shown.extend(call_lines(&self.out, &name, &input, width));
+        }
+        let result: Vec<String> = match &output.change {
             Some(change) if !output.is_error => diff::render(change, width.saturating_sub(6), |sgr, s| self.out.paint(sgr, s))
                 .into_iter()
                 .enumerate()
-                .map(|(i, line)| if i == 0 { self.out.paint("2", &format!("  ⎿ {prefix}{line}")) } else { format!("    {line}") })
+                .map(|(i, line)| if i == 0 { self.out.paint("2", &format!("  ⎿ {line}")) } else { format!("    {line}") })
                 .collect(),
-            _ => result_block(&self.out, name, &output.content, output.is_error, &prefix, width),
+            _ => result_block(&self.out, name, &output.content, output.is_error, "", width),
         };
+        shown.extend(result);
         self.out.lines(&shown);
         if self.results == self.calls {
             self.enter(Phase::Waiting, WAITING);
@@ -993,7 +1113,7 @@ pub(super) fn tokens(n: u64) -> String {
 }
 
 /// A one-line view of a tool call: `bash(cargo test)`, `grep(foo · src)`.
-fn call_label(name: &str, input: &Value, max: usize) -> String {
+pub(super) fn call_label(name: &str, input: &Value, max: usize) -> String {
     // The fields that say the most about a call, most telling first.
     const KEYS: [&str; 12] = [
         "agent_type", "description", "agent_id", "message", "command", "pattern", "path", "file_path", "glob", "url",
@@ -1067,6 +1187,87 @@ fn result_lines(name: &str, content: &str, is_error: bool, width: usize) -> Vec<
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn capture() -> Output {
+        let mut out = Output::stdout();
+        out.styled = false;
+        out.state.lock().unwrap().held = Some(Vec::new());
+        out
+    }
+
+    #[test]
+    fn same_name_results_stay_adjacent_to_their_call_even_out_of_order() {
+        let out = capture();
+        let mut terminal = Terminal::new(out.clone());
+        terminal.on_tool_call_id("a", "bash", &json!({"command":"df -h"}));
+        terminal.on_tool_call_id("b", "bash", &json!({"command":"du -sh"}));
+        assert!(out.state.lock().unwrap().held.as_ref().unwrap().is_empty());
+        terminal.on_tool_result_id("b", "bash", &ToolOutput::error("DU result"));
+        terminal.on_tool_result_id("a", "bash", &ToolOutput::ok("DF result"));
+        let state = out.state.lock().unwrap();
+        let lines = state.held.as_ref().unwrap();
+        assert_eq!(lines, &["● bash(du -sh)", "  ⎿ DU result", "● bash(df -h)", "  ⎿ DF result"]);
+        let items = tool_output::items(&state.tool_records);
+        assert_eq!(items[0].details.last().unwrap(), "DF result");
+        assert_eq!(items[1].details.last().unwrap(), "DU result");
+        assert_eq!(items[1].description, "Error");
+    }
+
+    #[test]
+    fn interrupted_calls_remain_inspectable_and_do_not_leak_into_next_turn() {
+        let out = capture();
+        let mut terminal = Terminal::new(out.clone());
+        terminal.on_tool_call_id("a", "bash", &json!({"command":"sleep 10"}));
+        terminal.end_turn(&Err(TurnEnd::Interrupted));
+        assert!(terminal.pending.is_empty());
+        let state = out.state.lock().unwrap();
+        assert!(state.held.as_ref().unwrap().iter().any(|line| line.contains("sleep 10")));
+        assert!(state.tool_records[0].item(1).description.starts_with("Interrupted"));
+        drop(state);
+        terminal.begin_turn();
+        assert!(terminal.pending.is_empty());
+        assert_eq!(out.state.lock().unwrap().tool_records.len(), 1);
+    }
+
+    #[test]
+    fn inspector_consumes_keys_without_editing_the_draft_and_clear_resets_it() {
+        let out = capture();
+        let inbox = Arc::new(Inbox::default());
+        out.open_input(Typing::default(), inbox.clone());
+        out.edit_input(|t| t.draft.set_text("unsent draft"));
+        assert!(!out.tool_output_key(&Key::Enter));
+        out.record_call("a", "bash", &json!({"command":"df -h"}));
+        assert!(out.tool_output_key(&Key::ToolOutput));
+        assert!(out.tool_output_key(&Key::Text("search".into())));
+        assert!(out.tool_output_key(&Key::Esc));
+        assert!(out.tool_output_key(&Key::Esc));
+        assert!(!out.tool_output_key(&Key::Enter));
+        assert_eq!(out.close_input().draft.text(), "unsent draft");
+        assert!(!inbox.wants_turn());
+        out.record_call("a", "bash", &json!({"command":"df -h"}));
+        out.restore_tool_output(&[]);
+        assert!(out.state.lock().unwrap().tool_records.is_empty());
+    }
+
+    #[test]
+    fn replay_pairs_each_call_with_its_result() {
+        let out = capture();
+        let messages = vec![Message { role: "assistant", source: None, content: vec![
+            json!({"type":"tool_use","id":"a","name":"bash","input":{"command":"df -h"}}),
+            json!({"type":"tool_use","id":"b","name":"bash","input":{"command":"du -sh"}}),
+        ]}, Message::user(vec![
+            json!({"type":"tool_result","tool_use_id":"a","content":"DF result"}),
+            json!({"type":"tool_result","tool_use_id":"b","content":"DU result"}),
+        ])];
+        // Include a user prompt so the replay knows where the turn starts.
+        let mut history = vec![Message::user(vec![json!({"type":"text","text":"disk usage"})])];
+        history.extend(messages);
+        replay(&out, &history);
+        let state = out.state.lock().unwrap();
+        let lines = state.held.as_ref().unwrap();
+        let first = lines.iter().position(|l| l.contains("df -h")).unwrap();
+        assert_eq!(&lines[first..first+4], &["● bash(df -h)", "  ⎿ DF result", "● bash(du -sh)", "  ⎿ DU result"]);
+    }
 
     #[test]
     fn labels_calls_by_their_main_arguments() {

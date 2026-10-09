@@ -82,6 +82,7 @@ impl ReplHelper {
                     continue;
                 }
             };
+            if out.tool_output_key(&key) { continue; }
             if key == Key::PasteImage {
                 super::paste_clipboard(out);
                 continue;

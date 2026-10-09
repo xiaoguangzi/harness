@@ -21,7 +21,7 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 const MAX_SEQUENCE: usize = 32;
 
 /// A key that edits the input box.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Key {
     /// Text typed, or pasted.
     Text(String),
@@ -37,6 +37,8 @@ pub enum Key {
     Right,
     Up,
     Down,
+    PageUp,
+    PageDown,
     Home,
     End,
     WordLeft,
@@ -49,6 +51,8 @@ pub enum Key {
     KillWord,
     /// Ctrl+V: pastes an image from the clipboard.
     PasteImage,
+    /// Ctrl+O: inspect the full output of tool calls.
+    ToolOutput,
     /// A terminal position report, ignored by the owned viewport.
     Position(usize),
 }
@@ -73,12 +77,9 @@ impl KeyWatch {
         Self::watch(None, false)
     }
 
-    /// Like [`KeyWatch::start`], handing every other key to `on_key` (on
-    /// the reading thread). Pasted text arrives as one `Key::Text`.
-    pub fn with_keys(on_key: impl FnMut(Key) + Send + 'static) -> Self {
-        Self::watch(Some(Box::new(on_key)), false)
-    }
-
+    /// Hands every key, including Esc, to the frontend on the reading
+    /// thread. Pasted text arrives as one `Key::Text`. The frontend decides
+    /// whether Esc closes a panel or interrupts a turn.
     pub fn for_prompt(on_key: impl FnMut(Key) + Send + 'static) -> Self {
         Self::watch(Some(Box::new(on_key)), true)
     }
@@ -94,7 +95,9 @@ impl KeyWatch {
         }
         // Byte at a time and silent, but keep ISIG so Ctrl-C still works.
         let mut raw = saved;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        // IEXTEN would consume Ctrl+O as VDISCARD on macOS instead of
+        // delivering it to the output inspector. Keep ISIG for Ctrl+C.
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::IEXTEN);
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
         if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
@@ -238,6 +241,7 @@ fn parse(buf: &[u8]) -> Parsed {
         0x0b => Key::KillToEnd,
         0x17 => Key::KillWord,
         0x16 => Key::PasteImage,
+        0x0f => Key::ToolOutput,
         0x00..=0x1f => return Parsed::Skip(1),
         _ => return parse_text(buf),
     };
@@ -316,6 +320,8 @@ fn parse_csi(buf: &[u8]) -> Parsed {
         (_, b'H') | (b"1" | b"7", b'~') => Key::Home,
         (_, b'F') | (b"4" | b"8", b'~') => Key::End,
         (b"3", b'~') => Key::Delete,
+        (b"5", b'~') => Key::PageUp,
+        (b"6", b'~') => Key::PageDown,
         // A cursor position report, `row;col R`.
         (_, b'R') if modified => match report_row(&buf[..=end]) {
             Some(row) => Key::Position(row),
@@ -379,7 +385,9 @@ mod tests {
         assert_eq!(parse(b"\x1bOH"), Parsed::Key(Key::Home, 3));
         assert_eq!(parse(b"\x1b\r"), Parsed::Key(Key::Newline, 2));
         assert_eq!(parse(b"\x1b\x1b"), Parsed::Esc);
-        assert_eq!(parse(b"\x1b[5~"), Parsed::Skip(4));
+        assert_eq!(parse(b"\x1b[5~"), Parsed::Key(Key::PageUp, 4));
+        assert_eq!(parse(b"\x1b[6~"), Parsed::Key(Key::PageDown, 4));
+        assert_eq!(parse(b"\x0f"), Parsed::Key(Key::ToolOutput, 1));
         assert_eq!(parse(b"\x07"), Parsed::Skip(1));
     }
 

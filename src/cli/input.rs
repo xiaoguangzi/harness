@@ -144,7 +144,7 @@ impl Draft {
                 let start = word_start(text, cursor);
                 self.remove(start, cursor);
             }
-            Key::Enter | Key::PasteImage | Key::Position(_) | Key::Tab | Key::Esc => {}
+            Key::Enter | Key::PasteImage | Key::ToolOutput | Key::PageUp | Key::PageDown | Key::Position(_) | Key::Tab | Key::Esc => {}
         }
     }
 
