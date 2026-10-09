@@ -33,6 +33,7 @@ use subagent::AgentTool;
 const USAGE: &str = "\
 Usage: harness [OPTIONS] [PROMPT...]
        harness plugin <command>   Install and manage plugins (harness plugin help)
+       harness provider <command> Add LLM gateways and models (harness provider help)
 
 With no PROMPT, starts the interactive REPL; with one, runs it and exits.
 
@@ -66,6 +67,13 @@ async fn main() -> Result<ExitCode> {
     settings::set_path(settings_path);
     if matches!(args.first().map(String::as_str), Some("plugin" | "plugins")) {
         let lines = tokio::task::block_in_place(|| plugins::manage::run(&args[1..], &mut plugins::manage::TerminalAsk))?;
+        for line in lines {
+            println!("{line}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if matches!(args.first().map(String::as_str), Some("provider" | "providers")) {
+        let lines = llm::manage::run(&args[1..], &mut plugins::manage::TerminalAsk)?;
         for line in lines {
             println!("{line}");
         }

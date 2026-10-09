@@ -25,6 +25,7 @@ harness --continue                      # resume the latest conversation here (s
 harness --web                           # web UI at http://localhost:8787 (see below)
 harness --sandbox                       # run the model's commands in an OS sandbox (see below)
 harness --plugin-dir ./my-plugin        # load a plugin from a directory for this run (see below)
+harness provider add relay              # add an LLM gateway, asking for its URL, key and models (see below)
 harness plugin install fmt@team         # install a plugin (see below; harness plugin help)
 harness --check-plugins                 # report what each enabled plugin loads, and what not
 harness --help                          # all options
@@ -134,6 +135,19 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 
 `${VAR}` / `${VAR:-default}` expand from the environment in `base_url`, `api_key` and `headers`. A spec without a known provider prefix is a model on the current provider, so gateway model names containing `/` (such as `openai/gpt-5`) also work.
 
+`harness provider` edits these settings from the command line (`/provider …` in the REPL does the same, and switches the conversation to the changed setup at once, on the same model if its provider is still there):
+
+```sh
+harness provider add relay-b       # asks for the protocol, base URL, API key and models; options skip the questions:
+harness provider add relay-b --protocol openai-responses --base-url https://relay-b.example.com/v1 \
+  --api-key '${RELAY_B_KEY}' --model gpt-5 --model gpt-5-mini
+harness provider model add relay-b/gpt-5 --context-window 400000 --effort high --default   # also --max-tokens
+harness provider default relay-a/claude-opus-5
+harness provider list              # also: remove <name>, model remove <provider>/<model>
+```
+
+`add` on an existing provider changes only what its options give (with no options, it asks again, Enter keeping each value). The key is stored as typed, so `${VAR}` (in single quotes on the shell) keeps it out of the file. When there is no working default model, `add` makes its first model the default. Each change says when the setup cannot be used yet, for example without a default model.
+
 Switch models mid-conversation with `/model <provider>/<model>`; `/model` alone lists providers and models. `/effort <level>` changes the effort for the rest of the session (kept across `/model`), and `/effort auto` goes back to the configured one. The history is kept in Anthropic form and converted for OpenAI (`function_call` / `function_call_output`, `input_image`, `input_file`); requests are stateless (`store: false`), with reasoning items replayed from their encrypted content. Model-bound blocks (Anthropic thinking, OpenAI reasoning) are only sent back to the model that produced them. Subagents can use a different gateway through `subagent_model` or an agent's `model`.
 
 ## Attaching files with `@`
@@ -167,6 +181,7 @@ The prompt is an input box between two rules that stays on the bottom rows of th
 |---|---|
 | `/help` | list commands |
 | `/model [spec]` | show providers and models, or switch to `<provider>/<model>` |
+| `/provider [command]` | list the providers and models; `/provider add`, `remove`, `model add`, `model remove` and `default` work as `harness provider` does and apply at once (see [LLM gateways](#llm-gateways)) |
 | `/effort [level]` | show the reasoning effort, or set it: `low`, `medium`, `high`, `xhigh`, `max`, or `auto` for the configured one |
 | `/clear` | start a new conversation |
 | `/compact [focus]` | summarize the conversation to free context (see [Compaction](#compaction)); `focus` says what the summary should keep |
@@ -499,7 +514,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 
 ## Layout
 
-- `src/main.rs` — startup: settings, `harness plugin` and `--check-plugins`, the sandbox, then what `setup.rs` builds; then the CLI or web frontend
+- `src/main.rs` — startup: settings, `harness plugin`, `harness provider` and `--check-plugins`, the sandbox, then what `setup.rs` builds; then the CLI or web frontend
 - `src/setup.rs` — what a conversation is built from: the plugins with their skills, agents, hooks, MCP and language servers (rebuilt by `/reload-plugins`), the user's MCP servers, the tool set and system prompt; `--check-plugins`; background auto-updates
 - `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section, editing it in place
 - `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), `/rewind` (`rewind.rs`), the spinner, input box and turn display (`output.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), rustyline helper with the input box's rules, menu keys, completion, multi-line input, pasting with Ctrl+V, Esc Esc and waking the prompt for a subagent's report (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
@@ -509,6 +524,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/agent/compact.rs` — compaction: when to compact, the summarization request, the history that replaces the conversation
 - `src/llm/` — LLM gateways
   - `config.rs` — providers from the settings and environment, model spec resolution, per-provider/model settings
+  - `manage.rs` — `harness provider` and `/provider …`: adding and removing providers and listed models, the default model, by editing the settings
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST with retries, SSE reader; marks the stream failures (a dropped connection, an overload) after which `llm::Client` requests the response again

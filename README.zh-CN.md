@@ -26,6 +26,7 @@ harness --continue                      # 继续当前目录最近的会话（�
 harness --web                           # Web UI，地址 http://localhost:8787（见下文）
 harness --sandbox                       # 在操作系统沙箱中运行模型的命令（见下文）
 harness --plugin-dir ./my-plugin        # 本次运行额外加载某个目录中的插件（见下文）
+harness provider add relay              # 添加 LLM 网关，会询问 URL、密钥和模型（见下文）
 harness plugin install fmt@team         # 安装插件（见下文；harness plugin help）
 harness --check-plugins                 # 报告每个已启用插件加载了什么、没加载什么
 harness --help                          # 查看全部选项
@@ -135,6 +136,19 @@ harness --help                          # 查看全部选项
 
 `base_url`、`api_key` 和 `headers` 中的 `${VAR}` / `${VAR:-default}` 会从环境变量展开。没有已知 provider 前缀的 spec 视为当前 provider 上的一个模型，因此包含 `/` 的网关模型名（如 `openai/gpt-5`）同样可用。
 
+`harness provider` 在命令行中修改这些配置（REPL 中的 `/provider …` 作用相同，并让当前会话立即改用新配置；模型所在的 provider 还在时保持原模型）：
+
+```sh
+harness provider add relay-b       # 询问协议、base URL、API key 和模型；给出选项则跳过提问：
+harness provider add relay-b --protocol openai-responses --base-url https://relay-b.example.com/v1 \
+  --api-key '${RELAY_B_KEY}' --model gpt-5 --model gpt-5-mini
+harness provider model add relay-b/gpt-5 --context-window 400000 --effort high --default   # 另有 --max-tokens
+harness provider default relay-a/claude-opus-5
+harness provider list              # 另有：remove <name>、model remove <provider>/<model>
+```
+
+对已有的 provider 执行 `add` 只修改选项给出的部分（不带选项时重新逐项询问，直接回车保留原值）。密钥按输入原样保存，所以写 `${VAR}`（在 shell 中用单引号）可以不把它写进文件。没有可用的默认模型时，`add` 把它的第一个模型设为默认模型。每次修改后，如果配置还不能使用（例如没有默认模型），会说明原因。
+
 会话中途可用 `/model <provider>/<model>` 切换模型；单独输入 `/model` 会列出 provider 和模型。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
 
 ## 用 `@` 附加文件
@@ -168,6 +182,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 |---|---|
 | `/help` | 列出命令 |
 | `/model [spec]` | 显示 provider 和模型，或切换到 `<provider>/<model>` |
+| `/provider [子命令]` | 列出 provider 和模型；`/provider add`、`remove`、`model add`、`model remove`、`default` 与 `harness provider` 相同，并立即生效（见 [LLM 网关](#llm-网关)） |
 | `/effort [level]` | 显示推理强度，或设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
 | `/clear` | 开始新会话 |
 | `/compact [重点]` | 总结会话以腾出上下文（见[上下文压缩](#上下文压缩)）；`重点` 指定摘要要特别保留的内容 |
@@ -500,7 +515,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 
 ## 目录结构
 
-- `src/main.rs` — 启动：配置、`harness plugin` 和 `--check-plugins`、沙箱，然后是 `setup.rs` 构建的内容；最后进入 CLI 或 web 前端
+- `src/main.rs` — 启动：配置、`harness plugin`、`harness provider` 和 `--check-plugins`、沙箱，然后是 `setup.rs` 构建的内容；最后进入 CLI 或 web 前端
 - `src/setup.rs` — 会话由什么构成：插件及其技能、代理、hook、MCP 与语言服务器（由 `/reload-plugins` 重建）、用户的 MCP 服务器、工具集和系统提示词；`--check-plugins`；后台自动更新
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
 - `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`/rewind`（`rewind.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、带输入框横线、菜单按键、补全、多行输入、Ctrl+V 粘贴、Esc Esc 以及为子代理报告唤醒提示符的 rustyline 辅助（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
@@ -510,6 +525,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/agent/compact.rs` — 上下文压缩：何时压缩、总结请求、替换会话的新历史
 - `src/llm/` — LLM 网关
   - `config.rs` — 由配置和环境变量得到 provider、模型 spec 解析、按 provider/模型的设置
+  - `manage.rs` — `harness provider` 与 `/provider …`：通过修改配置添加和移除 provider 与列出的模型、设置默认模型
   - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退）
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
   - `http.rs` — 带重试的 POST、SSE 读取器；标记哪些流式失败（连接断开、过载）之后 `llm::Client` 会重新请求回复

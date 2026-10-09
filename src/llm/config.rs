@@ -235,8 +235,8 @@ impl Providers {
         }
         if providers.is_empty() {
             bail!(
-                "no LLM provider configured: set ANTHROPIC_API_KEY (or OPENAI_API_KEY), or declare \
-                 gateways under `providers` in ~/.harness/settings.json"
+                "no LLM provider configured: set ANTHROPIC_API_KEY (or OPENAI_API_KEY), or add a gateway \
+                 with `harness provider add <name>`"
             );
         }
 
@@ -250,7 +250,7 @@ impl Providers {
         };
         let requested = env("HARNESS_MODEL").or(settings.model.clone()).or_else(|| this.fallback_default());
         let requested = requested.ok_or_else(|| {
-            anyhow!("no default model: set `model` in settings.json or HARNESS_MODEL=<provider>/<model>")
+            anyhow!("no default model: set one with `harness provider default <provider>/<model>`, or HARNESS_MODEL")
         })?;
         // A bare model name (e.g. HARNESS_MODEL=claude-opus-5) goes to the
         // sole provider, or to `anthropic` when there are several.

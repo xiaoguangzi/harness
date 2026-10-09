@@ -14,6 +14,7 @@
 mod anthropic;
 pub mod config;
 mod http;
+pub mod manage;
 mod openai;
 
 use std::collections::HashMap;
@@ -150,6 +151,13 @@ impl Client {
         Ok(Self { spec, ..self.clone() })
     }
 
+    /// The same model and `/effort` on a changed provider setup, or its
+    /// default model if this one's provider is gone.
+    pub fn with_providers(&self, providers: Providers) -> Self {
+        let spec = if providers.target(&self.spec).is_ok() { self.spec.clone() } else { providers.default_model.clone() };
+        Self { providers: Arc::new(providers), spec, ..self.clone() }
+    }
+
     /// The effort requests are sent with.
     pub fn effort(&self) -> Effort {
         self.effort
@@ -230,6 +238,24 @@ mod tests {
 
     use super::*;
     use crate::llm::config::tests::{file, no_env};
+
+    #[test]
+    fn keeps_the_model_and_effort_on_new_providers() {
+        let gateways = |names: &[&str]| {
+            let providers: serde_json::Map<String, Value> = names
+                .iter()
+                .map(|n| (n.to_string(), json!({"protocol": "anthropic", "base_url": "https://gw.example.com"})))
+                .collect();
+            let model = format!("{}/m", names[0]);
+            Providers::from_parts(&file(json!({"model": model, "providers": providers})), &no_env).unwrap()
+        };
+        let mut client = Client::new(gateways(&["a", "b"])).unwrap().switch("b/other").unwrap();
+        client.set_effort(Some(Effort::Low));
+        let moved = client.with_providers(gateways(&["c", "b"]));
+        assert_eq!((moved.spec(), moved.effort()), ("b/other", Effort::Low));
+        assert_eq!(moved.providers().names(), ["b", "c"]);
+        assert_eq!(client.with_providers(gateways(&["c"])).spec(), "c/m", "its provider is gone");
+    }
 
     /// How the mock server answers one request.
     enum Answer {

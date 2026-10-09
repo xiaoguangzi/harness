@@ -41,10 +41,11 @@ use menu::Command;
 use repl::{ReplHelper, Wake};
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 19] = [
+const BUILTINS: [(&str, &str); 20] = [
     ("/help", "show commands and keys"),
     ("/model", "show the model, or switch with /model <provider>/<model>"),
     ("/effort", "show the reasoning effort, or set it with /effort <level>"),
+    ("/provider", "list providers and models; /provider add|remove|model|default … changes them"),
     ("/clear", "start a new conversation"),
     ("/compact", "summarize the conversation to free context; /compact <focus> says what to keep"),
     ("/resume", "pick up an earlier conversation from this directory"),
@@ -415,6 +416,17 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 }
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
+            Input::Providers(args) => {
+                match tokio::task::block_in_place(|| llm::manage::run(&args, &mut plugins::manage::TerminalAsk)) {
+                    Ok(lines) => {
+                        out.lines(&lines);
+                        if llm::manage::changes(&args) {
+                            reload_providers(agent, &skills, editor.helper(), &out);
+                        }
+                    }
+                    Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+                }
+            }
             Input::Effort(None) => {
                 out.line(format!("effort: {}", out.paint("1", agent.client().effort().as_str())));
                 out.line(out.paint("2", "set with /effort low|medium|high|xhigh|max, or /effort auto"));
@@ -490,6 +502,24 @@ async fn apply_reload(agent: &mut Agent, env: &mut Env, skills: &mut Arc<Vec<Ski
     }
     env.shutdown_retired().await;
     true
+}
+
+/// Moves the agent to the providers as the settings have them now, on the
+/// same model if its provider is still there.
+fn reload_providers(agent: &mut Agent, skills: &[Skill], helper: Option<&ReplHelper>, out: &Output) {
+    match crate::settings::Settings::load().and_then(|s| llm::Providers::from_settings(&s)) {
+        Ok(providers) => {
+            let client = agent.client().with_providers(providers);
+            if client.spec() != agent.model() {
+                out.line(format!("model: {}", out.paint("1", client.spec())));
+            }
+            agent.set_client(client);
+            if let Some(helper) = helper {
+                helper.set_commands(menu_commands(agent, skills));
+            }
+        }
+        Err(_) => out.line(out.paint("2", "this conversation keeps the providers it had")),
+    }
 }
 
 /// Builds the system prompt again for a new conversation, so it has the
@@ -866,6 +896,8 @@ enum Input {
     Resume(Option<String>),
     /// `/rewind` goes back to before an earlier prompt.
     Rewind,
+    /// `/provider …`, as `harness provider` takes it.
+    Providers(Vec<String>),
     /// `/effort` shows the effort; `/effort <level>` sets it for this
     /// session, and `/effort auto` restores the configured one.
     Effort(Option<Option<llm::Effort>>),
@@ -928,6 +960,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "sandbox" => Input::Sandbox,
         "usage" => Input::Usage,
         "model" => Input::Model(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
+        "provider" | "providers" => Input::Providers(args.split_whitespace().map(String::from).collect()),
         "effort" => match args.trim() {
             "" => Input::Effort(None),
             "auto" | "default" => Input::Effort(Some(None)),
@@ -1095,6 +1128,7 @@ fn print_models(out: &Output, agent: &Agent) {
         out.line(format!(" {mark} {m}"));
     }
     out.line(out.paint("90", "switch with /model <provider>/<model>; any model name the gateway accepts works"));
+    out.line(out.paint("90", "add a provider with /provider add <name>, a model with /provider model add <provider>/<model>"));
 }
 
 fn print_agents(out: &Output, defs: &[AgentDef]) {
@@ -1257,6 +1291,8 @@ mod tests {
         assert_eq!(parse_input("fix it", &skills), Input::Prompt("fix it".into()));
         assert!(matches!(parse_input("/nope", &skills), Input::Error(_)));
         assert_eq!(parse_input("/effort", &skills), Input::Effort(None));
+        assert_eq!(parse_input("/provider", &skills), Input::Providers(Vec::new()));
+        assert_eq!(parse_input("/providers model add gw/m", &skills), Input::Providers(vec!["model".into(), "add".into(), "gw/m".into()]));
         assert_eq!(parse_input("/effort XHigh", &skills), Input::Effort(Some(Some(llm::Effort::XHigh))));
         assert_eq!(parse_input("/effort auto", &skills), Input::Effort(Some(None)));
         assert!(matches!(parse_input("/effort huge", &skills), Input::Error(_)));
