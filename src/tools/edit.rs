@@ -240,4 +240,30 @@ mod tests {
         assert!(outs.iter().all(|o| !o.is_error), "{outs:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aa\nbb\ncc\n");
     }
+
+    #[tokio::test]
+    async fn agents_editing_one_file_at_once_never_lose_a_change() {
+        // Each agent (a subagent, say) has its own tracker; both read the file.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, first) = read_file(&dir, "a\nb\n").await;
+        let files = FileTracker::default();
+        ReadTool::new(files.clone()).run(json!({"path": path})).await;
+        let second = EditTool::new(files);
+        for _ in 0..20 {
+            let (one, two) = tokio::join!(
+                first.run(json!({"path": path, "old_string": "a", "new_string": "a+"})),
+                second.run(json!({"path": path, "old_string": "b", "new_string": "b+"})),
+            );
+            // One goes first; the other sees the file changed under it.
+            assert!(one.is_error != two.is_error, "{one:?} {two:?}");
+            let refused = if one.is_error { &one } else { &two };
+            assert!(refused.content.contains("changed since it was last read"), "{}", refused.content);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.matches('+').count(), 1, "{text}");
+            std::fs::write(&path, "a\nb\n").unwrap();
+            for tool in [&first, &second] {
+                tool.files.record(&path);
+            }
+        }
+    }
 }

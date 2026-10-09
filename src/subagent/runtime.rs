@@ -98,6 +98,8 @@ pub struct Child {
     reporter: Reporter,
     background: AtomicBool,
     tool_calls: AtomicUsize,
+    /// What the run's latest tool call was, e.g. `bash: cargo test`.
+    last_call: Mutex<Option<String>>,
     state: Mutex<State>,
 }
 
@@ -145,8 +147,9 @@ impl Run {
 
 /// How a message sent to a subagent was taken.
 pub enum Sent {
-    /// It was running; it reads the message at its next step.
-    Queued,
+    /// It was running; it reads the message at its next step. How far it
+    /// has got.
+    Queued(String),
     Started(Run),
 }
 
@@ -197,6 +200,7 @@ impl Subagents {
             reporter: self.reporter.lock().unwrap().clone().unwrap_or_else(|| fallback.clone()),
             background: AtomicBool::new(background),
             tool_calls: AtomicUsize::new(0),
+            last_call: Mutex::new(None),
             state: Mutex::new(State {
                 status: Status::Stopped,
                 run: 0,
@@ -219,7 +223,7 @@ impl Subagents {
             let state = child.state.lock().unwrap();
             if state.status == Status::Running {
                 child.inbox.push(format!("A message from the agent that started you:\n\n{message}"), true);
-                return Ok(Sent::Queued);
+                return Ok(Sent::Queued(child.progress(&state)));
             }
         }
         check_capacity(&children)?;
@@ -235,6 +239,7 @@ impl Subagents {
         state.took = None;
         child.background.store(background, Ordering::Relaxed);
         child.tool_calls.store(0, Ordering::Relaxed);
+        *child.last_call.lock().unwrap() = None;
         let run = state.run;
         let task = child.clone().run(run, prompt, self.parent.clone(), tx);
         // The run takes this lock to finish, so it cannot end before its
@@ -387,6 +392,18 @@ impl Child {
         )
     }
 
+    /// How far the run in `state`, this child's (locked), has got: its tool
+    /// calls, time and latest call.
+    fn progress(&self, state: &State) -> String {
+        let calls = self.tool_calls.load(Ordering::Relaxed);
+        let secs = state.took.unwrap_or_else(|| state.started.elapsed()).as_secs();
+        let mut progress = format!("{calls} tool calls in {secs}s");
+        if let Some(last) = &*self.last_call.lock().unwrap() {
+            progress.push_str(&format!(", latest {last}"));
+        }
+        progress
+    }
+
     fn snapshot(&self, state: &State) -> Value {
         let took = state.took.unwrap_or_else(|| state.started.elapsed());
         json!({
@@ -398,6 +415,7 @@ impl Child {
             "status": state.status.as_str(),
             "background": self.background.load(Ordering::Relaxed),
             "tool_calls": self.tool_calls.load(Ordering::Relaxed),
+            "last_call": *self.last_call.lock().unwrap(),
             "seconds": took.as_secs(),
         })
     }
@@ -428,6 +446,16 @@ fn outcome(agent: &Agent, start: usize, result: Result<()>, tool_calls: usize) -
     }
 }
 
+/// `name` and the argument of `input` that says most about the call, in a
+/// line: `bash: cargo test`, `edit: src/main.rs`.
+fn call_summary(name: &str, input: &Value) -> String {
+    const KEYS: [&str; 7] = ["command", "path", "pattern", "file_path", "url", "query", "name"];
+    match KEYS.iter().find_map(|k| input.get(*k)?.as_str().filter(|v| !v.is_empty())) {
+        Some(arg) => format!("{name}: {}", crate::util::one_line(arg, 80)),
+        None => name.to_string(),
+    }
+}
+
 /// Reports a subagent's tool calls; its text is read from the finished
 /// conversation instead of being streamed.
 struct SubObserver<'a> {
@@ -440,6 +468,7 @@ impl Observer for SubObserver<'_> {
     fn on_tool_call(&mut self, name: &str, input: &Value) {
         let child = self.child;
         child.tool_calls.fetch_add(1, Ordering::Relaxed);
+        *child.last_call.lock().unwrap() = Some(call_summary(name, input));
         (child.reporter)(&json!({
             "type": "subagent",
             "id": child.id,
@@ -450,4 +479,16 @@ impl Observer for SubObserver<'_> {
         }));
     }
     fn on_tool_result(&mut self, _name: &str, _output: &ToolOutput) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calls_are_summed_up_by_their_main_argument() {
+        assert_eq!(call_summary("bash", &json!({"command": "cargo test\n  --all", "timeout": 5})), "bash: cargo test --all");
+        assert_eq!(call_summary("edit", &json!({"path": "src/main.rs", "old_string": "a"})), "edit: src/main.rs");
+        assert_eq!(call_summary("todo_write", &json!({"todos": []})), "todo_write");
+    }
 }

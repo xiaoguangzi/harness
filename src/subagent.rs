@@ -580,9 +580,9 @@ impl Tool for MessageAgentTool {
         let id = &input.agent_id;
         match subagents.send(id, input.message, input.run_in_background) {
             Err(e) => ToolOutput::error(format!("{e:#}")),
-            Ok(runtime::Sent::Queued) => {
-                ToolOutput::ok(format!("Subagent {id} is running; it will read the message at its next step."))
-            }
+            Ok(runtime::Sent::Queued(progress)) => ToolOutput::ok(format!(
+                "Subagent {id} is running ({progress}); it will read the message at its next step."
+            )),
             Ok(runtime::Sent::Started(_)) if input.run_in_background => ToolOutput::ok(format!(
                 "Subagent {id} is working on the message in the background; its report will arrive in a \
                  later message."

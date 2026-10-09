@@ -240,10 +240,14 @@ pub struct FileTracker {
     /// Each file's modification time when it was recorded, and a counter
     /// value saying how recently that was.
     seen: Arc<Mutex<Seen>>,
-    /// Held while a tool checks, changes and records a file, so calls from
-    /// one response that change the same file apply one after another.
-    changing: Arc<tokio::sync::Mutex<()>>,
 }
+
+/// Held while a tool checks, changes and records a file, so changes to the
+/// same file apply one after another: calls from one response, and those of
+/// agents running at once (subagents, web tasks), each with its own tracker.
+/// Without it, an agent could write a file over another's change that
+/// landed after its check.
+static CHANGING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Default)]
 struct Seen {
@@ -282,10 +286,10 @@ impl FileTracker {
         self.seen.lock().unwrap().files.retain(|path, _| keep.contains(path));
     }
 
-    /// Waits for any other change through this tracker to finish; hold the
+    /// Waits for any other agent's or call's file change to finish; hold the
     /// guard from checking the file until recording the change.
-    pub async fn changing(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.changing.lock().await
+    pub async fn changing(&self) -> tokio::sync::MutexGuard<'static, ()> {
+        CHANGING.lock().await
     }
 
     /// Ok for a new file, or for an existing file read since it last changed.
@@ -299,7 +303,8 @@ impl FileTracker {
                 path.display()
             )),
             Some((seen, _)) if *seen != Self::mtime(path) => Err(format!(
-                "{} changed since it was last read; read it again before changing it",
+                "{} changed since it was last read (another agent, a command or the user may have \
+                 changed it); read it again before changing it",
                 path.display()
             )),
             Some(_) => Ok(()),

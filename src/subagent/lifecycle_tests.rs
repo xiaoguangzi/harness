@@ -231,7 +231,7 @@ async fn a_running_subagent_reads_messages_at_its_next_step() {
         mock.next().await;
         let id = first_id(&subagents);
         let out = tools.run("message_agent", json!({"agent_id": id, "message": "also check the tests"})).await;
-        assert!(out.content.contains("next step"), "{}", out.content);
+        assert!(out.content.contains("(0 tool calls in 0s)") && out.content.contains("next step"), "{}", out.content);
     })
     .await;
     tokio::time::timeout(Duration::from_secs(5), parent.wanted()).await.unwrap();

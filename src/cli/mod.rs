@@ -855,19 +855,37 @@ fn remember_sent(editor: &mut rustyline::Editor<ReplHelper, rustyline::history::
     }
 }
 
-/// Shows that `running` background subagents are still at work until one
-/// reports back; false if the user interrupted the wait.
+/// Shows that `running` background subagents are still at work, and what
+/// they last did, until one reports back; false if the user interrupted the
+/// wait.
 async fn wait_for_reports(agent: &Agent, running: usize, out: &Output) -> bool {
     out.set_status(Some(&format!("Waiting for {running} background {}…", text::plural(running, "subagent"))));
     let mut esc = KeyWatch::start();
-    let reported = tokio::select! {
-        _ = agent.inbox().wanted() => true,
-        _ = tokio::signal::ctrl_c() => false,
-        _ = esc.pressed() => false,
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    let reported = loop {
+        tokio::select! {
+            _ = agent.inbox().wanted() => break true,
+            _ = tokio::signal::ctrl_c() => break false,
+            _ = esc.pressed() => break false,
+            _ = tick.tick() => out.set_status_detail(&background_progress(&agent.subagents().list())),
+        }
     };
     drop(esc);
     out.set_status(None);
     reported
+}
+
+/// The latest call of each running background subagent, for the line
+/// under the status.
+fn background_progress(subagents: &[Value]) -> String {
+    let running = subagents.iter().filter(|s| s["status"] == "running" && s["background"] == true);
+    let lines: Vec<String> = running
+        .map(|s| {
+            let last = s["last_call"].as_str().unwrap_or("starting");
+            format!("{} › {}", text::fit(s["label"].as_str().unwrap_or(""), 32), text::printable(last))
+        })
+        .collect();
+    lines.join(" · ")
 }
 
 #[derive(Debug, PartialEq)]
@@ -1163,6 +1181,9 @@ fn print_tasks(out: &Output, subagents: &[Value], shells: &[(String, String, boo
         ];
         if s["background"] == true {
             info.push("background".into());
+        }
+        if let Some(last) = s["last_call"].as_str().filter(|_| status == "running") {
+            info.push(format!("latest {}", text::printable(last)));
         }
         out.line(format!(
             "  {}  {}  {}  {}",

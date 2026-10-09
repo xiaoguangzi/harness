@@ -192,7 +192,7 @@ The prompt is an input box between two rules that stays on the bottom rows of th
 | `/tools` | list the tools the model can call |
 | `/skills` | list discovered skills |
 | `/agents` | list subagent types, their permission and tools |
-| `/tasks` | list the subagents this conversation started (id, status, model, tool calls, time) and its [background commands](#background-commands) |
+| `/tasks` | list the subagents this conversation started (id, status, model, tool calls, time, a running one's latest call) and its [background commands](#background-commands) |
 | `/stop [id]` | stop a running subagent or background command (`shell_1`), or all of them (see [Subagents](#subagents)) |
 | `/mcp` | list MCP servers, their tools and log files |
 | `/plugins [command]` | list the enabled plugins and what each adds; `/plugins update` fetches their latest versions, and `/plugins install`, `uninstall`, `enable`, `disable`, `configure`, `marketplace …` work as `harness plugin` does (see [Plugins](#plugins)) |
@@ -400,9 +400,10 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 ### Background subagents and follow-ups
 
 - **Foreground** (the default): the `agent` call waits for the report. Interrupting the turn stops the subagent.
-- **Background** (`run_in_background: true`): the call returns at once with the subagent's `agent_id`, and the main agent carries on. When the subagent is done, its report goes to the main agent with its next request: during a turn, after the tool calls running then (or, if the model was writing its answer, it carries on instead of ending the turn); after the turn, in a turn of its own. The REPL starts that turn while the prompt is empty. Anything you have typed is kept, and the report goes along with your message instead. One-shot mode waits for background subagents before it exits, and a web task starts the turn when it is idle. Background subagents keep running when you interrupt the turn.
-- **Follow-ups**: every subagent keeps its conversation. `message_agent` runs a finished or stopped one again on a new message, with its context intact (waiting for its report, or in the background). A running one gets the message at its next step. `stop_agent` stops one; changes it made remain.
+- **Background** (`run_in_background: true`): the call returns at once with the subagent's `agent_id`, and the main agent carries on. When the subagent is done, its report goes to the main agent with its next request: during a turn, after the tool calls running then (or, if the model was writing its answer, it carries on instead of ending the turn); after the turn, in a turn of its own. The REPL starts that turn while the prompt is empty. Anything you have typed is kept, and the report goes along with your message instead. One-shot mode waits for background subagents before it exits, showing what each did last, and a web task starts the turn when it is idle. Background subagents keep running when you interrupt the turn.
+- **Follow-ups**: every subagent keeps its conversation. `message_agent` runs a finished or stopped one again on a new message, with its context intact (waiting for its report, or in the background). A running one gets the message at its next step, and the main agent is told how far it has got (tool calls, time, latest call). `stop_agent` stops one; changes it made remain.
 - `/tasks` lists this conversation's subagents; `/stop <id>` stops one and `/stop` every running one. The main agent hears about subagents you stopped with your next message. In the web UI each subagent's card has a Stop button.
+- Agents running at once (the main agent, its subagents, web tasks) change files one at a time: `edit` and `write` refuse a file another changed since this one read it, rather than write over that change.
 - At most 8 subagents of a conversation run at once, and the 32 most recent are kept for follow-ups. They live in memory only: `/clear`, `/resume`, deleting a web task or quitting stops and forgets them.
 
 ## Plugins
