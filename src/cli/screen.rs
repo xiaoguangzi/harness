@@ -11,6 +11,21 @@ pub struct Screen {
 }
 
 impl Screen {
+    /// Removes the temporary footer and blank viewport padding. The next
+    /// shell prompt follows the transcript, while native history stays put.
+    pub fn finish(&mut self, width: usize, height: usize) -> String {
+        while self.output.last().is_some_and(|line| text::strip_ansi(line).trim().is_empty()) {
+            self.output.pop();
+        }
+        let mut frame = self.draw("", Vec::new(), None, width, height);
+        if self.output.len() >= height.max(1) {
+            // A completely full transcript needs one final row for the
+            // shell, rather than overwriting its last line.
+            frame.push_str("\r\n");
+        }
+        frame
+    }
+
     pub fn draw(
         &mut self,
         printed: &str,
@@ -76,6 +91,37 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_places_the_shell_after_content_and_removes_padding() {
+        let mut screen = Screen::default();
+        screen.draw("banner\n❯ exit\n\n", vec!["rule".into(), "❯ draft".into(), "rule".into()], Some((1, 2)), 80, 24);
+        let frame = screen.finish(80, 24);
+        assert!(frame.contains("❯ exit"));
+        assert!(!frame.contains("draft"));
+        assert!(!frame.contains("rule"));
+        assert!(frame.ends_with("\x1b[3;1H"));
+        assert!(!frame.ends_with("\x1b[24;1H\r\n"));
+    }
+
+    #[test]
+    fn exit_from_a_full_screen_keeps_the_last_transcript_line() {
+        let mut screen = Screen::default();
+        screen.draw("one\ntwo\nthree\n", Vec::new(), None, 20, 3);
+        let frame = screen.finish(20, 3);
+        assert!(frame.contains("three"));
+        assert!(frame.ends_with("\x1b[3;1H\r\n"));
+    }
+
+    #[test]
+    fn exit_after_resize_reflows_before_placing_the_shell() {
+        let mut screen = Screen::default();
+        screen.draw("abcdefgh\n", vec!["footer".into()], None, 20, 6);
+        let frame = screen.finish(5, 6);
+        assert!(frame.contains("abcd"));
+        assert!(frame.contains("efgh"));
+        assert!(frame.ends_with("\x1b[3;1H"));
+    }
 
     #[test]
     fn scrolls_only_transcript_and_reanchors_on_resize() {

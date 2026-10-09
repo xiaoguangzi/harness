@@ -157,10 +157,10 @@ impl Output {
     /// Hands the terminal to a conventional line-based command prompt.
     pub fn leave_screen(&self) {
         let mut state = self.state.lock().unwrap();
-        if state.screen.take().is_some() {
-            let row = text::terminal_height().unwrap_or(24).saturating_sub(1);
+        if let Some(mut viewport) = state.screen.take() {
+            let frame = viewport.finish(text::terminal_width(), text::terminal_height().unwrap_or(24));
             let mut stdout = io::stdout().lock();
-            let _ = write!(stdout, "{}\x1b[0m\x1b[?25h\r\n", input::goto(row));
+            let _ = write!(stdout, "{SYNC_START}{frame}\x1b[0m\x1b[?2004l{SYNC_END}");
             let _ = stdout.flush();
         }
     }
