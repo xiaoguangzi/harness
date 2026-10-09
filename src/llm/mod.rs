@@ -119,6 +119,8 @@ pub struct Client {
     spec: String,
     /// Set by `/effort`; replaces the configured effort for every model.
     effort: Option<Effort>,
+    /// Session override: unset uses config; `Some(None)` follows the main model.
+    subagent_model: Option<Option<String>>,
 }
 
 impl Client {
@@ -130,7 +132,7 @@ impl Client {
             .build()
             .context("building HTTP client")?;
         let spec = providers.default_model.clone();
-        Ok(Self { http, providers: Arc::new(providers), spec, effort: None })
+        Ok(Self { http, providers: Arc::new(providers), spec, effort: None, subagent_model: None })
     }
 
     /// The `provider/model` this client talks to.
@@ -155,7 +157,28 @@ impl Client {
     /// default model if this one's provider is gone.
     pub fn with_providers(&self, providers: Providers) -> Self {
         let spec = if providers.target(&self.spec).is_ok() { self.spec.clone() } else { providers.default_model.clone() };
-        Self { providers: Arc::new(providers), spec, ..self.clone() }
+        let subagent_model = self.subagent_model.clone()
+            .filter(|model| model.as_ref().is_none_or(|spec| providers.target(spec).is_ok()));
+        Self { providers: Arc::new(providers), spec, subagent_model, ..self.clone() }
+    }
+
+    /// The default for new subagents without an agent-specific model.
+    pub fn subagent_model(&self) -> Option<&str> {
+        match &self.subagent_model {
+            Some(model) => model.as_deref(),
+            None => self.providers.subagent_model.as_deref(),
+        }
+    }
+
+    /// Chooses a subagent model for this session, or follows the main model.
+    pub fn set_subagent_model(&mut self, model: Option<&str>) -> Result<()> {
+        let model = model.map(|spec| self.switch(spec).map(|client| client.spec)).transpose()?;
+        self.subagent_model = Some(model);
+        Ok(())
+    }
+
+    pub fn effort_override(&self) -> Option<Effort> {
+        self.effort
     }
 
     /// The effort requests are sent with.
@@ -255,6 +278,23 @@ mod tests {
         assert_eq!((moved.spec(), moved.effort()), ("b/other", Effort::Low));
         assert_eq!(moved.providers().names(), ["b", "c"]);
         assert_eq!(client.with_providers(gateways(&["c"])).spec(), "c/m", "its provider is gone");
+    }
+
+    #[test]
+    fn session_subagent_override_survives_switch_and_reload_and_validates_before_mutating() {
+        let providers = Providers::from_parts(&file(json!({
+            "model": "a/main", "subagent_model": "a/configured",
+            "providers": {"a": {"protocol": "anthropic", "base_url": "http://127.0.0.1:9"},
+                "b": {"protocol": "anthropic", "base_url": "http://127.0.0.1:9"}}
+        })), &no_env).unwrap();
+        let mut client = Client::new(providers.clone()).unwrap();
+        client.set_subagent_model(Some("b/session")).unwrap();
+        assert_eq!(client.switch("a/another").unwrap().subagent_model(), Some("b/session"));
+        assert_eq!(client.with_providers(providers.clone()).subagent_model(), Some("b/session"));
+        assert!(client.set_subagent_model(Some("b/")).is_err());
+        assert_eq!(client.subagent_model(), Some("b/session"));
+        client.set_subagent_model(None).unwrap();
+        assert_eq!(client.with_providers(providers).subagent_model(), None, "follow main overrides config");
     }
 
     /// How the mock server answers one request.

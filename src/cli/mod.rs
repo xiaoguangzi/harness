@@ -2,10 +2,13 @@
 
 mod clipboard;
 mod diff;
+mod dialog;
+mod commands;
 mod input;
 mod keys;
 mod markdown;
 mod menu;
+mod model;
 mod output;
 mod repl;
 mod rewind;
@@ -43,23 +46,23 @@ use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
 const BUILTINS: [(&str, &str); 20] = [
-    ("/help", "show commands and keys"),
-    ("/model", "show the model, or switch with /model <provider>/<model>"),
-    ("/effort", "show the reasoning effort, or set it with /effort <level>"),
-    ("/provider", "list providers and models; /provider add|remove|model|default … changes them"),
+    ("/help", "browse commands; Enter inserts one into the prompt"),
+    ("/model", "choose main/subagent models and effort; /model <provider>/<model> switches directly"),
+    ("/effort", "choose reasoning effort, or set it with /effort <level>"),
+    ("/provider", "manage providers and models; /provider add|remove|model|default … changes them"),
     ("/clear", "start a new conversation"),
     ("/compact", "summarize the conversation to free context; /compact <focus> says what to keep"),
     ("/resume", "pick up an earlier conversation from this directory"),
     ("/rewind", "go back to before an earlier prompt, with the code, the conversation or both (or Esc Esc)"),
     ("/init", "have the model write AGENTS.md, or improve it; /init <notes> says what else to cover"),
     ("/usage", "show the tokens used so far and how full the context is"),
-    ("/tools", "list the tools the model can call"),
-    ("/skills", "list available skills"),
-    ("/agents", "list subagent types and their tools"),
-    ("/tasks", "list the subagents and background commands this conversation started"),
-    ("/stop", "stop running subagents, or one with /stop <id>"),
-    ("/mcp", "list MCP servers and their tools"),
-    ("/plugins", "list plugins; /plugins install|uninstall|enable|disable|update|marketplace … manages them"),
+    ("/tools", "browse tool descriptions and input schemas"),
+    ("/skills", "browse skills; Enter inserts an invocation into the prompt"),
+    ("/agents", "browse subagent types, models, permissions and tools"),
+    ("/tasks", "browse this conversation's tasks and task actions"),
+    ("/stop", "choose a running task to stop, or stop one with /stop <id>"),
+    ("/mcp", "browse MCP servers, tools and connection errors"),
+    ("/plugins", "manage plugins; /plugins install|uninstall|enable|disable|update|marketplace … also works"),
     ("/reload-plugins", "load plugins, skills, agents and hooks again, for the next conversation"),
     ("/sandbox", "show what the sandbox allows commands to do"),
     ("/exit", "quit (or exit, Ctrl-D)"),
@@ -98,7 +101,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 None => anyhow::bail!("no saved conversation in this directory"),
             },
             Resume::Pick if one_shot => anyhow::bail!("--resume needs a session id in one-shot mode"),
-            Resume::Pick => pick_session(rec, &out)?,
+            Resume::Pick => pick_session(rec, &out, boxed).await?,
         };
         if let Some(id) = id {
             resume_session(agent, rec, &id, &out, !one_shot).await?;
@@ -261,7 +264,12 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 (line, helper.take_images())
             }
         };
-        match render_skill(parse_input(&line, &skills)).await {
+        let input = render_skill(parse_input(&line, &skills)).await;
+        let input = if boxed && line.split_whitespace().count() == 1 {
+            let Some(input) = commands::interactive(input, agent, env, &skills, &out, &mut typing).await else { continue };
+            input
+        } else { input };
+        match input {
             Input::Empty => {}
             Input::Exit => break,
             Input::Help => print_help(&out, &skills),
@@ -294,7 +302,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 };
                 let id = match id {
                     Some(id) => Ok(Some(id)),
-                    None => pick_session(rec, &out),
+                    None => pick_session(rec, &out, boxed).await,
                 };
                 let resumed = match id {
                     Ok(Some(id)) => {
@@ -313,7 +321,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                     out.line(out.paint("31", &format!("{e:#}")));
                 }
             }
-            Input::Rewind => match rewind::run(agent, &out, &mut typing) {
+            Input::Rewind => match rewind::run(agent, &out, &mut typing, boxed).await {
                 Ok(true) => {
                     if let Some(rec) = recorder.as_mut() {
                         save_session(agent, rec, &out);
@@ -382,14 +390,30 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
             },
             Input::Sandbox => print_sandbox(&out),
             Input::Usage => print_usage(&out, agent),
-            Input::Model(None) => print_models(&out, agent),
-            Input::Model(Some(spec)) => match agent.client().switch(&spec) {
-                Ok(client) => {
-                    out.line(format!("model: {}", out.paint("1", client.spec())));
-                    agent.set_client(client);
+            Input::Model(spec) => {
+                if spec.is_none() && boxed {
+                    if let Some(client) = model::pick(&out, agent.client()).await {
+                        out.line(format!("model: {}", out.paint("1", client.spec())));
+                        out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
+                        out.line(format!("effort: {}", out.paint("1", client.effort().as_str())));
+                        agent.set_client(client);
+                    }
+                    continue;
                 }
-                Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
-            },
+                let spec = match spec {
+                    None => { print_models(&out, agent); None }
+                    spec => spec,
+                };
+                if let Some(spec) = spec {
+                    match agent.client().switch(&spec) {
+                        Ok(client) => {
+                            out.line(format!("model: {}", out.paint("1", client.spec())));
+                            agent.set_client(client);
+                        }
+                        Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+                    }
+                }
+            }
             Input::Providers(args) => {
                 let handoff = out.handoff();
                 let managed = tokio::task::block_in_place(|| llm::manage::run(&args, &mut plugins::manage::TerminalAsk));
@@ -545,7 +569,7 @@ fn history_path() -> Option<std::path::PathBuf> {
 
 /// Lists this directory's saved conversations and asks which one to resume;
 /// `None` when there are none, or the user picked none.
-fn pick_session(rec: &Recorder, out: &Output) -> Result<Option<String>> {
+async fn pick_session(rec: &Recorder, out: &Output, boxed: bool) -> Result<Option<String>> {
     let sessions: Vec<session::Meta> =
         rec.store().list(&rec.meta().cwd).into_iter().filter(|m| m.id != rec.meta().id).take(LISTED_SESSIONS).collect();
     if sessions.is_empty() {
@@ -553,6 +577,14 @@ fn pick_session(rec: &Recorder, out: &Output) -> Result<Option<String>> {
         return Ok(None);
     }
     let now = session::now();
+    if boxed {
+        let items = sessions.iter().map(|m| dialog::Item::new(
+            if m.title.is_empty() { "(untitled)" } else { &m.title },
+            format!("{} · {} messages · {}", session::ago(m.updated, now), m.messages, m.model),
+        ).details(vec![format!("Session: {}", m.id), format!("Directory: {}", m.cwd)])).collect();
+        let selected = dialog::choose(out, "Resume conversation", "Enter resumes · Tab details · Esc cancels", items, 0).await;
+        return Ok(selected.map(|i| sessions[i].id.clone()));
+    }
     let width = text::terminal_width();
     for (i, m) in sessions.iter().enumerate() {
         let when = session::ago(m.updated, now);
@@ -1016,8 +1048,8 @@ fn effort_help(effort: llm::Effort) -> &'static str {
     }
 }
 
-fn print_help(out: &Output, skills: &[Skill]) {
-    let keys = [
+fn help_keys() -> [(&'static str, &'static str); 9] {
+    [
         ("/<skill> [args]", "run a skill"),
         ("@path", "attach a file, directory, image or PDF; @ opens a file menu (@file#L10-20 for lines)"),
         ("Ctrl+V", "paste an image from the clipboard (files copied in Finder or a file manager become @ mentions)"),
@@ -1027,7 +1059,11 @@ fn print_help(out: &Output, skills: &[Skill]) {
         ("Esc", "interrupt the running turn"),
         ("Esc Esc", "at an empty prompt: go back to before an earlier prompt (/rewind)"),
         ("Ctrl-C", "interrupt the running turn; twice at the prompt to quit"),
-    ];
+    ]
+}
+
+fn print_help(out: &Output, skills: &[Skill]) {
+    let keys = help_keys();
     for (key, what) in BUILTINS.iter().chain(&keys) {
         out.line(format!("  {} {what}", out.paint("1", &text::pad(key, 16))));
     }
@@ -1117,9 +1153,8 @@ fn print_skills(out: &Output, skills: &[Skill]) {
 fn print_models(out: &Output, agent: &Agent) {
     let providers = agent.client().providers();
     out.line(format!("current: {}", out.paint("1", agent.model())));
-    if let Some(sub) = &providers.subagent_model {
-        out.line(format!("subagents: {sub}"));
-    }
+    out.line(format!("subagents: {}", agent.client().subagent_model().unwrap_or("follow main model")));
+    out.line(format!("effort: {}", agent.client().effort().as_str()));
     for name in providers.names() {
         let protocol = providers.protocol_of(name).map_or("?", llm::Protocol::as_str);
         out.line(format!("provider {} ({protocol})", out.paint("1", name)));

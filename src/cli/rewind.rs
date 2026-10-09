@@ -33,7 +33,7 @@ const CHOICES: [(Restore, &str); 3] = [
 /// Lists the conversation's prompts, asks which to go back to before and
 /// what to put back, and does it. A prompt taken out of the conversation
 /// goes back into the input box. Returns whether anything changed.
-pub(super) fn run(agent: &mut Agent, out: &Output, typing: &mut Typing) -> Result<bool> {
+pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, boxed: bool) -> Result<bool> {
     let checkpoints = agent.file_history().checkpoints();
     if checkpoints.is_empty() {
         out.line(out.paint("2", "no earlier prompts to rewind to"));
@@ -42,7 +42,7 @@ pub(super) fn run(agent: &mut Agent, out: &Output, typing: &mut Typing) -> Resul
     let listed: Vec<_> = checkpoints.iter().rev().take(LISTED).collect();
     let now = session::now();
     let width = text::terminal_width();
-    for (i, c) in listed.iter().enumerate() {
+    for (i, c) in listed.iter().enumerate().filter(|_| !boxed) {
         let when = session::ago(c.time, now);
         let info = match c.files.len() {
             0 => String::new(),
@@ -57,21 +57,36 @@ pub(super) fn run(agent: &mut Agent, out: &Output, typing: &mut Typing) -> Resul
             out.paint("2", &info),
         ));
     }
-    let Some(n) = ask(out, "rewind to before which prompt? (number, Enter to cancel) ", listed.len())? else {
+    let picked = if boxed {
+        let items = listed.iter().map(|c| super::dialog::Item::new(
+            first_line(&c.prompt), format!("{} · {} files tracked", session::ago(c.time, now), c.files.len()),
+        ).details(vec![c.prompt.clone()])).collect();
+        super::dialog::choose(out, "Rewind conversation", "Choose a prompt; restoration options follow · Esc cancels", items, 0).await.map(|i| i + 1)
+    } else { ask(out, "rewind to before which prompt? (number, Enter to cancel) ", listed.len())? };
+    let Some(n) = picked else {
         return Ok(false);
     };
     let checkpoint = listed[n - 1];
 
     let changes = agent.file_history().changes(checkpoint.message);
-    match &changes {
+    if !boxed { match &changes {
         Ok(changes) if changes.is_empty() => out.line(out.paint("2", "  the code is as it was then")),
         Ok(changes) => out.lines(&change_lines(out, changes)),
         Err(e) => out.line(out.paint("33", &format!("  the code cannot be restored: {e:#}"))),
-    }
-    for (i, (_, label)) in CHOICES.iter().enumerate() {
+    } }
+    for (i, (_, label)) in CHOICES.iter().enumerate().filter(|_| !boxed) {
         out.line(format!("{} {label}", out.paint("1", &format!("{:>3}", i + 1))));
     }
-    let Some(choice) = ask(out, "restore what? (number, Enter to cancel) ", CHOICES.len())? else {
+    let picked = if boxed {
+        let details = match &changes {
+            Ok(changes) if changes.is_empty() => vec!["The code is already as it was then".into()],
+            Ok(changes) => change_lines(out, changes),
+            Err(e) => vec![format!("The code cannot be restored: {e:#}")],
+        };
+        let items = CHOICES.iter().map(|(_, label)| super::dialog::Item::new(*label, "Enter applies this restoration; Esc leaves the conversation and files unchanged").details(details.clone())).collect();
+        super::dialog::choose(out, "Restore what?", "Review the changes · Tab full details · Esc cancels", items, 0).await.map(|i| i + 1)
+    } else { ask(out, "restore what? (number, Enter to cancel) ", CHOICES.len())? };
+    let Some(choice) = picked else {
         return Ok(false);
     };
     let restore = CHOICES[choice - 1].0;

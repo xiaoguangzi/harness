@@ -412,7 +412,7 @@ impl AgentTool {
 
 /// The client for `def` when the caller's model is `parent`.
 fn client_from(def: &AgentDef, parent: &Client) -> anyhow::Result<Client> {
-    match def.model.as_deref().or(parent.providers().subagent_model.as_deref()) {
+    match def.model.as_deref().or(parent.subagent_model()) {
         Some(spec) => parent.switch(spec),
         None => Ok(parent.clone()),
     }
@@ -664,6 +664,22 @@ mod tests {
 
     fn names(r: &ToolRegistry) -> Vec<&str> {
         r.names().collect()
+    }
+
+    #[test]
+    fn new_subagents_use_session_model_and_effort_with_agent_specific_precedence() {
+        let mut parent = client();
+        parent.set_subagent_model(Some("gw/child-model")).unwrap();
+        parent.set_effort(Some(crate::llm::Effort::Low));
+        let child = client_from(&explore(), &parent).unwrap();
+        assert_eq!((child.spec(), child.effort()), ("gw/child-model", crate::llm::Effort::Low));
+        let mut explicit = explore();
+        explicit.model = Some("gw/agent-specific".into());
+        assert_eq!(client_from(&explicit, &parent).unwrap().spec(), "gw/agent-specific");
+        parent.set_subagent_model(None).unwrap();
+        parent = parent.switch("gw/new-main").unwrap();
+        assert_eq!(client_from(&explore(), &parent).unwrap().spec(), "gw/new-main");
+        assert_eq!(child.spec(), "gw/child-model", "existing children keep their client");
     }
 
     #[test]

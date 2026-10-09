@@ -49,6 +49,7 @@ pub struct Output {
 struct State {
     screen: Option<Screen>,
     menu: Option<Arc<Menu>>,
+    panel: Option<Arc<Mutex<dyn super::dialog::Panel>>>,
     status: Option<Status>,
     /// The input box, while a turn runs in the REPL.
     input: Option<InputBox>,
@@ -106,6 +107,7 @@ impl Output {
         let state = State {
             screen: None,
             menu: None,
+            panel: None,
             status: None,
             input: None,
             drawn: false,
@@ -151,6 +153,12 @@ impl Output {
     pub fn set_menu(&self, menu: Option<Arc<Menu>>) {
         let mut state = self.state.lock().unwrap();
         state.menu = menu;
+        self.show(&mut state, "");
+    }
+
+    pub(super) fn set_panel(&self, panel: Option<Arc<Mutex<dyn super::dialog::Panel>>>) {
+        let mut state = self.state.lock().unwrap();
+        state.panel = panel;
         self.show(&mut state, "");
     }
 
@@ -261,7 +269,7 @@ impl Output {
                 tick.tick().await;
                 let mut state = this.state.lock().unwrap();
                 let resized = state.size != (text::terminal_width(), text::terminal_height());
-                if state.status.is_some() || (state.input.is_some() && resized) {
+                if state.status.is_some() || ((state.input.is_some() || state.panel.is_some()) && resized) {
                     state.frame += 1;
                     this.show(&mut state, "");
                 }
@@ -380,7 +388,7 @@ impl Output {
 
     /// Whether the status or input box is to be drawn.
     fn redraws(&self, state: &State) -> bool {
-        (self.styled || state.screen.is_some()) && (state.status.is_some() || state.input.is_some())
+        (self.styled || state.screen.is_some()) && (state.status.is_some() || state.input.is_some() || state.panel.is_some())
     }
 
     pub fn line(&self, line: impl AsRef<str>) {
@@ -528,6 +536,9 @@ pub fn replay(out: &Output, messages: &[Message]) {
 /// input box also says where the cursor goes: (row, column).
 fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, Option<(usize, usize)>) {
     let width = text::terminal_width();
+    if let Some(panel) = &state.panel {
+        return panel.lock().unwrap().render(width, text::terminal_height().unwrap_or(24), &paint);
+    }
     let mut rows = Vec::new();
     if let Some(status) = &state.status {
         let mut hint = vec![elapsed(status.since.elapsed().as_secs())];

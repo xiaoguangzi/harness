@@ -148,7 +148,7 @@ harness provider list              # also: remove <name>, model remove <provider
 
 `add` on an existing provider changes only what its options give (with no options, it asks again, Enter keeping each value). The key is stored as typed, so `${VAR}` (in single quotes on the shell) keeps it out of the file. When there is no working default model, `add` makes its first model the default. Each change says when the setup cannot be used yet, for example without a default model.
 
-Switch models mid-conversation with `/model <provider>/<model>`; `/model` alone lists providers and models. `/effort <level>` changes the effort for the rest of the session (kept across `/model`), and `/effort auto` goes back to the configured one. The history is kept in Anthropic form and converted for OpenAI (`function_call` / `function_call_output`, `input_image`, `input_file`); requests are stateless (`store: false`), with reasoning items replayed from their encrypted content. Model-bound blocks (Anthropic thinking, OpenAI reasoning) are only sent back to the model that produced them. Subagents can use a different gateway through `subagent_model` or an agent's `model`.
+Switch models mid-conversation with `/model <provider>/<model>`, or run `/model` without arguments to open the model settings panel. Tab switches between the main model and subagent default, ↑/↓ selects a model, typing filters, and ←/→ adjusts the shared session effort (`auto`, `low`, `medium`, `high`, `xhigh`, `max`). The panel shows both model choices, protocol, configured context/output limits and effort. Enter applies all previewed changes to this session; Esc cancels them. Subagents can follow the main model or use a separate default; agent-specific models still take priority and existing children keep their original model. Redirected input still prints providers, models and effective settings. `/effort <level>` changes the effort for the rest of the session (kept across `/model`), and `/effort auto` goes back to the configured one. The history is kept in Anthropic form and converted for OpenAI (`function_call` / `function_call_output`, `input_image`, `input_file`); requests are stateless (`store: false`), with reasoning items replayed from their encrypted content. Model-bound blocks (Anthropic thinking, OpenAI reasoning) are only sent back to the model that produced them. Subagents can use a different gateway through `subagent_model` or an agent's `model`.
 
 ## Attaching files with `@`
 
@@ -177,25 +177,27 @@ The assistant's Markdown is rendered as it streams (a line at a time; tables are
 
 On an interactive terminal, startup claims the current screen and places the conversation at the top, preserving the shell and conversation in native terminal scrollback. The input box stays between two rules at the bottom, while waiting and while a turn runs. Commands and files open a menu below it; the box moves up to make room. One renderer handles text wrapping, cursor placement, menus and resizing, including when `NO_COLOR` disables colors. After a terminal reset or clear, the next edit, resize or running status redraw restores the viewport. What you type while the model works goes into it: press Enter and the message is listed above the box until the model gets it with its next request (after the tool calls running then; if the model was writing its answer, it carries on instead of ending the turn), and then it shows in the conversation. `@path` mentions and Ctrl+V work there too; the menus and history only at the prompt. A `/command` sent while a turn runs waits for the turn to end. To change your mind, press ↑ on the box's first line (the empty box says so while messages are queued): the messages the model has not got yet come back into the box, ahead of what you typed, to edit and send again, as in Claude Code. If you interrupt the turn, messages the model has not got yet go back into the box, and anything left in the box is still there at the prompt after the turn.
 
+Interactive command panels use the available terminal width, with headings and spacing and no borders. Bare selection commands open keyboard panels: `/effort`, `/resume`, `/rewind`, `/tasks`, `/stop`, `/provider` and `/plugins`. Use ↑/↓ to select, type to filter, Enter to continue and Esc to cancel or go back. `/help` and `/skills` can insert a command into the input box for you to edit before running it. `/tools`, `/agents`, `/mcp`, `/usage` and `/sandbox` open searchable read-only inspectors; Tab shows the selected item’s full details, ↑/↓ scroll, and Tab/Esc returns. Commands with explicit arguments and redirected input keep their line-based behavior. `/clear`, `/compact`, `/init`, `/reload-plugins` and `/exit` remain direct actions.
+
 | Command / key | |
 |---|---|
-| `/help` | list commands |
-| `/model [spec]` | show providers and models, or switch to `<provider>/<model>` |
-| `/provider [command]` | list the providers and models; `/provider add`, `remove`, `model add`, `model remove` and `default` work as `harness provider` does and apply at once (see [LLM gateways](#llm-gateways)) |
-| `/effort [level]` | show the reasoning effort, or set it: `low`, `medium`, `high`, `xhigh`, `max`, or `auto` for the configured one |
+| `/help` | browse commands; Enter inserts one into the prompt |
+| `/model [spec]` | configure main/subagent models and effort, or switch the main model directly to `<provider>/<model>` |
+| `/provider [command]` | open provider management;  `/provider add`, `remove`, `model add`, `model remove` and `default` work as `harness provider` does and apply at once (see [LLM gateways](#llm-gateways)) |
+| `/effort [level]` | choose reasoning effort, or set it directly: `low`, `medium`, `high`, `xhigh`, `max`, or `auto` for the configured one |
 | `/clear` | start a new conversation |
 | `/compact [focus]` | summarize the conversation to free context (see [Compaction](#compaction)); `focus` says what the summary should keep |
 | `/resume [id]` | pick up an earlier conversation from this directory (see [Resuming](#resuming-conversations)) |
 | `/rewind` | go back to before an earlier prompt, with the code, the conversation or both (see [Rewinding](#rewinding)) |
 | `/init [notes]` | have the model write the project's `AGENTS.md`, or improve it (see [Project notes](#project-notes)) |
 | `/usage` | show the tokens used since the REPL started, per model (requests, input, cache reads and writes, output; subagents and compaction included, kept across `/clear` and `/resume`), and about how much of the context window the conversation takes |
-| `/tools` | list the tools the model can call |
-| `/skills` | list discovered skills |
-| `/agents` | list subagent types, their permission and tools |
+| `/tools` | browse tool descriptions and input schemas |
+| `/skills` | browse discovered skills; Enter inserts an invocation |
+| `/agents` | browse subagent types, models, permissions and tools |
 | `/tasks` | list the subagents this conversation started (id, status, model, tool calls, time, a running one's latest call) and its [background commands](#background-commands) |
-| `/stop [id]` | stop a running subagent or background command (`shell_1`), or all of them (see [Subagents](#subagents)) |
+| `/stop [id]` | choose one or all running tasks to stop; an id stops that subagent or background command (`shell_1`) directly (see [Subagents](#subagents)) |
 | `/mcp` | list MCP servers, their tools and log files |
-| `/plugins [command]` | list the enabled plugins and what each adds; `/plugins update` fetches their latest versions, and `/plugins install`, `uninstall`, `enable`, `disable`, `configure`, `marketplace …` work as `harness plugin` does (see [Plugins](#plugins)) |
+| `/plugins [command]` | open plugin management;  `/plugins update` fetches their latest versions, and `/plugins install`, `uninstall`, `enable`, `disable`, `configure`, `marketplace …` work as `harness plugin` does (see [Plugins](#plugins)) |
 | `/reload-plugins` | load the plugins, skills, commands, agents and hooks again from the settings, for the next conversation: at once if this one is empty, else from `/clear` or `/resume` on |
 | `/sandbox` | show what the sandbox allows (see [Sandbox](#sandbox)) |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
@@ -205,13 +207,13 @@ On an interactive terminal, startup claims the current screen and places the con
 | ↑ while a turn runs | take the queued messages the model has not got yet back into the input box, to edit |
 | Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted. At the prompt, press it twice to quit |
 | `\` at line end, Alt+Enter | continue the message on a new line (Shift+Enter also works when the terminal sends a distinct key sequence) |
-| `/` | open the command menu under the prompt; it narrows as you type, ↑/↓ select, Tab fills in, Enter runs. After `/model ` it lists models |
+| `/` | open the command menu under the prompt; it narrows as you type, ↑/↓ select, Tab fills in, Enter runs. Run `/model` to configure main/subagent models and effort; `/model ` also offers model completion |
 | `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |
 | Ctrl+V | paste an image from the clipboard (see [Pasting images](#pasting-images)) |
 
 ## Background commands
 
-`bash` with `run_in_background: true` starts a command that keeps running, such as a dev server, a watcher or a long build, and returns its id (`shell_1`) at once. `bash_output` returns what it printed since the last look (stdout and stderr together, the newest 30000 bytes of it; up to 1 MB is kept) and whether it still runs; `kill_shell` stops it and the processes it started. A command that exits by itself is reported to the model, which then gets a turn if it is idle, like a background subagent's report. Background commands run under the same sandbox and file-change rules as other `bash` commands, at most 8 at once per conversation. `/tasks` lists them, `/stop shell_1` stops one and `/stop` all of them (the model is told); `/clear`, `/resume`, deleting a web task or quitting kills them.
+`bash` with `run_in_background: true` starts a command that keeps running, such as a dev server, a watcher or a long build, and returns its id (`shell_1`) at once. `bash_output` returns what it printed since the last look (stdout and stderr together, the newest 30000 bytes of it; up to 1 MB is kept) and whether it still runs; `kill_shell` stops it and the processes it started. A command that exits by itself is reported to the model, which then gets a turn if it is idle, like a background subagent's report. Background commands run under the same sandbox and file-change rules as other `bash` commands, at most 8 at once per conversation. `/tasks` browses them, `/stop shell_1` stops one, and `/stop` lets you choose one or all of them (the model is told); `/clear`, `/resume`, deleting a web task or quitting kills them.
 
 ## Compaction
 

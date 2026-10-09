@@ -149,7 +149,7 @@ harness provider list              # 另有：remove <name>、model remove <prov
 
 对已有的 provider 执行 `add` 只修改选项给出的部分（不带选项时重新逐项询问，直接回车保留原值）。密钥按输入原样保存，所以写 `${VAR}`（在 shell 中用单引号）可以不把它写进文件。没有可用的默认模型时，`add` 把它的第一个模型设为默认模型。每次修改后，如果配置还不能使用（例如没有默认模型），会说明原因。
 
-会话中途可用 `/model <provider>/<model>` 切换模型；单独输入 `/model` 会列出 provider 和模型。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
+会话中途可用 `/model <provider>/<model>` 直接切换模型，或输入无参数的 `/model` 并回车打开模型设置面板：Tab 切换主模型和子代理默认模型，↑/↓ 选择模型，输入文字筛选，←/→ 调整共同的会话 effort（`auto`、`low`、`medium`、`high`、`xhigh`、`max`）。面板显示两个模型选择、协议、配置的上下文/输出上限和 effort；Enter 一次应用所有预览修改，Esc 放弃修改，仅影响本次会话。子代理默认模型可设置为跟随主模型，也可独立选择；代理自身指定的模型仍优先，已有子代理保留原模型。重定向输入时仍打印 provider、模型列表和实际生效的设置。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
 
 ## 用 `@` 附加文件
 
@@ -178,25 +178,27 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 
 交互式终端启动后会占满当前屏幕，对话从顶部开始，shell 和对话输出保留在终端原生滚动历史中。输入框夹在两条横线之间，在等待输入和模型运行期间都固定在底部；命令和文件菜单在输入框下方展开，输入框会向上让出空间。文本换行、光标、菜单和窗口缩放由同一个渲染器处理，设置 `NO_COLOR` 也只关闭颜色，仍保留布局。终端 Reset 或 Clear Buffer 后，下一次编辑、缩放或运行状态刷新会恢复布局。模型工作时输入的内容会进入这个输入框：按 Enter 后，这条消息列在输入框上方，直到模型在下一次请求中拿到它（跟在当时正在运行的工具调用结果之后；如果模型正在写回答，它会继续而不是结束本轮），之后它显示在会话中。`@路径` 提及和 Ctrl+V 在这里同样可用；菜单和历史只在提示符处可用。一轮运行期间发送的 `/命令` 会等本轮结束再执行。想改主意时，在输入框第一行按 ↑（有排队消息时空输入框会给出提示）：模型尚未拿到的消息会回到输入框中、排在你已输入的内容之前，可以修改后重新发送，与 Claude Code 一样。如果中断本轮，模型尚未拿到的消息会回到输入框中；本轮结束后，输入框里剩下的内容仍会保留在提示符中。
 
+交互面板按终端可用宽度展开，使用标题和留白，不绘制边框或分隔线。无参数的选择类命令会打开键盘交互面板：`/effort`、`/resume`、`/rewind`、`/tasks`、`/stop`、`/provider` 和 `/plugins`。↑/↓ 选择，输入文字筛选，Enter 继续，Esc 取消或返回。`/help` 和 `/skills` 可将选中的命令填入输入框，便于补充参数后执行。`/tools`、`/agents`、`/mcp`、`/usage` 和 `/sandbox` 提供可搜索的只读详情面板；Tab 展开完整详情，↑/↓ 滚动，Tab/Esc 返回。带参数的命令和重定向输入保留原来的行为；`/clear`、`/compact`、`/init`、`/reload-plugins` 和 `/exit` 继续直接执行。
+
 | 命令 / 按键 | 说明 |
 |---|---|
-| `/help` | 列出命令 |
-| `/model [spec]` | 显示 provider 和模型，或切换到 `<provider>/<model>` |
-| `/provider [子命令]` | 列出 provider 和模型；`/provider add`、`remove`、`model add`、`model remove`、`default` 与 `harness provider` 相同，并立即生效（见 [LLM 网关](#llm-网关)） |
-| `/effort [level]` | 显示推理强度，或设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
+| `/help` | 浏览命令，Enter 将选项填入输入框 |
+| `/model [spec]` | 设置主模型、子代理默认模型及 effort，或直接切换主模型到 `<provider>/<model>` |
+| `/provider [子命令]` | 打开 provider 管理；`/provider add`、`remove`、`model add`、`model remove`、`default` 与 `harness provider` 相同，并立即生效（见 [LLM 网关](#llm-网关)） |
+| `/effort [level]` | 交互选择推理强度，或直接设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
 | `/clear` | 开始新会话 |
 | `/compact [重点]` | 总结会话以腾出上下文（见[上下文压缩](#上下文压缩)）；`重点` 指定摘要要特别保留的内容 |
 | `/resume [id]` | 继续当前目录下之前的会话（见[恢复会话](#恢复会话)） |
 | `/rewind` | 回到之前某条提示之前，恢复代码、对话或两者（见[回退](#回退)） |
 | `/init [说明]` | 让模型编写项目的 `AGENTS.md`，已有时改进它（见[项目说明](#项目说明)） |
 | `/usage` | 按模型显示 REPL 启动以来用掉的 token（请求数、输入、缓存读取与写入、输出；包括子代理和上下文压缩，`/clear` 和 `/resume` 后不清零），以及当前会话大约占用了多少上下文窗口 |
-| `/tools` | 列出模型可调用的工具 |
-| `/skills` | 列出发现的技能 |
-| `/agents` | 列出子代理类型及其权限和工具 |
+| `/tools` | 浏览工具说明和输入参数 schema |
+| `/skills` | 浏览技能，Enter 将调用命令填入输入框 |
+| `/agents` | 浏览子代理类型、模型、权限和工具 |
 | `/tasks` | 列出本会话启动的子代理（ID、状态、模型、工具调用次数、耗时、运行中子代理最近的一次调用）和[后台命令](#后台命令) |
-| `/stop [id]` | 停止一个运行中的子代理或后台命令（`shell_1`），或全部停止（见[子代理](#子代理subagents)） |
+| `/stop [id]` | 选择一个或全部运行中的任务停止；指定 ID 时直接停止对应子代理或后台命令（`shell_1`）（见[子代理](#子代理subagents)） |
 | `/mcp` | 列出 MCP 服务器、其工具和日志文件 |
-| `/plugins [子命令]` | 列出已启用的插件及各自提供的内容；`/plugins update` 拉取它们的最新版本，`/plugins install`、`uninstall`、`enable`、`disable`、`configure`、`marketplace …` 与 `harness plugin` 相同（见[插件](#插件plugins)） |
+| `/plugins [子命令]` | 打开插件管理；`/plugins update` 拉取它们的最新版本，`/plugins install`、`uninstall`、`enable`、`disable`、`configure`、`marketplace …` 与 `harness plugin` 相同（见[插件](#插件plugins)） |
 | `/reload-plugins` | 从配置重新加载插件、技能、命令、代理和 hook，供下一个会话使用：当前会话还是空的则立即生效，否则从 `/clear` 或 `/resume` 起生效 |
 | `/sandbox` | 显示沙箱允许的操作（见[沙箱](#沙箱)） |
 | `/<skill> [args]` | 直接运行一个技能（一次性模式同样可用：`harness /greet Bob`） |
@@ -206,13 +208,13 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | 一轮运行期间按 ↑ | 把模型尚未拿到的排队消息取回输入框，以便修改 |
 | Ctrl-C | 中断运行中的轮次：运行中的命令被终止，并告知模型请求已被中断。在提示符处连按两次退出 |
 | 行尾 `\`、Alt+Enter | 在新行继续这条消息；终端能发送独立键序列时也支持 Shift+Enter |
-| `/` | 在提示符下方打开命令菜单；随输入收窄，↑/↓ 选择，Tab 填入，Enter 运行。`/model ` 之后会列出模型 |
+| `/` | 在提示符下方打开命令菜单；随输入收窄，↑/↓ 选择，Tab 填入，Enter 运行。执行 `/model` 设置主模型、子代理模型及 effort；`/model ` 也可补全模型 |
 | `@` | 打开文件菜单（见[用 `@` 附加文件](#用--附加文件)） |
 | Ctrl+V | 粘贴剪贴板中的图片（见[粘贴图片](#粘贴图片)） |
 
 ## 后台命令
 
-`bash` 加上 `run_in_background: true` 会启动一个持续运行的命令（如开发服务器、watcher 或耗时的构建），并立即返回它的 ID（`shell_1`）。`bash_output` 返回它自上次查看以来的输出（stdout 和 stderr 合在一起，最多返回最新的 30000 字节；最多保留 1 MB）以及它是否仍在运行；`kill_shell` 停止它及其启动的进程。自行退出的命令会通知模型，模型空闲时会因此开始新的一轮，与后台子代理的报告相同。后台命令与其他 `bash` 命令一样受沙箱和文件修改规则约束，每个会话最多同时运行 8 个。`/tasks` 列出它们，`/stop shell_1` 停止一个，`/stop` 全部停止（会告知模型）；`/clear`、`/resume`、删除 Web 任务或退出程序都会杀掉它们。
+`bash` 加上 `run_in_background: true` 会启动一个持续运行的命令（如开发服务器、watcher 或耗时的构建），并立即返回它的 ID（`shell_1`）。`bash_output` 返回它自上次查看以来的输出（stdout 和 stderr 合在一起，最多返回最新的 30000 字节；最多保留 1 MB）以及它是否仍在运行；`kill_shell` 停止它及其启动的进程。自行退出的命令会通知模型，模型空闲时会因此开始新的一轮，与后台子代理的报告相同。后台命令与其他 `bash` 命令一样受沙箱和文件修改规则约束，每个会话最多同时运行 8 个。`/tasks` 浏览任务，`/stop shell_1` 停止一个，`/stop` 可选择停止一个或全部任务（会告知模型）；`/clear`、`/resume`、删除 Web 任务或退出程序都会杀掉它们。
 
 ## 上下文压缩
 
