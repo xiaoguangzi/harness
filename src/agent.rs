@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
@@ -67,6 +67,8 @@ pub trait Observer: Send {
     /// A hook has something for the user: its `systemMessage`, what it
     /// blocked, or how it failed.
     fn on_hook(&mut self, _message: &str) {}
+    /// Empty when no tool is waiting; otherwise the task IDs being awaited.
+    fn on_waiting(&mut self, _tasks: &[String]) {}
 }
 
 /// Messages for the model that arrive from elsewhere while it works or
@@ -94,6 +96,7 @@ struct Entry {
     /// Whether it should start a turn of its own, rather than wait for the
     /// next one.
     wake: bool,
+    completion: Option<String>,
 }
 
 impl Inbox {
@@ -106,18 +109,44 @@ impl Inbox {
     /// Queues content blocks for the model, like [`Inbox::push`]; returns
     /// an id to follow them by.
     pub fn push_content(&self, blocks: Vec<Value>, wake: bool) -> u64 {
+        self.enqueue(blocks, wake, None)
+    }
+
+    pub fn push_completion(&self, key: String, text: String) {
+        self.enqueue(vec![json!({"type": "text", "text": text})], true, Some(key));
+    }
+
+    /// Explicitly collected results must not also wake a later turn.
+    pub fn acknowledge(&self, key: &str) {
+        self.queue.lock().unwrap().entries.retain(|e| e.completion.as_deref() != Some(key));
+    }
+
+    pub async fn input_wanted(&self) {
+        loop {
+            let arrived = self.arrived.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+            if self.queue.lock().unwrap().entries.iter().any(|e| e.wake && e.completion.is_none()) { return; }
+            arrived.await;
+        }
+    }
+
+    fn enqueue(&self, blocks: Vec<Value>, wake: bool, completion: Option<String>) -> u64 {
+        let deferred = completion.is_some();
         let id = {
             let mut queue = self.queue.lock().unwrap();
             let id = queue.next_id;
             queue.next_id += 1;
-            queue.entries.push(Entry { id, blocks, wake });
+            queue.entries.push(Entry { id, blocks, wake, completion });
             id
         };
         if wake {
             self.arrived.notify_waiters();
             let hook = self.on_wake.lock().unwrap().clone();
             if let Some(hook) = hook {
-                hook();
+                // Completion is published under the task state lock. Invoke
+                // frontend hooks outside that lock to avoid lock inversion.
+                if deferred { tokio::spawn(async move { hook(); }); } else { hook(); }
             }
         }
         id
@@ -655,42 +684,68 @@ impl Agent {
             // every result back in a single user message. A call whose
             // streamed input was not valid JSON is not run; the model gets
             // the raw text back so it can retry.
-            let outputs = join_all(tool_uses.iter().zip(checks).map(|(t, check)| async move {
-                let (id, name) = (t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""));
-                if let Some(raw) = invalid.get(id) {
-                    return (ToolOutput::error(json!({"INVALID_JSON": raw}).to_string()), check, None);
+            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut calls: FuturesUnordered<_> = tool_uses.iter().zip(checks).enumerate().map(|(i, (t, check))| {
+                let tx = progress_tx.clone();
+                async move {
+                    let output = crate::tools::progress::scope(t["id"].as_str().unwrap_or("").to_string(), tx, async move {
+                        let (id, name) = (t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""));
+                        if let Some(raw) = invalid.get(id) {
+                            return (ToolOutput::error(json!({"INVALID_JSON": raw}).to_string()), check, None);
+                        }
+                        if let Some(reason) = &check.block {
+                            let text = hooks::feedback(Event::PreToolUse, &format!("The call was blocked: {reason}"));
+                            return (ToolOutput::error(text), check, None);
+                        }
+                        if check.halt.is_some() {
+                            return (ToolOutput::error("The call was not run: a hook stopped the turn"), check, None);
+                        }
+                        let input = check.updated_input.clone().unwrap_or_else(|| t["input"].clone());
+                        let mut out = tools.run(name, input.clone()).await;
+                        let post = hooks.post_tool_use(name, id, &input, &out, model).await;
+                        let event = if out.is_error { Event::PostToolUseFailure } else { Event::PostToolUse };
+                        if let Some(text) = &post.updated_output {
+                            out.content = text.clone();
+                        }
+                        let added = check.context.iter().map(|c| hooks::feedback(Event::PreToolUse, c));
+                        let added = added.chain(post.block.iter().chain(&post.context).map(|c| hooks::feedback(event, c)));
+                        for text in added {
+                            out.content.truncate(out.content.trim_end().len());
+                            out.content.push_str(&format!("\n\n{text}"));
+                        }
+                        (out, check, Some(post))
+                    }).await;
+                    (i, output)
                 }
-                if let Some(reason) = &check.block {
-                    let text = hooks::feedback(Event::PreToolUse, &format!("The call was blocked: {reason}"));
-                    return (ToolOutput::error(text), check, None);
+            }).collect();
+            drop(progress_tx);
+            let mut outputs: Vec<_> = (0..tool_uses.len()).map(|_| None).collect();
+            let mut waiting = std::collections::BTreeMap::new();
+            let mut progress_open = true;
+            while !calls.is_empty() {
+                tokio::select! {
+                    event = progress_rx.recv(), if progress_open => match event {
+                        Some((id, tasks)) => {
+                            if tasks.is_empty() { waiting.remove(&id); } else { waiting.insert(id, tasks); }
+                            let tasks: Vec<String> = waiting.values().flatten().cloned().collect();
+                            observer.on_waiting(&tasks);
+                        }
+                        None => progress_open = false,
+                    },
+                    Some((i, output)) = calls.next() => {
+                        let t = &tool_uses[i];
+                        observer.on_tool_result_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), &output.0);
+                        if let Some(post) = &output.2 { show_notices(post, observer); }
+                        outputs[i] = Some(output);
+                    }
                 }
-                if check.halt.is_some() {
-                    return (ToolOutput::error("The call was not run: a hook stopped the turn"), check, None);
-                }
-                let input = check.updated_input.clone().unwrap_or_else(|| t["input"].clone());
-                let mut out = tools.run(name, input.clone()).await;
-                let post = hooks.post_tool_use(name, id, &input, &out, model).await;
-                let event = if out.is_error { Event::PostToolUseFailure } else { Event::PostToolUse };
-                if let Some(text) = &post.updated_output {
-                    out.content = text.clone();
-                }
-                let added = check.context.iter().map(|c| hooks::feedback(Event::PreToolUse, c));
-                let added = added.chain(post.block.iter().chain(&post.context).map(|c| hooks::feedback(event, c)));
-                for text in added {
-                    out.content.truncate(out.content.trim_end().len());
-                    out.content.push_str(&format!("\n\n{text}"));
-                }
-                (out, check, Some(post))
-            }))
-            .await;
+            }
+            observer.on_waiting(&[]);
 
             let mut results = Vec::with_capacity(outputs.len());
             let mut halt = None;
-            for (t, (out, check, post)) in tool_uses.iter().zip(outputs) {
-                observer.on_tool_result_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), &out);
-                if let Some(post) = &post {
-                    show_notices(post, observer);
-                }
+            for (t, output) in tool_uses.iter().zip(outputs) {
+                let (out, check, post) = output.unwrap();
                 halt = halt.or(check.halt).or(post.and_then(|p| p.halt));
                 results.push(json!({
                     "type": "tool_result",

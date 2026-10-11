@@ -26,6 +26,10 @@ struct Input {
 
 #[async_trait]
 impl Tool for WriteTool {
+    fn access(&self, input: &Value) -> super::scheduling::Access {
+        super::scheduling::file_access(input)
+    }
+
     fn name(&self) -> &str {
         "write"
     }

@@ -18,6 +18,7 @@ use crate::llm::{Client, MAX_RETRIES};
 use crate::skills::Skill;
 use crate::subagent::{AgentDef, Forks, Subagents};
 use crate::tools::{FileTracker, ToolOutput};
+use crate::tools::shells::Shells;
 
 /// Tool results are cut to this many bytes in events; the model still gets
 /// the full result.
@@ -34,6 +35,7 @@ pub type Sequenced = (usize, Arc<str>);
 pub enum Status {
     Idle,
     Running,
+    Waiting,
     Error,
     Cancelled,
 }
@@ -43,6 +45,7 @@ impl Status {
         match self {
             Status::Idle => "idle",
             Status::Running => "running",
+            Status::Waiting => "waiting",
             Status::Error => "error",
             Status::Cancelled => "cancelled",
         }
@@ -79,6 +82,7 @@ pub struct Task {
     pub agent: tokio::sync::Mutex<Agent>,
     /// The agent's subagents and inbox, reachable while a turn holds the agent.
     pub subagents: Arc<Subagents>,
+    shells: Arc<Shells>,
     inbox: Arc<Inbox>,
     forks: Forks,
     /// The agent's hooks, for telling them the task waits.
@@ -114,6 +118,7 @@ impl Task {
                 files,
                 created,
                 subagents: agent.subagents().clone(),
+                shells: agent.shells().clone(),
                 inbox: agent.inbox().clone(),
                 forks,
                 hooks: agent.hooks().clone(),
@@ -135,6 +140,8 @@ impl Task {
             "status": meta.status.as_str(),
             "turns": meta.turns,
             "created": self.created,
+            "active": meta.handle.is_some(),
+            "pending_tasks": self.subagents.running_in_background() + self.shells.pending(),
         })
     }
 
@@ -171,7 +178,7 @@ impl Task {
     }
 
     fn push_status(&self, meta: &Meta) {
-        self.push(json!({"type": "status", "status": meta.status.as_str(), "model": meta.model}));
+        self.push(json!({"type": "status", "status": meta.status.as_str(), "model": meta.model, "active": meta.handle.is_some()}));
     }
 
     /// Starts a turn in the background. `user` is the event describing the
@@ -180,10 +187,24 @@ impl Task {
         self.start(Work::Turn(content), user)
     }
 
+    /// Steering a running turn must wake a wait rather than start a second
+    /// model request concurrently. Other work keeps its normal busy check.
+    pub fn send(self: &Arc<Self>, work: Work, user: Value) -> Result<(), &'static str> {
+        let meta = self.meta.lock().unwrap();
+        if meta.handle.is_some() && let Work::Turn(content) = work {
+            self.push(user);
+            drop(meta);
+            self.inbox.push_content(content, true);
+            return Ok(());
+        }
+        drop(meta);
+        self.start(work, user)
+    }
+
     /// Starts `work` in the background, like [`Task::start_turn`].
     pub fn start(self: &Arc<Self>, work: Work, user: Value) -> Result<(), &'static str> {
         let mut meta = self.meta.lock().unwrap();
-        if meta.status == Status::Running {
+        if meta.handle.is_some() {
             return Err("the task is still running; wait for it or cancel it");
         }
         meta.status = Status::Running;
@@ -236,7 +257,7 @@ impl Task {
                 let Some(task) = task.upgrade() else { return };
                 let (idle, model) = {
                     let meta = task.meta.lock().unwrap();
-                    (meta.turns == turns && meta.status != Status::Running, meta.model.clone())
+                    (meta.turns == turns && meta.status == Status::Idle, meta.model.clone())
                 };
                 if idle {
                     let message = format!("The task \"{}\" is waiting for your input", task.title);
@@ -246,8 +267,10 @@ impl Task {
         }
         match result {
             Ok(()) => {
-                meta.status = Status::Idle;
-                self.push(json!({"type": "done"}));
+                let pending = self.subagents.running_in_background() + self.shells.pending();
+                let waiting = pending > 0 || self.inbox.wants_turn();
+                meta.status = if waiting { Status::Waiting } else { Status::Idle };
+                self.push(json!({"type": if waiting { "waiting" } else { "done" }, "pending_tasks": pending}));
             }
             Err(e) => {
                 meta.status = Status::Error;
@@ -262,8 +285,12 @@ impl Task {
     /// before the next turn. Background subagents carry on.
     pub fn cancel(&self) -> bool {
         let mut meta = self.meta.lock().unwrap();
-        let Some(handle) = meta.handle.take() else { return false };
-        handle.abort();
+        if let Some(handle) = meta.handle.take() {
+            handle.abort();
+        } else if meta.status == Status::Waiting {
+            self.shells.stop_pending();
+            self.subagents.stop_all();
+        } else { return false; }
         meta.status = Status::Cancelled;
         self.push(json!({"type": "cancelled"}));
         self.push_status(&meta);
@@ -276,6 +303,13 @@ struct WebObserver<'a> {
 }
 
 impl Observer for WebObserver<'_> {
+    fn on_waiting(&mut self, tasks: &[String]) {
+        let mut meta = self.task.meta.lock().unwrap();
+        meta.status = if tasks.is_empty() { Status::Running } else { Status::Waiting };
+        self.task.push(json!({"type": "waiting_tasks", "task_ids": tasks}));
+        self.task.push_status(&meta);
+    }
+
     fn on_text_delta(&mut self, text: &str) {
         self.task.push(json!({"type": "text", "text": text}));
     }
@@ -291,6 +325,15 @@ impl Observer for WebObserver<'_> {
     fn on_tool_result(&mut self, name: &str, output: &ToolOutput) {
         let content = crate::tools::truncate(&output.content, MAX_EVENT_RESULT_BYTES);
         self.task.push(json!({"type": "tool_result", "name": name, "content": content, "is_error": output.is_error}));
+    }
+
+    fn on_tool_call_id(&mut self, id: &str, name: &str, input: &Value) {
+        self.task.push(json!({"type": "tool_call", "id": id, "name": name, "input": input}));
+    }
+
+    fn on_tool_result_id(&mut self, id: &str, name: &str, output: &ToolOutput) {
+        let content = crate::tools::truncate(&output.content, MAX_EVENT_RESULT_BYTES);
+        self.task.push(json!({"type": "tool_result", "id": id, "name": name, "content": content, "is_error": output.is_error}));
     }
 
     fn on_compact_start(&mut self) {

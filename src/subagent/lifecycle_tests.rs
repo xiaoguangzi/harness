@@ -138,6 +138,32 @@ fn texts(inbox: &Inbox) -> String {
 }
 
 #[tokio::test]
+async fn waits_for_mixed_tasks_and_does_not_replay_the_collected_report() {
+    let mock = Mock::new(|_| slow("child evidence", Duration::from_millis(50))).await;
+    let tools = mock.tools();
+    let (inbox, subagents) = conversation();
+    let shells = Arc::new(crate::tools::shells::Shells::new(inbox.clone()));
+    scope(subagents.clone(), mock.client.clone(), false, crate::tools::shells::scope(shells, async {
+        let out = tools.run("agent", json!({"agent_type": "explore", "description": "search", "prompt": "find", "run_in_background": true})).await;
+        assert!(!out.is_error);
+        let id = first_id(&subagents);
+        let out = tools.run("bash", json!({"command": "sleep 0.1; echo shell-evidence", "run_in_background": true, "resource": "mixed-test:shell"})).await;
+        assert!(!out.is_error);
+        let out = tools.run("wait_tasks", json!({"task_ids": [id, "shell_1"], "mode": "all"})).await;
+        assert!(!out.is_error, "{}", out.content);
+        let result: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(result["reason"], "completed");
+        assert_eq!(result["tasks"][0]["output"], "child evidence");
+        assert!(result["tasks"][1]["output"].as_str().unwrap().contains("shell-evidence"));
+        assert!(!inbox.wants_turn(), "both completion notifications were acknowledged");
+        let out = tools.run("message_agent", json!({"agent_id": id, "message": "again", "run_in_background": true})).await;
+        assert!(!out.is_error);
+        tokio::time::timeout(Duration::from_secs(5), inbox.wanted()).await.unwrap();
+        assert!(texts(&inbox).contains("child evidence"), "a new generation still notifies");
+    })).await;
+}
+
+#[tokio::test]
 async fn foreground_reports_come_back_as_text_and_can_be_continued() {
     let mut mock = Mock::new(|body| answer(if messages(body) > 1 { "follow-up report" } else { "first report" })).await;
     let tools = mock.tools();
@@ -194,6 +220,9 @@ async fn background_reports_arrive_after_the_turn_and_wake_the_parent() {
     assert_eq!(parent.subagents().running_in_background(), 1, "it outlives the turn");
 
     tokio::time::timeout(Duration::from_secs(5), parent.inbox().wanted()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !woken.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+    }).await.unwrap();
     assert!(woken.load(Ordering::SeqCst));
     assert_eq!(parent.subagents().running_in_background(), 0);
     parent.run_turn(Vec::new(), &mut Quiet).await.unwrap();
@@ -370,7 +399,7 @@ async fn general_purpose_gets_the_main_tools_but_cannot_delegate() {
     let mock = Mock::new(|_| answer("ok")).await;
     let tool = AgentTool::new(Arc::new(vec![general_purpose()]), mock.tools(), mock.client.clone(), silent());
     let registry = tool.registry_for(&general_purpose());
-    assert_eq!(registry.names().collect::<Vec<_>>(), vec!["bash", "bash_output", "edit", "glob", "grep", "kill_shell", "read", "write"]);
+    assert_eq!(registry.names().collect::<Vec<_>>(), vec!["bash", "bash_output", "edit", "glob", "grep", "kill_shell", "read", "wait_tasks", "write"]);
 }
 
 #[tokio::test]

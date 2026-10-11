@@ -130,7 +130,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 // exit once none is left running.
                 while result.is_ok() {
                     if !agent.inbox().wants_turn() {
-                        let running = agent.subagents().running_in_background();
+                        let running = agent.subagents().running_in_background() + agent.shells().pending();
                         if running == 0 {
                             break;
                         }
@@ -198,7 +198,10 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 typing.draft.note_image(last);
                 let idle = std::mem::take(&mut answered).then(|| notify_when_idle(agent.hooks(), agent.model()));
                 let past = editor.history().iter().cloned().collect();
+                let pending = agent.subagents().running_in_background() + agent.shells().pending();
+                if pending > 0 { out.set_status(Some(&format!("Waiting for {pending} background tasks…"))); }
                 let read = editor.helper().unwrap().read_box(&out, &mut typing, agent.inbox().clone(), past).await;
+                out.set_status(None);
                 if let Some(idle) = idle { idle.abort(); }
                 let (line, images) = match read {
                     Ok(Some(message)) => message,
@@ -890,7 +893,7 @@ fn remember_sent(editor: &mut rustyline::Editor<ReplHelper, rustyline::history::
 /// they last did, until one reports back; false if the user interrupted the
 /// wait.
 async fn wait_for_reports(agent: &Agent, running: usize, out: &Output) -> bool {
-    out.set_status(Some(&format!("Waiting for {running} background {}…", text::plural(running, "subagent"))));
+    out.set_status(Some(&format!("Waiting for {running} background tasks…")));
     let mut esc = KeyWatch::start();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
     let reported = loop {

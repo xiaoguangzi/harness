@@ -31,10 +31,18 @@ struct Input {
     timeout_ms: Option<u64>,
     #[serde(default)]
     run_in_background: bool,
+    #[serde(default)]
+    background_kind: super::shells::Kind,
+    resource: Option<String>,
 }
 
 #[async_trait]
 impl Tool for BashTool {
+    // The command owns its guard even after this call returns a shell ID.
+    fn access(&self, _input: &Value) -> super::scheduling::Access {
+        super::scheduling::Access::Concurrent
+    }
+
     fn name(&self) -> &str {
         "bash"
     }
@@ -51,7 +59,9 @@ impl Tool for BashTool {
          change files themselves (inline scripts that write files, `sed -i`, heredocs or \
          `echo` redirected into a file) are refused. With `run_in_background`, the command \
          keeps running (dev servers, watchers, long builds) and the call returns a shell id \
-         at once: read its output with `bash_output`, stop it with `kill_shell`."
+         at once: read its output with `bash_output`, wait for required results with `wait_tasks`, \
+         stop it with `kill_shell`. Finite tasks must be collected before reporting success. \
+         Services need background_kind service and an explicit independent resource."
     }
 
     fn input_schema(&self) -> Value {
@@ -69,6 +79,14 @@ impl Tool for BashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Run the command in the background and return its shell id at once (default false)."
+                },
+                "background_kind": {
+                    "type": "string", "enum": ["task", "service"],
+                    "description": "Default task: finite work whose result must be collected. Use service for a dev server or watcher that should keep running without holding task completion. Only for background commands."
+                },
+                "resource": {
+                    "type": "string",
+                    "description": "Default workspace: serialize commands and unknown mutations. Declare an independent resource (e.g. host:aliyun or service:web) only when it can safely overlap workspace work. Commands on the same resource serialize, including in the background. Services require an explicit resource."
                 }
             },
             "required": ["command"],
@@ -89,18 +107,31 @@ impl Tool for BashTool {
                  tests, git and running programs."
             ));
         }
+        let access = match input.resource.as_deref() {
+            None if input.run_in_background && input.background_kind == super::shells::Kind::Service => {
+                return ToolOutput::error("A background service needs an explicit resource, e.g. service:web, so it does not lock all workspace commands indefinitely");
+            }
+            None | Some("workspace") => super::scheduling::Access::Workspace,
+            Some(key) if key.trim().is_empty() || key.trim() != key || key.len() > 200 || key.starts_with("file:") => {
+                return ToolOutput::error("resource must be a nonempty name up to 200 bytes without surrounding whitespace; file: is reserved");
+            }
+            Some(key) => super::scheduling::Access::Resource(key.trim().to_string()),
+        };
         if input.run_in_background {
             let Some(shells) = super::shells::current() else {
                 return ToolOutput::error("Background commands only run within a conversation");
             };
-            return match shells.start(&input.command) {
+            let guard = super::scheduling::acquire(access).await;
+            return match shells.start(&input.command, input.background_kind, guard) {
                 Ok(id) => ToolOutput::ok(format!(
                     "Started in the background as {id}. Read its output with bash_output, and stop it with \
-                     kill_shell. You will be told when it exits; don't poll it in a loop."
+                     kill_shell. Continue independent work; use wait_tasks when you need its result. \
+                     Otherwise you will be told when it exits. Don't poll it in a loop."
                 )),
                 Err(e) => ToolOutput::error(e),
             };
         }
+        let _execution = super::scheduling::acquire(access).await;
         let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
         let (mut child, _sandboxed) = match spawn(&input.command) {

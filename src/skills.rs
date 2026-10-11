@@ -617,6 +617,10 @@ struct Input {
 
 #[async_trait]
 impl Tool for SkillTool {
+    fn access(&self, _input: &Value) -> crate::tools::scheduling::Access {
+        crate::tools::scheduling::Access::Concurrent
+    }
+
     fn name(&self) -> &str {
         "skill"
     }

@@ -566,7 +566,7 @@ async fn send_message(
         }
         None => user_message(&state, prompt, &task.files).await?,
     };
-    task.start(work, user).map_err(|e| api_error(StatusCode::CONFLICT, e))?;
+    task.send(work, user).map_err(|e| api_error(StatusCode::CONFLICT, e))?;
     Ok(Json(task.summary()))
 }
 

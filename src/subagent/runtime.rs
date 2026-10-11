@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::task::AbortHandle;
 
 use super::{MAX_RESULT_BYTES, Reporter};
@@ -101,6 +101,7 @@ pub struct Child {
     /// What the run's latest tool call was, e.g. `bash: cargo test`.
     last_call: Mutex<Option<String>>,
     state: Mutex<State>,
+    changed: Notify,
 }
 
 struct State {
@@ -111,6 +112,7 @@ struct State {
     /// How long the last run took, once it ended.
     took: Option<Duration>,
     handle: Option<AbortHandle>,
+    output: Option<ToolOutput>,
 }
 
 /// A started run of a subagent.
@@ -201,12 +203,14 @@ impl Subagents {
             background: AtomicBool::new(background),
             tool_calls: AtomicUsize::new(0),
             last_call: Mutex::new(None),
+            changed: Notify::new(),
             state: Mutex::new(State {
                 status: Status::Stopped,
                 run: 0,
                 started: Instant::now(),
                 took: None,
                 handle: None,
+                output: None,
             }),
         });
         children.push(child.clone());
@@ -237,6 +241,7 @@ impl Subagents {
         state.status = Status::Running;
         state.started = Instant::now();
         state.took = None;
+        state.output = None;
         child.background.store(background, Ordering::Relaxed);
         child.tool_calls.store(0, Ordering::Relaxed);
         *child.last_call.lock().unwrap() = None;
@@ -247,6 +252,7 @@ impl Subagents {
         state.handle = Some(tokio::spawn(task).abort_handle());
         child.report(&state, None);
         drop(state);
+        child.changed.notify_waiters();
         Run { child: child.clone(), run, done }
     }
 
@@ -282,6 +288,16 @@ impl Subagents {
     pub fn list(&self) -> Vec<Value> {
         self.children.lock().unwrap().iter().map(|c| c.snapshot(&c.state.lock().unwrap())).collect()
     }
+
+    pub(crate) fn wait_handle(&self, id: &str) -> Result<(Arc<Child>, u64)> {
+        let child = find(&self.children.lock().unwrap(), id)?;
+        let run = child.state.lock().unwrap().run;
+        Ok((child, run))
+    }
+
+    pub(crate) fn acknowledge(&self, id: &str, run: u64) {
+        self.parent.acknowledge(&format!("agent:{id}:{run}"));
+    }
 }
 
 impl Drop for Subagents {
@@ -315,6 +331,28 @@ fn new_id(children: &[Arc<Child>]) -> String {
 }
 
 impl Child {
+    pub(crate) fn waiting(&self, run: u64) -> bool {
+        let state = self.state.lock().unwrap();
+        state.run == run && state.status == Status::Running
+    }
+
+    pub(crate) async fn finished(&self, run: u64) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.waiting(run) { return; }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn result(&self, run: u64) -> Value {
+        let state = self.state.lock().unwrap();
+        let status = if state.run == run { state.status.as_str() } else { "superseded" };
+        let output = if state.run == run { state.output.as_ref().map(|o| &o.content) } else { None };
+        json!({"task_id": self.id, "run": run, "status": status, "output": output})
+    }
+
     fn is_running(&self) -> bool {
         self.state.lock().unwrap().status == Status::Running
     }
@@ -344,12 +382,14 @@ impl Child {
             state.status = if output.is_error { Status::Failed } else { Status::Completed };
             state.took = Some(state.started.elapsed());
             state.handle = None;
+            state.output = Some(output.clone());
             self.report(&state, Some(&output));
             // Pushed under the lock, so nobody sees it finished but unreported.
             if self.background.load(Ordering::Relaxed) {
-                parent.push(self.notification(state.status, &output.content), true);
+                parent.push_completion(format!("agent:{}:{run}", self.id), self.notification(state.status, &output.content));
             }
             drop(state);
+            self.changed.notify_waiters();
             let _ = done.send(output);
             return;
         }
@@ -367,6 +407,7 @@ impl Child {
         }
         state.status = Status::Stopped;
         state.took = Some(state.started.elapsed());
+        self.changed.notify_waiters();
         self.report(&state, None);
         if let Some(parent) = parent
             && self.background.load(Ordering::Relaxed)

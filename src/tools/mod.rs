@@ -11,6 +11,9 @@ mod glob;
 mod grep;
 mod read;
 pub mod shells;
+pub mod scheduling;
+pub(crate) mod progress;
+mod wait;
 #[allow(dead_code)] // `todo_write` isn't registered; see `with_defaults`
 pub mod todo;
 mod write;
@@ -23,6 +26,7 @@ pub use grep::GrepTool;
 pub use read::ReadTool;
 pub(crate) use read::number_lines;
 pub use shells::{BashOutputTool, KillShellTool};
+pub use wait::WaitTasksTool;
 #[allow(unused_imports)]
 pub use todo::TodoTool;
 pub use write::WriteTool;
@@ -101,6 +105,11 @@ pub trait Tool: Send + Sync {
     fn read_only(&self) -> bool {
         false
     }
+    /// Read-only tools may overlap. Unknown mutations own the workspace.
+    /// Orchestrators acquire guards through the tools they invoke instead.
+    fn access(&self, _input: &Value) -> scheduling::Access {
+        if self.read_only() { scheduling::Access::Concurrent } else { scheduling::Access::Workspace }
+    }
     async fn run(&self, input: Value) -> ToolOutput;
 }
 
@@ -125,6 +134,7 @@ impl ToolRegistry {
         registry.register(BashTool);
         registry.register(BashOutputTool);
         registry.register(KillShellTool);
+        registry.register(WaitTasksTool);
         registry.register(GrepTool);
         registry.register(GlobTool);
         // `todo_write` is off: current models plan well enough without it. The tool, its
@@ -200,7 +210,10 @@ impl ToolRegistry {
 
     pub async fn run(&self, name: &str, input: Value) -> ToolOutput {
         match self.tools.get(name) {
-            Some(tool) => tool.run(input).await,
+            Some(tool) => {
+                let _guard = scheduling::acquire(tool.access(&input)).await;
+                tool.run(input).await
+            }
             None => ToolOutput::error(format!("Unknown tool: {name}")),
         }
     }

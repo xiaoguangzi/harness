@@ -907,6 +907,15 @@ pub enum TurnEnd {
 }
 
 impl Observer for Terminal {
+    fn on_waiting(&mut self, tasks: &[String]) {
+        if tasks.is_empty() {
+            if self.pending.is_empty() { self.enter(Phase::Waiting, WAITING); }
+            else { self.enter(Phase::Running, "Running tools…"); }
+        } else {
+            self.enter(Phase::Running, &format!("Waiting for tasks: {}…", tasks.join(", ")));
+        }
+    }
+
     fn on_request_start(&mut self) {
         self.streamed = 0;
         // Messages sent from the input box go with this request.

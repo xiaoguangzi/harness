@@ -348,7 +348,7 @@ impl AgentTool {
              questions, launch several subagents in parallel in one response.\n\n\
              By default the call waits for the report. With `run_in_background: true` it returns at \
              once and you keep working; the report arrives by itself in a later message when the \
-             subagent is done, even after your turn has ended. Do not poll or wait for it, and never \
+             subagent is done, even after your turn has ended. Use wait_tasks if you need the result before continuing; do not poll, and never \
              guess what it will find. Every subagent gets an `agent_id`: `message_agent` continues \
              it with its context intact, `stop_agent` stops it. The report comes to you, not the \
              user; relay what matters.\n\nAvailable agents:",
@@ -398,7 +398,7 @@ impl AgentTool {
         registry.retain(|t| !TOOLS.contains(&t.name()) && def.allows(t.name()));
         // Without `bash` there are no background commands to read or stop.
         if registry.get("bash").is_none() {
-            registry.retain(|t| !matches!(t.name(), "bash_output" | "kill_shell"));
+            registry.retain(|t| !matches!(t.name(), "bash_output" | "kill_shell" | "wait_tasks"));
         }
         registry
     }
@@ -430,6 +430,10 @@ struct Input {
 
 #[async_trait]
 impl Tool for AgentTool {
+    fn access(&self, _input: &Value) -> crate::tools::scheduling::Access {
+        crate::tools::scheduling::Access::Concurrent
+    }
+
     fn name(&self) -> &str {
         "agent"
     }
@@ -504,7 +508,7 @@ impl AgentTool {
         }
         ToolOutput::ok(format!(
             "Started {} agent {} in the background. Its report will arrive in a later message when it \
-             finishes; do not poll, sleep or wait for it. Carry on with other work, or end your turn if \
+             finishes; use wait_tasks if you need its result. Do not poll or sleep in a loop. Carry on with other work, or end your turn if \
              there is nothing else to do.",
             def.name, run.child.id
         ))
@@ -544,6 +548,10 @@ pub struct MessageAgentTool;
 
 #[async_trait]
 impl Tool for MessageAgentTool {
+    fn access(&self, _input: &Value) -> crate::tools::scheduling::Access {
+        crate::tools::scheduling::Access::Concurrent
+    }
+
     fn name(&self) -> &str {
         "message_agent"
     }
@@ -603,6 +611,10 @@ pub struct StopAgentTool;
 
 #[async_trait]
 impl Tool for StopAgentTool {
+    fn access(&self, _input: &Value) -> crate::tools::scheduling::Access {
+        crate::tools::scheduling::Access::Concurrent
+    }
+
     fn name(&self) -> &str {
         "stop_agent"
     }

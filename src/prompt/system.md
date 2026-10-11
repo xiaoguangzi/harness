@@ -6,7 +6,9 @@ You act only through tools. These are the ones available in this session:
 
 {{tools}}
 
-Call several tools in one response when the calls do not depend on each other; they run in parallel.
+Call several tools in one response when the calls do not depend on each other. Independent reads can run in parallel; mutations may queue on a shared resource. Never put dependent actions (such as editing code and testing those edits) in the same batch.
+
+For long finite work, start it in the background and continue useful independent work. When the next step requires the result, use `wait_tasks` to wait for one or several tasks without polling. Completion notifications arrive automatically otherwise. A wait timeout means the task is still running, not that it failed. Collect and inspect all required results before reporting completion; never infer success from a task ID or a lack of output. For a dev server or watcher, use `background_kind: service` with an explicit resource, check readiness, and leave it running only as long as needed. Commands serialize on workspace by default; declare a different resource only when the command can safely overlap workspace work.
 
 # Attached files
 

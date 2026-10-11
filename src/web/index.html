@@ -141,12 +141,14 @@ button.btn.small { padding: 1px 9px; font-size: 11.5px; border-radius: 7px; box-
   background: var(--code); color: var(--muted);
 }
 .badge.running { color: var(--accent); background: var(--accent-soft); }
+.badge.waiting { color: var(--accent); background: var(--accent-soft); }
 .badge.idle { color: var(--ok); background: var(--ok-soft); }
 .badge.error { color: var(--err); background: var(--err-soft); }
 .badge.cancelled { color: var(--warn); background: var(--warn-soft); }
 .badge.ro { color: var(--ok); background: var(--ok-soft); }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--muted); flex: none; }
 .dot.running { background: var(--accent); animation: pulse 1s infinite alternate; }
+.dot.waiting { background: var(--accent); animation: pulse 1s infinite alternate; }
 .dot.idle { background: var(--ok); } .dot.error { background: var(--err); } .dot.cancelled { background: var(--warn); }
 @keyframes pulse { to { opacity: .3; } }
 
@@ -373,7 +375,7 @@ function toast(msg, isErr) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = "", isErr ? 6000 : 2500);
 }
 
-const STATUS = { running: "运行中", idle: "完成", error: "出错", cancelled: "已取消" };
+const STATUS = { running: "运行中", waiting: "等待后台任务", idle: "完成", error: "出错", cancelled: "已取消" };
 const oneLine = (v, n = 160) => { const s = typeof v === "string" ? v : JSON.stringify(v); return s.length > n ? s.slice(0, n) + "…" : s; };
 const pretty = v => typeof v === "string" ? v : JSON.stringify(v, null, 2);
 
@@ -628,7 +630,7 @@ function updateTaskHead(t) {
   st.className = "badge " + t.status; st.textContent = STATUS[t.status] || t.status;
   document.getElementById("task-title").textContent = t.title;
   document.getElementById("task-agent").textContent = t.agent;
-  document.getElementById("task-cancel").disabled = t.status !== "running";
+  document.getElementById("task-cancel").disabled = t.status !== "running" && t.status !== "waiting";
   const m = document.getElementById("task-model");
   if (m && document.activeElement !== m) setModel(m, t.model);
 }
@@ -689,7 +691,7 @@ function renderEvent(ev) {
           h("summary", {}, h("span", { class: "name" }, ev.name), h("span", { class: "args" + (ev.name === "bash" ? " cmd" : "") }, toolSummary(ev.name, ev.input)), h("span", { class: "badge" }, "…")),
           body);
         transcript.append(d);
-        pending.push({ name: ev.name, el: d, body });
+        pending.push({ id: ev.id, name: ev.name, input: ev.input, el: d, body });
         break;
       }
       case "subagent": subagentCard(ev).body.append(h("div", { class: "sub" }, `${ev.tool} ${oneLine(ev.input, 120)}`)); break;
@@ -710,15 +712,20 @@ function renderEvent(ev) {
         transcript.append(h("div", { class: "note" }, `↻ 回复中断（${ev.message}），${ev.wait}s 后重新请求（${ev.attempt}/${ev.max}）`)); break;
       case "hook": assistantEl = null;
         transcript.append(h("div", { class: "note hook" }, "⚑ " + ev.message)); break;
-      case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台子 agent 有了结果，继续")); break;
+      case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台任务有了结果，继续")); break;
       case "tool_result": {
-        const i = pending.findIndex(x => x.name === ev.name);
+        const i = pending.findIndex(x => ev.id ? x.id === ev.id : x.name === ev.name);
         const p = i >= 0 ? pending.splice(i, 1)[0] : null;
         const out = h("pre", {}, ev.content || "(空)");
         if (p) {
           p.body.append(out);
           const b = p.el.querySelector(".badge");
-          b.textContent = ev.is_error ? "错误" : "完成"; b.className = "badge " + (ev.is_error ? "error" : "idle");
+          let label = ev.is_error ? "错误" : "完成";
+          if (!ev.is_error && p.name === "bash" && p.input.run_in_background) label = "已转后台";
+          if (!ev.is_error && p.name === "wait_tasks") {
+            try { const reason = JSON.parse(ev.content).reason; label = reason === "timeout" ? "等待超时" : reason === "input" ? "收到新消息" : "已返回结果"; } catch {}
+          }
+          b.textContent = label; b.className = "badge " + (ev.is_error ? "error" : "idle");
           if (ev.is_error) p.el.classList.add("err");
         } else transcript.append(out);
         break;
@@ -728,7 +735,7 @@ function renderEvent(ev) {
       case "model": transcript.append(h("div", { class: "note" }, "模型切换为 " + ev.model)); break;
       case "status": {
         const t = tasks.find(x => x.id === currentTask);
-        if (t) { t.status = ev.status; t.model = ev.model; updateTaskHead(t); }
+        if (t) { t.status = ev.status; t.model = ev.model; t.active = ev.active; updateTaskHead(t); }
         if (ev.status !== "running") refreshTasks();
         break;
       }

@@ -69,6 +69,7 @@ const GUIDANCE: &[(&str, &str)] = &[
         "read what a background command printed since you last looked, and whether it still runs. \
          You are told when one exits by itself, so don't poll it in a loop.",
     ),
+    ("wait_tasks", "wait for background commands or subagents when your next step needs their results. Pass task_ids together, with mode any or all. Timeout leaves tasks running; continue independent work first."),
     ("kill_shell", "stop a background command you no longer need, such as a dev server once you are done with it."),
     (
         "skill",
@@ -81,7 +82,7 @@ const GUIDANCE: &[(&str, &str)] = &[
          open-ended searches that would take many calls, launching several at once for independent \
          questions; do a lookup that takes one or two calls yourself. With `run_in_background` you keep \
          working and the report arrives by itself in a later message, even after your turn ends: don't \
-         poll or wait for it, and don't guess what it will say. Give subagents that change files \
+         poll it; use wait_tasks if you need the result before continuing, and don't guess what it will say. Give subagents that change files \
          separate files to work on.",
     ),
     (

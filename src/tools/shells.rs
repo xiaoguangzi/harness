@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::AbortHandle;
+use tokio::sync::Notify;
 
 use super::bash::{KillGroup, PIPE_GRACE, spawn};
 use super::{Tool, ToolOutput, parse_input};
@@ -26,6 +27,14 @@ const MAX_KEPT: usize = 16;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 /// Output `bash_output` returns at once: the newest part of what is new.
 const MAX_OUTPUT_BYTES: usize = 30_000;
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    #[default]
+    Task,
+    Service,
+}
 
 tokio::task_local! {
     static CURRENT: Arc<Shells>;
@@ -55,12 +64,14 @@ struct List {
     started: usize,
 }
 
-struct Shell {
+pub(crate) struct Shell {
     id: String,
     command: String,
     started: Instant,
     state: Mutex<ShellState>,
     handle: Mutex<Option<AbortHandle>>,
+    kind: Kind,
+    changed: Notify,
 }
 
 struct ShellState {
@@ -86,7 +97,7 @@ impl Shells {
     }
 
     /// Starts `command` in the background; returns its id.
-    pub fn start(&self, command: &str) -> Result<String, String> {
+    pub fn start(&self, command: &str, kind: Kind, execution: super::scheduling::Guard) -> Result<String, String> {
         let mut list = self.state.lock().unwrap();
         if list.shells.iter().filter(|s| s.status() == Status::Running).count() >= MAX_RUNNING {
             return Err(format!(
@@ -101,10 +112,13 @@ impl Shells {
             started: Instant::now(),
             state: Mutex::new(ShellState { output: Vec::new(), dropped: 0, read: 0, status: Status::Running }),
             handle: Mutex::new(None),
+            kind,
+            changed: Notify::new(),
         });
         let watched = shell.clone();
         let inbox = self.inbox.clone();
         let task = tokio::spawn(async move {
+            let _execution = execution;
             let _guard = guard;
             watched.watch(child, &inbox).await;
         });
@@ -118,7 +132,7 @@ impl Shells {
         Ok(shell.id.clone())
     }
 
-    fn get(&self, id: &str) -> Result<Arc<Shell>, String> {
+    pub(crate) fn get(&self, id: &str) -> Result<Arc<Shell>, String> {
         let list = self.state.lock().unwrap();
         list.shells.iter().find(|s| s.id == id.trim()).cloned().ok_or_else(|| {
             let ids: Vec<&str> = list.shells.iter().map(|s| s.id.as_str()).collect();
@@ -170,6 +184,20 @@ impl Shells {
         let list = self.state.lock().unwrap();
         list.shells.iter().map(|s| (s.id.clone(), s.command.clone(), s.status() == Status::Running)).collect()
     }
+
+    pub fn pending(&self) -> usize {
+        self.state.lock().unwrap().shells.iter().filter(|s| s.kind == Kind::Task && s.running()).count()
+    }
+
+    pub fn stop_pending(&self) -> usize {
+        self.state.lock().unwrap().shells.iter().filter(|s| s.kind == Kind::Task && s.kill()).count()
+    }
+
+    pub fn acknowledge(&self, id: &str) {
+        self.inbox.acknowledge(id);
+    }
+
+    pub async fn input_wanted(&self) { self.inbox.input_wanted().await; }
 }
 
 impl Drop for Shells {
@@ -179,6 +207,28 @@ impl Drop for Shells {
 }
 
 impl Shell {
+    pub(crate) fn running(&self) -> bool { self.status() == Status::Running }
+
+    pub(crate) async fn finished(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.running() { return; }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn result(&self) -> Value {
+        let state = self.state.lock().unwrap();
+        let (status, code) = match state.status {
+            Status::Running => ("running", None),
+            Status::Exited(Some(0)) => ("completed", Some(0)),
+            Status::Exited(code) => ("failed", code),
+            Status::Killed => ("stopped", None),
+        };
+        json!({"task_id": self.id, "status": status, "exit_code": code})
+    }
     fn status(&self) -> Status {
         self.state.lock().unwrap().status
     }
@@ -203,26 +253,24 @@ impl Shell {
             let _ = tokio::time::timeout(PIPE_GRACE, reading).await;
         }
         let code = status.ok().and_then(|s| s.code());
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.status != Status::Running {
-                return;
-            }
-            state.status = Status::Exited(code);
-        }
         let how = match code {
             Some(code) => format!("exited with code {code}"),
             None => "was ended by a signal".to_string(),
         };
-        inbox.push(
+        let mut state = self.state.lock().unwrap();
+        if state.status != Status::Running { return; }
+        state.status = Status::Exited(code);
+        inbox.push_completion(
+            self.id.clone(),
             format!(
                 "<shell-notification>\nBackground command {} (`{}`) {how}. Read its output with bash_output.\n\
                  </shell-notification>",
                 self.id,
                 crate::util::ellipsize(&self.command, 200)
             ),
-            true,
         );
+        drop(state);
+        self.changed.notify_waiters();
     }
 
     /// Appends a stream to the output as it arrives.
@@ -256,12 +304,13 @@ impl Shell {
         if let Some(handle) = self.handle.lock().unwrap().take() {
             handle.abort();
         }
+        self.changed.notify_waiters();
         true
     }
 
     /// The status, and the output since the last call (its newest part if
     /// there is too much).
-    fn take_output(&self) -> String {
+    pub(crate) fn take_output(&self) -> String {
         let mut state = self.state.lock().unwrap();
         let end = state.dropped + state.output.len();
         let from = state.read.max(state.dropped);
@@ -344,7 +393,11 @@ impl Tool for BashOutputTool {
             Err(e) => return e,
         };
         match shells.get(&input.shell_id) {
-            Ok(shell) => ToolOutput::ok(shell.take_output()),
+            Ok(shell) => {
+                let output = shell.take_output();
+                if !shell.running() { shells.acknowledge(&shell.id); }
+                ToolOutput::ok(output)
+            }
             Err(e) => ToolOutput::error(e),
         }
     }
@@ -422,14 +475,15 @@ mod tests {
         assert!(!started.is_error && started.content.contains("shell_1"), "{}", started.content);
 
         wait_until(&shells, "shell_1", |s| s != Status::Running).await;
+        assert!(inbox.wants_turn(), "the exit wakes the conversation");
+        let note = inbox.take()[0]["text"].as_str().unwrap().to_string();
+        assert!(note.contains("shell_1") && note.contains("exited with code 3"), "{note}");
         let out = run(&BashOutputTool, &shells, json!({"shell_id": "shell_1"})).await;
         assert_eq!(out.content, "[shell_1: exited with code 3]\none\ntwo\n");
         let again = run(&BashOutputTool, &shells, json!({"shell_id": "shell_1"})).await;
         assert!(again.content.ends_with("(no new output)"), "only what is new: {}", again.content);
 
-        assert!(inbox.wants_turn(), "the exit wakes the conversation");
-        let note = inbox.take()[0]["text"].as_str().unwrap().to_string();
-        assert!(note.contains("shell_1") && note.contains("exited with code 3"), "{note}");
+        assert!(!inbox.wants_turn(), "explicit collection does not queue another turn");
     }
 
     #[tokio::test]
