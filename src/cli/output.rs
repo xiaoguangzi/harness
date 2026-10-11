@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::diff;
-use super::dialog::{List, Panel};
 use super::keys::Key;
 use super::tool_output::{self, Record};
+use super::transcript::{Entry, Transcript};
 use super::input::{self, Queued, Typing};
 use super::markdown::Markdown;
 use super::menu::Menu;
@@ -57,7 +57,8 @@ struct State {
     panel: Option<Arc<Mutex<dyn super::dialog::Panel>>>,
     status: Option<Status>,
     tool_records: Vec<Record>,
-    tool_panel: Option<List>,
+    tool_panel: Option<Transcript>,
+    transcript: Vec<Entry>,
     /// The input box, while a turn runs in the REPL.
     input: Option<InputBox>,
     /// Whether the status or input box is on screen, on the last `rows`;
@@ -119,6 +120,7 @@ impl Output {
             status: None,
             tool_records: Vec::new(),
             tool_panel: None,
+            transcript: Vec::new(),
             input: None,
             drawn: false,
             rows: 0,
@@ -187,7 +189,34 @@ impl Output {
     pub fn restore_tool_output(&self, messages: &[Message]) {
         let mut state = self.state.lock().unwrap();
         state.tool_records = tool_output::restore(messages);
+        state.transcript.clear();
+        let mut index = 0;
+        for message in messages {
+            for block in &message.content {
+                match block["type"].as_str() {
+                    Some("tool_use") => { state.transcript.push(Entry::Tool(index)); index += 1; }
+                    Some("text" | "thinking") => {
+                        let thinking = block["type"] == "thinking";
+                        let content = block[if thinking { "thinking" } else { "text" }].as_str().unwrap_or("");
+                        if !content.is_empty() {
+                            let label = if thinking { "Thinking" } else if message.role == "user" { "❯ You" } else { "● Assistant" };
+                            state.transcript.push(Entry::Text { label, content: content.into() });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         state.tool_panel = None;
+    }
+
+    pub(super) fn transcript_text(&self, label: &'static str, content: &str, append: bool) {
+        if content.is_empty() { return; }
+        let mut state = self.state.lock().unwrap();
+        if append && let Some(Entry::Text { label: previous, content: text }) = state.transcript.last_mut()
+            && *previous == label
+        { text.push_str(content); }
+        else { state.transcript.push(Entry::Text { label, content: content.into() }); }
     }
 
     pub fn show_tool_output(&self, interactive: bool) {
@@ -209,25 +238,20 @@ impl Output {
         let mut state = self.state.lock().unwrap();
         if key == &Key::ToolOutput && state.panel.is_none() {
             state.tool_panel = if state.tool_panel.is_some() { None }
-                else { Some(List::tool_output(tool_output::items(&state.tool_records))) };
-        } else if let Some(panel) = &mut state.tool_panel {
-            if panel.inspect_key(key.clone()) { state.tool_panel = None; }
+                else { Some(Transcript::default()) };
+        } else if let Some(mut panel) = state.tool_panel.take() {
+            if !panel.key(key, &state.transcript, &state.tool_records,
+                text::terminal_width(), text::terminal_height().unwrap_or(24)) { state.tool_panel = Some(panel); }
         } else { return false; }
         self.show(&mut state, "");
         true
-    }
-
-    fn refresh_tool_panel(state: &mut State) {
-        if let Some(panel) = &mut state.tool_panel {
-            panel.set_items(tool_output::items(&state.tool_records));
-        }
     }
 
     fn record_call(&self, id: &str, name: &str, input: &Value) -> usize {
         let mut state = self.state.lock().unwrap();
         let index = state.tool_records.len();
         state.tool_records.push(Record::pending(id, name, input));
-        Self::refresh_tool_panel(&mut state);
+        state.transcript.push(Entry::Tool(index));
         self.show(&mut state, "");
         index
     }
@@ -236,9 +260,7 @@ impl Output {
         let mut state = self.state.lock().unwrap();
         let record = &mut state.tool_records[index];
         if let Some(output) = output { record.complete(output); } else { record.interrupt(); }
-        let call = (record.name.clone(), record.input.clone());
-        Self::refresh_tool_panel(&mut state);
-        call
+        (record.name.clone(), record.input.clone())
     }
 
     /// Hands the terminal to a conventional line-based command prompt.
@@ -629,7 +651,8 @@ pub fn replay(out: &Output, messages: &[Message]) {
 fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, Option<(usize, usize)>) {
     let width = text::terminal_width();
     if let Some(panel) = &state.tool_panel {
-        return panel.render(width, text::terminal_height().unwrap_or(24), &paint);
+        return panel.render(&state.transcript, &state.tool_records, width,
+            text::terminal_height().unwrap_or(24), &paint);
     }
     if let Some(panel) = &state.panel {
         return panel.lock().unwrap().render(width, text::terminal_height().unwrap_or(24), &paint);
@@ -640,7 +663,7 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
         if status.tokens > 0 {
             hint.push(format!("↓ {} tokens", tokens(status.tokens)));
         }
-        hint.push("esc to interrupt · ctrl+o output".to_string());
+        hint.push("esc to interrupt · ctrl+o transcript".to_string());
         let hint = format!(" ({})", hint.join(" · "));
         let label = text::fit(&status.label, width.saturating_sub(text::width(&hint) + 3));
         // Forward then back through the glyphs, without repeating the ends.
@@ -888,6 +911,7 @@ impl Observer for Terminal {
         self.streamed = 0;
         // Messages sent from the input box go with this request.
         for queued in self.out.take_delivered() {
+            self.out.transcript_text("❯ You", &queued.text, false);
             if self.last != Block::None {
                 self.out.line("");
             }
@@ -900,6 +924,7 @@ impl Observer for Terminal {
     }
 
     fn on_thinking_delta(&mut self, delta: &str) {
+        self.out.transcript_text("Thinking", delta, true);
         self.streamed(delta.len());
         if self.phase != Phase::Thinking {
             self.enter(Phase::Thinking, "Thinking…");
@@ -922,6 +947,7 @@ impl Observer for Terminal {
     }
 
     fn on_text_delta(&mut self, delta: &str) {
+        self.out.transcript_text("● Assistant", delta, true);
         self.streamed(delta.len());
         if self.last != Block::Text {
             if delta.trim().is_empty() {
@@ -1240,13 +1266,40 @@ mod tests {
         assert!(out.tool_output_key(&Key::ToolOutput));
         assert!(out.tool_output_key(&Key::Text("search".into())));
         assert!(out.tool_output_key(&Key::Esc));
-        assert!(out.tool_output_key(&Key::Esc));
         assert!(!out.tool_output_key(&Key::Enter));
         assert_eq!(out.close_input().draft.text(), "unsent draft");
         assert!(!inbox.wants_turn());
         out.record_call("a", "bash", &json!({"command":"df -h"}));
         out.restore_tool_output(&[]);
         assert!(out.state.lock().unwrap().tool_records.is_empty());
+        assert!(out.state.lock().unwrap().transcript.is_empty());
+    }
+
+    #[test]
+    fn expanded_history_restores_prompts_thoughts_tools_and_replies_in_order() {
+        let out = capture();
+        out.restore_tool_output(&[
+            Message::user(vec![json!({"type":"text","text":"check inode"})]),
+            Message { role: "assistant", source: None, content: vec![
+                json!({"type":"thinking","thinking":"inspect first","signature":"not displayed"}),
+                json!({"type":"tool_use","id":"a","name":"bash","input":{"command":"df -i"}}),
+                json!({"type":"tool_use","id":"b","name":"bash","input":{"command":"pwd"}}),
+            ]},
+            Message::user(vec![
+                json!({"type":"tool_result","tool_use_id":"b","content":"SECOND"}),
+                json!({"type":"tool_result","tool_use_id":"a","content":"FIRST"}),
+            ]),
+            Message { role: "assistant", source: None, content: vec![json!({"type":"text","text":"done"})] },
+        ]);
+        let state = out.state.lock().unwrap();
+        assert!(matches!(&state.transcript[0], Entry::Text { label: "❯ You", content } if content == "check inode"));
+        assert!(matches!(&state.transcript[1], Entry::Text { label: "Thinking", content } if content == "inspect first"));
+        assert!(matches!(&state.transcript[2], Entry::Tool(0)));
+        assert!(matches!(&state.transcript[3], Entry::Tool(1)));
+        assert!(matches!(&state.transcript[4], Entry::Text { label: "● Assistant", content } if content == "done"));
+        assert_eq!(state.transcript.len(), 5);
+        assert_eq!(state.tool_records[0].item(1).details.last().unwrap(), "FIRST");
+        assert_eq!(state.tool_records[1].item(2).details.last().unwrap(), "SECOND");
     }
 
     #[test]

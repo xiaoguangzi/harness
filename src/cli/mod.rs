@@ -15,6 +15,7 @@ mod rewind;
 mod screen;
 mod text;
 mod tool_output;
+mod transcript;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -58,7 +59,7 @@ const BUILTINS: [(&str, &str); 21] = [
     ("/init", "have the model write AGENTS.md, or improve it; /init <notes> says what else to cover"),
     ("/usage", "show the tokens used so far and how full the context is"),
     ("/tools", "browse tool descriptions and input schemas"),
-    ("/output", "inspect full tool inputs and returned output (or Ctrl+O, including while running)"),
+    ("/output", "browse the expanded conversation (or Ctrl+O, including while running)"),
     ("/skills", "browse skills; Enter inserts an invocation into the prompt"),
     ("/agents", "browse subagent types, models, permissions and tools"),
     ("/tasks", "browse this conversation's tasks and task actions"),
@@ -743,6 +744,8 @@ async fn run_shown(
     mut input: Option<TurnInput<'_>>,
 ) -> Result<(), TurnEnd> {
     term.begin_turn();
+    let prompt = content.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
+    if !prompt.is_empty() { out.transcript_text("❯ You", &prompt, false); }
     let inbox = agent.inbox().clone();
     let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
     let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1049,7 +1052,7 @@ fn print_banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {
             if crate::sandbox::active().is_some() { " · sandboxed" } else { "" }
         ),
     ));
-    out.line(out.paint("2", "  / for commands · @ for files · Ctrl+O for tool output · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt"));
+    out.line(out.paint("2", "  / for commands · @ for files · Ctrl+O for transcript · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt"));
     out.line("");
 }
 
@@ -1067,7 +1070,7 @@ fn help_keys() -> [(&'static str, &'static str); 10] {
     [
         ("/<skill> [args]", "run a skill"),
         ("@path", "attach a file, directory, image or PDF; @ opens a file menu (@file#L10-20 for lines)"),
-        ("Ctrl+O", "inspect full tool output; Tab returns to the call list, Esc goes back/closes"),
+        ("Ctrl+O", "expanded transcript; / searches, i shows inputs, Esc closes"),
         ("Ctrl+V", "paste an image from the clipboard (files copied in Finder or a file manager become @ mentions)"),
         ("\\ or Alt+Enter", "continue on a new line"),
         ("↑ ↓ Tab Enter", "pick from the menu shown while typing / or @"),
