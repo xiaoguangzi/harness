@@ -1,5 +1,7 @@
 //! `/model`: preview main/subagent models and reasoning effort together.
 
+use std::cell::Cell;
+
 use super::Output;
 use super::input::Draft;
 use super::keys::Key;
@@ -19,6 +21,8 @@ pub(super) struct Picker {
     target: Target,
     query: Draft,
     selected: usize,
+    /// The first model shown.
+    top: Cell<usize>,
     error: Option<String>,
 }
 
@@ -34,7 +38,7 @@ impl Picker {
         }
         let mut picker = Self {
             original: client.clone(), pending: client.clone(), models,
-            target: Target::Main, query: Draft::default(), selected: 0, error: None,
+            target: Target::Main, query: Draft::default(), selected: 0, top: Cell::new(0), error: None,
         };
         picker.focus_current();
         picker
@@ -73,7 +77,9 @@ impl Picker {
         self.pending.effort_override().and_then(|effort| Effort::ALL.iter().position(|e| *e == effort)).map_or(0, |i| i + 1)
     }
 
-    /// Changes are staged until Enter; cancellation never touches the live client.
+    /// Changes are staged until Enter; cancellation never touches the live
+    /// client. Only ↑/↓ and Enter take the highlighted model: typing to
+    /// filter or changing the effort leaves the staged models alone.
     fn handle_key(&mut self, key: Key) -> Option<Option<Client>> {
         match key {
             Key::Esc | Key::Eof => return Some(None),
@@ -95,7 +101,6 @@ impl Picker {
                 }
             }
             Key::Left | Key::Right => {
-                self.preview_choice();
                 let index = self.effort_index();
                 let next = if key == Key::Left { index.saturating_sub(1) } else { (index + 1).min(Effort::ALL.len()) };
                 self.pending.set_effort(next.checked_sub(1).map(|i| Effort::ALL[i]));
@@ -104,7 +109,6 @@ impl Picker {
             key => {
                 self.query.edit(key);
                 self.focus_current();
-                self.preview_choice();
             }
         }
         None
@@ -132,7 +136,7 @@ impl Picker {
         let choices = self.choices();
         let count = height.saturating_sub(15).clamp(1, 6);
         let list_at = rows.len();
-        let start = (self.selected + 1).saturating_sub(count);
+        let start = super::dialog::window(&self.top, self.selected, count, choices.len());
         let original = match self.target { Target::Main => Some(self.original.spec()), Target::Subagents => self.original.subagent_model() };
         for (i, choice) in choices.iter().enumerate().skip(start).take(count) {
             let current = choice.as_deref() == original;
@@ -173,7 +177,7 @@ impl Picker {
         };
         rows.push(row(note));
         let controls = if room >= 55 {
-            ["↑/↓ model · ←/→ effort · Tab main/subagents", "Enter apply · Esc cancel · /effort is still available"]
+            ["↑/↓ model · ←/→ effort · Tab main/subagents", "Enter apply · Esc cancel"]
         } else {
             ["↑/↓ model · ←/→ effort", "Tab target · Enter apply · Esc cancel"]
         };
@@ -240,7 +244,12 @@ mod tests {
     fn filters_models_and_keeps_empty_results_open() {
         let mut picker = Picker::new(&client());
         picker.handle_key(Key::Text("GAM".into()));
-        assert_eq!(picker.pending.spec(), "gw/gamma");
+        assert_eq!(picker.pending.spec(), "gw/beta", "filtering only moves the highlight");
+        picker.handle_key(Key::Tab);
+        picker.handle_key(Key::Tab);
+        assert_eq!(picker.pending.spec(), "gw/beta", "switching targets doesn't take the highlighted model");
+        picker.handle_key(Key::Text("GAM".into()));
+        assert_eq!(picker.handle_key(Key::Enter).unwrap().unwrap().spec(), "gw/gamma", "Enter takes it");
         picker.handle_key(Key::Text("unknown".into()));
         assert!(picker.handle_key(Key::Enter).is_none());
         let rows = picker.render(80, 24, |_, s| s.into()).0;

@@ -5,6 +5,7 @@
 use anyhow::{Result, bail};
 use rustyline::error::ReadlineError;
 
+use super::dialog::{Item, Keys, choose};
 use super::input::Typing;
 use super::{Output, diff, text};
 use crate::agent::Agent;
@@ -58,10 +59,14 @@ pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, bo
         ));
     }
     let picked = if boxed {
-        let items = listed.iter().map(|c| super::dialog::Item::new(
-            first_line(&c.prompt), format!("{} · {} files tracked", session::ago(c.time, now), c.files.len()),
+        let items = listed.iter().map(|c| Item::new(
+            first_line(&c.prompt), match c.files.len() {
+                0 => session::ago(c.time, now),
+                n => format!("{} · {n} {} changed", session::ago(c.time, now), text::plural(n, "file")),
+            },
         ).details(vec![c.prompt.clone()])).collect();
-        super::dialog::choose(out, "Rewind conversation", "Choose a prompt; restoration options follow · Esc cancels", items, 0).await.map(|i| i + 1)
+        let keys = Keys { enter: "continue", esc: "cancel" };
+        choose(out, "Rewind conversation", "Go back to before which prompt? What to restore comes next", keys, items, 0).await.map(|i| i + 1)
     } else { ask(out, "rewind to before which prompt? (number, Enter to cancel) ", listed.len())? };
     let Some(n) = picked else {
         return Ok(false);
@@ -78,18 +83,11 @@ pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, bo
         out.line(format!("{} {label}", out.paint("1", &format!("{:>3}", i + 1))));
     }
     let picked = if boxed {
-        let details = match &changes {
-            Ok(changes) if changes.is_empty() => vec!["The code is already as it was then".into()],
-            Ok(changes) => change_lines(out, changes),
-            Err(e) => vec![format!("The code cannot be restored: {e:#}")],
-        };
-        let items = CHOICES.iter().map(|(_, label)| super::dialog::Item::new(*label, "Enter applies this restoration; Esc leaves the conversation and files unchanged").details(details.clone())).collect();
-        super::dialog::choose(out, "Restore what?", "Review the changes · Tab full details · Esc cancels", items, 0).await.map(|i| i + 1)
-    } else { ask(out, "restore what? (number, Enter to cancel) ", CHOICES.len())? };
-    let Some(choice) = picked else {
+        restore_choice(out, &changes).await
+    } else { ask(out, "restore what? (number, Enter to cancel) ", CHOICES.len())?.map(|choice| CHOICES[choice - 1].0) };
+    let Some(restore) = picked else {
         return Ok(false);
     };
-    let restore = CHOICES[choice - 1].0;
 
     let mut done = Vec::new();
     if restore != Restore::Conversation {
@@ -139,6 +137,32 @@ fn change_lines(out: &Output, changes: &[Change]) -> Vec<String> {
         lines.push(out.paint("2", &format!("    … and {} more", changes.len() - LISTED_FILES)));
     }
     lines
+}
+
+/// Asks what to restore in a panel. The code choices are offered only when
+/// there are changes to undo and they can be undone.
+async fn restore_choice(out: &Output, changes: &Result<Vec<Change>>) -> Option<Restore> {
+    let (subtitle, files) = match changes {
+        Ok(changes) if changes.is_empty() => ("The code is as it was then, so only the conversation goes back".to_string(), None),
+        Ok(changes) => {
+            let files = format!("{} {} go back", changes.len(), text::plural(changes.len(), "file"));
+            ("Tab lists the files that go back".to_string(), Some((files, change_lines(out, changes))))
+        }
+        Err(e) => (format!("The code cannot be restored: {e:#}"), None),
+    };
+    let mut offered = Vec::new();
+    for (restore, label) in CHOICES {
+        let item = match (restore, &files) {
+            (Restore::Conversation, _) => Item::new(label, "Files stay as they are"),
+            (Restore::Both, Some((files, lines))) => Item::new(label, format!("{files}, and the conversation")).details(lines.clone()),
+            (Restore::Code, Some((files, lines))) => Item::new(label, format!("{files}; the conversation stays")).details(lines.clone()),
+            (_, None) => continue,
+        };
+        offered.push((restore, item));
+    }
+    let items = offered.iter().map(|(_, item)| item.clone()).collect();
+    let i = choose(out, "Restore what?", &subtitle, Keys { enter: "restore", esc: "cancel" }, items, 0).await?;
+    Some(offered[i].0)
 }
 
 /// `+3 -1`, `removed` or `recreated`, for a file going back.

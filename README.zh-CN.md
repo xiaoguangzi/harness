@@ -149,7 +149,7 @@ harness provider list              # 另有：remove <name>、model remove <prov
 
 对已有的 provider 执行 `add` 只修改选项给出的部分（不带选项时重新逐项询问，直接回车保留原值）。密钥按输入原样保存，所以写 `${VAR}`（在 shell 中用单引号）可以不把它写进文件。没有可用的默认模型时，`add` 把它的第一个模型设为默认模型。每次修改后，如果配置还不能使用（例如没有默认模型），会说明原因。
 
-会话中途可用 `/model <provider>/<model>` 直接切换模型，或输入无参数的 `/model` 并回车打开模型设置面板：Tab 切换主模型和子代理默认模型，↑/↓ 选择模型，输入文字筛选，←/→ 调整共同的会话 effort（`auto`、`low`、`medium`、`high`、`xhigh`、`max`）。面板显示两个模型选择、协议、配置的上下文/输出上限和 effort；Enter 一次应用所有预览修改，Esc 放弃修改，仅影响本次会话。子代理默认模型可设置为跟随主模型，也可独立选择；代理自身指定的模型仍优先，已有子代理保留原模型。重定向输入时仍打印 provider、模型列表和实际生效的设置。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
+会话中途可用 `/model <provider>/<model>` 直接切换模型，或输入无参数的 `/model` 并回车打开模型设置面板：Tab 切换主模型和子代理默认模型，↑/↓ 选择模型，输入文字筛选（Enter 采用高亮的模型，仅筛选不会改变设置），←/→ 调整共同的会话 effort（`auto`、`low`、`medium`、`high`、`xhigh`、`max`）。面板显示两个模型选择、协议、配置的上下文/输出上限和 effort；Enter 一次应用所有预览修改，Esc 放弃修改，仅影响本次会话。子代理默认模型可设置为跟随主模型，也可独立选择；代理自身指定的模型仍优先，已有子代理保留原模型。重定向输入时仍打印 provider、模型列表和实际生效的设置。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
 
 ## 用 `@` 附加文件
 
@@ -180,7 +180,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 
 每个已完成的工具调用会与自己的结果相邻显示，同一批并发调用多次使用同名工具也能明确对应。正常对话默认只显示简短预览。按 Ctrl+O 或执行 `/output`，可连续浏览展开的整段会话：用户问题、思考、回复和所有保留的工具结果放在一起，命令下方直接显示输出。按 `i` 或 Tab 显示/隐藏完整 JSON 输入与 Call ID；↑/↓ 或 `j`/`k` 逐行滚动，PgUp/PgDn 或空格/`b` 翻页，Home/End 或 `g`/`G` 跳到开头/末尾，按 `/` 输入关键词并回车搜索，`n`/`N` 查找下一处/上一处。搜索输入中 Esc 取消搜索；其他时候 Esc、`q` 或 Ctrl+O 关闭视图。打开时定位到底部并跟随新输出，向上滚动后暂停跟随，按 `G` 恢复；操作提示固定在屏幕底部。模型运行期间同样可用，不会提交或丢弃输入草稿。`/resume` 恢复已保存的会话内容，`/clear` 清空视图。完整文本仍受工具自身的输出上限约束，例如 `bash` 最多保留 30,000 字节并标明截断；图片和文档附件在此文本视图中只显示说明。
 
-交互面板按终端可用宽度展开，使用标题和留白，不绘制边框或分隔线。无参数的选择类命令会打开键盘交互面板：`/effort`、`/resume`、`/rewind`、`/tasks`、`/stop`、`/provider` 和 `/plugins`。↑/↓ 选择，输入文字筛选，Enter 继续，Esc 取消或返回。`/help` 和 `/skills` 可将选中的命令填入输入框，便于补充参数后执行。`/tools`、`/agents`、`/mcp`、`/usage` 和 `/sandbox` 提供可搜索的只读详情面板；Tab 展开完整详情，↑/↓ 滚动，Tab/Esc 返回。带参数的命令和重定向输入保留原来的行为；`/clear`、`/compact`、`/init`、`/reload-plugins` 和 `/exit` 继续直接执行。
+交互面板按终端可用宽度展开，使用标题和留白，不绘制边框或分隔线；宽度足够时每项的说明显示在名称旁边，放不下时在列表下方完整显示选中项的说明。无参数的选择类命令会打开键盘交互面板：`/effort`、`/resume`、`/rewind`、`/tasks`、`/stop`、`/provider` 和 `/plugins`。↑/↓ 选择，输入文字筛选，Enter 继续，Esc 取消或返回。`/help` 和 `/skills` 可将选中的命令填入输入框，便于补充参数后执行。`/tools`、`/agents`、`/mcp`、`/usage` 和 `/sandbox` 提供可搜索的只读详情面板；Tab 展开完整详情，↑/↓ 滚动，Tab/Esc 返回。没有可显示的任务时 `/stop` 和 `/tasks` 只给出提示；`/rewind` 仅在代码有改动且可以恢复时提供恢复代码的选项。带参数的命令和重定向输入保留原来的行为；`/clear`、`/compact`、`/init`、`/reload-plugins` 和 `/exit` 继续直接执行。
 
 | 命令 / 按键 | 说明 |
 |---|---|
@@ -531,7 +531,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/main.rs` — 启动：配置、`harness plugin`、`harness provider` 和 `--check-plugins`、沙箱，然后是 `setup.rs` 构建的内容；最后进入 CLI 或 web 前端
 - `src/setup.rs` — 会话由什么构成：插件及其技能、代理、hook、MCP 与语言服务器（由 `/reload-plugins` 重建）、用户的 MCP 服务器、工具集和系统提示词；`--check-plugins`；后台自动更新
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
-- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`/rewind`（`rewind.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
+- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）及各个无参数命令在面板中显示的内容（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
 - `src/agent/usage.rs` — `/usage` 显示的按模型统计的 token 数，与子代理共享

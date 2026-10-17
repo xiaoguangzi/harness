@@ -589,9 +589,10 @@ async fn pick_session(rec: &Recorder, out: &Output, boxed: bool) -> Result<Optio
     if boxed {
         let items = sessions.iter().map(|m| dialog::Item::new(
             if m.title.is_empty() { "(untitled)" } else { &m.title },
-            format!("{} · {} messages · {}", session::ago(m.updated, now), m.messages, m.model),
+            format!("{} · {} {} · {}", session::ago(m.updated, now), m.messages, text::plural(m.messages, "message"), m.model),
         ).details(vec![format!("Session: {}", m.id), format!("Directory: {}", m.cwd)])).collect();
-        let selected = dialog::choose(out, "Resume conversation", "Enter resumes · Tab details · Esc cancels", items, 0).await;
+        let keys = dialog::Keys { enter: "resume", esc: "cancel" };
+        let selected = dialog::choose(out, "Resume conversation", "Earlier conversations in this directory", keys, items, 0).await;
         return Ok(selected.map(|i| sessions[i].id.clone()));
     }
     let width = text::terminal_width();
