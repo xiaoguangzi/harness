@@ -135,6 +135,8 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 
 `${VAR}` / `${VAR:-default}` expand from the environment in `base_url`, `api_key` and `headers`. A spec without a known provider prefix is a model on the current provider, so gateway model names containing `/` (such as `openai/gpt-5`) also work.
 
+Both protocols automatically try **gzip request compression**, with no configuration needed: JSON bodies of at least 1 KiB are sent with `Content-Encoding: gzip` when compression saves bytes. HTTP 415, or 400/422 errors indicating unsupported encoding, decompression or JSON decoding failures, trigger one immediate fallback with the identical uncompressed JSON. If that succeeds, this client and its clones (including subagents) skip gzip for that full endpoint URL until configuration reload or process restart. Endpoints are detected independently, with no separate probe requests. Authentication, rate limits, ordinary parameter errors and 5xx do not establish incompatibility; network and service errors retain the existing retry policy. Unrecognized gateway errors are still reported normally. The transport sets `Content-Encoding` and `Content-Length` to match the actual body, overriding custom headers with those names. Gzip reduces bytes transferred, not context or billed tokens, and does not replace [context compaction](#compaction).
+
 `harness provider` edits these settings from the command line (`/provider …` in the REPL does the same, and switches the conversation to the changed setup at once, on the same model if its provider is still there):
 
 ```sh

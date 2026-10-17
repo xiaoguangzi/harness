@@ -114,7 +114,7 @@ pub struct Usage {
 /// A handle on one model at one provider. Cheap to clone.
 #[derive(Clone)]
 pub struct Client {
-    http: reqwest::Client,
+    http: http::Client,
     providers: Arc<Providers>,
     spec: String,
     /// Set by `/effort`; replaces the configured effort for every model.
@@ -132,7 +132,7 @@ impl Client {
             .build()
             .context("building HTTP client")?;
         let spec = providers.default_model.clone();
-        Ok(Self { http, providers: Arc::new(providers), spec, effort: None, subagent_model: None })
+        Ok(Self { http: http::Client::new(http), providers: Arc::new(providers), spec, effort: None, subagent_model: None })
     }
 
     /// The `provider/model` this client talks to.
@@ -159,7 +159,7 @@ impl Client {
         let spec = if providers.target(&self.spec).is_ok() { self.spec.clone() } else { providers.default_model.clone() };
         let subagent_model = self.subagent_model.clone()
             .filter(|model| model.as_ref().is_none_or(|spec| providers.target(spec).is_ok()));
-        Self { providers: Arc::new(providers), spec, subagent_model, ..self.clone() }
+        Self { http: self.http.reset_compression(), providers: Arc::new(providers), spec, subagent_model, ..self.clone() }
     }
 
     /// The default for new subagents without an agent-specific model.

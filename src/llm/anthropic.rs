@@ -16,7 +16,7 @@ const API_VERSION: &str = "2023-06-01";
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
 pub(super) async fn create(
-    http_client: &reqwest::Client,
+    http_client: &http::Client,
     target: &Target<'_>,
     system: &str,
     tools: &[ToolDef],
