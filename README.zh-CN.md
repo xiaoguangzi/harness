@@ -136,8 +136,6 @@ harness --help                          # 查看全部选项
 
 `base_url`、`api_key` 和 `headers` 中的 `${VAR}` / `${VAR:-default}` 会从环境变量展开。没有已知 provider 前缀的 spec 视为当前 provider 上的一个模型，因此包含 `/` 的网关模型名（如 `openai/gpt-5`）同样可用。
 
-两种协议均默认自动尝试 **gzip 请求体压缩**，无需配置：JSON 达到 1 KiB 且压缩后更小时，发送 `Content-Encoding: gzip`。若网关返回 HTTP 415，或 400/422 且错误表明编码不支持、解压或 JSON 解码失败，会立即用相同 JSON 原文回退一次；原文请求成功后，该客户端及其克隆（包括子代理）会记住这个完整端点 URL 不支持 gzip，后续跳过压缩，直到配置重载或进程重启。不同端点独立检测，无额外的探测请求。鉴权、限流、普通参数错误及 5xx 不会被据此判为不支持；网络和服务错误沿用已有重试策略。无法识别的网关错误仍会正常报错。`Content-Encoding` 和 `Content-Length` 由传输层根据实际请求体设置，覆盖自定义同名头。gzip 只减少网络传输字节，不减少上下文 token 或计费 token，也不替代[上下文压缩](#上下文压缩)。
-
 `harness provider` 在命令行中修改这些配置（REPL 中的 `/provider …` 作用相同，并让当前会话立即改用新配置；模型所在的 provider 还在时保持原模型）：
 
 ```sh

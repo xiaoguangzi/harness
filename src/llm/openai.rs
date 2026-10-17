@@ -24,7 +24,7 @@ use super::config::Target;
 use super::{Message, Response, StreamEvent, ToolDef, Usage, http, parse_tool_input, same_source};
 
 pub(super) async fn create(
-    http_client: &http::Client,
+    http_client: &reqwest::Client,
     target: &Target<'_>,
     system: &str,
     tools: &[ToolDef],
