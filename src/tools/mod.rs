@@ -33,7 +33,7 @@ pub use wait::WaitTasksTool;
 pub use todo::TodoTool;
 pub use write::WriteTool;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -262,6 +262,8 @@ static CHANGING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Seen {
     files: HashMap<PathBuf, (Option<SystemTime>, u64)>,
     counter: u64,
+    /// The `AGENTS.md` files of subdirectories the model was shown.
+    notes: HashSet<PathBuf>,
 }
 
 impl FileTracker {
@@ -290,9 +292,30 @@ impl FileTracker {
     }
 
     /// Forgets every file but `keep`, e.g. once the model no longer sees
-    /// the others' contents.
+    /// the others' contents; it no longer sees subdirectories' notes either.
     pub fn retain(&self, keep: &[PathBuf]) {
-        self.seen.lock().unwrap().files.retain(|path, _| keep.contains(path));
+        let mut seen = self.seen.lock().unwrap();
+        seen.files.retain(|path, _| keep.contains(path));
+        seen.notes.clear();
+    }
+
+    /// The `AGENTS.md` files of the directories between `root` (whose own
+    /// is in the system prompt) and `file` that the model was not shown
+    /// yet, outermost first; they count as shown from now on.
+    pub fn new_notes(&self, root: &Path, file: &Path) -> Vec<PathBuf> {
+        let file = Self::key(file);
+        let Ok(inside) = file.strip_prefix(root) else { return Vec::new() };
+        let dirs: Vec<PathBuf> =
+            inside.parent().into_iter().flat_map(Path::ancestors).filter(|d| !d.as_os_str().is_empty()).map(|d| root.join(d)).collect();
+        let mut seen = self.seen.lock().unwrap();
+        let mut notes = Vec::new();
+        for dir in dirs.into_iter().rev() {
+            let note = dir.join("AGENTS.md");
+            if note.is_file() && seen.notes.insert(note.clone()) {
+                notes.push(note);
+            }
+        }
+        notes
     }
 
     /// Waits for any other agent's or call's file change to finish; hold the

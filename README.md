@@ -395,7 +395,12 @@ Hooks run your own commands at points of the agent loop: to block dangerous comm
 
 ## Project notes
 
-If the working directory has an `AGENTS.md`, its contents go into the system prompt, for the main agent and for subagents (except the built-in `explore`, which only searches). Past 40,000 bytes it is cut at a line, and the model is told to read the rest. No other file (a `CLAUDE.md`, one in a parent directory or in `~`) is looked for.
+If the working directory has an `AGENTS.md`, its contents go into the system prompt, for the main agent and for subagents (except the built-in `explore`, which only searches). Past 40,000 bytes it is cut at a line, and the model is told to read the rest. Two more are read:
+
+- `~/.harness/AGENTS.md`, your own instructions for every project, goes into the system prompt too, before the project's (cut at 20,000 bytes).
+- An `AGENTS.md` in a subdirectory of the working directory (`crates/core/AGENTS.md`) comes with the first file the model `read`s below it, after the file's lines, outermost first, each once (cut at 20,000 bytes). After a [compaction](#compaction) they come again, as the model no longer has them.
+
+No other file (a `CLAUDE.md`, one in a parent directory) is looked for.
 
 The file is read when a conversation starts: the REPL's first one, after `/clear` or `/resume`, and each new web task. `/init` has the model write it, or improve the one there is, from the code, the `README.md` and notes written for other agents (`CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`), which it leaves in place; `/init <notes>` says what else to cover. It also works one-shot (`harness /init`) and in the web UI.
 

@@ -17,6 +17,22 @@ impl ReadTool {
     pub fn new(files: FileTracker) -> Self {
         Self { files }
     }
+
+    /// The notes of the subdirectories `path` is in, below the working
+    /// directory (whose own are in the system prompt), that the model has
+    /// not seen yet.
+    fn directory_notes(&self, path: &std::path::Path) -> String {
+        let Ok(root) = std::env::current_dir() else { return String::new() };
+        let mut text = String::new();
+        for note in self.files.new_notes(&root, path) {
+            let label = note.strip_prefix(&root).unwrap_or(&note).display().to_string();
+            if let Some(notes) = crate::prompt::directory_notes(&note, &label) {
+                text.push_str("\n\n");
+                text.push_str(&notes);
+            }
+        }
+        text
+    }
 }
 
 #[derive(Deserialize)]
@@ -100,7 +116,7 @@ impl Tool for ReadTool {
         }
         let lines = window.lines.iter().map(String::as_str);
         match render(lines, offset, limit, window.total) {
-            Ok(out) => ToolOutput::ok(out),
+            Ok(out) => ToolOutput::ok(out + &self.directory_notes(path)),
             Err(e) => ToolOutput::error(format!("{}: {e}", input.path)),
         }
     }
@@ -225,6 +241,31 @@ mod tests {
 
     fn path(f: &tempfile::NamedTempFile) -> String {
         f.path().to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn shows_each_subdirectory_s_notes_once() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "top").unwrap();
+        std::fs::write(root.join("crates/AGENTS.md"), "crates").unwrap();
+        std::fs::write(root.join("crates/core/AGENTS.md"), "core").unwrap();
+        let files = FileTracker::default();
+        let file = root.join("crates/core/src/lib.rs");
+        let names = |notes: Vec<std::path::PathBuf>| -> Vec<String> {
+            notes.iter().map(|n| n.strip_prefix(root).unwrap().display().to_string()).collect()
+        };
+        assert_eq!(names(files.new_notes(root, &file)), ["crates/AGENTS.md", "crates/core/AGENTS.md"], "not the root's");
+        assert!(files.new_notes(root, &file).is_empty(), "shown once");
+        assert!(files.new_notes(root, &root.join("crates/x.rs")).is_empty());
+        assert!(files.new_notes(root, std::path::Path::new("/elsewhere/AGENTS.md")).is_empty());
+        files.retain(&[]);
+        assert_eq!(files.new_notes(root, &file).len(), 2, "again after a compaction");
+
+        let notes = crate::prompt::directory_notes(&root.join("crates/core/AGENTS.md"), "crates/core/AGENTS.md").unwrap();
+        assert!(notes.starts_with("`crates/core/AGENTS.md` holds notes for the files in `crates/core/`"), "{notes}");
+        assert!(notes.ends_with("<agents-md>\ncore\n</agents-md>"), "{notes}");
     }
 
     #[tokio::test]

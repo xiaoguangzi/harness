@@ -17,6 +17,8 @@ const INIT: &str = include_str!("init.md");
 /// How much of `AGENTS.md` goes into the prompt, in bytes; the model reads
 /// the rest itself.
 const NOTES_LIMIT: usize = 40_000;
+/// The same for `~/.harness/AGENTS.md` and a subdirectory's `AGENTS.md`.
+const OTHER_NOTES_LIMIT: usize = 20_000;
 
 /// How to use each built-in tool, in the order they are listed.
 const GUIDANCE: &[(&str, &str)] = &[
@@ -104,7 +106,7 @@ pub fn main(tools: &ToolRegistry) -> String {
         section.push_str(&claude_code_names(tools.names().collect()));
     }
     let prompt = TEMPLATE.replace("{{tools}}", &section).replace("{{environment}}", &environment());
-    prompt + &project_notes(&std::env::current_dir().unwrap_or_default())
+    prompt + &user_notes() + &project_notes(&std::env::current_dir().unwrap_or_default())
 }
 
 /// The prompt `/init` sends: write or improve `AGENTS.md`, with what the
@@ -130,7 +132,7 @@ pub fn subagent(def: &AgentDef) -> String {
     let notes = if def.path.is_none() && def.name == "explore" {
         String::new()
     } else {
-        project_notes(&std::env::current_dir().unwrap_or_default())
+        user_notes() + &project_notes(&std::env::current_dir().unwrap_or_default())
     };
     format!(
         "{}\n\nYou were started by another agent, which sees only your final message; the user does \
@@ -218,31 +220,66 @@ fn environment() -> String {
 
 /// The section with `dir`'s `AGENTS.md`, empty when there is none (or it is
 /// blank). Past [`NOTES_LIMIT`] it is cut at a line, and the model is told
-/// where to read on.
+/// to read the rest itself.
 fn project_notes(dir: &Path) -> String {
-    let Ok(text) = std::fs::read_to_string(dir.join("AGENTS.md")) else { return String::new() };
+    let path = dir.join("AGENTS.md");
+    let Some(shown) = notes_text(&path, "`AGENTS.md`", NOTES_LIMIT) else { return String::new() };
+    format!(
+        "\n\n# Project notes\n\n`AGENTS.md` in the working directory holds this project's conventions and \
+         commands, written for the agents that work on it. Follow it; the user's own instructions come \
+         first.\n\n{shown}"
+    )
+}
+
+/// The section with `~/.harness/AGENTS.md`, the user's notes for every
+/// project, empty without one.
+fn user_notes() -> String {
+    let Some(home) = std::env::var_os("HOME") else { return String::new() };
+    let path = Path::new(&home).join(".harness/AGENTS.md");
+    let Some(shown) = notes_text(&path, &format!("`{}`", path.display()), OTHER_NOTES_LIMIT) else {
+        return String::new();
+    };
+    format!(
+        "\n\n# The user's notes\n\n`~/.harness/AGENTS.md` holds the user's own instructions for every \
+         project. Follow them; the user's messages come first, and the project's notes below may add to \
+         them.\n\n{shown}"
+    )
+}
+
+/// The notes of the subdirectory holding `path`, an `AGENTS.md` that
+/// `read` shows the model with the first file it reads below it; `label`
+/// is how the result names it.
+pub fn directory_notes(path: &Path, label: &str) -> Option<String> {
+    let shown = notes_text(path, &format!("`{label}`"), OTHER_NOTES_LIMIT)?;
+    let dir = Path::new(label).parent().map(|d| d.display().to_string()).unwrap_or_default();
+    Some(format!(
+        "`{label}` holds notes for the files in `{dir}/`, written for the agents that work on them. Follow \
+         them there; the user's own instructions come first.\n\n{shown}"
+    ))
+}
+
+/// `path`'s text in `<agents-md>` tags, `None` when it is missing or
+/// blank. Past `limit` bytes it is cut at a line, with a note to read the
+/// rest; `label` names the file in that note.
+fn notes_text(path: &Path, label: &str, limit: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
     // Only the end is trimmed, so the line the model reads on from is right.
     let text = text.trim_end();
     if text.trim_start().is_empty() {
-        return String::new();
+        return None;
     }
-    let (shown, rest) = if text.len() > NOTES_LIMIT {
-        let mut end = NOTES_LIMIT;
+    let (shown, rest) = if text.len() > limit {
+        let mut end = limit;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
         let end = text[..end].rfind('\n').unwrap_or(end);
         let line = text[..end].lines().count() + 1;
-        let rest = format!("\n\n[`AGENTS.md` goes on; read it with `read` from line {line} on.]");
-        (&text[..end], rest)
+        (&text[..end], format!("\n\n[{label} goes on; read it with `read` from line {line} on.]"))
     } else {
         (text, String::new())
     };
-    format!(
-        "\n\n# Project notes\n\n`AGENTS.md` in the working directory holds this project's conventions and \
-         commands, written for the agents that work on it. Follow it; the user's own instructions come \
-         first.\n\n<agents-md>\n{shown}\n</agents-md>{rest}"
-    )
+    Some(format!("<agents-md>\n{shown}\n</agents-md>{rest}"))
 }
 
 /// The local date as `YYYY-MM-DD`.
