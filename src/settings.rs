@@ -128,6 +128,16 @@ impl Settings {
         Ok(serde_json::from_str(text)?)
     }
 
+    /// Leaves out what `--bare` does not load: MCP servers, hooks and the
+    /// enabled plugins.
+    pub fn strip_for_bare(&mut self) {
+        if crate::util::bare() {
+            self.mcp_servers.clear();
+            self.hooks.clear();
+            self.enabled_plugins.clear();
+        }
+    }
+
     /// The variables holding credentials the harness sends: the default
     /// providers' keys, and the ones the providers' `api_key` and headers
     /// and the MCP servers' headers refer to, but those `shell.keep_env`

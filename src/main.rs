@@ -45,6 +45,8 @@ Options:
       --settings FILE Read settings from FILE instead
       --plugin-dir DIR Load the plugin in DIR as well (repeatable)
       --check-plugins Load the plugins, report what loaded and what not, and exit
+      --bare          Start without plugins, hooks, MCP servers, skills, custom agents and AGENTS.md
+      --output-format FORMAT  One-shot output: text (default), json or stream-json
   -h, --help          Print this help
   -V, --version       Print the version
 
@@ -80,6 +82,13 @@ async fn main() -> Result<ExitCode> {
     }
     let (plugin_dirs, args) = plugins::parse_flag(args)?;
     let mut settings = Settings::load()?;
+    let bare = args.iter().any(|a| a == "--bare");
+    let args: Vec<String> = args.into_iter().filter(|a| a != "--bare").collect();
+    if bare {
+        // Only what the command line names is loaded.
+        util::set_bare();
+        settings.strip_for_bare();
+    }
     for file in settings::legacy_files() {
         eprintln!("\x1b[33m{} is no longer read; move its settings into ~/.harness/settings.json\x1b[0m", file.display());
     }
@@ -102,7 +111,9 @@ async fn main() -> Result<ExitCode> {
         eprintln!("\x1b[33m{w}\x1b[0m");
     }
     ext.activate();
-    setup::auto_update(std::mem::take(&mut ext.auto_update));
+    if !bare {
+        setup::auto_update(std::mem::take(&mut ext.auto_update));
+    }
     let web_addr = web::parse_flag(&args)?;
     // The web UI can fix a missing or broken provider setup, so it starts
     // without one.

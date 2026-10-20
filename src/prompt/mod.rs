@@ -222,6 +222,9 @@ fn environment() -> String {
 /// blank). Past [`NOTES_LIMIT`] it is cut at a line, and the model is told
 /// to read the rest itself.
 fn project_notes(dir: &Path) -> String {
+    if crate::util::bare() {
+        return String::new();
+    }
     let path = dir.join("AGENTS.md");
     let Some(shown) = notes_text(&path, "`AGENTS.md`", NOTES_LIMIT) else { return String::new() };
     format!(
@@ -234,6 +237,9 @@ fn project_notes(dir: &Path) -> String {
 /// The section with `~/.harness/AGENTS.md`, the user's notes for every
 /// project, empty without one.
 fn user_notes() -> String {
+    if crate::util::bare() {
+        return String::new();
+    }
     let Some(home) = std::env::var_os("HOME") else { return String::new() };
     let path = Path::new(&home).join(".harness/AGENTS.md");
     let Some(shown) = notes_text(&path, &format!("`{}`", path.display()), OTHER_NOTES_LIMIT) else {
@@ -250,6 +256,9 @@ fn user_notes() -> String {
 /// `read` shows the model with the first file it reads below it; `label`
 /// is how the result names it.
 pub fn directory_notes(path: &Path, label: &str) -> Option<String> {
+    if crate::util::bare() {
+        return None;
+    }
     let shown = notes_text(path, &format!("`{label}`"), OTHER_NOTES_LIMIT)?;
     let dir = Path::new(label).parent().map(|d| d.display().to_string()).unwrap_or_default();
     Some(format!(

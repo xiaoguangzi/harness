@@ -73,6 +73,8 @@ struct State {
     /// Lines printed while the line editor reads, shown once it is done:
     /// printing then would tear up the line being edited.
     held: Option<Vec<String>>,
+    /// Nothing is drawn: stdout belongs to something else (JSON output).
+    silent: bool,
 }
 
 /// Restores a usable shell cursor on normal exit and error unwinding.
@@ -131,6 +133,7 @@ impl Output {
             size: (0, None),
             frame: 0,
             held: None,
+            silent: false,
         };
         Self { state: Arc::new(Mutex::new(state)), styled }
     }
@@ -362,6 +365,11 @@ impl Output {
 
     /// Holds back output while the line editor reads (`true`), and prints
     /// what was held once it is done (`false`).
+    /// Draws nothing from now on, with `silent`.
+    pub fn set_silent(&self, silent: bool) {
+        self.state.lock().unwrap().silent = silent;
+    }
+
     pub fn hold(&self, hold: bool) {
         let held = {
             let mut state = self.state.lock().unwrap();
@@ -459,6 +467,9 @@ impl Output {
     /// Prints `printed` above the status and input box, and redraws them,
     /// in one write.
     fn show(&self, state: &mut State, printed: &str) {
+        if state.silent {
+            return;
+        }
         if printed.is_empty() && !self.redraws(state) && !state.drawn && state.screen.is_none() {
             return;
         }

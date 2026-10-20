@@ -59,10 +59,12 @@ impl Extensions {
             hooks.entry(event).or_default().extend(groups);
         }
 
-        let (mut skills, skipped) = skills::discover(&skills::default_roots());
+        // `--bare` reads no skills, commands or agents from the directories.
+        let roots = |roots: Vec<PathBuf>| if crate::util::bare() { Vec::new() } else { roots };
+        let (mut skills, skipped) = skills::discover(&roots(skills::default_roots()));
         warnings.extend(skipped.into_iter().map(|w| format!("skill skipped: {w}")));
         // A skill wins over a command of the same name, as in Claude Code.
-        let (commands, skipped) = skills::discover_commands(&skills::default_command_roots());
+        let (commands, skipped) = skills::discover_commands(&roots(skills::default_command_roots()));
         warnings.extend(skipped.into_iter().map(|w| format!("command skipped: {w}")));
         for command in commands {
             if !skills.iter().any(|s| s.name == command.name) {
@@ -72,7 +74,7 @@ impl Extensions {
         skills.extend(loaded.skills);
         skills.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let (mut agent_defs, skipped) = subagent::discover(&subagent::default_roots());
+        let (mut agent_defs, skipped) = subagent::discover(&roots(subagent::default_roots()));
         warnings.extend(skipped.into_iter().map(|w| format!("agent skipped: {w}")));
         agent_defs.extend(loaded.agents);
         agent_defs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -203,6 +205,7 @@ impl Env {
         self.ext.mcp.wait().await;
         let reuse: Vec<&mcp::Manager> =
             [Some(&self.ext.mcp), self.pending.as_ref().map(|p| &p.mcp)].into_iter().flatten().filter_map(mcp::Servers::connected).collect();
+        settings.strip_for_bare();
         let mut ext = Extensions::load(&mut settings, &self.plugin_dirs, &reuse);
         let mcp_failures = failures(ext.mcp.wait().await);
         let loaded = ext.plugins.list.iter().filter(|p| p.outcome.is_ok()).count();

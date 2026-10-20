@@ -1,6 +1,21 @@
 //! Small helpers shared by the config loaders.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde_json::Value;
+
+static BARE: AtomicBool = AtomicBool::new(false);
+
+/// `--bare`: the harness starts without what the settings and directories
+/// add (plugins, hooks, MCP servers, skills and commands, custom agents,
+/// `AGENTS.md` notes).
+pub fn set_bare() {
+    BARE.store(true, Ordering::Relaxed);
+}
+
+pub fn bare() -> bool {
+    BARE.load(Ordering::Relaxed)
+}
 
 /// Held by tests that change the process-wide working directory, and by
 /// tests whose child processes would inherit it.

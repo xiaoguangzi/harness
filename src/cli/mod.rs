@@ -5,6 +5,7 @@ mod diff;
 mod dialog;
 mod commands;
 mod input;
+pub mod json;
 mod keys;
 mod markdown;
 mod menu;
@@ -82,6 +83,14 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
     let files = &env.files.clone();
     let mut skills = env.ext.skills.clone();
     let (resume, args) = session::parse_args(args)?;
+    let (format, args) = json::parse_flag(args)?;
+    if format != json::Format::Text {
+        if args.is_empty() {
+            anyhow::bail!("--output-format json and stream-json need a prompt to run");
+        }
+        // Only the JSON goes to stdout.
+        out.set_silent(true);
+    }
     out.spawn_spinner();
     let mut term = Terminal::new(out.clone());
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
@@ -123,6 +132,9 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
             },
             input => input,
         };
+        if format != json::Format::Text {
+            return Ok(one_shot_json(agent, &line, input, files, format, recorder.as_mut(), &out).await);
+        }
         return match input {
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
@@ -568,6 +580,67 @@ async fn finish_mcp(agent: &mut Agent, env: &mut Env, out: &Output) {
     let (tools, system) = env.conversation(agent.client());
     agent.set_tools(tools);
     agent.set_system(system);
+}
+
+/// One-shot mode with `--output-format json` or `stream-json`: runs the
+/// prompt in `input`, and the turns that background work brings, then
+/// prints the result (see [`json::Events`]).
+async fn one_shot_json(
+    agent: &mut Agent,
+    line: &str,
+    input: Input,
+    files: &FileTracker,
+    format: json::Format,
+    recorder: Option<&mut Recorder>,
+    out: &Output,
+) -> ExitCode {
+    let session_id = recorder.as_ref().map(|rec| rec.meta().id.clone());
+    let mut events = json::Events::new(format);
+    events.init(agent, session_id.as_deref());
+    let start = agent.messages().len();
+    let mut interrupted = false;
+    let mut result = match input {
+        Input::Prompt(prompt) => {
+            agent.set_prompt_label(line);
+            let content = attachments(line, &[], files).into_content(&prompt);
+            tokio::select! {
+                result = agent.run_turn(content, &mut events) => result,
+                _ = tokio::signal::ctrl_c() => { interrupted = true; Err(anyhow::anyhow!("interrupted")) }
+            }
+        }
+        Input::Error(e) => Err(anyhow::anyhow!(e)),
+        _ => Err(anyhow::anyhow!("REPL commands are only available interactively")),
+    };
+    // Answer background subagents' reports as they come in, and finish
+    // once none is left running.
+    while result.is_ok() {
+        if !agent.inbox().wants_turn() {
+            let running = agent.subagents().running_in_background() + agent.shells().pending();
+            if running == 0 {
+                break;
+            }
+            if !wait_for_reports(agent, running, out).await {
+                interrupted = true;
+                result = Err(anyhow::anyhow!("interrupted"));
+                break;
+            }
+        }
+        result = tokio::select! {
+            result = agent.run_turn(Vec::new(), &mut events) => result,
+            _ = tokio::signal::ctrl_c() => { interrupted = true; Err(anyhow::anyhow!("interrupted")) }
+        };
+    }
+    if let Some(rec) = recorder {
+        save_session(agent, rec, out);
+    }
+    agent.end_session("other").await;
+    let error = result.as_ref().err().map(|e| format!("{e:#}"));
+    json::print(&events.result(agent, session_id.as_deref(), error, start));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) if interrupted => ExitCode::from(130),
+        Err(_) => ExitCode::FAILURE,
+    }
 }
 
 /// Waits for `read`, the input box; if the user is away for `after`, the

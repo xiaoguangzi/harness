@@ -28,6 +28,8 @@ harness --plugin-dir ./my-plugin        # load a plugin from a directory for thi
 harness provider add relay              # add an LLM gateway, asking for its URL, key and models (see below)
 harness plugin install fmt@team         # install a plugin (see below; harness plugin help)
 harness --check-plugins                 # report what each enabled plugin loads, and what not
+harness --output-format json "..."      # one-shot, printing a JSON result for scripts (see below)
+harness --bare "..."                    # start without plugins, hooks, MCP servers, skills or AGENTS.md
 harness --help                          # all options
 ```
 
@@ -44,6 +46,16 @@ Rerun `cargo install --path .` after pulling changes. While developing, `cargo r
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | implicit `openai` provider (Responses API) |
 | `HARNESS_SANDBOX` | `1` or `0`: turn the [sandbox](#sandbox) on or off (the `--sandbox` / `--no-sandbox` flags win) |
 | `HARNESS_WEB_TOKEN` | web UI token (generated at startup if unset) |
+
+## Scripting
+
+`--output-format json` makes a one-shot run print a single JSON object on stdout when it is done, and nothing else: `result` (the model's last answer), `is_error` and `error`, `session_id` (for `--resume`), `model`, `requests`, `duration_ms` and `usage` (input, cache read and write, output tokens). `--output-format stream-json` prints one JSON object per line as the run goes: `init` (session, model, cwd, tool names), `text` (each finished block of the answer), `tool_call` and `tool_result` (paired by `id`), `usage` per request, `retry`, `compact`, `hook`, and finally the same `result`. The exit code is 0, 1 on an error, or 130 when interrupted. As in text mode, the run waits for the background work it started.
+
+`--bare` starts lean and predictable: no plugins, hooks or MCP servers from the settings, no skills, commands or custom agents from the directories, and no `AGENTS.md` notes; the providers, the sandbox and the built-in tools and agents stay, and `--plugin-dir` still loads the plugins it names.
+
+```sh
+harness --bare --output-format json "list the TODO comments in src" | jq -r .result
+```
 
 ## Settings
 
@@ -579,7 +591,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/main.rs` — startup: settings, `harness plugin`, `harness provider` and `--check-plugins`, the sandbox, then what `setup.rs` builds; then the CLI or web frontend
 - `src/setup.rs` — what a conversation is built from: the plugins with their skills, agents, hooks, MCP and language servers (rebuilt by `/reload-plugins`), the user's MCP servers, the tool set and system prompt; `--check-plugins`; background auto-updates
 - `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section, editing it in place
-- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), `/rewind` (`rewind.rs`), the keyboard panels slash commands open (`dialog.rs`) and what each bare command shows in one (`commands.rs`), the `/model` panel for models and effort (`model.rs`), the spinner, input box and turn display (`output.rs`), retained tool results (`tool_output.rs`), the searchable expanded conversation (`transcript.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), shared viewport and native scrollback (`screen.rs`), prompt input, menu keys, completion, history, multi-line input, Ctrl+V and Esc Esc (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), `--output-format json` / `stream-json` (`json.rs`), `/rewind` (`rewind.rs`), the keyboard panels slash commands open (`dialog.rs`) and what each bare command shows in one (`commands.rs`), the `/model` panel for models and effort (`model.rs`), the spinner, input box and turn display (`output.rs`), retained tool results (`tool_output.rs`), the searchable expanded conversation (`transcript.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), shared viewport and native scrollback (`screen.rs`), prompt input, menu keys, completion, history, multi-line input, Ctrl+V and Esc Esc (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
 - `src/agent/usage.rs` — the per-model token counts `/usage` shows, shared with the subagents

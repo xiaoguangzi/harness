@@ -29,6 +29,8 @@ harness --plugin-dir ./my-plugin        # 本次运行额外加载某个目录�
 harness provider add relay              # 添加 LLM 网关，会询问 URL、密钥和模型（见下文）
 harness plugin install fmt@team         # 安装插件（见下文；harness plugin help）
 harness --check-plugins                 # 报告每个已启用插件加载了什么、没加载什么
+harness --output-format json "..."      # 一次性模式，输出供脚本使用的 JSON 结果（见下文）
+harness --bare "..."                    # 不加载插件、hooks、MCP 服务器、技能和 AGENTS.md 启动
 harness --help                          # 查看全部选项
 ```
 
@@ -45,6 +47,16 @@ harness --help                          # 查看全部选项
 | `OPENAI_API_KEY`、`OPENAI_BASE_URL` | 隐式的 `openai` provider（Responses API） |
 | `HARNESS_SANDBOX` | `1` 或 `0`：开启或关闭[沙箱](#沙箱)（`--sandbox` / `--no-sandbox` 参数优先） |
 | `HARNESS_WEB_TOKEN` | Web UI token（未设置则启动时自动生成） |
+
+## 脚本调用
+
+`--output-format json` 让一次性运行在结束时向 stdout 输出一个 JSON 对象，此外什么都不输出：`result`（模型最后的回答）、`is_error` 和 `error`、`session_id`（可用于 `--resume`）、`model`、`requests`、`duration_ms` 和 `usage`（输入、缓存读写、输出 token）。`--output-format stream-json` 在运行过程中每行输出一个 JSON 对象：`init`（会话、模型、工作目录、工具名）、`text`（回答中每个完成的文本块）、`tool_call` 和 `tool_result`（按 `id` 配对）、每次请求的 `usage`、`retry`、`compact`、`hook`，最后是同样的 `result`。退出码为 0，出错为 1，被中断为 130。和文本模式一样，运行会等它启动的后台工作完成。
+
+`--bare` 以精简、可预期的方式启动：不加载配置里的插件、hooks 和 MCP 服务器，不从目录读取技能、命令和自定义代理，也不读 `AGENTS.md`；provider、沙箱、内置工具和内置代理照常可用，`--plugin-dir` 仍会加载它指定的插件。
+
+```sh
+harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .result
+```
 
 ## 配置
 
@@ -580,7 +592,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/main.rs` — 启动：配置、`harness plugin`、`harness provider` 和 `--check-plugins`、沙箱，然后是 `setup.rs` 构建的内容；最后进入 CLI 或 web 前端
 - `src/setup.rs` — 会话由什么构成：插件及其技能、代理、hook、MCP 与语言服务器（由 `/reload-plugins` 重建）、用户的 MCP 服务器、工具集和系统提示词；`--check-plugins`；后台自动更新
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
-- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）及各个无参数命令在面板中显示的内容（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
+- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）及各个无参数命令在面板中显示的内容（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
 - `src/agent/usage.rs` — `/usage` 显示的按模型统计的 token 数，与子代理共享
