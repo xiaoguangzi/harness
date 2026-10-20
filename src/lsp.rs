@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -32,6 +32,8 @@ use crate::util::expand_env;
 /// How long a server may take to start, and to answer a request.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a server that failed to start is not tried again.
+const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// How long `diagnostics` waits for a server to report on a file it just
 /// got.
 const DIAGNOSTICS_WAIT: Duration = Duration::from_secs(10);
@@ -103,12 +105,15 @@ pub fn command_exists(command: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(&command).is_file())
 }
 
+/// A server started, or why and when it could not start.
+type Started = Result<Arc<Server>, (String, Instant)>;
+
 /// The configured servers, started as they are needed.
 #[derive(Default)]
 pub struct Manager {
     configs: BTreeMap<String, ServerConfig>,
-    /// Each server started so far, or why it could not start.
-    started: tokio::sync::Mutex<HashMap<String, Result<Arc<Server>, String>>>,
+    /// Each server started so far.
+    started: tokio::sync::Mutex<HashMap<String, Started>>,
 }
 
 impl Manager {
@@ -136,11 +141,13 @@ impl Manager {
         {
             return Ok((server.clone(), language));
         }
-        if let Some(Err(e)) = started.get(name) {
+        if let Some(Err((e, at))) = started.get(name)
+            && at.elapsed() < RETRY_AFTER
+        {
             return Err(e.clone());
         }
         let server = Server::start(name, config).await.map(Arc::new);
-        started.insert(name.clone(), server.clone());
+        started.insert(name.clone(), server.clone().map_err(|e| (e, Instant::now())));
         server.map(|s| (s, language))
     }
 

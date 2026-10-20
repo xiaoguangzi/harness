@@ -314,7 +314,9 @@ Declare servers under `mcpServers` in the [settings](#settings), in the same sha
 
 - Transports: `stdio` (default when `command` is set) and streamable `http` (default when `url` is set), via the official Rust SDK [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk). A stdio server may set `cwd`, the directory it runs in. Servers that sign in with OAuth are not supported.
 - `${VAR}` / `${VAR:-default}` are expanded from the environment in every string.
-- Servers connect concurrently at startup; a server that fails is reported and skipped.
+- Servers connect concurrently at startup, in the background: the REPL is ready at once (the banner says how many are connecting), and its first request waits for them, so a conversation has the same tools, and the prompt cache the same prefix, from the start. One-shot mode and the web UI wait before starting. A server that fails is reported and skipped; `/mcp` shows how long each took.
+- A connection that is lost (the server exited, or an HTTP session expired) is opened again on the next call, with the tools as first listed. A call the loss cut short is repeated only if the tool is read-only (`readOnlyHint`); otherwise the model is told it may already have taken effect. After a failed reconnect, calls fail at once for 10 seconds before it is tried again.
+- `/reload-plugins` keeps the plugins' servers whose config did not change running, rather than starting them again.
 - Tools are exposed as `mcp__<server>__<tool>`. Text, embedded text resources and PNG/JPEG/GIF/WebP images are passed back to the model.
 - A stdio server's stderr goes to `$TMPDIR/harness-mcp-<server>.log`.
 

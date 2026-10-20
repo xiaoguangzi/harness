@@ -31,7 +31,7 @@ pub struct Extensions {
     pub agent_defs: Arc<Vec<AgentDef>>,
     pub hooks: Arc<hooks::Config>,
     /// The plugins' MCP servers.
-    pub mcp: mcp::Manager,
+    pub mcp: mcp::Servers,
     /// The plugins' language servers, started as they are needed.
     pub lsp: Arc<lsp::Manager>,
     bin_dirs: Vec<PathBuf>,
@@ -44,8 +44,9 @@ pub struct Extensions {
 impl Extensions {
     /// Loads the plugins `settings` enable and those in `plugin_dirs`
     /// (fetching what is missing), the skills, commands and agents, and the
-    /// hooks (taken out of `settings`), and starts the plugins' MCP servers.
-    pub async fn load(settings: &mut Settings, plugin_dirs: &[PathBuf]) -> Self {
+    /// hooks (taken out of `settings`), and starts connecting to the
+    /// plugins' MCP servers, taking over those `reuse` has connected alike.
+    pub fn load(settings: &mut Settings, plugin_dirs: &[PathBuf], reuse: &[&mcp::Manager]) -> Self {
         let loaded = tokio::task::block_in_place(|| plugins::load(settings, plugin_dirs));
         let mut warnings = loaded.warnings;
         for plugin in &loaded.plugins.list {
@@ -85,12 +86,7 @@ impl Extensions {
             }
             installed
         });
-        let mcp = mcp::Manager::start(&loaded.mcp_servers).await;
-        for status in &mcp.statuses {
-            if let Err(e) = &status.outcome {
-                warnings.push(format!("MCP server `{}` failed: {e}", status.name));
-            }
-        }
+        let mcp = mcp::Servers::connect(&loaded.mcp_servers, reuse);
         Self {
             plugins: loaded.plugins,
             skills: Arc::new(skills),
@@ -117,7 +113,7 @@ pub struct Env {
     pub ext: Extensions,
     /// Reloaded extensions waiting for the next conversation.
     pending: Option<Extensions>,
-    pub user_mcp: mcp::Manager,
+    pub user_mcp: mcp::Servers,
     /// The main conversation's file tracker, shared with `@` mentions.
     pub files: FileTracker,
     pub forks: Forks,
@@ -125,11 +121,11 @@ pub struct Env {
     plugin_dirs: Vec<PathBuf>,
     /// Plugin MCP and language servers no conversation gets any more, to
     /// shut down once the tools holding them are gone.
-    retired: Vec<(mcp::Manager, Arc<lsp::Manager>)>,
+    retired: Vec<(mcp::Servers, Arc<lsp::Manager>)>,
 }
 
 impl Env {
-    pub fn new(ext: Extensions, user_mcp: mcp::Manager, reporter: Reporter, plugin_dirs: Vec<PathBuf>) -> Self {
+    pub fn new(ext: Extensions, user_mcp: mcp::Servers, reporter: Reporter, plugin_dirs: Vec<PathBuf>) -> Self {
         let (files, forks) = (FileTracker::default(), Forks::default());
         Self { ext, pending: None, user_mcp, files, forks, reporter, plugin_dirs, retired: Vec::new() }
     }
@@ -142,8 +138,11 @@ impl Env {
         if !skill_tool.is_empty() {
             registry.register(skill_tool);
         }
-        self.user_mcp.register(&mut registry);
-        self.ext.mcp.register(&mut registry);
+        for servers in [&self.user_mcp, &self.ext.mcp] {
+            if let Some(manager) = servers.connected() {
+                manager.register(&mut registry);
+            }
+        }
         if !self.ext.lsp.is_empty() {
             registry.register(lsp::LspTool::new(self.ext.lsp.clone()));
         }
@@ -165,25 +164,57 @@ impl Env {
         (registry, system)
     }
 
-    /// The MCP servers: the user's, then the plugins'.
+    /// The connected MCP servers: the user's, then the plugins'.
     pub fn mcp_statuses(&self) -> impl Iterator<Item = &mcp::Status> {
-        self.user_mcp.statuses.iter().chain(&self.ext.mcp.statuses)
+        let connected = [&self.user_mcp, &self.ext.mcp].into_iter().filter_map(mcp::Servers::connected);
+        connected.flat_map(|m| &m.statuses)
+    }
+
+    /// How many MCP servers are configured, if some still connect.
+    pub fn mcp_connecting(&self) -> Option<usize> {
+        let servers = [&self.user_mcp, &self.ext.mcp];
+        servers.iter().any(|s| s.connected().is_none()).then(|| servers.iter().map(|s| s.configured()).sum())
+    }
+
+    /// Waits for the MCP servers still connecting; returns a warning for
+    /// each that failed. Rebuild the conversation's tools after it.
+    pub async fn wait_mcp(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for servers in [&mut self.user_mcp, &mut self.ext.mcp] {
+            if servers.connected().is_none() {
+                warnings.extend(failures(servers.wait().await));
+            }
+        }
+        warnings
+    }
+
+    /// Agents' tools that no tool registered matches, as warnings.
+    pub fn unknown_agent_tools(&self, client: &Client) -> Vec<String> {
+        let probe = AgentTool::new(self.ext.agent_defs.clone(), self.base_tools(), client.clone(), self.reporter.clone());
+        probe.unknown_tools().into_iter().map(|(agent, tool)| format!("agent `{agent}` lists unknown tool `{tool}`")).collect()
     }
 
     /// Loads the plugins, skills, agents and hooks again from the settings
     /// file, for the next conversation; returns what to tell the user.
     pub async fn reload(&mut self) -> Result<Vec<String>> {
         let mut settings = Settings::load()?;
-        let ext = Extensions::load(&mut settings, &self.plugin_dirs).await;
+        // The plugin servers connected alike are carried over, not started
+        // again.
+        self.ext.mcp.wait().await;
+        let reuse: Vec<&mcp::Manager> =
+            [Some(&self.ext.mcp), self.pending.as_ref().map(|p| &p.mcp)].into_iter().flatten().filter_map(mcp::Servers::connected).collect();
+        let mut ext = Extensions::load(&mut settings, &self.plugin_dirs, &reuse);
+        let mcp_failures = failures(ext.mcp.wait().await);
         let loaded = ext.plugins.list.iter().filter(|p| p.outcome.is_ok()).count();
         let mut lines = vec![format!(
             "reloaded: {loaded} plugin{}, {} skills and commands, {} agents, {} MCP servers from plugins",
             if loaded == 1 { "" } else { "s" },
             ext.skills.len(),
             ext.agent_defs.len(),
-            ext.mcp.statuses.iter().filter(|s| s.outcome.is_ok()).count(),
+            ext.mcp.connected().map_or(0, |m| m.statuses.iter().filter(|s| s.outcome.is_ok()).count()),
         )];
         lines.extend(ext.warnings.iter().cloned());
+        lines.extend(mcp_failures);
         if let Some(old) = self.pending.replace(ext) {
             self.retired.push((old.mcp, old.lsp));
         }
@@ -227,6 +258,12 @@ impl Env {
         self.ext.mcp.shutdown().await;
         self.user_mcp.shutdown().await;
     }
+}
+
+/// A warning for each of `manager`'s servers that failed to connect.
+fn failures(manager: &mcp::Manager) -> Vec<String> {
+    let failed = manager.statuses.iter().filter_map(|s| s.outcome.as_ref().err().map(|e| (&s.name, e)));
+    failed.map(|(name, e)| format!("MCP server `{name}` failed: {e}")).collect()
 }
 
 /// Fetches the latest of `checkouts` in the background, for the next start;

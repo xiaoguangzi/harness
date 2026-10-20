@@ -28,7 +28,6 @@ use agent::Agent;
 use llm::{Client, Providers};
 use settings::Settings;
 use setup::{Env, Extensions};
-use subagent::AgentTool;
 
 const USAGE: &str = "\
 Usage: harness [OPTIONS] [PROMPT...]
@@ -93,7 +92,10 @@ async fn main() -> Result<ExitCode> {
     tools::bash::hide_env(settings.credential_vars());
     let (sandbox_flag, args) = sandbox::parse_flag(args);
     sandbox::init(sandbox_flag, &settings.sandbox).await?;
-    let mut ext = Extensions::load(&mut settings, &plugin_dirs).await;
+    // MCP servers connect in the background: the REPL waits for them only
+    // once the first prompt is in.
+    let user_mcp = mcp::Servers::connect(&settings.mcp_servers, &[]);
+    let mut ext = Extensions::load(&mut settings, &plugin_dirs, &[]);
     for w in &ext.warnings {
         eprintln!("\x1b[33m{w}\x1b[0m");
     }
@@ -106,12 +108,6 @@ async fn main() -> Result<ExitCode> {
         Err(e) if web_addr.is_none() => return Err(e),
         loaded => loaded,
     };
-    let user_mcp = mcp::Manager::start(&settings.mcp_servers).await;
-    for status in &user_mcp.statuses {
-        if let Err(e) = &status.outcome {
-            eprintln!("\x1b[33mMCP server `{}` failed: {e}\x1b[0m", status.name);
-        }
-    }
     let out = cli::Output::stdout();
     // Web tasks show their subagents' progress themselves; this is for the
     // terminal, and for subagents started from the web UI's tool page.
@@ -122,6 +118,9 @@ async fn main() -> Result<ExitCode> {
     let mut env = Env::new(ext, user_mcp, reporter, plugin_dirs);
 
     if let Some(addr) = web_addr {
+        for w in env.wait_mcp().await {
+            eprintln!("\x1b[33m{w}\x1b[0m");
+        }
         let mcp_status = env
             .mcp_statuses()
             .map(|s| match &s.outcome {
@@ -145,11 +144,12 @@ async fn main() -> Result<ExitCode> {
     }
 
     let client = Client::new(providers?)?;
-    let probe = AgentTool::new(env.ext.agent_defs.clone(), env.base_tools(), client.clone(), env.reporter.clone());
-    for (agent, tool) in probe.unknown_tools() {
-        eprintln!("\x1b[33magent `{agent}` lists unknown tool `{tool}`\x1b[0m");
+    // With MCP servers still connecting, the REPL checks once they are in.
+    if env.mcp_connecting().is_none() {
+        for w in env.unknown_agent_tools(&client) {
+            eprintln!("\x1b[33m{w}\x1b[0m");
+        }
     }
-    drop(probe);
     let (registry, system) = env.conversation(&client);
     let mut agent = Agent::new(client, registry, system);
     let result = cli::run(&mut agent, args, &mut env, out).await;

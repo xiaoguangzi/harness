@@ -113,6 +113,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
 
     // One-shot mode: `harness "do something"` or `harness /skill args`.
     if one_shot {
+        finish_mcp(agent, env, &out).await;
         let line = args.join(" ");
         let input = match render_skill(parse_input(&line, &skills)).await {
             Input::Skill(skill, args) => match run_fork(agent, env, &skill, &args, &out).await {
@@ -180,6 +181,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
         // A background subagent reported back, or a message sent from the
         // input box is still on its way: the model answers first.
         if agent.inbox().wants_turn() {
+            finish_mcp(agent, env, &out).await;
             let input = boxed.then_some(TurnInput { typing: &mut typing, files });
             let _ = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut(), input).await;
             remember_sent(&mut editor, &mut typing);
@@ -271,6 +273,9 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
             }
         };
         let input = render_skill(parse_input(&line, &skills)).await;
+        if !matches!(input, Input::Exit | Input::Empty) {
+            finish_mcp(agent, env, &out).await;
+        }
         let input = if boxed && line.split_whitespace().count() == 1 {
             let Some(input) = commands::interactive(input, agent, env, &skills, &out, &mut typing).await else { continue };
             input
@@ -540,6 +545,22 @@ fn reload_providers(agent: &mut Agent, skills: &[Skill], helper: Option<&ReplHel
 /// `AGENTS.md` as it is now (`/init` may have written it).
 fn refresh_system(agent: &mut Agent) {
     let system = crate::prompt::main(agent.tools());
+    agent.set_system(system);
+}
+
+/// Waits for the MCP servers still connecting at startup, then gives the
+/// agent their tools (before its first request, so the prompt cache's
+/// prefix holds from there).
+async fn finish_mcp(agent: &mut Agent, env: &mut Env, out: &Output) {
+    let Some(count) = env.mcp_connecting() else { return };
+    out.set_status(Some(&format!("Connecting to {count} MCP {}…", text::plural(count, "server"))));
+    let warnings = env.wait_mcp().await;
+    out.set_status(None);
+    for w in warnings.into_iter().chain(env.unknown_agent_tools(agent.client())) {
+        out.line(out.paint("33", &w));
+    }
+    let (tools, system) = env.conversation(agent.client());
+    agent.set_tools(tools);
     agent.set_system(system);
 }
 
@@ -1042,7 +1063,10 @@ fn print_banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {
         Some(rest) if !home.is_empty() => format!("~{rest}"),
         _ => cwd,
     };
-    let servers = env.mcp_statuses().filter(|s| s.outcome.is_ok()).count();
+    let servers = match env.mcp_connecting() {
+        Some(count) => format!("{count} MCP servers connecting"),
+        None => format!("{} MCP servers", env.mcp_statuses().filter(|s| s.outcome.is_ok()).count()),
+    };
     let loaded = env.ext.plugins.list.iter().filter(|p| p.outcome.is_ok()).count();
     let plugins = match loaded {
         0 => String::new(),
@@ -1054,7 +1078,7 @@ fn print_banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {
     out.line(out.paint(
         "2",
         &format!(
-            "  {cwd} · {} tools · {} skills · {servers} MCP servers{plugins}{}",
+            "  {cwd} · {} tools · {} skills · {servers}{plugins}{}",
             agent.tools().names().count(),
             skills.len(),
             if crate::sandbox::active().is_some() { " · sandboxed" } else { "" }
