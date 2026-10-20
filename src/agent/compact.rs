@@ -172,7 +172,7 @@ impl Agent {
         // The summary is not shown as it streams.
         let (log, model) = (&self.usage, self.client.spec());
         let mut on_event = |event: StreamEvent| match event {
-            StreamEvent::Retry { error, attempt, wait } => observer.on_retry(error, attempt, wait),
+            StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
             StreamEvent::PartialUsage(usage) => log.record(model, &usage),
             _ => {}
         };

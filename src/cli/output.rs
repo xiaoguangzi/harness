@@ -18,7 +18,7 @@ use super::menu::Menu;
 use super::screen::Screen;
 use super::text;
 use crate::agent::{INTERRUPTED, Inbox, Observer};
-use crate::llm::{MAX_RETRIES, Message, Usage, retry_reason};
+use crate::llm::{Message, Usage, retry_reason};
 use crate::tools::ToolOutput;
 
 /// Spinner glyphs, played forward and back.
@@ -1047,19 +1047,22 @@ impl Observer for Terminal {
         }
     }
 
-    fn on_retry(&mut self, error: &anyhow::Error, attempt: u32, wait: Duration) {
+    fn on_retry(&mut self, error: &anyhow::Error, attempt: u32, max: u32, wait: Duration) {
         // What streamed stays on screen; the notice marks where it broke off
         // and the response starts over below it.
         self.end_text();
         self.enter(Phase::Waiting, WAITING);
+        let what = if self.streamed > 0 { "response broke off" } else { "request failed" };
         self.streamed = 0;
-        let detail = format!("({}); retrying in {}s ({attempt}/{MAX_RETRIES})", retry_reason(error), wait.as_secs());
+        let detail = format!("({}); retrying in {}s ({attempt}/{max})", retry_reason(error), wait.as_secs());
         if !self.out.presented() {
-            eprintln!("warning: response broke off {detail}");
+            eprintln!("warning: {what} {detail}");
             return;
         }
         self.separate(Block::Tools);
-        self.out.line(self.out.paint("33", &format!("↻ Response broke off {detail}")));
+        let mut what = what.to_string();
+        what[..1].make_ascii_uppercase();
+        self.out.line(self.out.paint("33", &format!("↻ {what} {detail}")));
     }
 
     fn on_compact_start(&mut self) {

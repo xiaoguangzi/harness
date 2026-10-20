@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use super::config::Target;
+use super::config::{CacheTtl, Target};
 use super::{Message, Response, StreamEvent, ToolDef, http, parse_tool_input, same_source};
 
 const API_VERSION: &str = "2023-06-01";
@@ -29,7 +29,7 @@ pub(super) async fn create(
     if target.fallbacks() {
         headers.push(("anthropic-beta".into(), FALLBACK_BETA.into()));
     }
-    let resp = http::post_with_retries(http_client, &target.url("messages"), &headers, &body).await?;
+    let resp = http::post(http_client, &target.url("messages"), &headers, &body, target.gzip()).await?;
 
     let mut acc = Accumulator::default();
     let result = http::read_sse(resp, "message_stop", |event| acc.apply(&event, on_event)).await;
@@ -80,10 +80,13 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
         "output_config": {"effort": target.effort.as_str()},
         "stream": true,
     });
-    if target.prompt_cache() {
+    if let Some(ttl) = target.cache_ttl() {
         // Automatic prompt caching: the growing conversation prefix is
         // re-read from cache on every loop iteration.
-        body["cache_control"] = json!({"type": "ephemeral"});
+        body["cache_control"] = match ttl {
+            CacheTtl::FiveMinutes => json!({"type": "ephemeral"}),
+            CacheTtl::OneHour => json!({"type": "ephemeral", "ttl": "1h"}),
+        };
     }
     if target.fallbacks() {
         // On a safety decline, the API re-runs the request on a fallback
@@ -381,6 +384,15 @@ mod tests {
         let target = Target { effort: crate::llm::Effort::XHigh, ..target };
         let body = build_body(&target, "sys", &tools, &messages);
         assert_eq!(body["output_config"], json!({"effort": "xhigh"}));
+
+        let p = Providers::from_parts(
+            &file(json!({"model": "gw/m", "providers": {"gw": {"protocol": "anthropic",
+                "base_url": "https://gw.example.com", "prompt_cache_ttl": "1h"}}})),
+            &no_env,
+        )
+        .unwrap();
+        let body = build_body(&p.target("gw/m").unwrap(), "sys", &tools, &messages);
+        assert_eq!(body["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
     }
 
     fn run_events(events: &[Value]) -> (Response, String) {

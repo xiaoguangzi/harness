@@ -126,13 +126,17 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 | `api_key` | sent as `x-api-key` (Anthropic) or `Authorization: Bearer` (OpenAI); override with `"auth": "bearer"` / `"x-api-key"` |
 | `headers` | extra request headers |
 | `max_tokens` | output cap: top level, per provider or per model |
-| `context_window` | the model's context window in tokens (default `200000`): top level, per provider or per model; the conversation is [compacted](#compaction) before it fills up |
+| `context_window` | the model's context window in tokens: top level, per provider or per model; the conversation is [compacted](#compaction) before it fills up. Without one, well-known models get theirs (1M for Claude Opus 4.6 and later, Sonnet 4.6 and later, Haiku 5.5 and Fable; 200k for older Claude models; 400k for GPT-5, also behind a gateway's prefix such as `anthropic/claude-…`) and others `200000`; set it when a gateway allows less |
 | `effort` | top level or per model: `low`, `medium`, `high` (default), `xhigh` or `max`. Sent as Anthropic `output_config.effort` or OpenAI `reasoning.effort`; `extra_body` still overrides it, e.g. `{"output_config": null}` for a model that takes no effort |
 | `extra_body` | merged into every request body, also per model; a `null` removes a default key, e.g. `{"thinking": null}` for a model without adaptive thinking, or `{"include": null}` for a gateway that rejects encrypted reasoning |
 | `fallbacks`, `eager_input_streaming` | Anthropic-only API features; default on for `api.anthropic.com`, off for gateways |
 | `tool_result_media` | Anthropic only: images and PDFs a tool returns (`read`, MCP tools) stay inside its `tool_result`. Default on for `api.anthropic.com`; off for gateways, where they follow the tool results in the same message instead, because many gateways drop them from tool results |
 | `prompt_cache` | Anthropic automatic prompt caching; default on |
+| `prompt_cache_ttl` | Anthropic only: how long the cache keeps the conversation after its last use, `5m` (default) or `1h`. Writing to the 1-hour cache costs twice the input price rather than 1.25 times, which pays off when you often pause between 5 minutes and an hour |
+| `gzip` | gzip-compress request bodies of 1 KiB or more; default on for `api.anthropic.com`, off for gateways, many of which reject it |
 | `models` | per-model overrides; listed models show in `/model` and Tab completion |
+
+A request that fails in passing (a connection that fails or drops, HTTP 408, 409 or 5xx, a response that breaks off) is sent again up to 3 times, after 1, 2 and 4 seconds; an overloaded or rate-limited API (HTTP 429 or 529, or such an error in the stream) up to 10 times, the wait doubling up to a minute, about five minutes in all. A `retry-after` (or `retry-after-ms`) header sets the wait instead; one over 10 minutes is not waited for. Each retry shows as `↻` with its reason.
 
 `${VAR}` / `${VAR:-default}` expand from the environment in `base_url`, `api_key` and `headers`. A spec without a known provider prefix is a model on the current provider, so gateway model names containing `/` (such as `openai/gpt-5`) also work.
 
@@ -570,7 +574,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
   - `manage.rs` — `harness provider` and `/provider …`: adding and removing providers and listed models, the default model, by editing the settings
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
-  - `http.rs` — POST with retries, SSE reader; marks the stream failures (a dropped connection, an overload) after which `llm::Client` requests the response again
+  - `http.rs` — POST (gzip-compressed where that is on), SSE reader; marks the failures (a dropped connection, an overload, a retryable status) after which `llm::Client` sends the request again, and how long to wait
 - `src/prompt/` — system prompts: the main agent's template (`system.md`) with its tools, environment and `AGENTS.md`, and subagents' (`mod.rs`); what `/init` asks for (`init.md`)
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
 - `src/checkpoint.rs` — checkpoints for `/rewind`: the files `edit` and `write` change, kept as they were before each prompt, saved with the session; restoring them

@@ -57,8 +57,8 @@ pub trait Observer: Send {
     fn on_usage(&mut self, _usage: &Usage) {}
     /// The response broke off and is requested again after `wait`: what
     /// streamed since the last `on_request_start` is void, and output
-    /// starts over. `attempt` counts from 1 to `llm::MAX_RETRIES`.
-    fn on_retry(&mut self, _error: &anyhow::Error, _attempt: u32, _wait: Duration) {}
+    /// starts over. `attempt` counts from 1 to `max`.
+    fn on_retry(&mut self, _error: &anyhow::Error, _attempt: u32, _max: u32, _wait: Duration) {}
     /// The conversation is being summarized to make room in the context.
     fn on_compact_start(&mut self) {}
     /// The summary replaced the history: the context went from `before` to
@@ -606,7 +606,7 @@ impl Agent {
                     log.record(model, &usage);
                     observer.on_usage(&usage);
                 }
-                StreamEvent::Retry { error, attempt, wait } => observer.on_retry(error, attempt, wait),
+                StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
             };
             let response =
                 self.client.create(&self.system, &definitions, &self.messages, &mut on_event).await?;

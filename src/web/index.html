@@ -709,7 +709,7 @@ function renderEvent(ev) {
         break;
       }
       case "retry": assistantEl = null;
-        transcript.append(h("div", { class: "note" }, `↻ 回复中断（${ev.message}），${ev.wait}s 后重新请求（${ev.attempt}/${ev.max}）`)); break;
+        transcript.append(h("div", { class: "note" }, `↻ 请求出错（${ev.message}），${ev.wait}s 后重新请求（${ev.attempt}/${ev.max}）`)); break;
       case "hook": assistantEl = null;
         transcript.append(h("div", { class: "note hook" }, "⚑ " + ev.message)); break;
       case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台任务有了结果，继续")); break;

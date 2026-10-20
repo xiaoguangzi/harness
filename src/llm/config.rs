@@ -135,9 +135,35 @@ pub struct ProviderConfig {
     pub tool_result_media: Option<bool>,
     /// Anthropic only: automatic prompt caching. Default: on.
     pub prompt_cache: Option<bool>,
+    /// Anthropic only: how long cached prompts are kept. Default: `5m`.
+    pub prompt_cache_ttl: Option<CacheTtl>,
+    /// Requests are gzip-compressed. Default: on for the official
+    /// Anthropic API, off for gateways, many of which don't accept it.
+    pub gzip: Option<bool>,
     /// Per-model overrides; listed models are offered by `/model`.
     #[serde(default)]
     pub models: BTreeMap<String, ModelConfig>,
+}
+
+/// How long the Anthropic API keeps a cached prompt prefix after it was
+/// last used: writing it costs 1.25 times the input price for 5 minutes,
+/// twice that for an hour.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+pub enum CacheTtl {
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl CacheTtl {
+    pub fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            CacheTtl::FiveMinutes => 5 * 60,
+            CacheTtl::OneHour => 60 * 60,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -349,6 +375,8 @@ impl ProviderConfig {
             eager_input_streaming: None,
             tool_result_media: None,
             prompt_cache: None,
+            prompt_cache_ttl: None,
+            gzip: None,
             models: BTreeMap::new(),
         }
     }
@@ -381,6 +409,7 @@ impl Target<'_> {
             .and_then(|m| m.context_window)
             .or(self.config.context_window)
             .or(self.default_context_window)
+            .or_else(|| known_context_window(self.model))
             .unwrap_or(DEFAULT_CONTEXT_WINDOW)
     }
 
@@ -410,6 +439,16 @@ impl Target<'_> {
         self.config.prompt_cache.unwrap_or(true)
     }
 
+    /// How long the prompt cache keeps the conversation, when it is on.
+    pub fn cache_ttl(&self) -> Option<CacheTtl> {
+        (self.config.protocol == Protocol::Anthropic && self.prompt_cache())
+            .then(|| self.config.prompt_cache_ttl.unwrap_or_default())
+    }
+
+    pub fn gzip(&self) -> bool {
+        self.config.gzip.unwrap_or_else(|| self.config.is_official_anthropic())
+    }
+
     /// `{base_url}/v1/{path}`, not doubling a `/v1` already in `base_url`.
     pub fn url(&self, path: &str) -> String {
         let base = &self.config.base_url;
@@ -432,6 +471,28 @@ impl Target<'_> {
         headers.extend(self.config.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
         headers
     }
+}
+
+/// The context window of a well-known model, by its name as the official
+/// APIs give it, also behind a gateway's prefix (`anthropic/claude-…`,
+/// Bedrock's `us.anthropic.claude-…`) or with a date or tag after it.
+fn known_context_window(model: &str) -> Option<u32> {
+    let name = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let name = name.find("claude-").map_or(name.as_str(), |at| &name[at..]);
+    const MILLION: u32 = 1_000_000;
+    let window = if let Some(claude) = name.strip_prefix("claude-") {
+        let one_million = ["opus-4-6", "opus-4-7", "opus-4-8", "opus-5", "sonnet-4-6", "sonnet-5", "haiku-5", "fable-", "mythos-"];
+        if one_million.iter().any(|p| claude.starts_with(p)) { MILLION } else { 200_000 }
+    } else if name.starts_with("gpt-5") {
+        400_000
+    } else if name.starts_with("gpt-4.1") {
+        1_047_576
+    } else if name.starts_with("o3") || name.starts_with("o4-mini") {
+        200_000
+    } else {
+        return None;
+    };
+    Some(window)
 }
 
 #[cfg(test)]
@@ -482,6 +543,7 @@ pub(crate) mod tests {
         assert_eq!(a.url("messages"), "https://a.example.com/v1/messages");
         assert_eq!(a.headers(), vec![("x-api-key".to_string(), "ka".to_string())]);
         assert!(!a.fallbacks() && !a.eager_input_streaming() && a.prompt_cache(), "gateways default conservative");
+        assert!(!a.gzip() && a.cache_ttl() == Some(CacheTtl::FiveMinutes));
 
         let b = p.target("relay-b/gpt-5").unwrap();
         assert_eq!(b.url("responses"), "https://b.example.com/v1/responses");
@@ -496,6 +558,8 @@ pub(crate) mod tests {
         assert_eq!(p.target("relay-b/other").unwrap().max_tokens(), 8000);
         assert_eq!(p.target("relay-a/m").unwrap().max_tokens(), DEFAULT_MAX_TOKENS);
         assert_eq!(p.target("relay-a/m").unwrap().context_window(), DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(p.target("relay-a/claude-opus-5").unwrap().context_window(), 1_000_000, "a known model");
+        assert_eq!(p.target("relay-b/gpt-5").unwrap().context_window(), 400_000);
 
         let mut s = two_relays();
         s.max_tokens = Some(2000);
@@ -522,8 +586,27 @@ pub(crate) mod tests {
         assert_eq!(p.names(), vec!["anthropic", "openai"]);
         assert_eq!(p.default_model, "anthropic/claude-opus-5");
         let a = p.target(&p.default_model).unwrap();
-        assert!(a.fallbacks() && a.eager_input_streaming(), "official API gets its features");
+        assert!(a.fallbacks() && a.eager_input_streaming() && a.gzip(), "official API gets its features");
+        assert_eq!(p.target("openai/gpt-5").unwrap().cache_ttl(), None);
         assert_eq!(p.target("openai/gpt-5").unwrap().url("responses"), "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn knows_the_context_windows_of_well_known_models() {
+        for (model, window) in [
+            ("claude-opus-5-5", Some(1_000_000)),
+            ("claude-sonnet-4-6", Some(1_000_000)),
+            ("us.anthropic.claude-fable-5-1", Some(1_000_000)),
+            ("anthropic/claude-haiku-5-5", Some(1_000_000)),
+            ("claude-haiku-4-5-20251001", Some(200_000)),
+            ("claude-sonnet-4-5", Some(200_000)),
+            ("Claude-Opus-4-1", Some(200_000)),
+            ("openai/gpt-5-mini", Some(400_000)),
+            ("gpt-4.1", Some(1_047_576)),
+            ("qwen3-coder", None),
+        ] {
+            assert_eq!(known_context_window(model), window, "{model}");
+        }
     }
 
     #[test]

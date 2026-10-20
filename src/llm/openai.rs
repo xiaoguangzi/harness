@@ -32,7 +32,7 @@ pub(super) async fn create(
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<Response> {
     let body = build_body(target, system, tools, messages);
-    let resp = http::post_with_retries(http_client, &target.url("responses"), &target.headers(), &body).await?;
+    let resp = http::post(http_client, &target.url("responses"), &target.headers(), &body, target.gzip()).await?;
 
     let mut acc = Accumulator::default();
     http::read_sse(resp, "response.completed", |event| acc.apply(&event, on_event)).await?;

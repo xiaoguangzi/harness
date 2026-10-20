@@ -127,13 +127,17 @@ harness --help                          # 查看全部选项
 | `api_key` | 以 `x-api-key`（Anthropic）或 `Authorization: Bearer`（OpenAI）发送；可用 `"auth": "bearer"` / `"x-api-key"` 覆盖 |
 | `headers` | 额外的请求头 |
 | `max_tokens` | 输出上限：顶层、按 provider 或按模型设置 |
-| `context_window` | 模型的上下文窗口（token 数，默认 `200000`）：顶层、按 provider 或按模型设置；会话在窗口占满前会被[压缩](#上下文压缩) |
+| `context_window` | 模型的上下文窗口（token 数）：顶层、按 provider 或按模型设置；会话在窗口占满前会被[压缩](#上下文压缩)。不设置时，常见模型用它们自己的窗口（Claude Opus 4.6 及以后、Sonnet 4.6 及以后、Haiku 5.5 和 Fable 为 1M；更早的 Claude 模型为 200k；GPT-5 为 400k；网关加了前缀如 `anthropic/claude-…` 也能识别），其他模型为 `200000`；网关允许的更小时请手动设置 |
 | `effort` | 顶层或按模型设置：`low`、`medium`、`high`（默认）、`xhigh` 或 `max`。以 Anthropic 的 `output_config.effort` 或 OpenAI 的 `reasoning.effort` 发送；`extra_body` 仍可覆盖它，例如对不支持 effort 的模型用 `{"output_config": null}` |
 | `extra_body` | 合并进每个请求体，也可按模型设置；`null` 会移除默认键，例如对不支持自适应思考的模型用 `{"thinking": null}`，或对拒绝加密推理的网关用 `{"include": null}` |
 | `fallbacks`、`eager_input_streaming` | 仅 Anthropic 的 API 特性；`api.anthropic.com` 默认开启，网关默认关闭 |
 | `tool_result_media` | 仅 Anthropic：工具返回的图片和 PDF（`read`、MCP 工具）放在 `tool_result` 里。`api.anthropic.com` 默认开启；网关默认关闭，此时它们放在同一条消息里、紧跟工具结果之后，因为很多网关会丢掉工具结果里的图片 |
 | `prompt_cache` | Anthropic 自动提示词缓存；默认开启 |
+| `prompt_cache_ttl` | 仅 Anthropic：缓存在最后一次使用后保留多久，`5m`（默认）或 `1h`。写入 1 小时缓存的价格是输入价的 2 倍而不是 1.25 倍，常在 5 分钟到 1 小时之间停顿时更划算 |
+| `gzip` | 用 gzip 压缩 1 KiB 及以上的请求体；`api.anthropic.com` 默认开启，网关默认关闭，因为很多网关不接受 |
 | `models` | 按模型的覆盖项；列出的模型会显示在 `/model` 和 Tab 补全中 |
+
+临时性失败的请求（连接失败或断开、HTTP 408、409 或 5xx、回复中途断开）最多重发 3 次，分别等 1、2、4 秒；API 过载或限流（HTTP 429、529，或流中出现这类错误）最多重发 10 次，等待时间翻倍直到 1 分钟，总共约 5 分钟。响应带 `retry-after`（或 `retry-after-ms`）头时按它等待；超过 10 分钟的不等。每次重试都会显示一行 `↻` 和原因。
 
 `base_url`、`api_key` 和 `headers` 中的 `${VAR}` / `${VAR:-default}` 会从环境变量展开。没有已知 provider 前缀的 spec 视为当前 provider 上的一个模型，因此包含 `/` 的网关模型名（如 `openai/gpt-5`）同样可用。
 
@@ -571,7 +575,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
   - `manage.rs` — `harness provider` 与 `/provider …`：通过修改配置添加和移除 provider 与列出的模型、设置默认模型
   - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退）
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
-  - `http.rs` — 带重试的 POST、SSE 读取器；标记哪些流式失败（连接断开、过载）之后 `llm::Client` 会重新请求回复
+  - `http.rs` — POST（开启时用 gzip 压缩）、SSE 读取器；标记哪些失败（连接断开、过载、可重试的状态码）之后 `llm::Client` 会重发请求，以及要等多久
 - `src/prompt/` — 系统提示词：主代理的模板（`system.md`）及其工具、环境和 `AGENTS.md`，子代理的提示词（`mod.rs`）；`/init` 的要求（`init.md`）
 - `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
 - `src/checkpoint.rs` — `/rewind` 的检查点：`edit` 和 `write` 修改的文件在每条提示之前的版本，随会话保存；恢复它们

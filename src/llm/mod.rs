@@ -55,14 +55,11 @@ pub enum StreamEvent<'a> {
     /// Token counts of a request that failed partway, as far as the stream
     /// got; a finished request carries them in [`Response::usage`] instead.
     PartialUsage(Usage),
-    /// The response broke off (`error` says why) and the request is sent
-    /// again after `wait`: what streamed so far is void, and the response
-    /// starts over. `attempt` counts from 1 to [`MAX_RETRIES`].
-    Retry { error: &'a anyhow::Error, attempt: u32, wait: Duration },
+    /// The request failed or its response broke off (`error` says why),
+    /// and it is sent again after `wait`: what streamed so far is void, and
+    /// the response starts over. `attempt` counts from 1 to `max`.
+    Retry { error: &'a anyhow::Error, attempt: u32, max: u32, wait: Duration },
 }
-
-/// How many times a response that broke off is requested again.
-pub const MAX_RETRIES: u32 = http::MAX_RETRIES;
 
 /// Why a response broke off, in one line: how far its stream got and the
 /// underlying cause, without the layers between.
@@ -205,9 +202,10 @@ impl Client {
     }
 
     /// Sends a streaming request and assembles the final response, calling
-    /// `on_event` as text arrives. A response that breaks off midway (the
-    /// connection drops, the API reports an overload) is requested again,
-    /// after a [`StreamEvent::Retry`]; nothing has acted on it yet.
+    /// `on_event` as text arrives. A request that fails in passing (the
+    /// connection drops, the API is overloaded or rate-limited, the response
+    /// breaks off midway) is sent again, after a [`StreamEvent::Retry`];
+    /// nothing has acted on it yet.
     pub async fn create(
         &self,
         system: &str,
@@ -226,10 +224,10 @@ impl Client {
                 }
             };
             match result {
-                Err(error) if attempt < MAX_RETRIES && http::is_transient(&error) => {
+                Err(error) => {
+                    let Some((wait, max)) = http::retry_delay(&error, attempt + 1) else { return Err(error) };
                     attempt += 1;
-                    let wait = Duration::from_secs(1 << (attempt - 1));
-                    on_event(StreamEvent::Retry { error: &error, attempt, wait });
+                    on_event(StreamEvent::Retry { error: &error, attempt, max, wait });
                     tokio::time::sleep(wait).await;
                 }
                 result => return result,

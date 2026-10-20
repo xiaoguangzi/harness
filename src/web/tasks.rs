@@ -14,7 +14,7 @@ use tokio::task::AbortHandle;
 
 use crate::agent::{Agent, Inbox, Observer};
 use crate::hooks::{Event, Hooks};
-use crate::llm::{Client, MAX_RETRIES};
+use crate::llm::Client;
 use crate::skills::Skill;
 use crate::subagent::{AgentDef, Forks, Subagents};
 use crate::tools::{FileTracker, ToolOutput};
@@ -348,12 +348,12 @@ impl Observer for WebObserver<'_> {
         self.task.push(json!({"type": "compact", "before": before, "after": after}));
     }
 
-    fn on_retry(&mut self, error: &anyhow::Error, attempt: u32, wait: Duration) {
+    fn on_retry(&mut self, error: &anyhow::Error, attempt: u32, max: u32, wait: Duration) {
         self.task.push(json!({
             "type": "retry",
             "message": crate::llm::retry_reason(error),
             "attempt": attempt,
-            "max": MAX_RETRIES,
+            "max": max,
             "wait": wait.as_secs(),
         }));
     }
