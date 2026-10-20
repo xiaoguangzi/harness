@@ -229,6 +229,21 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 { "shell": { "keep_env": ["OPENAI_API_KEY"], "snapshot": true } }
 ```
 
+### SSH
+
+命令里的每次 `ssh` 都会建立一条新连接：密钥交换加认证，即使连本机也要 0.2 秒，连远端机器要几秒。OpenSSH 可以共用一条连接（之后每条命令约 10 毫秒），在 `~/.ssh/config` 中加入：
+
+```
+Host *
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 10m
+```
+
+这样第一次 `ssh` 某台主机后，会留下一条主连接运行 10 分钟，之后的 `ssh` 都通过它的 socket 走。在 Linux 上开启[沙箱](#沙箱)时，命令启动的主连接会随命令一起结束（命令所在的 PID 命名空间被回收），所以要在 harness 之外自己启动它：在终端里执行 `ssh -fN myhost`，之后的命令就会复用它。socket 所在目录不能在 `deny_read` 中（如果隐藏了 `~/.ssh`，就把 `ControlPath` 设到别处）。注意，这时即使 `"network": false`，命令也能通过这个 socket 访问该主机，因为这个选项拦的是网络连接，不拦 Unix socket。
+
+命令超时时，harness 杀掉的是本地的 `ssh`，而不是它在远端启动的进程；远端的长任务要在远端用 `timeout` 包一层，或者作为后台命令运行。
+
 ## 后台命令
 
 `bash` 加上 `run_in_background: true` 会启动一个持续运行的命令（如开发服务器、watcher 或耗时的构建），并立即返回它的 ID（`shell_1`）。`bash_output` 返回它自上次查看以来的输出（stdout 和 stderr 合在一起，最多返回最新的 30000 字节；最多保留 1 MB）以及它是否仍在运行；`kill_shell` 停止它及其启动的进程。自行退出的命令会通知模型，模型空闲时会因此开始新的一轮，与后台子代理的报告相同。后台命令与其他 `bash` 命令一样受沙箱和文件修改规则约束，每个会话最多同时运行 8 个。`/tasks` 浏览任务，`/stop shell_1` 停止一个，`/stop` 可选择停止一个或全部任务（会告知模型）；`/clear`、`/resume`、删除 Web 任务或退出程序都会杀掉它们。

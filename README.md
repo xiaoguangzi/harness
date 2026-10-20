@@ -228,6 +228,21 @@ Commands inherit the harness's environment, except the credentials the harness i
 { "shell": { "keep_env": ["OPENAI_API_KEY"], "snapshot": true } }
 ```
 
+### SSH
+
+Each `ssh` in a command sets up a new connection: a key exchange and authentication that take 0.2 s even to the same machine, and seconds to a distant host. OpenSSH can share one connection instead (about 10 ms per command); put this in `~/.ssh/config`:
+
+```
+Host *
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 10m
+```
+
+The first `ssh` to a host then leaves a master connection running for 10 minutes, and later ones go through its socket. With the [sandbox](#sandbox) on Linux, a master that a command starts ends with the command (its PID namespace goes), so start it yourself outside the harness, `ssh -fN myhost` in a terminal, and commands will use it. The socket's directory must not be in `deny_read` (choose a `ControlPath` outside `~/.ssh` if you hide that). Note that commands then reach the host through the socket even with `"network": false`, since that blocks network connections, not Unix sockets.
+
+When a command times out, the harness kills the local `ssh`, not what it started on the remote host; run long remote work under `timeout` there, or as a background command.
+
 ## Background commands
 
 `bash` with `run_in_background: true` starts a command that keeps running, such as a dev server, a watcher or a long build, and returns its id (`shell_1`) at once. `bash_output` returns what it printed since the last look (stdout and stderr together, the newest 30000 bytes of it; up to 1 MB is kept) and whether it still runs; `kill_shell` stops it and the processes it started. A command that exits by itself is reported to the model, which then gets a turn if it is idle, like a background subagent's report. Background commands run under the same sandbox and file-change rules as other `bash` commands, at most 8 at once per conversation. `/tasks` browses them, `/stop shell_1` stops one, and `/stop` lets you choose one or all of them (the model is told); `/clear`, `/resume`, deleting a web task or quitting kills them.
