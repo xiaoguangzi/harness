@@ -241,6 +241,8 @@ pub struct Agent {
     /// Whether SessionStart hooks ran for this conversation, so SessionEnd
     /// hooks run when it ends.
     in_session: bool,
+    /// Compacts as if the context window were at most this big.
+    compact_window: Option<u64>,
 }
 
 impl Agent {
@@ -272,7 +274,28 @@ impl Agent {
             hooks,
             session_start: Some("startup"),
             in_session: false,
+            compact_window: None,
         }
+    }
+
+    /// The context window the conversation is compacted to fit: the
+    /// model's, or a smaller one set with [`Agent::set_compact_window`].
+    pub fn context_window(&self) -> u64 {
+        self.client.context_window().min(self.compact_window.unwrap_or(u64::MAX))
+    }
+
+    /// Compacts the conversation as if the context window were at most
+    /// `window` tokens.
+    pub fn set_compact_window(&mut self, window: Option<u64>) {
+        self.compact_window = window;
+    }
+
+    /// Starts a fork's conversation with `messages`, its parent's, whose
+    /// last message has calls without results: `results` answer them in
+    /// the fork's first message, ahead of its prompt.
+    pub fn fork_from(&mut self, messages: Vec<Message>, results: Vec<Value>) {
+        self.messages = messages;
+        self.inbox.push_content(results, false);
     }
 
     /// The `provider/model` in use.
@@ -627,6 +650,12 @@ impl Agent {
             let tool_uses: Vec<Value> =
                 content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
             self.messages.push(Message { role: "assistant", content, source: Some(self.client.spec().to_string()) });
+            // A fork starts from the conversation as it is now.
+            let forks = tool_uses.iter().any(|t| t["name"] == "agent" && t["input"]["agent_type"] == crate::subagent::FORK);
+            if forks {
+                let (system, tools, messages) = (self.system.clone(), self.tools.clone(), self.messages.clone());
+                self.subagents.set_fork_base(Some(crate::subagent::ForkBase { system, tools, messages }));
+            }
             if let Some(usage) = &response.usage {
                 self.context = Some((self.messages.len(), usage.input_tokens + usage.output_tokens));
             }
@@ -743,6 +772,9 @@ impl Agent {
                 }
             }
             observer.on_waiting(&[]);
+            if forks {
+                self.subagents.set_fork_base(None);
+            }
 
             let mut results = Vec::with_capacity(outputs.len());
             let mut halt = None;
@@ -783,7 +815,7 @@ fn show_notices(outcome: &Outcome, observer: &mut dyn Observer) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::llm::Providers;
     use crate::llm::config::tests::{file, no_env};
@@ -830,7 +862,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Notices(Vec<String>);
+    pub(crate) struct Notices(pub(crate) Vec<String>);
 
     impl Observer for Notices {
         fn on_text_delta(&mut self, _: &str) {}

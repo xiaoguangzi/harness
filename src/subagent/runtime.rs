@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
 use tokio::task::AbortHandle;
 
-use super::{MAX_RESULT_BYTES, Reporter};
+use super::{ForkBase, MAX_RESULT_BYTES, Reporter};
 use crate::agent::{Agent, Inbox, Observer, UsageLog};
 use crate::checkpoint::FileHistory;
 use crate::hooks::Hooks;
@@ -85,6 +85,8 @@ pub struct Subagents {
     hooks: Mutex<Hooks>,
     /// In the order they started.
     children: Mutex<Vec<Arc<Child>>>,
+    /// What a fork starts from, while the calls that may start one run.
+    fork_base: Mutex<Option<ForkBase>>,
 }
 
 pub struct Child {
@@ -158,7 +160,16 @@ pub enum Sent {
 impl Subagents {
     pub fn new(parent: Arc<Inbox>, usage: Arc<UsageLog>, history: Arc<FileHistory>, hooks: Hooks) -> Self {
         let (reporter, hooks, children) = (Mutex::new(None), Mutex::new(hooks), Mutex::new(Vec::new()));
-        Self { parent, usage, history, reporter, hooks, children }
+        Self { parent, usage, history, reporter, hooks, children, fork_base: Mutex::new(None) }
+    }
+
+    /// Keeps what a fork would start from (`None` forgets it).
+    pub fn set_fork_base(&self, base: Option<ForkBase>) {
+        *self.fork_base.lock().unwrap() = base;
+    }
+
+    pub fn fork_base(&self) -> Option<ForkBase> {
+        self.fork_base.lock().unwrap().clone()
     }
 
     /// Gives subagents started from here on `hooks` (as theirs).

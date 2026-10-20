@@ -85,7 +85,7 @@ impl Agent {
     }
 
     fn context_limit(&self) -> u64 {
-        context_limit(self.client.context_window(), self.client.max_tokens())
+        context_limit(self.context_window(), self.client.max_tokens())
     }
 
     /// Compacts the conversation now (`/compact`), outside a turn. `focus`
@@ -217,7 +217,7 @@ impl Agent {
             let mut kept = Vec::new();
             let mut blocks = Vec::new();
             // About four bytes a token.
-            let mut room = (self.client.context_window() / 100 * REATTACHED_PERCENT * 4) as usize;
+            let mut room = (self.context_window() / 100 * REATTACHED_PERCENT * 4) as usize;
             for path in files.recent(REATTACHED_FILES) {
                 if room < 1_000 {
                     break;

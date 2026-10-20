@@ -428,6 +428,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 
 - **`explore`** (built-in): a codebase search agent whose only tools are `grep` and `glob`. Use it for "where is X / which files use Y" questions.
 - **`general-purpose`** (built-in): a coding agent with the main agent's tools (`bash`, `edit`, `write`, MCP tools and the rest, under the same sandbox) for multi-step research or a well-scoped change. Subagents share the working directory, so the main agent is told to give each one that changes files its own files.
+- **`fork`** (built-in): a copy of the main agent that starts with its whole conversation, the same system prompt, tools and model, for a side task that needs what the conversation already knows. As its requests start with the same prefix, they read it from the prompt cache, which makes a fork cheap to start despite the long context. Its first message answers the calls of the response that started it (the call that started it says it is a fork) and then gives it the task. It has the subagent tools in its tool list, to keep the prefix the same, but they refuse to run there.
 - **Custom agents**: Markdown files in `.harness/agents/` or `.claude/agents/` (project or `~`; the first found wins, and a file named like a built-in overrides it):
 
   ```markdown
@@ -437,13 +438,15 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
   tools: read, grep          # optional; `mcp__server__*` matches a prefix
   permission: read-only      # default; `write` allows bash/edit/write and non-read-only MCP tools
   model: claude-sonnet-5     # optional
+  effort: low                # optional; how hard it thinks (low … max)
+  autoCompactWindow: 100000  # optional; compact its conversation as if the window were this big
   ---
   You are a code reviewer...
   ```
 
 - **Custom agents default to read-only**: a read-only agent only gets tools marked read-only (`read`, `grep`, `glob`, `lsp`, `skill`, and MCP tools whose server sets `readOnlyHint`), even if its `tools` list names others. `tools` narrows further. An agent without `bash` does not get `bash_output` or `kill_shell` either, having no background commands. The `agent` tool lists each type as read-only or able to modify files by the tools it actually gets, with its description cut to 400 characters.
 - Subagents cannot start subagents. Their file reads use their own tracker, so they never count as reads for the main agent's `edit` and `write`.
-- Model: the agent's `model`, else `subagent_model` / `HARNESS_SUBAGENT_MODEL`, else the model the conversation is on now (after any `/model` or `/effort`); any `<provider>/<model>`. Claude Code's `sonnet`, `opus` and `haiku` aliases count as unset, like `inherit`.
+- Model: the agent's `model`, else `subagent_model` / `HARNESS_SUBAGENT_MODEL`, else the model the conversation is on now (after any `/model` or `/effort`); any `<provider>/<model>`. Effort: the `agent` call's `effort`, else the agent's, else the conversation's. Claude Code's `sonnet`, `opus` and `haiku` aliases count as unset, like `inherit`.
 - Tools may be named as in Claude Code (`Read`, `Bash`, `KillShell`); they map to the harness's own (`LS` to `glob`).
 - `/agents` lists the available types.
 

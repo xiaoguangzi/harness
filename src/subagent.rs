@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 
 use crate::agent::Agent;
 use crate::hooks::{self, Hooks};
-use crate::llm::Client;
+use crate::llm::{Client, Effort, Message};
 use crate::skills::{Fork, PluginDirs, Skill, parse_frontmatter, split_frontmatter};
 use crate::tools::{FileTracker, Tool, ToolOutput, ToolRegistry, parse_input};
 pub use runtime::{Subagents, scope};
@@ -78,6 +78,11 @@ pub struct AgentDef {
     /// the permission grants.
     pub tools: Option<Vec<String>>,
     pub model: Option<String>,
+    /// The reasoning effort it works with; `None` keeps the caller's.
+    pub effort: Option<Effort>,
+    /// `autoCompactWindow`: its conversation is compacted as if the model's
+    /// context window were at most this many tokens.
+    pub compact_window: Option<u64>,
     /// Where the definition came from; `None` for built-ins.
     pub path: Option<PathBuf>,
 }
@@ -119,6 +124,8 @@ pub fn explore() -> AgentDef {
         permission: Permission::ReadOnly,
         tools: Some(vec!["grep".into(), "glob".into()]),
         model: None,
+        effort: None,
+        compact_window: None,
         path: None,
     }
 }
@@ -143,6 +150,8 @@ pub fn general_purpose() -> AgentDef {
         permission: Permission::Write,
         tools: None,
         model: None,
+        effort: None,
+        compact_window: None,
         path: None,
     }
 }
@@ -259,12 +268,17 @@ fn parse_def(text: &str, file: &Path, default: Permission) -> Result<AgentDef, S
     };
     let tools = fields.get("tools").map(|t| tool_list(t));
     let model = model_field(fields.get("model"));
+    let effort = fields.get("effort").map(|e| Effort::parse(e).map_err(|e| e.to_string())).transpose()?;
+    let compact_window = match fields.get("autoCompactWindow") {
+        Some(n) => Some(n.trim().parse::<u64>().ok().filter(|&n| n > 0).ok_or(format!("`autoCompactWindow` is a number of tokens, not `{n}`"))?),
+        None => None,
+    };
     let prompt = body.trim().to_string();
     if prompt.is_empty() {
         return Err("empty system prompt".into());
     }
     let path = std::path::absolute(file).ok();
-    Ok(AgentDef { name, description, prompt, permission, tools, model, path })
+    Ok(AgentDef { name, description, prompt, permission, tools, model, effort, compact_window, path })
 }
 
 /// Runs `context: fork` skills for the `skill` tool and the frontends,
@@ -351,7 +365,8 @@ impl AgentTool {
              subagent is done, even after your turn has ended. Use wait_tasks if you need the result before continuing; do not poll, and never \
              guess what it will find. Every subagent gets an `agent_id`: `message_agent` continues \
              it with its context intact, `stop_agent` stops it. The report comes to you, not the \
-             user; relay what matters.\n\nAvailable agents:",
+             user; relay what matters. `effort` (low to max) sets how hard it thinks: lower for \
+             simple searches, higher for hard problems.\n\nAvailable agents:",
         );
         let mut tool = Self { defs, base, client, reporter, description: String::new() };
         for d in tool.defs.iter() {
@@ -359,6 +374,12 @@ impl AgentTool {
             let text = crate::util::one_line(&d.description, MAX_LISTED_DESCRIPTION);
             description.push_str(&format!("\n- {} ({access}): {text}", d.name));
         }
+        description.push_str(&format!(
+            "\n- {FORK} (can modify files): a copy of you that starts with this whole conversation, your \
+             tools and your model, for a side task that needs what you already know; it reuses the \
+             prompt cache, so it starts cheaply. Its `prompt` only needs to say what to do now. It \
+             cannot start subagents."
+        ));
         tool.description = description;
         tool
     }
@@ -418,6 +439,21 @@ fn client_from(def: &AgentDef, parent: &Client) -> anyhow::Result<Client> {
     }
 }
 
+/// The agent type that forks the conversation rather than start a fresh one.
+pub const FORK: &str = "fork";
+
+/// What a fork starts from: the conversation as it was when the model
+/// called the `agent` tool, which the parent keeps in its [`Subagents`]
+/// while that response's tool calls run.
+#[derive(Clone)]
+pub struct ForkBase {
+    pub system: String,
+    pub tools: ToolRegistry,
+    /// Up to the assistant message with the calls, whose results are not
+    /// in yet.
+    pub messages: Vec<Message>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
@@ -426,6 +462,7 @@ struct Input {
     prompt: String,
     #[serde(default)]
     run_in_background: bool,
+    effort: Option<String>,
 }
 
 #[async_trait]
@@ -443,7 +480,7 @@ impl Tool for AgentTool {
     }
 
     fn input_schema(&self) -> Value {
-        let names: Vec<&str> = self.defs.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = self.defs.iter().map(|d| d.name.as_str()).chain([FORK]).collect();
         json!({
             "type": "object",
             "properties": {
@@ -453,6 +490,11 @@ impl Tool for AgentTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Return at once instead of waiting; the report arrives in a later message."
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": Effort::ALL.map(Effort::as_str),
+                    "description": "How hard the subagent thinks; default: the agent's own, else yours."
                 }
             },
             "required": ["agent_type", "description", "prompt"],
@@ -462,7 +504,8 @@ impl Tool for AgentTool {
 
     /// Only as read-only as the agents it can start.
     fn read_only(&self) -> bool {
-        self.defs.iter().all(|d| self.only_reads(d))
+        // A fork gets the caller's tools.
+        self.defs.iter().all(|d| self.only_reads(d)) && self.base.names().all(|n| self.base.get(n).is_some_and(|t| t.read_only()))
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
@@ -470,11 +513,22 @@ impl Tool for AgentTool {
             Ok(i) => i,
             Err(e) => return e,
         };
+        if runtime::nested() {
+            return ToolOutput::error("Subagents cannot start subagents");
+        }
+        let effort = match input.effort.as_deref().map(Effort::parse).transpose() {
+            Ok(effort) => effort,
+            Err(e) => return ToolOutput::error(format!("{e:#}")),
+        };
+        if input.agent_type == FORK {
+            return self.launch_fork(&input.description, input.prompt, input.run_in_background, effort).await;
+        }
         let Some(def) = self.defs.iter().find(|d| d.name == input.agent_type) else {
             return ToolOutput::error(format!("Unknown agent type: {}", input.agent_type));
         };
-        let tools = self.registry_for(def);
-        self.launch(def, tools, &input.description, input.prompt, input.run_in_background).await
+        let def = AgentDef { effort: effort.or(def.effort), ..def.clone() };
+        let tools = self.registry_for(&def);
+        self.launch(&def, tools, &input.description, input.prompt, input.run_in_background).await
     }
 }
 
@@ -494,12 +548,31 @@ impl AgentTool {
                 (Arc::new(subagents), self.client.clone())
             }
         };
-        let client = match client_from(def, &parent) {
+        let mut client = match client_from(def, &parent) {
             Ok(c) => c,
             Err(e) => return ToolOutput::error(format!("Agent `{}` has an unusable model: {e:#}", def.name)),
         };
-        let agent = Agent::new(client, tools, crate::prompt::subagent(def));
-        let run = match subagents.spawn(agent, &def.name, description, prompt, background, &self.reporter) {
+        if def.effort.is_some() {
+            client.set_effort(def.effort);
+        }
+        let mut agent = Agent::new(client, tools, crate::prompt::subagent(def));
+        agent.set_compact_window(def.compact_window);
+        self.start(&subagents, agent, &def.name, description, prompt, background).await
+    }
+
+    /// Runs `agent` as a subagent of the conversation that owns
+    /// `subagents`; returns its report, or with `background` that it
+    /// started.
+    async fn start(
+        &self,
+        subagents: &Subagents,
+        agent: Agent,
+        agent_type: &str,
+        description: &str,
+        prompt: String,
+        background: bool,
+    ) -> ToolOutput {
+        let run = match subagents.spawn(agent, agent_type, description, prompt, background, &self.reporter) {
             Ok(run) => run,
             Err(e) => return ToolOutput::error(format!("{e:#}")),
         };
@@ -507,11 +580,49 @@ impl AgentTool {
             return run.report().await;
         }
         ToolOutput::ok(format!(
-            "Started {} agent {} in the background. Its report will arrive in a later message when it \
+            "Started {agent_type} agent {} in the background. Its report will arrive in a later message when it \
              finishes; use wait_tasks if you need its result. Do not poll or sleep in a loop. Carry on with other work, or end your turn if \
              there is nothing else to do.",
-            def.name, run.child.id
+            run.child.id
         ))
+    }
+
+    /// Forks the conversation whose turn is running: a subagent with its
+    /// history, system prompt, tools and model, so its requests start with
+    /// the same prefix and read it from the prompt cache. Its first message
+    /// answers the calls of the response that started it, then gives it
+    /// `prompt`.
+    async fn launch_fork(&self, description: &str, prompt: String, background: bool, effort: Option<Effort>) -> ToolOutput {
+        let (Some((subagents, mut client)), Some(id)) = (runtime::current(), crate::tools::progress::call_id()) else {
+            return ToolOutput::error("A fork needs a conversation to start from");
+        };
+        let Some(base) = subagents.fork_base() else {
+            return ToolOutput::error("A fork needs a conversation to start from");
+        };
+        if effort.is_some() {
+            client.set_effort(effort);
+        }
+        let calls = base.messages.last().map_or(&[][..], |m| m.content.as_slice());
+        let results: Vec<Value> = calls
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|call| {
+                let text = if call["id"] == id.as_str() {
+                    "You are a fork of this conversation: this call started you, in a subagent of your own. \
+                     Do the task in the next message; your final message is your report to the agent that \
+                     forked you, which carries on with the conversation. You cannot start subagents."
+                } else {
+                    "(This call runs in the agent that forked you; its result is not available here.)"
+                };
+                json!({"type": "tool_result", "tool_use_id": call["id"], "content": text})
+            })
+            .collect();
+        let mut tools = base.tools;
+        // Its reads are its own, as any subagent's.
+        tools.track_files(&FileTracker::default());
+        let mut agent = Agent::new(client, tools, base.system);
+        agent.fork_from(base.messages, results);
+        self.start(&subagents, agent, FORK, description, prompt, background).await
     }
 
     /// Runs skill `skill` in a subagent of the type its `fork` names (with
@@ -582,8 +693,8 @@ impl Tool for MessageAgentTool {
             Ok(i) => i,
             Err(e) => return e,
         };
-        let Some((subagents, _)) = runtime::current() else {
-            return ToolOutput::error("message_agent only works within a conversation");
+        let Some((subagents, _)) = runtime::current().filter(|_| !runtime::nested()) else {
+            return ToolOutput::error("message_agent only works in a conversation that started subagents");
         };
         let id = &input.agent_id;
         match subagents.send(id, input.message, input.run_in_background) {
@@ -639,8 +750,8 @@ impl Tool for StopAgentTool {
             Ok(i) => i,
             Err(e) => return e,
         };
-        let Some((subagents, _)) = runtime::current() else {
-            return ToolOutput::error("stop_agent only works within a conversation");
+        let Some((subagents, _)) = runtime::current().filter(|_| !runtime::nested()) else {
+            return ToolOutput::error("stop_agent only works in a conversation that started subagents");
         };
         let id = &input.agent_id;
         match subagents.stop(id, false) {
@@ -698,7 +809,7 @@ mod tests {
     fn explore_only_gets_grep_and_glob() {
         let tool = agent_tool(vec![explore()]);
         assert_eq!(names(&tool.registry_for(&explore())), vec!["glob", "grep"]);
-        assert!(tool.read_only());
+        assert!(!tool.read_only(), "a fork gets the caller's tools");
     }
 
     #[test]
@@ -781,11 +892,12 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("fixer.md"),
-            "---\nname: fixer\ndescription: Fixes things\npermission: write\ntools:\n  - bash\n  - write\n---\nFix it.\n",
+            "---\nname: fixer\ndescription: Fixes things\npermission: write\ntools:\n  - bash\n  - write\neffort: low\nautoCompactWindow: 80000\n---\nFix it.\n",
         )
         .unwrap();
         std::fs::write(dir.path().join("explore.md"), "---\ndescription: custom explore\n---\nMine.\n").unwrap();
         std::fs::write(dir.path().join("bad.md"), "---\ndescription: x\npermission: root\n---\nbody\n").unwrap();
+        std::fs::write(dir.path().join("window.md"), "---\ndescription: x\nautoCompactWindow: lots\n---\nbody\n").unwrap();
 
         let (defs, warnings) = discover(&[dir.path().into()]);
         let by_name: BTreeMap<&str, &AgentDef> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
@@ -798,8 +910,11 @@ mod tests {
         assert_eq!(reviewer.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(by_name["fixer"].permission, Permission::Write);
         assert_eq!(by_name["fixer"].tools.as_deref(), Some(&["bash".to_string(), "write".into()][..]));
-        assert_eq!(warnings.len(), 1);
+        assert_eq!((by_name["fixer"].effort, by_name["fixer"].compact_window), (Some(Effort::Low), Some(80_000)));
+        assert_eq!((reviewer.effort, reviewer.compact_window), (None, None));
+        assert_eq!(warnings.len(), 2);
         assert!(warnings[0].contains("unknown permission"));
+        assert!(warnings[1].contains("autoCompactWindow"), "{warnings:?}");
     }
 
     #[test]
@@ -809,6 +924,44 @@ mod tests {
         assert_eq!(tool_list("- read - 'write'"), ["read", "write"]);
         assert_eq!(model_field(Some(&"opus".to_string())), None);
         assert_eq!(model_field(Some(&" gw/m ".to_string())).as_deref(), Some("gw/m"));
+    }
+
+    #[tokio::test]
+    async fn forks_start_from_the_conversation_and_effort_applies() {
+        use crate::agent::mock::{gateway, texts};
+        let call = |id: &str, input: Value| json!({"type": "tool_use", "id": id, "name": "agent", "input": input});
+        let (client, mut requests) = gateway(move |n| match n {
+            0 => (vec![call("f1", json!({"agent_type": "fork", "description": "side", "prompt": "Count the files"}))], "tool_use", 10),
+            1 => (vec![json!({"type": "text", "text": "fork done"})], "end_turn", 10),
+            2 => (vec![call("g1", json!({"agent_type": "explore", "description": "find", "prompt": "Find it", "effort": "low"}))], "tool_use", 10),
+            3 => (vec![json!({"type": "text", "text": "found"})], "end_turn", 10),
+            _ => (vec![json!({"type": "text", "text": "ok"})], "end_turn", 10),
+        })
+        .await;
+        let mut registry = ToolRegistry::with_defaults(FileTracker::default());
+        let defs = Arc::new(vec![explore(), general_purpose()]);
+        let tool = AgentTool::new(defs, registry.clone(), client.clone(), Arc::new(|_: &Value| {}));
+        assert!(tool.input_schema()["properties"]["agent_type"]["enum"].as_array().unwrap().contains(&json!("fork")));
+        registry.register(tool);
+        let mut parent = Agent::new(client, registry, "the main prompt");
+        parent.run_turn(vec![json!({"type": "text", "text": "hi"})], &mut crate::agent::tests::Notices::default()).await.unwrap();
+
+        let first = requests.recv().await.unwrap();
+        let fork = requests.recv().await.unwrap();
+        assert_eq!((&fork["system"], &fork["tools"]), (&first["system"], &first["tools"]), "the same prefix");
+        let messages = fork["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["content"][0]["id"], "f1", "the parent's call");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "f1");
+        assert!(messages[2]["content"][0]["content"].as_str().unwrap().contains("You are a fork"));
+        assert_eq!(texts(&messages[2]).last().unwrap(), "Count the files");
+
+        let back = requests.recv().await.unwrap();
+        let result = &back["messages"][2]["content"][0];
+        assert!(result["content"][0]["text"].as_str().unwrap_or(result["content"].as_str().unwrap_or("")).contains("fork done"), "{result}");
+        let explore = requests.recv().await.unwrap();
+        assert_eq!(explore["output_config"]["effort"], "low");
+        assert_eq!(back["output_config"]["effort"], "high", "the parent's own");
     }
 
     #[tokio::test]

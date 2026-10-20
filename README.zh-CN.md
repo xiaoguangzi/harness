@@ -429,6 +429,7 @@ Claude Code 的命令（技能的旧形式）同样可用：`.harness/commands/`
 
 - **`explore`**（内置）：只有 `grep` 和 `glob` 工具的代码库搜索代理。用于“X 在哪里 / 哪些文件用了 Y”这类问题。
 - **`general-purpose`**（内置）：拥有主代理全部工具（`bash`、`edit`、`write`、MCP 工具等，受同一沙箱约束）的编码代理，用于多步调研或范围明确的修改。子代理共享工作目录，因此主代理会被要求给每个修改文件的子代理分配各自的文件。
+- **`fork`**（内置）：主代理的一个副本，带着整段会话、相同的 system 提示词、工具和模型启动，用于需要会话中已有信息的支线任务。它的请求与主代理以相同的前缀开头，会从提示词缓存读取，所以即使上下文很长，启动 fork 也很便宜。它的第一条消息先回应启动它的那次回复中的工具调用（启动它的那个调用会说明它是 fork），再给出任务。为了保持前缀相同，它的工具列表里也有子代理工具，但在 fork 里调用会被拒绝。
 - **自定义代理**：`.harness/agents/` 或 `.claude/agents/`（项目或 `~`）中的 Markdown 文件（先找到的优先，与内置代理同名的文件会覆盖内置项）：
 
   ```markdown
@@ -438,13 +439,15 @@ Claude Code 的命令（技能的旧形式）同样可用：`.harness/commands/`
   tools: read, grep          # 可选；`mcp__server__*` 匹配前缀
   permission: read-only      # 默认；`write` 允许 bash/edit/write 和非只读的 MCP 工具
   model: claude-sonnet-5     # 可选
+  effort: low                # 可选；思考力度（low … max）
+  autoCompactWindow: 100000  # 可选；按这么大的窗口压缩它的会话
   ---
   You are a code reviewer...
   ```
 
 - **自定义代理默认只读**：只读代理只会获得标记为只读的工具（`read`、`grep`、`glob`、`lsp`、`skill`，以及服务器设置了 `readOnlyHint` 的 MCP 工具），即使它的 `tools` 列表写了其他工具也不行。`tools` 用于进一步收窄。没有 `bash` 的代理也不会获得 `bash_output` 和 `kill_shell`，因为它没有后台命令。`agent` 工具按每种代理实际拿到的工具标注它是只读还是能修改文件，描述截断到 400 个字符。
 - 子代理不能再启动子代理。它们的文件读取使用自己的追踪器，因此不会计入主代理 `edit` 和 `write` 所需的已读记录。
-- 模型：代理的 `model`，否则 `subagent_model` / `HARNESS_SUBAGENT_MODEL`，否则会话当前使用的模型（包括 `/model`、`/effort` 切换之后）；任意 `<provider>/<model>`。Claude Code 的 `sonnet`、`opus`、`haiku` 别名视同未设置，与 `inherit` 相同。
+- 模型：代理的 `model`，否则 `subagent_model` / `HARNESS_SUBAGENT_MODEL`，否则会话当前使用的模型（包括 `/model`、`/effort` 切换之后）；任意 `<provider>/<model>`。Claude Code 的 `sonnet`、`opus`、`haiku` 别名视同未设置，与 `inherit` 相同。思考力度：`agent` 调用的 `effort`，否则代理自己的，否则会话的。
 - 工具可以用 Claude Code 的名称（`Read`、`Bash`、`KillShell`），会映射为 harness 自己的工具（`LS` 映射为 `glob`）。
 - `/agents` 列出可用类型。
 

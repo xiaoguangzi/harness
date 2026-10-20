@@ -13,6 +13,11 @@ pub async fn scope<F: Future>(id: String, tx: UnboundedSender<Event>, future: F)
     CURRENT.scope((id, tx), future).await
 }
 
+/// The id of the tool call running in this task, if any.
+pub fn call_id() -> Option<String> {
+    CURRENT.try_with(|(id, _)| id.clone()).ok()
+}
+
 pub struct Waiting(Option<(String, UnboundedSender<Event>)>);
 
 pub fn waiting(tasks: Vec<String>) -> Waiting {
