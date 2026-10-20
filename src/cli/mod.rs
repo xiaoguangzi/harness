@@ -1289,6 +1289,20 @@ fn print_sandbox(out: &Output) {
     }
 }
 
+/// About what the requests cost at list prices (or the configured ones),
+/// for the models whose price is known.
+pub(super) fn usage_cost(agent: &Agent) -> Option<String> {
+    let providers = agent.client().providers();
+    let models = agent.usage().models();
+    let priced: Vec<f64> =
+        models.iter().filter_map(|(model, t)| providers.price(model).map(|(price, ttl)| price.cost(&t.usage, ttl))).collect();
+    if priced.is_empty() {
+        return None;
+    }
+    let left_out = if priced.len() < models.len() { ", leaving out models without a known price" } else { "" };
+    Some(format!("about ${:.2} at list prices{left_out}", priced.iter().sum::<f64>()))
+}
+
 fn print_usage(out: &Output, agent: &Agent) {
     let models = agent.usage().models();
     if models.is_empty() {
@@ -1321,6 +1335,9 @@ fn print_usage(out: &Output, agent: &Agent) {
         let cached: u64 = models.iter().map(|(_, t)| t.usage.cache_read_tokens).sum();
         if let Some(percent) = (cached * 100).checked_div(input) {
             out.line(format!("  {}", out.paint("2", &format!("{percent}% of input tokens came from the prompt cache"))));
+        }
+        if let Some(cost) = usage_cost(agent) {
+            out.line(format!("  {}", out.paint("2", &cost)));
         }
     }
     let used = agent.context_tokens();

@@ -85,6 +85,9 @@ pub async fn interactive(
                 format!("Input: {}", t.usage.input_tokens), format!("Cache reads: {}", t.usage.cache_read_tokens),
                 format!("Cache writes: {}", t.usage.cache_write_tokens), format!("Output: {}", t.usage.output_tokens),
             ])));
+            if let Some(cost) = super::usage_cost(agent) {
+                items.push(Item::new("Cost", cost));
+            }
             dialog::inspect(out, "Usage", "This conversation, by model", items).await;
             None
         }

@@ -173,6 +173,36 @@ pub struct ModelConfig {
     pub context_window: Option<u32>,
     pub effort: Option<Effort>,
     pub extra_body: Option<Map<String, Value>>,
+    /// What its tokens cost, for `/usage`'s estimate.
+    pub price: Option<Price>,
+}
+
+/// A model's prices in dollars per million tokens. Without their own,
+/// cache reads cost a tenth of the input price and cache writes 1.25 times
+/// it (twice it for the one-hour cache), as on the Anthropic API.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
+}
+
+impl Price {
+    const fn new(input: f64, output: f64, cache_read: f64) -> Self {
+        Self { input, output, cache_read: Some(cache_read), cache_write: None }
+    }
+
+    /// What `usage` costs, in dollars, with cache writes for `ttl`.
+    pub fn cost(&self, usage: &super::Usage, ttl: Option<CacheTtl>) -> f64 {
+        let write_factor = if ttl == Some(CacheTtl::OneHour) { 2.0 } else { 1.25 };
+        let (read, write) = (self.cache_read.unwrap_or(self.input / 10.0), self.cache_write.unwrap_or(self.input * write_factor));
+        let uncached = usage.input_tokens.saturating_sub(usage.cache_read_tokens + usage.cache_write_tokens);
+        let tokens = |n: u64, price: f64| n as f64 * price / 1_000_000.0;
+        tokens(uncached, self.input) + tokens(usage.cache_read_tokens, read) + tokens(usage.cache_write_tokens, write)
+            + tokens(usage.output_tokens, self.output)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +385,14 @@ impl Providers {
         self.providers.get(name)
     }
 
+    /// What tokens of the model `spec` cost, and how long its cache keeps
+    /// them, if the price is configured or known.
+    pub fn price(&self, spec: &str) -> Option<(Price, Option<CacheTtl>)> {
+        let target = self.target(spec).ok()?;
+        let price = target.model_config().and_then(|m| m.price).or_else(|| known_price(target.model))?;
+        Some((price, target.cache_ttl()))
+    }
+
     pub fn protocol_of(&self, provider: &str) -> Option<Protocol> {
         self.providers.get(provider).map(|p| p.protocol)
     }
@@ -471,6 +509,27 @@ impl Target<'_> {
         headers.extend(self.config.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
         headers
     }
+}
+
+/// The list price of a well-known model, named as for
+/// [`known_context_window`].
+fn known_price(model: &str) -> Option<Price> {
+    let name = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let claude = name.find("claude-").map(|at| &name[at + "claude-".len()..])?;
+    const PRICES: [(&str, Price); 11] = [
+        ("fable-5-1", Price::new(10.0, 50.0, 0.25)),
+        ("mythos-5-1", Price::new(10.0, 50.0, 0.25)),
+        ("fable-", Price::new(10.0, 50.0, 1.0)),
+        ("opus-5-5", Price::new(4.0, 20.0, 0.2)),
+        ("opus-5", Price::new(5.0, 25.0, 0.5)),
+        ("opus-4-", Price::new(5.0, 25.0, 0.5)),
+        ("sonnet-5", Price::new(2.0, 10.0, 0.2)),
+        ("sonnet-4-6", Price::new(3.0, 15.0, 0.3)),
+        ("sonnet-4", Price::new(3.0, 15.0, 0.3)),
+        ("haiku-5", Price::new(0.1, 0.5, 0.01)),
+        ("haiku-4-5", Price::new(1.0, 5.0, 0.1)),
+    ];
+    PRICES.iter().find(|(prefix, _)| claude.starts_with(prefix)).map(|(_, price)| *price)
 }
 
 /// The context window of a well-known model, by its name as the official
@@ -607,6 +666,23 @@ pub(crate) mod tests {
         ] {
             assert_eq!(known_context_window(model), window, "{model}");
         }
+    }
+
+    #[test]
+    fn prices_known_and_configured_models() {
+        let mut s = two_relays();
+        s.providers.get_mut("relay-b").unwrap().models.get_mut("gpt-5").unwrap().price =
+            Some(Price { input: 1.25, output: 10.0, cache_read: Some(0.125), cache_write: None });
+        let p = Providers::from_parts(&s, &no_env).unwrap();
+        let usage = crate::llm::Usage { input_tokens: 2_000_000, cache_read_tokens: 1_000_000, cache_write_tokens: 400_000, output_tokens: 100_000 };
+        let (opus, ttl) = p.price("relay-a/claude-opus-5").unwrap();
+        // 600k uncached at $5, 1M read at $0.50, 400k written at $6.25, 100k out at $25.
+        assert!((opus.cost(&usage, ttl) - (3.0 + 0.5 + 2.5 + 2.5)).abs() < 1e-9);
+        assert!((opus.cost(&usage, Some(CacheTtl::OneHour)) - (3.0 + 0.5 + 4.0 + 2.5)).abs() < 1e-9);
+        assert_eq!(p.price("relay-b/gpt-5").unwrap().0.input, 1.25, "the configured price");
+        assert!(p.price("relay-b/gpt-5-mini").is_none() && p.price("relay-a/qwen3").is_none());
+        assert_eq!(known_price("claude-opus-5-5").unwrap().input, 4.0, "a newer model before its family");
+        assert_eq!(known_price("claude-haiku-4-5-20251001").unwrap().input, 1.0);
     }
 
     #[test]

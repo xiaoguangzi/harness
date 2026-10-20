@@ -149,6 +149,7 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 | `prompt_cache_ttl` | Anthropic only: how long the cache keeps the conversation after its last use, `5m` (default) or `1h`. Writing to the 1-hour cache costs twice the input price rather than 1.25 times, which pays off when you often pause between 5 minutes and an hour |
 | `gzip` | gzip-compress request bodies of 1 KiB or more; default on for `api.anthropic.com`, off for gateways, many of which reject it |
 | `models` | per-model overrides; listed models show in `/model` and Tab completion |
+| `price` | per model: what its tokens cost in dollars per million, `{"input": 1.25, "output": 10, "cache_read": 0.125}` (`cache_write` too; by default a tenth and 1.25 times the input price, twice it with the 1-hour cache), for the estimate `/usage` shows. Claude models have their list prices built in |
 
 A request that fails in passing (a connection that fails or drops, HTTP 408, 409 or 5xx, a response that breaks off) is sent again up to 3 times, after 1, 2 and 4 seconds; an overloaded or rate-limited API (HTTP 429 or 529, or such an error in the stream) up to 10 times, the wait doubling up to a minute, about five minutes in all. A `retry-after` (or `retry-after-ms`) header sets the wait instead; one over 10 minutes is not waited for. Each retry shows as `↻` with its reason.
 
@@ -211,7 +212,7 @@ Interactive command panels use the available terminal width, with headings and s
 | `/resume [id]` | pick up an earlier conversation from this directory (see [Resuming](#resuming-conversations)) |
 | `/rewind` | go back to before an earlier prompt, with the code, the conversation or both (see [Rewinding](#rewinding)) |
 | `/init [notes]` | have the model write the project's `AGENTS.md`, or improve it (see [Project notes](#project-notes)) |
-| `/usage` | show the tokens used since the REPL started, per model (requests, input, cache reads and writes, output; subagents and compaction included, kept across `/clear` and `/resume`), and about how much of the context window the conversation takes |
+| `/usage` | show the tokens used since the REPL started, per model (requests, input, cache reads and writes, output; subagents and compaction included, kept across `/clear` and `/resume`), about what they cost for models whose [price](#llm-gateways) is known, and about how much of the context window the conversation takes |
 | `/tools` | browse tool descriptions and input schemas |
 | `/output` | browse the expanded conversation; also Ctrl+O while running |
 | `/skills` | browse discovered skills; Enter inserts an invocation |
