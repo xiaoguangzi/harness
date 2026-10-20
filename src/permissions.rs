@@ -22,7 +22,6 @@
 //! `bypassPermissions`, the default, asks for nothing. A conversation's
 //! subagents share its permissions and mode.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use async_trait::async_trait;
@@ -343,8 +342,9 @@ pub enum HookDecision {
 /// directory.
 fn in_working_dir(input: &Value) -> bool {
     let Some(path) = input["path"].as_str() else { return false };
-    let Ok(cwd) = std::env::current_dir() else { return false };
-    let path = std::path::absolute(Path::new(path)).unwrap_or_default();
+    // A subagent's worktree, if it has one.
+    let cwd = crate::tools::workdir::get();
+    let path = cwd.join(path);
     path.starts_with(&cwd) && !path.components().any(|c| c == std::path::Component::ParentDir)
 }
 

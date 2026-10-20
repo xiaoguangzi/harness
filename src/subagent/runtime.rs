@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
 use tokio::task::AbortHandle;
 
+use super::worktree::Worktree;
 use super::{ForkBase, MAX_RESULT_BYTES, Reporter};
 use crate::agent::{Agent, Inbox, Observer, UsageLog};
 use crate::checkpoint::FileHistory;
@@ -94,6 +95,8 @@ pub struct Child {
     pub agent_type: String,
     pub description: String,
     pub model: String,
+    /// The git worktree it works in, with `isolation: "worktree"`.
+    worktree: Option<Worktree>,
     agent: tokio::sync::Mutex<Agent>,
     /// The child's own inbox: messages sent to it while it runs.
     inbox: Arc<Inbox>,
@@ -192,6 +195,7 @@ impl Subagents {
         prompt: String,
         background: bool,
         fallback: &Reporter,
+        worktree: Option<Worktree>,
     ) -> Result<Run> {
         let mut children = self.children.lock().unwrap();
         check_capacity(&children)?;
@@ -208,6 +212,7 @@ impl Subagents {
             agent_type: agent_type.to_string(),
             description: description.to_string(),
             model: agent.model().to_string(),
+            worktree,
             inbox: agent.inbox().clone(),
             agent: tokio::sync::Mutex::new(agent),
             reporter: self.reporter.lock().unwrap().clone().unwrap_or_else(|| fallback.clone()),
@@ -379,8 +384,15 @@ impl Child {
         let start = agent.messages().len();
         let mut observer = SubObserver { child: &self };
         let mut content = vec![json!({"type": "text", "text": prompt})];
+        // Removed after a run that left nothing in it.
+        let worktree = self.worktree.as_ref().map(|w| (w, w.ensure()));
+        if let Some((_, Err(e))) = &worktree {
+            content = vec![json!({"type": "text", "text": format!("Your git worktree could not be made again ({e:#}); stop and report that.")})];
+        }
+        let workdir = worktree.as_ref().map(|(w, _)| w.workdir.clone());
         loop {
-            let result = agent.run_turn(std::mem::take(&mut content), &mut observer).await;
+            let turn = agent.run_turn(std::mem::take(&mut content), &mut observer);
+            let result = crate::tools::workdir::scope(workdir.clone(), turn).await;
             let mut state = self.state.lock().unwrap();
             if state.run != run || state.status != Status::Running {
                 return;
@@ -389,7 +401,10 @@ impl Child {
             if result.is_ok() && self.inbox.wants_turn() {
                 continue;
             }
-            let output = outcome(&agent, start, result, self.tool_calls.load(Ordering::Relaxed));
+            let mut output = outcome(&agent, start, result, self.tool_calls.load(Ordering::Relaxed));
+            if let Some((worktree, _)) = &worktree {
+                output.content.push_str(&format!("\n\n({})", worktree.settle()));
+            }
             state.status = if output.is_error { Status::Failed } else { Status::Completed };
             state.took = Some(state.started.elapsed());
             state.handle = None;

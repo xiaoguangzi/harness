@@ -13,6 +13,7 @@ mod read;
 pub mod shells;
 pub mod snapshot;
 pub(crate) mod spill;
+pub mod workdir;
 pub mod scheduling;
 pub(crate) mod progress;
 mod wait;

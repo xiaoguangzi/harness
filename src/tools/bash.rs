@@ -274,6 +274,8 @@ pub fn added_commands() -> Vec<String> {
 /// is on, in a process group of its own so its children can be killed with
 /// it. Keep the guard until the process exits.
 pub(super) fn spawn(command: &str) -> Result<(Child, Option<sandbox::Guard>), String> {
+    // A subagent in a worktree runs its commands there.
+    let command = &super::workdir::command(command);
     let (mut cmd, guard) = match sandbox::active() {
         Some(sandbox) => match sandbox.command("bash", ["-c", command]) {
             Ok((cmd, guard)) => (cmd, Some(guard)),

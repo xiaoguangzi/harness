@@ -75,10 +75,11 @@ impl Tool for EditTool {
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
-        let input: Input = match parse_input(input) {
+        let mut input: Input = match parse_input(input) {
             Ok(i) => i,
             Err(e) => return e,
         };
+        input.path = super::workdir::resolve(&input.path);
         if input.old_string.is_empty() {
             return ToolOutput::error("`old_string` is empty; to create a file, use `write`");
         }

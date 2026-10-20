@@ -132,7 +132,7 @@ pub fn subagent(def: &AgentDef) -> String {
     let notes = if def.path.is_none() && def.name == "explore" {
         String::new()
     } else {
-        user_notes() + &project_notes(&std::env::current_dir().unwrap_or_default())
+        user_notes() + &project_notes(&crate::tools::workdir::get())
     };
     format!(
         "{}\n\nYou were started by another agent, which sees only your final message; the user does \
@@ -192,7 +192,7 @@ fn tools_section(tools: &ToolRegistry) -> String {
 }
 
 fn environment() -> String {
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = crate::tools::workdir::get();
     let git = cwd.ancestors().any(|dir| dir.join(".git").exists());
     let shell = std::env::var("SHELL").ok().and_then(|s| Path::new(&s).file_name().map(|n| n.to_string_lossy().into_owned()));
     let mut lines = vec![

@@ -22,7 +22,7 @@ impl ReadTool {
     /// directory (whose own are in the system prompt), that the model has
     /// not seen yet.
     fn directory_notes(&self, path: &std::path::Path) -> String {
-        let Ok(root) = std::env::current_dir() else { return String::new() };
+        let root = super::workdir::get();
         let mut text = String::new();
         for note in self.files.new_notes(&root, path) {
             let label = note.strip_prefix(&root).unwrap_or(&note).display().to_string();
@@ -85,10 +85,11 @@ impl Tool for ReadTool {
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
-        let input: Input = match parse_input(input) {
+        let mut input: Input = match parse_input(input) {
             Ok(i) => i,
             Err(e) => return e,
         };
+        input.path = super::workdir::resolve(&input.path);
 
         if let Some(sandbox) = crate::sandbox::active()
             && let Err(e) = sandbox.check_read(input.path.as_ref())

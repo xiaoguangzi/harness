@@ -291,7 +291,7 @@ Host *
 
 下一步依赖结果时，调用 `wait_tasks`：`task_ids` 可以混合 shell ID 和子代理 ID；`mode` 为 `any`（任意一个完成）或 `all`（默认，全部完成）；`timeout_ms` 默认 60000，最大 300000。等待会挂起工具，不通过反复请求模型轮询；返回状态和已完成结果，并撤销尚未交给模型的同一条完成通知。等待超时、收到用户新消息或等待被打断，都不会杀掉后台任务；不再需要时明确停止。`bash_output` 仍用于即时读取增量输出。汇报成功前必须收集并检查必要的结果。
 
-工具结果完成后会及时显示，并按调用 ID 配对；交给模型时仍是一批完整、按调用顺序排列的结果。独立读取可以并发，未知写入工具和默认命令在工作区上串行。后台命令会持有资源锁直到退出或被停止。只有能够与工作区安全并行的任务才应声明其他 `resource`，如 `host:aliyun`；相同资源的命令会串行。文件修改保留原有的先读后写与过期读取检查。这些锁协调 harness 内的工具，不控制外部程序或未声明的远程资源；不自动推断命令依赖，也不自动隔离 worktree。
+工具结果完成后会及时显示，并按调用 ID 配对；交给模型时仍是一批完整、按调用顺序排列的结果。独立读取可以并发，未知写入工具和默认命令在工作区上串行。后台命令会持有资源锁直到退出或被停止。只有能够与工作区安全并行的任务才应声明其他 `resource`，如 `host:aliyun`；相同资源的命令会串行。文件修改保留原有的先读后写与过期读取检查。这些锁协调 harness 内的工具，不控制外部程序或未声明的远程资源；不自动推断命令依赖；同时修改文件的子代理可以用 [worktree 隔离](#子代理subagents)分开。
 
 ## 大输出
 
@@ -530,6 +530,7 @@ Claude Code 的命令（技能的旧形式）同样可用：`.harness/commands/`
 - **后续追问**：每个子代理都保留自己的会话。`message_agent` 让已完成或已停止的子代理带着原有上下文处理一条新消息（等待其报告，或在后台运行）；仍在运行的子代理会在下一步收到这条消息，主代理同时得知它的进度（工具调用次数、耗时、最近的一次调用）。`stop_agent` 停止子代理，它已做的修改会保留。
 - `/tasks` 列出本会话的子代理；`/stop <id>` 停止一个，`/stop` 停止所有运行中的。你停止的子代理会随你的下一条消息告知主代理。Web UI 中每张子代理卡片都有停止按钮。
 - 同时运行的代理（主代理、它的子代理、Web 任务）逐个修改文件：如果某个文件在本代理读过之后被另一个代理改过，`edit` 和 `write` 会拒绝修改，而不是覆盖对方的改动。
+- **worktree 隔离**：`agent` 调用带上 `isolation: "worktree"` 时，子代理在自己的 git worktree 中工作：从当前检出的提交新建分支 `harness/<id>`，放在 `$TMPDIR/harness-<uid>/worktrees/`（沙箱允许命令写入这里）；它的相对路径和命令都从那里开始，并且位于仓库中相同的子目录。它只能看到已提交的文件，看不到未提交的改动。结束时，如果它在 worktree 中什么都没改，worktree 会被删除；否则它的报告会说明改动在哪里（文件、提交、分支）以及如何审阅、合并和删除，这些由主代理决定。用 `message_agent` 追问时会继续在同一个 worktree 中工作。需要一个至少有一次提交的 git 仓库；`lsp` 仍然查看主检出目录。
 - 每个会话最多同时运行 8 个子代理，保留最近的 32 个用于后续追问。它们只存在于内存中：`/clear`、`/resume`、删除 Web 任务或退出程序都会停止并遗忘它们。
 
 ## 插件（Plugins）
@@ -662,6 +663,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/permissions.rs` — 权限：配置中的规则、各个模式、哪些调用直接运行、询问或拒绝，以及通过前端询问
 - `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read`、`edit` 和 `write` 检查的路径规则
 - `src/subagent.rs` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具
+- `src/subagent/worktree.rs` — `isolation: "worktree"` 子代理的 git worktree：创建、结算与删除
 - `src/subagent/runtime.rs` — 一个会话的子代理：前台与后台运行、后续追问、停止、向主代理收件箱报告
 - `src/mcp.rs` — MCP 客户端：服务器配置、连接、`mcp__*` 工具适配器
 - `src/lsp.rs` — 插件语言服务器的 LSP 客户端：配置、按需启动、基于 stdio 的 JSON-RPC、诊断；`lsp` 工具
@@ -681,6 +683,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
   - `snapshot.rs` — 登录 Shell 的环境，启动时为模型执行的命令采集一次
   - `shells.rs` — 后台命令（`bash` 的 `run_in_background`）：每个会话各自的一组，`bash_output` 和 `kill_shell` 工具，退出时通知收件箱
   - `todo.rs` — `todo_write` 工具：模型的待办清单，每次整体发送（未注册，保留以便重新启用）
+  - `workdir.rs` — 子代理自己的工作目录（它的 worktree），工具据此解析相对路径
   - `spill.rs` — 太大无法返回的输出：给模型开头和结尾，全部内容写入文件
   - `grep.rs` — 通过 ugrep 的正则搜索（PCRE，遵循 `.gitignore`，`files_with_matches` / `content` / `count` 模式）
   - `glob.rs` — 通过 ugrep 按 glob 模式查找文件（`.gitignore` 与沙箱规则同 `grep`；支持 `{a,b}`；最近修改的在前，最多 `head_limit` 个，默认 100）

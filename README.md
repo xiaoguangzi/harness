@@ -290,7 +290,7 @@ Finite background commands default to `background_kind: "task"`. One-shot mode w
 
 When the next step depends on a result, call `wait_tasks` with `task_ids` (shell IDs or subagent IDs), `mode: "any"` or `"all"` (default), and optional `timeout_ms` (default 60000, maximum 300000). It suspends without polling the model, returns statuses and completed results, and acknowledges pending duplicate completion notifications. A timeout, new user message, or interrupted wait leaves background tasks running; stop them explicitly when no longer needed. `bash_output` remains an immediate, incremental output check. Required work must be collected before reporting success.
 
-Tool results appear as soon as they finish, paired by call ID, while the model receives one complete batch in call order. Independent reads overlap; unknown mutating tools and commands serialize on the workspace. A background command retains its resource guard until it exits or is stopped. Set `resource` only for work that can safely overlap the workspace, for example `host:aliyun`; commands using the same resource serialize. File changes retain the existing read-before-write and stale-file checks. These guards coordinate harness tools, not external programs or unnamed remote resources. No command-dependency inference or automatic worktree isolation is performed.
+Tool results appear as soon as they finish, paired by call ID, while the model receives one complete batch in call order. Independent reads overlap; unknown mutating tools and commands serialize on the workspace. A background command retains its resource guard until it exits or is stopped. Set `resource` only for work that can safely overlap the workspace, for example `host:aliyun`; commands using the same resource serialize. File changes retain the existing read-before-write and stale-file checks. These guards coordinate harness tools, not external programs or unnamed remote resources. No command dependencies are inferred; subagents that change files at once can be kept apart with [worktree isolation](#subagents).
 
 ## Large outputs
 
@@ -529,6 +529,7 @@ The main agent can delegate a self-contained task with the `agent` tool. A subag
 - **Follow-ups**: every subagent keeps its conversation. `message_agent` runs a finished or stopped one again on a new message, with its context intact (waiting for its report, or in the background). A running one gets the message at its next step, and the main agent is told how far it has got (tool calls, time, latest call). `stop_agent` stops one; changes it made remain.
 - `/tasks` lists this conversation's subagents; `/stop <id>` stops one and `/stop` every running one. The main agent hears about subagents you stopped with your next message. In the web UI each subagent's card has a Stop button.
 - Agents running at once (the main agent, its subagents, web tasks) change files one at a time: `edit` and `write` refuse a file another changed since this one read it, rather than write over that change.
+- **Worktree isolation**: with `isolation: "worktree"` in the `agent` call, a subagent works in a git worktree of its own, on a new branch `harness/<id>` from the commit checked out now, in `$TMPDIR/harness-<uid>/worktrees/` (which the sandbox lets commands write); its relative paths and commands start there, in the same subdirectory of the repository. It sees committed files only, not uncommitted changes. When it is done, a worktree it changed nothing in is removed; otherwise its report says where the changes are (files, commits, branch) and how to review, merge and remove them, which is up to the main agent. A follow-up with `message_agent` continues in the same worktree. It needs a git repository with a commit; `lsp` still looks at the main checkout.
 - At most 8 subagents of a conversation run at once, and the 32 most recent are kept for follow-ups. They live in memory only: `/clear`, `/resume`, deleting a web task or quitting stops and forgets them.
 
 ## Plugins
@@ -661,6 +662,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/permissions.rs` — permissions: the settings' rules, the modes, which calls run, ask or are refused, and asking through the frontend
 - `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read`, `edit` and `write` check
 - `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
+- `src/subagent/worktree.rs` — git worktrees for subagents with `isolation: "worktree"`: making, settling and removing them
 - `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox
 - `src/mcp.rs` — MCP client: server configs, connections, `mcp__*` tool adapters
 - `src/lsp.rs` — LSP client for plugins' language servers: configs, starting them on demand, JSON-RPC over stdio, diagnostics; the `lsp` tool
@@ -680,6 +682,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
   - `snapshot.rs` — the login shell's environment, captured once at startup for the model's commands
   - `shells.rs` — background commands (`bash` `run_in_background`): each conversation's own set, the `bash_output` and `kill_shell` tools, exit reports to the inbox
   - `todo.rs` — the `todo_write` tool: the model's checklist, sent whole each time (not registered: kept for re-enabling)
+  - `workdir.rs` — a subagent's own working directory (its worktree), against which the tools resolve paths
   - `spill.rs` — output too large to return: its start and end for the model, all of it in a file
   - `grep.rs` — regex search via ugrep (PCRE, honours `.gitignore`, `files_with_matches` / `content` / `count` modes)
   - `glob.rs` — find files by glob pattern via ugrep (same `.gitignore` and sandbox rules as `grep`; `{a,b}` alternatives; newest first, at most `head_limit`, default 100)

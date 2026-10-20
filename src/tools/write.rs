@@ -61,10 +61,11 @@ impl Tool for WriteTool {
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
-        let input: Input = match parse_input(input) {
+        let mut input: Input = match parse_input(input) {
             Ok(i) => i,
             Err(e) => return e,
         };
+        input.path = super::workdir::resolve(&input.path);
         let path = Path::new(&input.path);
         if path.is_dir() {
             return ToolOutput::error(format!("{} is a directory", input.path));

@@ -29,6 +29,7 @@
 //! `bash` or `write` unless it declares `permission: write`.
 
 pub mod runtime;
+pub mod worktree;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -366,7 +367,9 @@ impl AgentTool {
              guess what it will find. Every subagent gets an `agent_id`: `message_agent` continues \
              it with its context intact, `stop_agent` stops it. The report comes to you, not the \
              user; relay what matters. `effort` (low to max) sets how hard it thinks: lower for \
-             simple searches, higher for hard problems.\n\nAvailable agents:",
+             simple searches, higher for hard problems. With `isolation: \"worktree\"` a subagent that \
+             changes files works in a git worktree of its own, from the last commit; its report says where \
+             its changes are, for you to review and merge.\n\nAvailable agents:",
         );
         let mut tool = Self { defs, base, client, reporter, description: String::new() };
         for d in tool.defs.iter() {
@@ -463,6 +466,13 @@ struct Input {
     #[serde(default)]
     run_in_background: bool,
     effort: Option<String>,
+    isolation: Option<Isolation>,
+}
+
+#[derive(Deserialize, PartialEq)]
+enum Isolation {
+    #[serde(rename = "worktree")]
+    Worktree,
 }
 
 #[async_trait]
@@ -495,6 +505,11 @@ impl Tool for AgentTool {
                     "type": "string",
                     "enum": Effort::ALL.map(Effort::as_str),
                     "description": "How hard the subagent thinks; default: the agent's own, else yours."
+                },
+                "isolation": {
+                    "type": "string",
+                    "enum": ["worktree"],
+                    "description": "worktree: work in a git worktree of its own, on its own branch from HEAD, so its changes do not touch yours or other subagents'. It sees committed files only, not uncommitted changes."
                 }
             },
             "required": ["agent_type", "description", "prompt"],
@@ -520,22 +535,41 @@ impl Tool for AgentTool {
             Ok(effort) => effort,
             Err(e) => return ToolOutput::error(format!("{e:#}")),
         };
+        let worktree = match input.isolation {
+            Some(Isolation::Worktree) => {
+                let name = crate::session::new_id();
+                match tokio::task::spawn_blocking(move || worktree::Worktree::create(&crate::tools::workdir::get(), &name)).await {
+                    Ok(Ok(worktree)) => Some(worktree),
+                    Ok(Err(e)) => return ToolOutput::error(format!("Could not make a git worktree: {e:#}")),
+                    Err(e) => return ToolOutput::error(format!("Could not make a git worktree: {e}")),
+                }
+            }
+            None => None,
+        };
         if input.agent_type == FORK {
-            return self.launch_fork(&input.description, input.prompt, input.run_in_background, effort).await;
+            return self.launch_fork(&input.description, input.prompt, input.run_in_background, effort, worktree).await;
         }
         let Some(def) = self.defs.iter().find(|d| d.name == input.agent_type) else {
             return ToolOutput::error(format!("Unknown agent type: {}", input.agent_type));
         };
         let def = AgentDef { effort: effort.or(def.effort), ..def.clone() };
         let tools = self.registry_for(&def);
-        self.launch(&def, tools, &input.description, input.prompt, input.run_in_background).await
+        self.launch(&def, tools, &input.description, input.prompt, input.run_in_background, worktree).await
     }
 }
 
 impl AgentTool {
     /// Starts a subagent of type `def` with `tools` on `prompt`; returns its
     /// report, or with `background` that it started.
-    async fn launch(&self, def: &AgentDef, tools: ToolRegistry, description: &str, prompt: String, background: bool) -> ToolOutput {
+    async fn launch(
+        &self,
+        def: &AgentDef,
+        tools: ToolRegistry,
+        description: &str,
+        prompt: String,
+        background: bool,
+        worktree: Option<worktree::Worktree>,
+    ) -> ToolOutput {
         // Outside a conversation (the web UI's tool page) a subagent can
         // only run in the foreground, on the tool's own model.
         let (subagents, parent) = match runtime::current() {
@@ -555,9 +589,11 @@ impl AgentTool {
         if def.effort.is_some() {
             client.set_effort(def.effort);
         }
-        let mut agent = Agent::new(client, tools, crate::prompt::subagent(def));
+        // Its environment says where it works.
+        let system = crate::tools::workdir::sync(worktree.as_ref().map(|w| w.workdir.clone()), || crate::prompt::subagent(def));
+        let mut agent = Agent::new(client, tools, system);
         agent.set_compact_window(def.compact_window);
-        self.start(&subagents, agent, &def.name, description, prompt, background).await
+        self.start(&subagents, agent, &def.name, description, prompt, background, worktree).await
     }
 
     /// Runs `agent` as a subagent of the conversation that owns
@@ -571,8 +607,9 @@ impl AgentTool {
         description: &str,
         prompt: String,
         background: bool,
+        worktree: Option<worktree::Worktree>,
     ) -> ToolOutput {
-        let run = match subagents.spawn(agent, agent_type, description, prompt, background, &self.reporter) {
+        let run = match subagents.spawn(agent, agent_type, description, prompt, background, &self.reporter, worktree) {
             Ok(run) => run,
             Err(e) => return ToolOutput::error(format!("{e:#}")),
         };
@@ -592,7 +629,14 @@ impl AgentTool {
     /// the same prefix and read it from the prompt cache. Its first message
     /// answers the calls of the response that started it, then gives it
     /// `prompt`.
-    async fn launch_fork(&self, description: &str, prompt: String, background: bool, effort: Option<Effort>) -> ToolOutput {
+    async fn launch_fork(
+        &self,
+        description: &str,
+        prompt: String,
+        background: bool,
+        effort: Option<Effort>,
+        worktree: Option<worktree::Worktree>,
+    ) -> ToolOutput {
         let (Some((subagents, mut client)), Some(id)) = (runtime::current(), crate::tools::progress::call_id()) else {
             return ToolOutput::error("A fork needs a conversation to start from");
         };
@@ -622,7 +666,17 @@ impl AgentTool {
         tools.track_files(&FileTracker::default());
         let mut agent = Agent::new(client, tools, base.system);
         agent.fork_from(base.messages, results);
-        self.start(&subagents, agent, FORK, description, prompt, background).await
+        // Its system prompt is the parent's, which names the parent's
+        // working directory.
+        let prompt = match &worktree {
+            Some(w) => format!(
+                "(You work in a git worktree of your own, {}: relative paths and commands start there, and your \
+                 changes stay there.)\n\n{prompt}",
+                w.workdir.display()
+            ),
+            None => prompt,
+        };
+        self.start(&subagents, agent, FORK, description, prompt, background, worktree).await
     }
 
     /// Runs skill `skill` in a subagent of the type its `fork` names (with
@@ -641,7 +695,7 @@ impl AgentTool {
             let allowed = AgentDef { tools: Some(allowed.clone()), ..def.clone() };
             tools.retain(|t| allowed.allows(t.name()));
         }
-        self.launch(&def, tools, &format!("/{skill}"), prompt, false).await
+        self.launch(&def, tools, &format!("/{skill}"), prompt, false, None).await
     }
 }
 
@@ -962,6 +1016,45 @@ mod tests {
         let explore = requests.recv().await.unwrap();
         assert_eq!(explore["output_config"]["effort"], "low");
         assert_eq!(back["output_config"]["effort"], "high", "the parent's own");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn isolated_subagents_change_files_in_a_worktree_of_their_own() {
+        use crate::agent::mock::gateway;
+        let _guard = crate::util::lock_cwd();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "start"]);
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repo.path()).unwrap();
+        let (client, mut requests) = gateway(move |n| match n {
+            0 => (vec![json!({"type": "tool_use", "id": "a1", "name": "agent", "input": {
+                "agent_type": "general-purpose", "description": "make it", "prompt": "Make made.txt", "isolation": "worktree"}})], "tool_use", 10),
+            1 => (vec![json!({"type": "tool_use", "id": "w1", "name": "write", "input": {"path": "made.txt", "content": "x"}})], "tool_use", 10),
+            2 => (vec![json!({"type": "text", "text": "made it"})], "end_turn", 10),
+            _ => (vec![json!({"type": "text", "text": "ok"})], "end_turn", 10),
+        })
+        .await;
+        let mut registry = ToolRegistry::with_defaults(FileTracker::default());
+        let tool = AgentTool::new(Arc::new(vec![general_purpose()]), registry.clone(), client.clone(), Arc::new(|_: &Value| {}));
+        registry.register(tool);
+        let mut parent = Agent::new(client, registry, "sys");
+        let result = parent.run_turn(vec![json!({"type": "text", "text": "go"})], &mut crate::agent::tests::Notices::default()).await;
+        std::env::set_current_dir(previous).unwrap();
+        result.unwrap();
+        let _ = requests.recv().await;
+        let child = requests.recv().await.unwrap();
+        assert!(child["system"].as_str().unwrap().contains("/worktrees/"), "its environment names the worktree");
+        let _ = requests.recv().await;
+        let back = requests.recv().await.unwrap();
+        let report = back["messages"][2]["content"][0]["content"].as_str().unwrap_or_default().to_string();
+        assert!(report.contains("made it") && report.contains("left 1 changed file"), "{report}");
+        assert!(!repo.path().join("made.txt").exists(), "the main checkout is untouched");
+        let dir = report.split("own, ").nth(1).unwrap().split(", on branch").next().unwrap();
+        assert_eq!(std::fs::read_to_string(std::path::Path::new(dir).join("made.txt")).unwrap(), "x");
+        std::process::Command::new("git").arg("-C").arg(repo.path()).args(["worktree", "remove", "--force", dir]).output().unwrap();
     }
 
     #[tokio::test]

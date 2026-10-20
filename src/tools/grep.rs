@@ -139,10 +139,13 @@ impl Tool for GrepTool {
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
-        let input: Input = match parse_input(input) {
+        let mut input: Input = match parse_input(input) {
             Ok(i) => i,
             Err(e) => return e,
         };
+        if super::workdir::current().is_some() {
+            input.path = Some(super::workdir::resolve(input.path.as_deref().unwrap_or(".")));
+        }
 
         let stdout = match ugrep(input.ugrep_args()).await {
             Ok(Some(stdout)) => stdout,
