@@ -21,6 +21,11 @@ pub fn ellipsize(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// A short span of time: "850 ms", "3.2s".
+pub fn short_duration(d: std::time::Duration) -> String {
+    if d.as_millis() < 1000 { format!("{} ms", d.as_millis()) } else { format!("{:.1}s", d.as_secs_f64()) }
+}
+
 /// `text` on one line (runs of whitespace, and `\n` written out, as one
 /// space), cut to at most `max_chars` characters: a description in a list.
 pub fn one_line(text: &str, max_chars: usize) -> String {

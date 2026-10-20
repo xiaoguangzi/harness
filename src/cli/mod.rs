@@ -1111,7 +1111,8 @@ fn print_sandbox(out: &Output) {
         out.line("the sandbox is off; start with --sandbox, HARNESS_SANDBOX=1 or \"sandbox\": {\"enabled\": true} in ~/.harness/settings.json");
         return;
     };
-    for (label, value) in sandbox.describe() {
+    let startup = ("startup", format!("{} per command (measured at launch)", crate::util::short_duration(sandbox.startup())));
+    for (label, value) in sandbox.describe().into_iter().chain([startup]) {
         out.line(format!("  {} {value}", out.paint("1", &text::pad(label, 10))));
     }
 }
@@ -1300,12 +1301,16 @@ fn print_mcp<'a>(out: &Output, statuses: impl Iterator<Item = &'a mcp::Status>) 
     for status in statuses {
         match &status.outcome {
             Ok(tools) => {
-                out.line(format!("{} {} ({} tools)", out.paint("32", "●"), status.name, tools.len()));
+                let took = crate::util::short_duration(status.took);
+                out.line(format!("{} {} ({} tools, connected in {took})", out.paint("32", "●"), status.name, tools.len()));
                 for t in tools {
                     out.line(format!("    {t}"));
                 }
             }
-            Err(e) => out.line(format!("{} {} failed: {e}", out.paint("31", "●"), status.name)),
+            Err(e) => {
+                let took = crate::util::short_duration(status.took);
+                out.line(format!("{} {} failed after {took}: {e}", out.paint("31", "●"), status.name));
+            }
         }
         out.line(format!("    {}", out.paint("90", &format!("log: {}", mcp::log_path(&status.name).display()))));
     }

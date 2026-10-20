@@ -953,8 +953,9 @@ async function showEnvPage() {
         info.skills.map(s => h("tr", {}, h("td", { class: "mono" }, "/" + s.name), h("td", {}, s.description, h("div", { class: "muted mono" }, s.dir)))))
         : h("p", { class: "note" }, "未发现 skill 或命令（.harness/skills、.claude/skills、.agents/skills、.harness/commands、.claude/commands 及 ~ 下同名目录）")),
     h("div", { class: "card" }, h("h2", {}, "MCP 服务器"),
-      info.mcp.length ? h("table", {}, h("tr", {}, h("th", {}, "服务器"), h("th", {}, "状态 / 工具")),
+      info.mcp.length ? h("table", {}, h("tr", {}, h("th", {}, "服务器"), h("th", {}, "连接耗时"), h("th", {}, "状态 / 工具")),
         info.mcp.map(m => h("tr", {}, h("td", { class: "mono" }, m.name),
+          h("td", { class: "mono" }, m.connect_ms < 1000 ? m.connect_ms + " ms" : (m.connect_ms / 1000).toFixed(1) + "s"),
           h("td", {}, m.error ? h("span", { style: "color:var(--err)" }, m.error) : h("span", { class: "mono" }, m.tools.join(", ") || "(无工具)")))))
         : h("p", { class: "note" }, "未配置 MCP 服务器（~/.harness/settings.json 的 mcpServers）")),
     h("div", { class: "card" }, h("h2", {}, "插件"),

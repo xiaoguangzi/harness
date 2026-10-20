@@ -69,9 +69,10 @@ pub async fn interactive(
         }
         Input::ListMcp => {
             let items = env.mcp_statuses().map(|s| {
+                let took = crate::util::short_duration(s.took);
                 let (description, details) = match &s.outcome {
-                    Ok(tools) => (format!("Connected · {} {}", tools.len(), text::plural(tools.len(), "tool")), tools.clone()),
-                    Err(e) => ("Connection failed".into(), vec![e.clone()]),
+                    Ok(tools) => (format!("Connected in {took} · {} {}", tools.len(), text::plural(tools.len(), "tool")), tools.clone()),
+                    Err(e) => (format!("Connection failed after {took}"), vec![e.clone()]),
                 };
                 Item::new(&s.name, description).details(details.into_iter().chain(std::iter::once(format!("Log: {}", crate::mcp::log_path(&s.name).display()))))
             }).collect();
@@ -90,7 +91,10 @@ pub async fn interactive(
         Input::Sandbox => {
             let items = crate::sandbox::active().map_or_else(
                 || vec![Item::new("Sandbox is off", "Start with --sandbox to enable it; this view does not change permissions")],
-                |s| s.describe().into_iter().map(|(label, value)| Item::new(label, value)).collect(),
+                |s| {
+                    let startup = ("startup", format!("{} per command (measured at launch)", crate::util::short_duration(s.startup())));
+                    s.describe().into_iter().chain([startup]).map(|(label, value)| Item::new(label, value)).collect()
+                },
             );
             dialog::inspect(out, "Sandbox", "What commands may do; read-only", items).await;
             None

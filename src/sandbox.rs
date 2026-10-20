@@ -17,6 +17,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -103,6 +104,9 @@ pub struct Sandbox {
     /// Sorted from shallow to deep, so later rules take precedence, as in
     /// a Seatbelt profile and the order of bwrap's mounts.
     rules: Vec<Rule>,
+    /// How long starting `true` in it took at startup: what the sandbox
+    /// adds to each command.
+    startup: Duration,
 }
 
 static ACTIVE: OnceLock<Sandbox> = OnceLock::new();
@@ -150,8 +154,8 @@ pub async fn init(flag: Option<bool>, config: &Config) -> Result<Option<&'static
         return Ok(None);
     }
     let cwd = std::env::current_dir().context("finding the working directory")?;
-    let sandbox = Sandbox::new(Backend::native()?, &cwd, home.as_deref(), config);
-    sandbox.probe().await?;
+    let mut sandbox = Sandbox::new(Backend::native()?, &cwd, home.as_deref(), config);
+    sandbox.startup = sandbox.probe().await?;
     Ok(Some(ACTIVE.get_or_init(|| sandbox)))
 }
 
@@ -191,13 +195,14 @@ impl Sandbox {
             }
         }
         unique.sort_by_key(|r| r.path.components().count());
-        Self { backend, cwd, network: config.network, rules: unique }
+        Self { backend, cwd, network: config.network, rules: unique, startup: Duration::ZERO }
     }
 
     /// Runs `true` in the sandbox, to fail at startup rather than on every
-    /// command.
-    async fn probe(&self) -> Result<()> {
+    /// command; returns how long it took.
+    async fn probe(&self) -> Result<Duration> {
         let program = self.backend.program();
+        let started = Instant::now();
         let output = match self.command("true", [""; 0]) {
             Ok((mut command, _guard)) => command.output().await,
             Err(e) => Err(e),
@@ -210,7 +215,7 @@ impl Sandbox {
             Err(e) => return Err(e).with_context(|| format!("running {program}")),
         };
         if output.status.success() {
-            return Ok(());
+            return Ok(started.elapsed());
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let hint = match self.backend {
@@ -397,6 +402,12 @@ impl Sandbox {
         }
         items.push(("network", if self.network { "allowed" } else { "loopback only" }.into()));
         items
+    }
+
+    /// What the sandbox adds to each command, as measured at startup. Not
+    /// in [`Sandbox::describe`], which the system prompt repeats.
+    pub fn startup(&self) -> Duration {
+        self.startup
     }
 
     /// A note for the system prompt.

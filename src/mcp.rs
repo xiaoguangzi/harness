@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -255,6 +255,8 @@ impl Tool for McpTool {
 pub struct Status {
     pub name: String,
     pub outcome: Result<Vec<String>, String>,
+    /// How long connecting and listing its tools took, or failing to.
+    pub took: Duration,
 }
 
 /// Connected servers, kept alive for the session.
@@ -271,19 +273,24 @@ impl Manager {
     /// tools. A server that fails to start is reported, not fatal.
     pub async fn start(configs: &BTreeMap<String, ServerConfig>) -> Self {
         let connections = futures::future::join_all(configs.iter().map(|(name, cfg)| async move {
-            let server = Server::connect(name, cfg).await?;
-            // Every page counts: a server that keeps returning cursors must
-            // not hold up startup either.
-            let tools = tokio::time::timeout(CONNECT_TIMEOUT, server.service.list_all_tools())
-                .await
-                .map_err(|_| anyhow!("timed out after {}s listing tools", CONNECT_TIMEOUT.as_secs()))?
-                .map_err(|e| anyhow!("tools/list failed: {e}"))?;
-            Ok::<_, anyhow::Error>((server, tools))
+            let started = Instant::now();
+            let connection = async {
+                let server = Server::connect(name, cfg).await?;
+                // Every page counts: a server that keeps returning cursors
+                // must not hold up startup either.
+                let tools = tokio::time::timeout(CONNECT_TIMEOUT, server.service.list_all_tools())
+                    .await
+                    .map_err(|_| anyhow!("timed out after {}s listing tools", CONNECT_TIMEOUT.as_secs()))?
+                    .map_err(|e| anyhow!("tools/list failed: {e}"))?;
+                Ok::<_, anyhow::Error>((server, tools))
+            }
+            .await;
+            (connection, started.elapsed())
         }))
         .await;
 
         let mut manager = Self::default();
-        for ((name, _), connection) in configs.iter().zip(connections) {
+        for ((name, _), (connection, took)) in configs.iter().zip(connections) {
             let outcome = match connection {
                 Ok((server, tools)) => {
                     let server = Arc::new(server);
@@ -306,7 +313,7 @@ impl Manager {
                 }
                 Err(e) => Err(format!("{e:#}")),
             };
-            manager.statuses.push(Status { name: name.clone(), outcome });
+            manager.statuses.push(Status { name: name.clone(), outcome, took });
         }
         manager
     }

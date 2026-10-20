@@ -124,8 +124,8 @@ async fn main() -> Result<ExitCode> {
         let mcp_status = env
             .mcp_statuses()
             .map(|s| match &s.outcome {
-                Ok(tools) => serde_json::json!({"name": s.name, "tools": tools}),
-                Err(e) => serde_json::json!({"name": s.name, "error": e}),
+                Ok(tools) => serde_json::json!({"name": s.name, "tools": tools, "connect_ms": s.took.as_millis() as u64}),
+                Err(e) => serde_json::json!({"name": s.name, "error": e, "connect_ms": s.took.as_millis() as u64}),
             })
             .collect();
         let setup = web::Setup {

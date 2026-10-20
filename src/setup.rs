@@ -296,10 +296,15 @@ pub async fn check_plugins(settings: &Settings, plugin_dirs: &[PathBuf]) -> Exit
     let mcp = mcp::Manager::start(&loaded.mcp_servers).await;
     for status in &mcp.statuses {
         match &status.outcome {
-            Ok(tools) => println!("\x1b[32m✓\x1b[0m MCP server {} ({} tools)", status.name, tools.len()),
+            Ok(tools) => println!(
+                "\x1b[32m✓\x1b[0m MCP server {} ({} tools, connected in {})",
+                status.name,
+                tools.len(),
+                crate::util::short_duration(status.took)
+            ),
             Err(e) => {
                 failed += 1;
-                println!("\x1b[31m✗\x1b[0m MCP server {}: {e}", status.name);
+                println!("\x1b[31m✗\x1b[0m MCP server {} (after {}): {e}", status.name, crate::util::short_duration(status.took));
                 println!("    \x1b[90mlog: {}\x1b[0m", mcp::log_path(&status.name).display());
             }
         }
