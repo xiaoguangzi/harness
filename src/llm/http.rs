@@ -48,6 +48,25 @@ impl fmt::Display for Transient {
     }
 }
 
+/// An error status the API answered with, which sending the same request
+/// again would not change. Its text is the error message.
+#[derive(Debug)]
+pub struct StatusError {
+    pub status: u16,
+    message: String,
+}
+
+impl fmt::Display for StatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// The status of a request that failed with `error`, if it got an answer.
+pub fn status(error: &anyhow::Error) -> Option<u16> {
+    error.downcast_ref::<StatusError>().map(|e| e.status)
+}
+
 /// When to send a request that failed with `error` again, as attempt
 /// `attempt` (from 1), and how many attempts that kind of failure gets:
 /// `None` if it is not [`Transient`] or its attempts are spent. The wait
@@ -123,7 +142,7 @@ pub async fn post(
             let overloaded = s >= 500 && text.contains("overloaded");
             anyhow::Error::msg(Transient { message, overloaded, retry_after })
         }
-        _ => anyhow::Error::msg(message),
+        status => anyhow::Error::msg(StatusError { status, message }),
     })
 }
 

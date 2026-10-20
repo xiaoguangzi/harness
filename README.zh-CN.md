@@ -149,6 +149,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `prompt_cache` | Anthropic 自动提示词缓存；默认开启 |
 | `prompt_cache_ttl` | 仅 Anthropic：缓存在最后一次使用后保留多久，`5m`（默认）或 `1h`。写入 1 小时缓存的价格是输入价的 2 倍而不是 1.25 倍，常在 5 分钟到 1 小时之间停顿时更划算 |
 | `gzip` | 用 gzip 压缩 1 KiB 及以上的请求体；`api.anthropic.com` 默认开启，网关默认关闭，因为很多网关不接受 |
+| `tool_search` | 仅 Anthropic：MCP 工具定义合计约 1 万 token 以上时，以 `defer_loading` 发送，模型用服务端的 tool search 工具查找需要的工具，在那之前它们不占上下文（内置工具始终加载）。`api.anthropic.com` 默认开启，网关默认关闭；provider 对这样的请求返回 HTTP 400 或 422 时，会去掉 tool search 再发一次，成功的话本次运行剩下的时间里不再对它使用 tool search |
 | `models` | 按模型的覆盖项；列出的模型会显示在 `/model` 和 Tab 补全中 |
 | `price` | 按模型设置：每百万 token 的美元价格，`{"input": 1.25, "output": 10, "cache_read": 0.125}`（也可设 `cache_write`；默认缓存读取为输入价的十分之一、写入为 1.25 倍，1 小时缓存为 2 倍），用于 `/usage` 显示的费用估算。Claude 模型内置了官方价格 |
 

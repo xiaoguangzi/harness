@@ -695,6 +695,8 @@ impl Agent {
 
             match stop_reason {
                 "tool_use" => {}
+                // A server tool paused the response: it goes on from here.
+                "pause_turn" => continue,
                 "max_tokens" if !tool_uses.is_empty() => {
                     // A tool_use block cut off by max_tokens may carry partial
                     // input; don't execute it.

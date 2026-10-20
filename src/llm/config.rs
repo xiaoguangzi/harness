@@ -140,6 +140,10 @@ pub struct ProviderConfig {
     /// Requests are gzip-compressed. Default: on for the official
     /// Anthropic API, off for gateways, many of which don't accept it.
     pub gzip: Option<bool>,
+    /// Anthropic only: many MCP tools are found with the tool search tool
+    /// rather than all sent in full. Default: on for the official API, off
+    /// for gateways, whose models may not have it.
+    pub tool_search: Option<bool>,
     /// Per-model overrides; listed models are offered by `/model`.
     #[serde(default)]
     pub models: BTreeMap<String, ModelConfig>,
@@ -415,6 +419,7 @@ impl ProviderConfig {
             prompt_cache: None,
             prompt_cache_ttl: None,
             gzip: None,
+            tool_search: None,
             models: BTreeMap::new(),
         }
     }
@@ -485,6 +490,11 @@ impl Target<'_> {
 
     pub fn gzip(&self) -> bool {
         self.config.gzip.unwrap_or_else(|| self.config.is_official_anthropic())
+    }
+
+    pub fn tool_search(&self) -> bool {
+        self.config.protocol == Protocol::Anthropic
+            && self.config.tool_search.unwrap_or_else(|| self.config.is_official_anthropic())
     }
 
     /// `{base_url}/v1/{path}`, not doubling a `/v1` already in `base_url`.

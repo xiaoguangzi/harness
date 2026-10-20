@@ -12,6 +12,15 @@ use super::config::{CacheTtl, Target};
 use super::{Message, Response, StreamEvent, ToolDef, http, parse_tool_input, same_source};
 
 const API_VERSION: &str = "2023-06-01";
+/// The tool search tool, with which the model finds deferred tools.
+const TOOL_SEARCH: &str = "tool_search_tool_bm25";
+const TOOL_SEARCH_TYPE: &str = "tool_search_tool_bm25_20251119";
+/// MCP tools are deferred once their definitions come to about this many
+/// tokens.
+const TOOL_SEARCH_MIN_TOKENS: usize = 10_000;
+/// Providers whose requests failed with tool search and went through
+/// without it.
+static NO_TOOL_SEARCH: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
 /// Server-side refusal fallback, `fallbacks: "default"` form.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
@@ -23,13 +32,25 @@ pub(super) async fn create(
     messages: &[Message],
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<Response> {
-    let body = build_body(target, system, tools, messages);
+    let search = wants_tool_search(target, tools);
+    let body = build_body(target, system, tools, messages, search);
     let mut headers = target.headers();
     headers.push(("anthropic-version".into(), API_VERSION.into()));
     if target.fallbacks() {
         headers.push(("anthropic-beta".into(), FALLBACK_BETA.into()));
     }
-    let resp = http::post(http_client, &target.url("messages"), &headers, &body, target.gzip()).await?;
+    let url = target.url("messages");
+    let resp = match http::post(http_client, &url, &headers, &body, target.gzip()).await {
+        // Perhaps the model does not have tool search: without it then, and
+        // not again with this provider if that works.
+        Err(e) if search && matches!(http::status(&e), Some(400 | 422)) => {
+            let body = build_body(target, system, tools, messages, false);
+            let resp = http::post(http_client, &url, &headers, &body, target.gzip()).await?;
+            NO_TOOL_SEARCH.lock().unwrap().insert(target.config.base_url.clone());
+            resp
+        }
+        resp => resp?,
+    };
 
     let mut acc = Accumulator::default();
     let result = http::read_sse(resp, "message_stop", |event| acc.apply(&event, on_event)).await;
@@ -45,24 +66,47 @@ pub(super) async fn create(
     Ok(response)
 }
 
-fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[Message]) -> Value {
+/// Whether the MCP tools in `tools` are deferred, for the model to find
+/// with the tool search tool: when the provider has it, and their
+/// definitions would take a lot of the context.
+fn wants_tool_search(target: &Target<'_>, tools: &[ToolDef]) -> bool {
+    if !target.tool_search() || NO_TOOL_SEARCH.lock().unwrap().contains(&target.config.base_url) {
+        return false;
+    }
+    let size: usize = tools.iter().filter(|t| deferrable(t)).map(|t| t.name.len() + t.description.len() + t.input_schema.to_string().len()).sum();
+    // About four bytes a token; some tool must stay loaded.
+    size / 4 >= TOOL_SEARCH_MIN_TOKENS && tools.iter().any(|t| !deferrable(t))
+}
+
+/// MCP tools may be deferred; the built-in ones stay loaded.
+fn deferrable(tool: &ToolDef) -> bool {
+    tool.name.starts_with("mcp__")
+}
+
+fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[Message], search: bool) -> Value {
     let spec = target.spec();
     let eager = target.eager_input_streaming();
-    let tools: Vec<Value> = tools
+    let mut tools: Vec<Value> = tools
         .iter()
         .map(|t| {
             let mut def = json!({"name": t.name, "description": t.description, "input_schema": t.input_schema});
             if eager && t.eager_input_streaming {
                 def["eager_input_streaming"] = json!(true);
             }
+            if search && deferrable(t) {
+                def["defer_loading"] = json!(true);
+            }
             def
         })
         .collect();
+    if search {
+        tools.push(json!({"type": TOOL_SEARCH_TYPE, "name": TOOL_SEARCH}));
+    }
     let media_inside = target.tool_result_media();
     let messages: Vec<Value> = messages
         .iter()
         .filter_map(|m| {
-            let mut content = history_blocks(m, &spec);
+            let mut content = history_blocks(m, &spec, search);
             if !media_inside {
                 content = lift_tool_media(content);
             }
@@ -98,8 +142,9 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
 }
 
 /// A message's blocks as sent to `spec`: OpenAI reasoning items never go to
-/// Anthropic, and thinking blocks only go back to the model that wrote them.
-fn history_blocks(message: &Message, spec: &str) -> Vec<Value> {
+/// Anthropic, thinking blocks only go back to the model that wrote them,
+/// and tool searches only to a request that has the tool (`search`).
+fn history_blocks(message: &Message, spec: &str, search: bool) -> Vec<Value> {
     let own = same_source(message, spec);
     message
         .content
@@ -107,6 +152,8 @@ fn history_blocks(message: &Message, spec: &str) -> Vec<Value> {
         .filter(|b| match b["type"].as_str().unwrap_or("") {
             "openai_reasoning" => false,
             "thinking" | "redacted_thinking" => own,
+            "server_tool_use" if b["name"] == TOOL_SEARCH => search,
+            "tool_search_tool_result" => search,
             _ => true,
         })
         .cloned()
@@ -212,7 +259,12 @@ impl Accumulator {
                 let Some(block) = content.get_mut(index) else {
                     bail!("stop for unknown content block {index}");
                 };
-                if block["type"] == "tool_use" {
+                if block["type"] == "server_tool_use" {
+                    // A server tool's input, which the API has run already.
+                    if let Some(input) = self.partial_json.remove(&index).as_deref().and_then(parse_tool_input) {
+                        block["input"] = input;
+                    }
+                } else if block["type"] == "tool_use" {
                     let raw = self.partial_json.remove(&index).unwrap_or_default();
                     match parse_tool_input(&raw) {
                         Some(input) => block["input"] = input,
@@ -332,10 +384,88 @@ mod tests {
         let messages = vec![Message::user(results)];
         for (url, inside) in [("https://gw.example.com", false), ("https://api.anthropic.com", true)] {
             let providers = Providers::from_parts(&config(url), &no_env).unwrap();
-            let body = build_body(&providers.target("p/m").unwrap(), "sys", &[], &messages);
+            let body = build_body(&providers.target("p/m").unwrap(), "sys", &[], &messages, false);
             let first = &body["messages"][0]["content"][0]["content"];
             assert_eq!(first[1]["type"], if inside { "image" } else { "text" }, "{url}");
         }
+    }
+
+    fn tool(name: &str, description_bytes: usize) -> ToolDef {
+        ToolDef { name: name.into(), description: "d".repeat(description_bytes), input_schema: json!({"type": "object"}), eager_input_streaming: false }
+    }
+
+    #[test]
+    fn defers_many_mcp_tools_behind_tool_search() {
+        let p = Providers::from_parts(
+            &file(json!({"model": "gw/m", "providers": {
+                "gw": {"protocol": "anthropic", "base_url": "https://gw.example.com", "tool_search": true},
+                "off": {"protocol": "anthropic", "base_url": "https://gw2.example.com"}}})),
+            &no_env,
+        )
+        .unwrap();
+        let target = p.target("gw/m").unwrap();
+        let few = vec![tool("read", 100), tool("mcp__gh__issues", 1_000)];
+        let many = vec![tool("read", 100), tool("mcp__gh__issues", 30_000), tool("mcp__gh__prs", 20_000)];
+        assert!(!wants_tool_search(&target, &few), "they are small");
+        assert!(wants_tool_search(&target, &many));
+        assert!(!wants_tool_search(&p.target("off/m").unwrap(), &many), "off for gateways by default");
+        assert!(!wants_tool_search(&target, &many[1..]), "something must stay loaded");
+
+        let search = json!({"type": "server_tool_use", "id": "s1", "name": TOOL_SEARCH, "input": {"query": "issues"}});
+        let found = json!({"type": "tool_search_tool_result", "tool_use_id": "s1", "content": {"type": "tool_search_tool_search_result",
+            "tool_references": [{"type": "tool_reference", "tool_name": "mcp__gh__issues"}]}});
+        let messages = vec![
+            Message::user(vec![json!({"type": "text", "text": "list issues"})]),
+            Message { role: "assistant", content: vec![search.clone(), found.clone(), json!({"type": "text", "text": "ok"})], source: Some("gw/m".into()) },
+        ];
+        let body = build_body(&target, "sys", &many, &messages, true);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0].get("defer_loading"), None, "built-in tools stay loaded");
+        assert_eq!((&tools[1]["defer_loading"], &tools[2]["defer_loading"]), (&json!(true), &json!(true)));
+        assert_eq!(tools[3], json!({"type": TOOL_SEARCH_TYPE, "name": TOOL_SEARCH}));
+        assert_eq!(body["messages"][1]["content"], json!([search, found, {"type": "text", "text": "ok"}]));
+        let body = build_body(&target, "sys", &many, &messages, false);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(body["messages"][1]["content"], json!([{"type": "text", "text": "ok"}]), "searches go without the tool");
+    }
+
+    #[tokio::test]
+    async fn goes_without_tool_search_where_it_is_rejected() {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let searched = body["tools"].as_array().unwrap().iter().any(|t| t["name"] == TOOL_SEARCH);
+                record.lock().unwrap().push(searched);
+                async move {
+                    if searched {
+                        return axum::http::Response::builder().status(400).body(axum::body::Body::from("unknown tool type")).unwrap();
+                    }
+                    let events = [
+                        json!({"type": "message_start", "message": {"content": []}}),
+                        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+                        json!({"type": "message_stop"}),
+                    ];
+                    let sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+                    axum::http::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from(sse)).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = file(json!({"model": "gw/m", "providers": {"gw": {"protocol": "anthropic", "base_url": url, "tool_search": true}}}));
+        let providers = Providers::from_parts(&config, &no_env).unwrap();
+        let target = providers.target("gw/m").unwrap();
+        let tools = vec![tool("read", 10), tool("mcp__big__x", 50_000)];
+        let http = reqwest::Client::new();
+        let messages = [Message::user(vec![json!({"type": "text", "text": "hi"})])];
+        for _ in 0..2 {
+            create(&http, &target, "sys", &tools, &messages, &mut |_| {}).await.unwrap();
+        }
+        assert_eq!(*seen.lock().unwrap(), [true, false, false], "tried once, then left out");
     }
 
     #[test]
@@ -372,7 +502,7 @@ mod tests {
                 source: Some("gw/claude-sonnet-4-5".into()),
             },
         ];
-        let body = build_body(&target, "sys", &tools, &messages);
+        let body = build_body(&target, "sys", &tools, &messages, false);
         assert!(body.get("fallbacks").is_none(), "gateways don't get fallbacks by default");
         assert!(body.get("thinking").is_none(), "model extra_body removed thinking");
         assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
@@ -382,7 +512,7 @@ mod tests {
         assert_eq!(body["output_config"], json!({"effort": "high"}), "the default");
 
         let target = Target { effort: crate::llm::Effort::XHigh, ..target };
-        let body = build_body(&target, "sys", &tools, &messages);
+        let body = build_body(&target, "sys", &tools, &messages, false);
         assert_eq!(body["output_config"], json!({"effort": "xhigh"}));
 
         let p = Providers::from_parts(
@@ -391,8 +521,23 @@ mod tests {
             &no_env,
         )
         .unwrap();
-        let body = build_body(&p.target("gw/m").unwrap(), "sys", &tools, &messages);
+        let body = build_body(&p.target("gw/m").unwrap(), "sys", &tools, &messages, false);
         assert_eq!(body["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
+    }
+
+    #[test]
+    fn assembles_server_tool_calls() {
+        let (response, _) = run_events(&[
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "s1", "name": TOOL_SEARCH, "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"query\": \"gh\"}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_search_tool_result", "tool_use_id": "s1", "content": {}}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_stop"}),
+        ]);
+        assert_eq!(response.content[0]["input"], json!({"query": "gh"}));
+        assert_eq!(response.content[1]["type"], "tool_search_tool_result");
+        assert!(response.invalid_tool_inputs.is_empty());
     }
 
     fn run_events(events: &[Value]) -> (Response, String) {
