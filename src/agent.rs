@@ -353,7 +353,8 @@ impl Agent {
     }
 
     /// Lists the next prompt among the checkpoints as `text`, e.g. the
-    /// `/command` it was made from, rather than as the prompt itself.
+    /// `/command` it was made from, rather than as the prompt itself; the
+    /// UserPromptSubmit hooks get it too.
     pub fn set_prompt_label(&mut self, text: &str) {
         self.next_prompt = Some(text.to_string());
     }
@@ -438,10 +439,11 @@ impl Agent {
     /// up (see `compact`).
     pub async fn run_turn(&mut self, mut content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
         self.settle();
-        let label = self.next_prompt.take();
-        let prompt = (!content.is_empty()).then(|| label.unwrap_or_else(|| prompt_text(&content)));
+        // What the user typed: hooks see a `/command` before it was expanded.
+        let typed = self.next_prompt.take().unwrap_or_else(|| prompt_text(&content));
+        let prompt = (!content.is_empty()).then(|| typed.clone());
         if !content.is_empty() && !self.hooks.is_subagent() {
-            self.prompt_hooks(&mut content, observer).await?;
+            self.prompt_hooks(&typed, &mut content, observer).await?;
         }
         let arrived = self.inbox.take();
         if content.is_empty() && arrived.is_empty() {
@@ -480,10 +482,10 @@ impl Agent {
         result
     }
 
-    /// Runs the UserPromptSubmit hooks on the prompt in `content` (its last
-    /// text block): they may refuse it, or add to it.
-    async fn prompt_hooks(&mut self, content: &mut Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
-        let outcome = self.hooks.user_prompt_submit(&prompt_text(content), self.client.spec()).await;
+    /// Runs the UserPromptSubmit hooks on `typed`, the prompt as the user
+    /// typed it: they may refuse it, or add to `content`.
+    async fn prompt_hooks(&mut self, typed: &str, content: &mut Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
+        let outcome = self.hooks.user_prompt_submit(typed, self.client.spec()).await;
         show_notices(&outcome, observer);
         if let Some(reason) = outcome.block.or(outcome.halt) {
             let reason = if reason.is_empty() { String::new() } else { format!(": {reason}") };
@@ -902,6 +904,20 @@ mod tests {
         assert!(error.to_string().contains("has a secret"), "{error}");
         assert!(agent.messages().is_empty());
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn prompt_hooks_see_a_command_as_typed() {
+        let _guard = crate::util::lock_cwd();
+        let (client, _requests) = compact::tests::gateway(|_| (vec![text("hi")], "end_turn", 100)).await;
+        let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
+        let hook = r#"grep -q '"prompt":"/review src"' && { echo 'typed' >&2; exit 2; }; exit 0"#;
+        agent.set_hooks(crate::hooks::tests::hooks(json!({"UserPromptSubmit": command(hook)})));
+        agent.set_prompt_label("/review src");
+        let error = agent.run_turn(vec![text("Review the code in src ...")], &mut Notices::default()).await;
+        assert!(error.unwrap_err().to_string().contains("typed"));
+        agent.run_turn(vec![text("plain")], &mut Notices::default()).await.unwrap();
     }
 
     #[tokio::test]

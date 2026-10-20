@@ -209,6 +209,8 @@ impl Task {
         }
         meta.status = Status::Running;
         meta.turns += 1;
+        // A `/command` as typed, for the checkpoints and hooks.
+        let command = user["text"].as_str().filter(|t| t.starts_with('/')).map(String::from);
         self.push(user);
         self.push_status(&meta);
 
@@ -217,7 +219,12 @@ impl Task {
             let mut agent = task.agent.lock().await;
             let observer = &mut WebObserver { task: &task };
             let result = match work {
-                Work::Turn(content) => agent.run_turn(content, observer).await,
+                Work::Turn(content) => {
+                    if let Some(command) = &command {
+                        agent.set_prompt_label(command);
+                    }
+                    agent.run_turn(content, observer).await
+                }
                 Work::Compact(focus) => agent.compact(focus.as_deref(), observer).await,
                 Work::Fork(skill, args) => {
                     let (subagents, client) = (agent.subagents().clone(), agent.client().clone());

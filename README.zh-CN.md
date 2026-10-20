@@ -374,7 +374,7 @@ Hooks 在 agent 循环的特定时机运行你自己的命令：拦截危险命�
 | `PreToolUse` | 工具调用之前 | 工具名 | 拦截调用（退出码 2，或 `permissionDecision: "deny"`）、修改输入（`updatedInput`）、补充上下文 |
 | `PostToolUse` | 调用成功之后 | 工具名 | 给模型反馈（退出码 2，或 `decision: "block"` 加 `reason`）、补充上下文、替换结果（`updatedToolOutput`） |
 | `PostToolUseFailure` | 调用失败之后 | 工具名 | 给模型反馈、补充上下文 |
-| `UserPromptSubmit` | 你的 prompt 发出之前 | — | 拒绝它（退出码 2 或 `decision: "block"`；原因显示给你）、补充上下文 |
+| `UserPromptSubmit` | 你的 prompt 发出之前；`/命令` 按你输入的原样给出，尚未展开 | — | 拒绝它（退出码 2 或 `decision: "block"`；原因显示给你）、补充上下文 |
 | `Stop` | 模型结束回合时 | — | 让它继续干活（退出码 2 或 `decision: "block"`；原因就是给它的指示） |
 | `SubagentStart` | 子代理的第一个请求之前 | agent 类型 | 给子代理补充上下文 |
 | `SubagentStop` | 子代理结束一次运行时 | agent 类型 | 与 `Stop` 相同，作用于子代理 |
@@ -385,11 +385,11 @@ Hooks 在 agent 循环的特定时机运行你自己的命令：拦截危险命�
 | `Notification` | 一个回合结束后，REPL 提示符或 web 任务等你输入已满 60 秒时 | `idle_prompt` | 不影响执行；会收到 `notification_type` 和 `message`，可用来弹出桌面通知 |
 
 - hook 以 `sh -c <command>` 在工作目录中运行，不在沙箱内，`$CLAUDE_PROJECT_DIR` 和 `$HARNESS_PROJECT_DIR` 都设为工作目录。给出 `args`（字符串列表）时，`command` 带着这些参数直接启动、不经过 shell，参数不会被展开或切分（插件 hook 中的 `${CLAUDE_PLUGIN_ROOT}` 等仍会替换）。事件以 JSON 从 stdin 传入：`session_id`、`transcript_path`（保存的会话文件）、`cwd`、`hook_event_name`、`model`、`permission_mode`（固定为 `bypassPermissions`：harness 运行工具前从不询问）、子代理中的 `agent_id` 和 `agent_type`，以及事件自己的字段（`tool_name`、`tool_use_id`、`tool_input`、`tool_response` 或 `error`；`prompt`；`stop_hook_active`、`last_assistant_message`；`trigger`、`custom_instructions`、`compact_summary`；`source`、`reason`）。
-- 退出码 0：stdout 以 `{` 开头时按 JSON 读取（`continue` / `stopReason`、`systemMessage`、`decision` / `reason`、`hookSpecificOutput`），否则对 `SessionStart`、`SubagentStart` 和 `UserPromptSubmit` 作为给模型的上下文，对其他事件忽略。退出码 2 表示拦截，stderr 是原因。其他退出码、超时（`timeout`，单位秒，默认 600）或无效 JSON 会显示给你，不影响执行。`continue: false` 结束当前回合。
+- 退出码 0：stdout 以 `{` 开头时按 JSON 读取（`continue` / `stopReason`、`systemMessage`、`decision` / `reason`、`hookSpecificOutput`），否则对 `SessionStart`、`SubagentStart` 和 `UserPromptSubmit` 作为给模型的上下文，对其他事件忽略。退出码 2 表示拦截，stderr 是原因。其他退出码、超时（`timeout`，单位秒，默认 600）、命令无法启动或无效 JSON 会显示给你，不影响执行；除非 command hook 设置了 `"onFailure": "block"`：这时失败与退出码 2 一样会拦截，适合出错时也不能被绕过的守卫脚本。`continue: false` 结束当前回合。
 - 工具也可以用 Claude Code 的名字匹配，hook 看到的也是这些名字：`bash` 是 `Bash`，`read` / `edit` / `write` / `grep` / `glob` / `lsp` 是 `Read` / `Edit` / `Write` / `Grep` / `Glob` / `LSP`，`agent` 是 `Agent`（或 `Task`）；MCP 工具仍是 `mcp__<server>__<tool>`。只由名字组成的 matcher（`Edit|Write`）做精确匹配，其他的按正则表达式匹配（`mcp__fs__.*`），空串或 `*` 匹配全部。文件工具的 `path` 也会以 `file_path` 给出，`updatedInput` 用哪个都可以。
 - `permissionDecision: "ask"` 会拒绝调用，因为没有人可以询问。
 - `prompt` 类型的 hook（`{"type": "prompt", "prompt": "…", "model": "…", "timeout": 30}`）不运行命令，而是询问模型：当前会话的模型，或者 `model` 指定的、provider 认识的模型（Claude Code 的 `haiku` 之类别名不算）。事件的输入 JSON 替换 prompt 中的 `$ARGUMENTS`（没有占位符时附在末尾），模型回答 `{"ok": true}` 或 `{"ok": false, "reason": "…"}`；`ok: false` 等同于退出码 2 加上该原因，所以 Stop 上的 prompt hook 能让模型继续干活。默认 30 秒，可用 `timeout` 设置；它的请求不计入 `/usage`。
-- 匹配同一事件的所有 hook 同时运行；同一条命令列出两次只运行一次。hooks 在子代理（用 `SubagentStop` 代替 `Stop`）和 web 任务中同样生效。
+- 匹配同一事件的所有 hook 同时运行，最多同时 12 个；同一条命令列出两次只运行一次。hooks 在子代理（用 `SubagentStop` 代替 `Stop`）和 web 任务中同样生效。
 - hook 给模型的内容放在 `<hook-feedback>` 块中；给你的内容（`systemMessage`、拒绝原因、运行失败）显示为 `⚑` 开头的一行。
 - `if` 用 Claude Code 的权限规则语法把工具事件的 hook 限定到部分调用：`Bash(git commit:*)` 或 `Bash(git push *)`（命令，或复合命令中的某一段，以此开头；`*` 匹配任意内容）、`Edit(src/**/*.ts)`（文件路径），或只写工具名。`async: true` 的 hook 在后台运行，不阻塞调用；它给模型的内容随下一个请求发出。`asyncRewake: true` 同样在后台运行，若以退出码 2 结束，则用 `rewakeMessage` 加上 hook 给出的原因唤醒模型，模型空闲时会单独开一个回合。
 - 只支持 `command` 和 `prompt` 类型的 hook 以及上面这些事件；其他 hook 类型（`http`、`agent`、`mcp_tool`）以及其他事件（`PermissionRequest` 等）在配置中会报错（[插件](#插件plugins)中的则给出警告并略过）。hooks 只来自配置文件及其启用的插件，仓库无法自行添加；修改在下次启动时生效，或在 `/reload-plugins` 后对下一个会话生效。

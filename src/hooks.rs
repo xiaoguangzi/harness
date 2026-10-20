@@ -25,7 +25,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use futures::future::join_all;
+use futures::StreamExt;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,6 +45,8 @@ const SESSION_END_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_SESSION_END_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a prompt hook may take unless it sets `timeout`.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The most hooks of one event that run at once; the rest wait their turn.
+const MAX_CONCURRENT: usize = 12;
 /// Text a hook gives the model is cut to this many bytes.
 const MAX_CONTEXT_BYTES: usize = 10_000;
 /// What a prompt hook's model is told.
@@ -119,8 +121,21 @@ struct Handler {
     mode: Mode,
     /// Seconds.
     timeout: Option<u64>,
+    /// `onFailure: "block"`: a hook that fails blocks, rather than let
+    /// things go on as if it had not run.
+    block_on_failure: bool,
     /// Set for a plugin's hooks: `CLAUDE_PLUGIN_ROOT` and the like.
     env: Vec<(String, String)>,
+}
+
+/// `onFailure` in a hook's settings: `continue` (the default) or `block`.
+fn block_on_failure(value: Option<&str>, action: &Action) -> Result<bool, String> {
+    match (value, action) {
+        (None | Some("continue"), _) => Ok(false),
+        (Some("block"), Action::Command { .. }) => Ok(true),
+        (Some("block"), Action::Prompt { .. }) => Err("`onFailure` is for command hooks".into()),
+        (Some(other), _) => Err(format!("`onFailure` is `continue` or `block`, not `{other}`")),
+    }
 }
 
 /// Whether the agent waits for a hook.
@@ -165,6 +180,8 @@ struct RawHandler {
     rewake: bool,
     #[serde(rename = "rewakeMessage")]
     rewake_message: Option<String>,
+    #[serde(rename = "onFailure")]
+    on_failure: Option<String>,
     /// Claude Code's line for its UI; unused.
     #[serde(rename = "rewakeSummary")]
     _rewake_summary: Option<String>,
@@ -267,7 +284,8 @@ impl TryFrom<RawHandler> for Handler {
         let action = Action::new(&raw.kind, raw.command, raw.args, raw.prompt, raw.model)?;
         let condition = raw.condition.as_deref().map(Condition::parse).transpose()?;
         let mode = Mode::new(raw.background, raw.rewake, raw.rewake_message);
-        Ok(Handler { action, condition, mode, timeout: raw.timeout, env: Vec::new() })
+        let block_on_failure = block_on_failure(raw.on_failure.as_deref(), &action)?;
+        Ok(Handler { action, condition, mode, timeout: raw.timeout, block_on_failure, env: Vec::new() })
     }
 }
 
@@ -459,7 +477,15 @@ pub fn plugin_config(events: &Value, plugin: &PluginDirs, warnings: &mut Vec<Str
                     }
                 };
                 let mode = Mode::new(handler["async"] == true, handler["asyncRewake"] == true, text("rewakeMessage"));
-                hooks.push(Handler { action, condition, mode, timeout: handler["timeout"].as_u64(), env: plugin.env() });
+                let block_on_failure = match block_on_failure(text("onFailure").as_deref(), &action) {
+                    Ok(block) => block,
+                    Err(e) => {
+                        warnings.push(format!("{name} hook: {e}; left out"));
+                        continue;
+                    }
+                };
+                let timeout = handler["timeout"].as_u64();
+                hooks.push(Handler { action, condition, mode, timeout, block_on_failure, env: plugin.env() });
             }
             if !hooks.is_empty() {
                 config.entry(event).or_default().push(Group { matcher, hooks });
@@ -686,9 +712,10 @@ impl Hooks {
         for handler in background {
             self.run_in_background(event, handler, input.clone());
         }
-        let replies = join_all(handlers.iter().map(|h| self.call(event, h, &input))).await;
+        let calls: Vec<_> = handlers.iter().map(|h| self.call(event, h, &input)).collect();
+        let replies: Vec<_> = futures::stream::iter(calls).buffered(MAX_CONCURRENT).collect().await;
         for (handler, reply) in handlers.iter().zip(replies) {
-            outcome.add(event, &handler.action.label(), reply);
+            outcome.add(event, handler, reply);
         }
         outcome
     }
@@ -726,12 +753,13 @@ impl Hooks {
             condition: None,
             mode: handler.mode.clone(),
             timeout: handler.timeout,
+            block_on_failure: handler.block_on_failure,
             env: handler.env.clone(),
         };
         tokio::spawn(async move {
             let reply = hooks.call(event, &handler, &input).await;
             let mut outcome = Outcome::default();
-            outcome.add(event, &handler.action.label(), reply);
+            outcome.add(event, &handler, reply);
             let Some(inbox) = &hooks.inbox else { return };
             let mut texts: Vec<String> = outcome.context;
             let wake = match (&handler.mode, outcome.block) {
@@ -778,12 +806,18 @@ impl Hooks {
 }
 
 impl Outcome {
-    /// Takes in what the hook `command` answered.
-    fn add(&mut self, event: Event, command: &str, reply: Result<Reply, String>) {
-        let name = format!("{} hook `{}`", event.as_str(), crate::util::ellipsize(command, 60));
+    /// Takes in what the hook `handler` answered.
+    fn add(&mut self, event: Event, handler: &Handler, reply: Result<Reply, String>) {
+        let name = format!("{} hook `{}`", event.as_str(), crate::util::ellipsize(&handler.action.label(), 60));
+        let failed = |outcome: &mut Self, failure: String| {
+            if handler.block_on_failure {
+                outcome.block(&format!("{failure}, and it blocks when it fails"));
+            }
+            outcome.notices.push(failure);
+        };
         let reply = match reply {
             Ok(reply) => reply,
-            Err(e) => return self.notices.push(format!("{name} failed: {e}")),
+            Err(e) => return failed(self, format!("{name} failed: {e}")),
         };
         match reply.code {
             Some(0) => {}
@@ -795,7 +829,7 @@ impl Outcome {
                 let status = code.map_or("killed by a signal".to_string(), |c| format!("exit code {c}"));
                 let detail = reply.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
                 let detail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
-                return self.notices.push(format!("{name} failed ({status}){detail}"));
+                return failed(self, format!("{name} failed ({status}){detail}"));
             }
         }
         let stdout = reply.stdout.trim();
@@ -810,7 +844,7 @@ impl Outcome {
         }
         let output: Value = match serde_json::from_str(stdout) {
             Ok(output) => output,
-            Err(e) => return self.notices.push(format!("{name} printed invalid JSON: {e}")),
+            Err(e) => return failed(self, format!("{name} printed invalid JSON: {e}")),
         };
         if output["continue"] == false && self.halt.is_none() {
             self.halt = Some(output["stopReason"].as_str().unwrap_or_default().to_string());
@@ -971,6 +1005,8 @@ pub(crate) mod tests {
             json!({"Stop": [{"hooks": [{"type": "command", "command": "y", "once": true}]}]}),
             json!({"PreToolUse": [{"hooks": [{"type": "command", "command": "y", "if": "Bash(git"}]}]}),
             json!({"PreToolUse": [{"matcher": "(", "hooks": []}]}),
+            json!({"Stop": [{"hooks": [{"type": "command", "command": "y", "onFailure": "stop"}]}]}),
+            json!({"Stop": [{"hooks": [{"type": "prompt", "prompt": "y", "onFailure": "block"}]}]}),
         ];
         for config in bad {
             assert!(serde_json::from_value::<Config>(config.clone()).is_err(), "{config}");
@@ -1136,6 +1172,22 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn hooks_that_block_on_failure() {
+        let _guard = crate::util::lock_cwd();
+        let failing = |on_failure: &str| {
+            hooks(json!({"PreToolUse": [{"hooks": [
+                {"type": "command", "command": "echo broken >&2; exit 1", "onFailure": on_failure}]}]}))
+        };
+        let outcome = failing("continue").pre_tool_use("bash", "t1", &json!({}), "m").await;
+        assert!(outcome.block.is_none() && outcome.notices[0].contains("failed (exit code 1): broken"));
+        let outcome = failing("block").pre_tool_use("bash", "t1", &json!({}), "m").await;
+        assert!(outcome.block.unwrap().contains("broken, and it blocks when it fails"));
+        let missing = hooks(json!({"Stop": [{"hooks": [
+            {"type": "command", "command": "/nonexistent/hook", "args": [], "onFailure": "block"}]}]}));
+        assert!(missing.stop(false, "", "m").await.block.is_some(), "a hook that cannot start fails too");
+    }
+
+    #[tokio::test]
     async fn a_hook_that_runs_too_long_is_killed() {
         let _guard = crate::util::lock_cwd();
         let h = hooks(json!({"Stop": [{"hooks": [{"type": "command", "command": "sleep 30", "timeout": 1}]}]}));
