@@ -19,7 +19,7 @@ use crate::subagent::Subagents;
 use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
 
-pub use compact::is_compacted;
+pub use compact::{is_compacted, set_idle as set_idle_compaction};
 #[cfg(test)]
 pub(crate) use compact::tests as mock;
 pub use usage::UsageLog;

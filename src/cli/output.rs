@@ -59,6 +59,8 @@ struct State {
     tool_records: Vec<Record>,
     tool_panel: Option<Transcript>,
     transcript: Vec<Entry>,
+    /// How many tool records there were at the last compaction.
+    compacted_at: usize,
     /// The input box, while a turn runs in the REPL.
     input: Option<InputBox>,
     /// Whether the status or input box is on screen, on the last `rows`;
@@ -121,6 +123,7 @@ impl Output {
             tool_records: Vec::new(),
             tool_panel: None,
             transcript: Vec::new(),
+            compacted_at: 0,
             input: None,
             drawn: false,
             rows: 0,
@@ -189,6 +192,7 @@ impl Output {
     pub fn restore_tool_output(&self, messages: &[Message]) {
         let mut state = self.state.lock().unwrap();
         state.tool_records = tool_output::restore(messages);
+        state.compacted_at = state.tool_records.len();
         state.transcript.clear();
         let mut index = 0;
         for message in messages {
@@ -208,6 +212,28 @@ impl Output {
             }
         }
         state.tool_panel = None;
+    }
+
+    /// Marks a compaction in the expanded transcript with `note` and the
+    /// tool calls made since the one before.
+    pub(super) fn compaction_note(&self, note: &str) {
+        let mut state = self.state.lock().unwrap();
+        let since = state.compacted_at.min(state.tool_records.len());
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for record in &state.tool_records[since..] {
+            match counts.iter_mut().find(|(n, _)| *n == record.name) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((&record.name, 1)),
+            }
+        }
+        counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let mut content = note.trim_start_matches("✻ ").to_string();
+        if !counts.is_empty() {
+            let listed: Vec<String> = counts.iter().map(|(name, count)| format!("{name} ×{count}")).collect();
+            content.push_str(&format!("\nTool calls before it: {}", listed.join(", ")));
+        }
+        state.compacted_at = state.tool_records.len();
+        state.transcript.push(Entry::Text { label: "✻ Compaction", content });
     }
 
     pub(super) fn transcript_text(&self, label: &'static str, content: &str, append: bool) {
@@ -906,6 +932,40 @@ pub enum TurnEnd {
     Failed(anyhow::Error),
 }
 
+/// Shows a compaction of a conversation waiting at the prompt: a line when
+/// it is done, and the hook notices it brings.
+pub struct IdleCompaction<'a> {
+    out: &'a Output,
+}
+
+impl<'a> IdleCompaction<'a> {
+    pub fn new(out: &'a Output) -> Self {
+        Self { out }
+    }
+}
+
+impl Observer for IdleCompaction<'_> {
+    fn on_text_delta(&mut self, _: &str) {}
+    fn on_text_end(&mut self) {}
+    fn on_tool_call(&mut self, _: &str, _: &Value) {}
+    fn on_tool_result(&mut self, _: &str, _: &ToolOutput) {}
+
+    fn on_compact_start(&mut self) {
+        self.out.set_status(Some("Compacting the idle conversation before its cache expires…"));
+    }
+
+    fn on_compact_end(&mut self, before: u64, after: u64) {
+        self.out.set_status(None);
+        let note = format!("✻ Compacted the idle conversation: context {} → about {}", tokens(before), tokens(after));
+        self.out.compaction_note(&note);
+        self.out.line(self.out.paint("2", &note));
+    }
+
+    fn on_hook(&mut self, message: &str) {
+        self.out.line(self.out.paint("33", &format!("⚑ {message}")));
+    }
+}
+
 impl Observer for Terminal {
     fn on_waiting(&mut self, tasks: &[String]) {
         if tasks.is_empty() {
@@ -1085,6 +1145,7 @@ impl Observer for Terminal {
     fn on_compact_end(&mut self, before: u64, after: u64) {
         self.context_tokens = after;
         let note = format!("✻ Compacted the conversation: context {} → about {}", tokens(before), tokens(after));
+        self.out.compaction_note(&note);
         if !self.out.presented() {
             eprintln!("{note}");
         } else {

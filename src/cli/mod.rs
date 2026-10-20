@@ -20,6 +20,7 @@ mod transcript;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use rustyline::error::ReadlineError;
@@ -202,7 +203,12 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 let past = editor.history().iter().cloned().collect();
                 let pending = agent.subagents().running_in_background() + agent.shells().pending();
                 if pending > 0 { out.set_status(Some(&format!("Waiting for {pending} background tasks…"))); }
-                let read = editor.helper().unwrap().read_box(&out, &mut typing, agent.inbox().clone(), past).await;
+                let inbox = agent.inbox().clone();
+                let read = editor.helper().unwrap().read_box(&out, &mut typing, inbox, past);
+                let read = match agent.idle_compaction_after() {
+                    Some(after) => compacting_while(read, after, agent, &out, recorder.as_mut()).await,
+                    None => read.await,
+                };
                 out.set_status(None);
                 if let Some(idle) = idle { idle.abort(); }
                 let (line, images) = match read {
@@ -562,6 +568,38 @@ async fn finish_mcp(agent: &mut Agent, env: &mut Env, out: &Output) {
     let (tools, system) = env.conversation(agent.client());
     agent.set_tools(tools);
     agent.set_system(system);
+}
+
+/// Waits for `read`, the input box; if the user is away for `after`, the
+/// conversation is compacted meanwhile. A message sent before that is done
+/// cancels it, which leaves the conversation as it was.
+async fn compacting_while<T>(
+    read: impl Future<Output = T>,
+    after: Duration,
+    agent: &mut Agent,
+    out: &Output,
+    recorder: Option<&mut Recorder>,
+) -> T {
+    let compact = async {
+        tokio::time::sleep(after).await;
+        let mut observer = output::IdleCompaction::new(out);
+        match agent.compact_when_idle(&mut observer).await {
+            Ok(()) => {
+                if let Some(rec) = recorder {
+                    save_session(agent, rec, out);
+                }
+            }
+            Err(e) => out.line(out.paint("31", &format!("could not compact the idle conversation: {e:#}"))),
+        }
+    };
+    tokio::pin!(read, compact);
+    let mut compacting = true;
+    loop {
+        tokio::select! {
+            result = &mut read => return result,
+            () = &mut compact, if compacting => compacting = false,
+        }
+    }
 }
 
 /// Runs the Notification hooks if the prompt still waits after

@@ -7,6 +7,8 @@
 //! recent messages, the summary, and, as Claude Code does, the files read
 //! most recently, as they are now. The assistant turns and tool results go.
 
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
@@ -52,6 +54,33 @@ above. Build on the work already done and avoid repeating it.";
 
 /// Starts the todo list a compaction carries over.
 const TODO_PREFIX: &str = "Your todo list before the compaction (keep it current with todo_write):";
+/// Starts the count of the tool calls the summary replaces.
+const TOOLS_PREFIX: &str = "Tool calls made before the compaction:";
+
+/// By default, an idle conversation is compacted from this many tokens.
+const IDLE_MIN_TOKENS: u64 = 200_000;
+/// How long before its prompt cache expires an idle conversation is
+/// compacted, so the summary request still reads the cache.
+const IDLE_BEFORE_EXPIRY: Duration = Duration::from_secs(45);
+
+/// When an idle conversation is compacted: the settings' `idle_compaction`
+/// (default on) and `idle_compaction_min_tokens`.
+#[derive(Debug, Clone, Copy)]
+struct IdleConfig {
+    enabled: bool,
+    min_tokens: u64,
+}
+
+static IDLE: std::sync::OnceLock<IdleConfig> = std::sync::OnceLock::new();
+
+/// Sets when idle conversations are compacted, from the settings.
+pub fn set_idle(enabled: Option<bool>, min_tokens: Option<u64>) {
+    let _ = IDLE.set(IdleConfig { enabled: enabled.unwrap_or(true), min_tokens: min_tokens.unwrap_or(IDLE_MIN_TOKENS) });
+}
+
+fn idle_config() -> IdleConfig {
+    *IDLE.get().unwrap_or(&IdleConfig { enabled: true, min_tokens: IDLE_MIN_TOKENS })
+}
 
 /// Whether `message` is the one a compaction left in place of the history.
 pub fn is_compacted(message: &Message) -> bool {
@@ -97,6 +126,32 @@ impl Agent {
         self.compact_history(Trigger::Manual(focus), &definitions, observer).await.map(drop)
     }
 
+    /// How long this conversation may wait for the user before it is
+    /// compacted, or `None` if it is not to be: it must take at least the
+    /// configured tokens of the context. The wait ends a little before the
+    /// prompt cache would expire, so the summary request still reads it,
+    /// and the user's next message no longer resends the long history
+    /// uncached.
+    pub fn idle_compaction_after(&self) -> Option<Duration> {
+        self.idle_after(idle_config())
+    }
+
+    fn idle_after(&self, config: IdleConfig) -> Option<Duration> {
+        if !config.enabled || self.messages.is_empty() || self.context_tokens() < config.min_tokens {
+            return None;
+        }
+        let ttl = self.client.cache_ttl().unwrap_or(crate::llm::config::CacheTtl::FiveMinutes).duration();
+        Some(ttl.saturating_sub(IDLE_BEFORE_EXPIRY))
+    }
+
+    /// Compacts the conversation while it waits for the user (see
+    /// [`Agent::idle_compaction_after`]). Cancelling leaves it as it was.
+    pub async fn compact_when_idle(&mut self, observer: &mut dyn Observer) -> Result<()> {
+        self.settle();
+        let definitions = self.tools.definitions();
+        self.compact_history(Trigger::Idle, &definitions, observer).await.map(drop)
+    }
+
     /// Compacts the conversation if the next request would come too close
     /// to the context window, as a turn's loop does before each request.
     pub(super) async fn compact_if_full(&mut self, definitions: &[ToolDef], observer: &mut dyn Observer) -> Result<()> {
@@ -139,7 +194,7 @@ impl Agent {
     ) -> Result<bool> {
         let (trigger, focus) = match trigger {
             Trigger::Manual(focus) => ("manual", focus),
-            Trigger::Auto => ("auto", None),
+            Trigger::Auto | Trigger::Idle => ("auto", None),
         };
         let pending = match self.messages.last() {
             Some(last) if last.role == "user" && !has_tool_results(last) => 1,
@@ -200,6 +255,9 @@ impl Agent {
         let mut content: Vec<Value> =
             kept_user_messages(history).into_iter().map(|text| json!({"type": "text", "text": text})).collect();
         content.push(json!({"type": "text", "text": format!("{SUMMARY_PREFIX}\n\n<summary>\n{}\n</summary>", summary.trim())}));
+        if let Some(calls) = tool_counts(history) {
+            content.push(json!({"type": "text", "text": format!("{TOOLS_PREFIX} {calls}.")}));
+        }
         // The latest todo list goes on as it was.
         let todos = history
             .iter()
@@ -263,6 +321,8 @@ enum Trigger<'a> {
     Manual(Option<&'a str>),
     /// The context filling up.
     Auto,
+    /// The conversation waiting for the user.
+    Idle,
 }
 
 /// How many input tokens a request may carry before the conversation is
@@ -277,6 +337,21 @@ fn context_limit(window: u64, max_tokens: u64) -> u64 {
 /// [`KEPT_USER_BYTES`] counting from the newest; the one that crosses the
 /// limit is cut. Attachments, tool results, earlier summaries and reports
 /// from subagents are left out.
+/// How many calls of each tool `history` has, most called first:
+/// `bash ×12, read ×30`; `None` without any.
+fn tool_counts(history: &[Message]) -> Option<String> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for name in history.iter().flat_map(|m| &m.content).filter(|b| b["type"] == "tool_use").filter_map(|b| b["name"].as_str()) {
+        match counts.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((name, 1)),
+        }
+    }
+    counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let listed: Vec<String> = counts.iter().map(|(name, count)| format!("{name} ×{count}")).collect();
+    (!listed.is_empty()).then(|| listed.join(", "))
+}
+
 fn kept_user_messages(history: &[Message]) -> Vec<String> {
     let texts = history
         .iter()
@@ -286,7 +361,7 @@ fn kept_user_messages(history: &[Message]) -> Vec<String> {
         .filter_map(|b| b["text"].as_str().filter(|_| b["type"] == "text"))
         .filter(|t| !t.is_empty() && *t != INTERRUPTED)
         .filter(|t| {
-            !["<file ", "<directory ", "<subagent-notification>", "<shell-notification>", "The files read most recently", TODO_PREFIX]
+            !["<file ", "<directory ", "<subagent-notification>", "<shell-notification>", "The files read most recently", TODO_PREFIX, TOOLS_PREFIX]
                 .iter()
                 .any(|p| t.starts_with(p))
         });
@@ -544,6 +619,21 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn compacts_an_idle_conversation_before_its_cache_expires() {
+        let (client, mut requests) = gateway(|_| (vec![text("done")], "end_turn", 3_000)).await;
+        let mut agent = Agent::new(client, crate::tools::ToolRegistry::default(), "sys");
+        let config = |min_tokens| IdleConfig { enabled: true, min_tokens };
+        assert_eq!(agent.idle_after(config(1)), None, "nothing to compact");
+        agent.run_turn(vec![text("go")], &mut Seen::default()).await.unwrap();
+        let _ = requests.recv().await;
+        assert_eq!(agent.idle_after(config(1)), Some(Duration::from_secs(255)), "before the 5-minute cache expires");
+        assert_eq!(agent.idle_after(config(100_000)), None, "too short to bother");
+        assert_eq!(agent.idle_after(IdleConfig { enabled: false, min_tokens: 1 }), None);
+        agent.compact_when_idle(&mut Seen::default()).await.unwrap();
+        assert!(is_compacted(&agent.messages[0]) && agent.messages.len() == 1);
+    }
+
+    #[tokio::test]
     async fn compacts_in_the_middle_of_a_turn_and_reattaches_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notes.txt");
@@ -577,6 +667,9 @@ pub(crate) mod tests {
         assert!(file.contains("alpha") && file.contains("beta"), "{file}");
         let todo = compacted.iter().find(|t| t.starts_with(TODO_PREFIX)).expect("the todo list goes on");
         assert!(todo.ends_with("- [ ] Read the notes (in progress)\n- [ ] Answer"), "{todo}");
+        let calls = compacted.iter().find(|t| t.starts_with(TOOLS_PREFIX)).expect("the calls are counted");
+        assert!(calls.ends_with(" todo_write ×1, read ×1.") || calls.ends_with(" read ×1, todo_write ×1."), "{calls}");
+        assert!(!compacted[0].starts_with(TOOLS_PREFIX));
 
         assert_eq!(agent.messages.len(), 2);
         assert_eq!(agent.last_text(0), "finished");

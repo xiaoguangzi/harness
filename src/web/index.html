@@ -713,6 +713,10 @@ function renderEvent(ev) {
       case "hook": assistantEl = null;
         transcript.append(h("div", { class: "note hook" }, "⚑ " + ev.message)); break;
       case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台任务有了结果，继续")); break;
+      case "idle_compact": assistantEl = null; transcript.append(h("div", { class: "note" }, "✻ 任务空闲，在提示词缓存过期前压缩会话")); break;
+      case "compact_start": assistantEl = null; transcript.append(h("div", { class: "note" }, "✻ 正在压缩会话…")); break;
+      case "compact": assistantEl = null;
+        transcript.append(h("div", { class: "note" }, `✻ 已压缩会话：上下文 ${Math.round(ev.before / 1000)}k → 约 ${Math.round(ev.after / 1000)}k`)); break;
       case "tool_result": {
         const i = pending.findIndex(x => ev.id ? x.id === ev.id : x.name === ev.name);
         const p = i >= 0 ? pending.splice(i, 1)[0] : null;

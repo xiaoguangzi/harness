@@ -190,6 +190,12 @@ impl Client {
         self.providers.target(&self.spec).map_or(0, |t| t.max_tokens()).into()
     }
 
+    /// How long the prompt cache keeps this model's conversation, when the
+    /// provider caches prompts.
+    pub fn cache_ttl(&self) -> Option<config::CacheTtl> {
+        self.providers.target(&self.spec).ok()?.cache_ttl()
+    }
+
     /// The model's context window in tokens, as configured.
     pub fn context_window(&self) -> u64 {
         self.providers.target(&self.spec).map_or(u32::MAX, |t| t.context_window()).into()

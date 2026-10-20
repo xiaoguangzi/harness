@@ -62,6 +62,8 @@ pub enum Work {
     /// A skill that runs in a subagent, with its arguments, then a turn on
     /// its report.
     Fork(Box<Skill>, String),
+    /// Compacting the conversation while the task waits for the user.
+    IdleCompact,
 }
 
 struct Meta {
@@ -226,6 +228,7 @@ impl Task {
                     agent.run_turn(content, observer).await
                 }
                 Work::Compact(focus) => agent.compact(focus.as_deref(), observer).await,
+                Work::IdleCompact => agent.compact_when_idle(observer).await,
                 Work::Fork(skill, args) => {
                     let (subagents, client) = (agent.subagents().clone(), agent.client().clone());
                     match task.forks.run_for_user(&skill, &args, subagents, client).await {
@@ -234,15 +237,37 @@ impl Task {
                     }
                 }
             };
+            let compact_after = result.as_ref().ok().and_then(|_| agent.idle_compaction_after());
             drop(agent);
             task.finish(result);
             // Reports that arrived as the turn ended get a turn of their own.
             task.wake();
+            if let Some(after) = compact_after {
+                task.compact_when_idle(after);
+            }
         };
         // Holding `meta` until the handle is stored keeps `finish` (which
         // takes the same lock) from running first.
         meta.handle = Some(tokio::spawn(run).abort_handle());
         Ok(())
+    }
+
+    /// Compacts the conversation if the task is still idle after `after`,
+    /// before its prompt cache expires. A message sent meanwhile waits for
+    /// the compaction, then gets its turn.
+    fn compact_when_idle(self: &Arc<Self>, after: Duration) {
+        let (task, turns) = (Arc::downgrade(self), self.meta.lock().unwrap().turns);
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let Some(task) = task.upgrade() else { return };
+            let idle = {
+                let meta = task.meta.lock().unwrap();
+                meta.turns == turns && meta.status == Status::Idle && meta.handle.is_none()
+            };
+            if idle {
+                let _ = task.start(Work::IdleCompact, json!({"type": "idle_compact"}));
+            }
+        });
     }
 
     /// Starts a turn for what waits in the agent's inbox, such as a

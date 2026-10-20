@@ -63,6 +63,7 @@ harness --help                          # 查看全部选项
 | 键 | 说明 |
 |---|---|
 | `model`、`subagent_model`、`effort`、`max_tokens`、`context_window`、`providers` | 模型和 [LLM 网关](#llm-网关) |
+| `idle_compaction`、`idle_compaction_min_tokens` | [空闲压缩](#上下文压缩) |
 | `mcpServers` | [MCP 服务器](#mcp-服务器) |
 | `sandbox` | [沙箱](#沙箱) |
 | `shell` | [模型所执行命令的环境](#命令的环境) |
@@ -266,7 +267,9 @@ Host *
 
 当一次请求之后，模型 `context_window` 剩下的空间不够放一次完整回复（`max_tokens`）再加窗口 5% 的余量时，模型先总结会话，再用摘要替换历史，做法与 Codex 相同。窗口 256k、`max_tokens` 为默认的 64k 时，阈值约为 179k token；窗口 1M 时约为 886k。摘要通过一次普通请求获得（system 提示词和工具不变，缓存前缀仍然命中），请求末尾是一段总结提示：进展和决定、用户的约束、涉及的文件、遇到的错误及修复、剩余工作和下一步。新的历史只有一条消息：用户自己发过的消息（从最新往前，原文保留约 2 万 token），然后是摘要，以及最近读过的 5 个文件的当前内容（每个约 5k token 以内，总共不超过窗口的 10%）。assistant 回复、工具结果和附件都会丢弃，只有重新附上的文件仍算作 `edit` 和 `write` 已读过。
 
-压缩发生在一轮开始前（新消息原样保留在摘要之后），也发生在同一轮的工具调用之间，所以长任务会自己继续下去；REPL 会显示 `✻ Compacted the conversation: context 172.4k → about 9.8k`。`/compact [重点]` 可以手动压缩。如果总结请求本身也超长，会去掉最早的几轮对话再试；如果压缩后上下文仍然太满，或同一轮里第三次又被填满，这一轮会报错停止，而不是无限循环。压缩可以像普通一轮一样打断，打断后历史保持原样。保存的会话存的是压缩后的历史，恢复时会在压缩处显示 `✻ Conversation compacted`。
+压缩发生在一轮开始前（新消息原样保留在摘要之后），也发生在同一轮的工具调用之间，所以长任务会自己继续下去；REPL 会显示 `✻ Compacted the conversation: context 172.4k → about 9.8k`。`/compact [重点]` 可以手动压缩。如果总结请求本身也超长，会去掉最早的几轮对话再试；如果压缩后上下文仍然太满，或同一轮里第三次又被填满，这一轮会报错停止，而不是无限循环。压缩可以像普通一轮一样打断，打断后历史保持原样。保存的会话存的是压缩后的历史，恢复时会在压缩处显示 `✻ Conversation compacted`。新的历史还会写明摘要取代了每个工具各多少次调用（`bash ×12, read ×30`），展开的对话记录（Ctrl+O）也会在每次压缩处标出这些数字。
+
+**空闲压缩。** 上下文至少 20 万 token 的会话停在 REPL 提示符、或 web 任务空闲时，会在提示词缓存过期前 45 秒压缩（4¼ 分钟后；`"prompt_cache_ttl": "1h"` 时为 59¼ 分钟后），这样总结请求仍然命中缓存，你的下一条消息也不会把整段长历史以未缓存的价格重新发送。REPL 会在输入框上方显示 `✻ Compacted the idle conversation: …`，输入框保持打开；在压缩完成前发送消息会取消它，会话保持原样（web UI 中则是消息等压缩完成再发送）。PreCompact 和 PostCompact hook 看到的触发方式是 `auto`。在配置中设置 `"idle_compaction": false` 可以关闭，`"idle_compaction_min_tokens"` 设置阈值。
 
 ## 恢复会话
 
