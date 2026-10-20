@@ -90,6 +90,7 @@ async fn main() -> Result<ExitCode> {
         }
         return Ok(setup::check_plugins(&settings, &plugin_dirs).await);
     }
+    tools::bash::hide_env(settings.credential_vars());
     let (sandbox_flag, args) = sandbox::parse_flag(args);
     sandbox::init(sandbox_flag, &settings.sandbox).await?;
     let mut ext = Extensions::load(&mut settings, &plugin_dirs).await;

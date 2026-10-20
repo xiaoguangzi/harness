@@ -517,7 +517,11 @@ async fn apply_reload(agent: &mut Agent, env: &mut Env, skills: &mut Arc<Vec<Ski
 /// Moves the agent to the providers as the settings have them now, on the
 /// same model if its provider is still there.
 fn reload_providers(agent: &mut Agent, skills: &[Skill], helper: Option<&ReplHelper>, out: &Output) {
-    match crate::settings::Settings::load().and_then(|s| llm::Providers::from_settings(&s)) {
+    let settings = crate::settings::Settings::load();
+    if let Ok(settings) = &settings {
+        crate::tools::bash::hide_env(settings.credential_vars());
+    }
+    match settings.and_then(|s| llm::Providers::from_settings(&s)) {
         Ok(providers) => {
             let client = agent.client().with_providers(providers);
             if client.spec() != agent.model() {

@@ -65,6 +65,7 @@ harness --help                          # 查看全部选项
 | `model`、`subagent_model`、`effort`、`max_tokens`、`context_window`、`providers` | 模型和 [LLM 网关](#llm-网关) |
 | `mcpServers` | [MCP 服务器](#mcp-服务器) |
 | `sandbox` | [沙箱](#沙箱) |
+| `shell` | [模型所执行命令的环境](#命令的环境) |
 | `hooks` | [Hooks](#hooks) |
 | `enabledPlugins`、`extraKnownMarketplaces`、`pluginConfigs` | [插件](#插件plugins) |
 
@@ -215,6 +216,16 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `@` | 打开文件菜单（见[用 `@` 附加文件](#用--附加文件)） |
 | Ctrl+V | 粘贴剪贴板中的图片（见[粘贴图片](#粘贴图片)） |
 | Ctrl+O | 打开/关闭展开的会话视图，模型运行期间同样可用 |
+
+## 命令的环境
+
+每条 `bash` 命令都在工作目录中新起一个 `bash -c` 进程运行，所以 `cd`、`export`、`source` 只对这一条命令有效。启动一条命令只需几毫秒（`/sandbox` 会显示沙箱额外增加的开销），与一次模型请求相比微不足道，因此不使用常驻 Shell：命令可以并发执行，超时只会杀掉这条命令及其启动的进程，一条命令的改动也不会影响后续命令，或其他子代理、Web 任务的命令。
+
+命令继承 harness 的环境变量，但 harness 自己发送的凭据除外：`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`OPENAI_API_KEY`、`HARNESS_WEB_TOKEN`，以及 providers 的 `api_key`、`headers` 和 MCP 服务器的 `headers` 中以 `${VAR}` 引用的变量。这样仓库里的脚本就读不到它们（在开放网络时也就无法把它们发出去）。MCP 服务器 `env` 中引用的变量会保留，因为 `gh` 这类工具常常共用它们。如果确实要让命令拿到其中某个变量：
+
+```json
+{ "shell": { "keep_env": ["OPENAI_API_KEY"] } }
+```
 
 ## 后台命令
 

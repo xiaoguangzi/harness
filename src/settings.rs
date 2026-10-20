@@ -30,6 +30,8 @@ use serde_json::{Map, Value};
 
 use crate::llm::Effort;
 use crate::llm::config::ProviderConfig;
+use crate::tools::bash;
+use crate::util::env_refs;
 use crate::{hooks, mcp, plugins, sandbox};
 
 #[derive(Debug, Default, Deserialize)]
@@ -47,6 +49,8 @@ pub struct Settings {
     pub mcp_servers: BTreeMap<String, mcp::ServerConfig>,
     #[serde(default)]
     pub sandbox: sandbox::Config,
+    #[serde(default)]
+    pub shell: bash::Config,
     #[serde(default)]
     pub hooks: hooks::Config,
     /// `"<plugin>@<marketplace>": true` for each plugin to load.
@@ -118,6 +122,21 @@ impl Settings {
         }
         Ok(serde_json::from_str(text)?)
     }
+
+    /// The variables holding credentials the harness sends: the default
+    /// providers' keys, and the ones the providers' `api_key` and headers
+    /// and the MCP servers' headers refer to, but those `shell.keep_env`
+    /// keeps. The commands the model runs don't get them.
+    pub fn credential_vars(&self) -> Vec<String> {
+        let providers = self.providers.values().flat_map(|p| p.api_key.iter().chain(p.headers.values()));
+        let mcp = self.mcp_servers.values().flat_map(|s| s.headers.values());
+        let referred = providers.chain(mcp).flat_map(|v| env_refs(v));
+        let mut names: Vec<String> = bash::CREDENTIAL_VARS.into_iter().chain(referred).map(String::from).collect();
+        names.retain(|n| !self.shell.keep_env.contains(n));
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 /// Changes the settings file with `change`, which gets it as JSON (an
@@ -187,6 +206,25 @@ pub fn legacy_files() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_vars_are_the_keys_the_harness_sends() {
+        let s = Settings::parse(
+            r#"{
+              "providers": {"gw": {"protocol": "anthropic", "base_url": "${GW_URL}", "api_key": "${GW_KEY}",
+                                   "headers": {"X-Team": "${TEAM:-t}"}}},
+              "mcpServers": {"exa": {"url": "https://mcp.exa.ai/mcp", "headers": {"Authorization": "Bearer ${EXA_KEY}"}},
+                             "gh": {"command": "gh-mcp", "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}},
+              "shell": {"keep_env": ["OPENAI_API_KEY"]}
+            }"#,
+        )
+        .unwrap();
+        // Not the URL, nor what MCP servers get in their environment.
+        assert_eq!(
+            s.credential_vars(),
+            ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "EXA_KEY", "GW_KEY", "HARNESS_WEB_TOKEN", "TEAM"]
+        );
+    }
 
     #[test]
     fn parses_every_section() {

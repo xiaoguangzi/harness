@@ -64,6 +64,7 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 | `model`, `subagent_model`, `effort`, `max_tokens`, `context_window`, `providers` | models and [LLM gateways](#llm-gateways) |
 | `mcpServers` | [MCP servers](#mcp-servers) |
 | `sandbox` | the [sandbox](#sandbox) |
+| `shell` | the [environment of the model's commands](#commands-environment) |
 | `hooks` | [hooks](#hooks) |
 | `enabledPlugins`, `extraKnownMarketplaces`, `pluginConfigs` | [plugins](#plugins) |
 
@@ -214,6 +215,16 @@ Interactive command panels use the available terminal width, with headings and s
 | `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |
 | Ctrl+V | paste an image from the clipboard (see [Pasting images](#pasting-images)) |
 | Ctrl+O | open/close the expanded transcript, including during a running turn |
+
+## Commands' environment
+
+Each `bash` command runs in a fresh `bash -c` process in the working directory, so `cd`, `export` and `source` last only for that command. Starting one takes a few milliseconds (`/sandbox` shows what the sandbox adds), little next to a model request, so commands are not kept in a long-lived shell: they stay concurrent, a timeout kills exactly the command and what it started, and nothing one command changes leaks into the next, or into another subagent's or web task's.
+
+Commands inherit the harness's environment, except the credentials the harness itself sends: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`, `HARNESS_WEB_TOKEN`, and the variables that providers' `api_key` and `headers` and MCP servers' `headers` refer to as `${VAR}`. A script in the repository then cannot read them (and, with the network open, send them away). What MCP servers get in their `env` stays, since tools such as `gh` often share it. To give commands one of them anyway:
+
+```json
+{ "shell": { "keep_env": ["OPENAI_API_KEY"] } }
+```
 
 ## Background commands
 

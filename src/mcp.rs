@@ -57,7 +57,7 @@ pub struct ServerConfig {
     cwd: Option<String>,
     url: Option<String>,
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    pub(crate) headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, PartialEq)]

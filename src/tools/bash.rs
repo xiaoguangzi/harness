@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::pin::pin;
@@ -195,6 +196,28 @@ impl Tool for BashTool {
     }
 }
 
+/// Variables holding the harness's own credentials, which the commands the
+/// model runs never see.
+pub const CREDENTIAL_VARS: [&str; 4] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "HARNESS_WEB_TOKEN"];
+
+/// The `shell` section of the settings file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// Credential variables to leave in the commands' environment after all.
+    #[serde(default)]
+    pub keep_env: Vec<String>,
+}
+
+static HIDDEN_ENV: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
+
+/// Removes `names` from the environment of the commands the model runs,
+/// besides the ones removed already: a key the settings stop naming may
+/// still have been read.
+pub fn hide_env(names: impl IntoIterator<Item = String>) {
+    HIDDEN_ENV.write().unwrap().extend(names);
+}
+
 /// The `PATH` of the commands the model runs, when the enabled plugins'
 /// `bin/` directories add to it, and those directories.
 static EXTRA_PATH: RwLock<Option<OsString>> = RwLock::new(None);
@@ -246,6 +269,9 @@ pub(super) fn spawn(command: &str) -> Result<(Child, Option<sandbox::Guard>), St
     };
     if let Some(path) = EXTRA_PATH.read().unwrap().as_ref() {
         cmd.env("PATH", path);
+    }
+    for name in HIDDEN_ENV.read().unwrap().iter() {
+        cmd.env_remove(name);
     }
     let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn();
     child.map(|child| (child, guard)).map_err(|e| format!("Failed to spawn bash: {e}"))
@@ -491,6 +517,15 @@ mod tests {
     async fn run(input: Value) -> ToolOutput {
         let _guard = crate::util::lock_cwd();
         BashTool.run(input).await
+    }
+
+    #[tokio::test]
+    async fn hidden_variables_stay_out_of_commands() {
+        unsafe { std::env::set_var("HARNESS_TEST_HIDDEN_KEY", "secret") };
+        unsafe { std::env::set_var("HARNESS_TEST_SHOWN_VAR", "shown") };
+        hide_env(["HARNESS_TEST_HIDDEN_KEY".to_string()]);
+        let out = run(json!({"command": "echo \"${HARNESS_TEST_HIDDEN_KEY:-unset} $HARNESS_TEST_SHOWN_VAR\""})).await;
+        assert_eq!(out, ToolOutput::ok("unset shown\n"));
     }
 
     #[tokio::test]

@@ -359,13 +359,13 @@ struct SaveConfig {
 /// startup, so changes to those apply on the next start.
 async fn save_config(State(state): State<Shared>, Json(req): Json<SaveConfig>) -> ApiResult<Json<Value>> {
     let path = settings::path().ok_or_else(|| bad_request("no settings file: HOME is not set"))?;
-    let providers = Settings::parse(&req.text)
-        .and_then(|s| Providers::from_settings(&s))
-        .map_err(|e| bad_request(format!("{e:#}")))?;
+    let settings = Settings::parse(&req.text).map_err(|e| bad_request(format!("{e:#}")))?;
+    let providers = Providers::from_settings(&settings).map_err(|e| bad_request(format!("{e:#}")))?;
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| bad_request(format!("creating {}: {e}", dir.display())))?;
     }
     settings::write_private(path, &req.text).map_err(|e| bad_request(format!("writing {}: {e}", path.display())))?;
+    crate::tools::bash::hide_env(settings.credential_vars());
 
     let live = build_live(&state.base_tools, &state.agent_defs, &state.reporter, &state.forks, Ok(providers));
     // Idle tasks move to the new providers, keeping their model if it still

@@ -59,6 +59,20 @@ pub fn expand_env(s: &str) -> String {
     out
 }
 
+/// The variables `s` refers to as `${VAR}` or `${VAR:-default}`.
+pub fn env_refs(s: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else { break };
+        let expr = &after[..end];
+        names.push(expr.split_once(":-").map_or(expr, |(var, _)| var));
+        rest = &after[end + 1..];
+    }
+    names
+}
+
 /// Deep-merges `patch` into `base`: objects merge key by key, a `null` in
 /// `patch` removes the key, anything else replaces it.
 pub fn merge_json(base: &mut Value, patch: &Value) {
@@ -92,6 +106,12 @@ mod tests {
         assert_eq!(expand_env("${HARNESS_TEST_UNSET_VAR:-dflt}/x"), "dflt/x");
         assert_eq!(expand_env("${HARNESS_TEST_UNSET_VAR}"), "");
         assert_eq!(expand_env("no vars, ${unclosed"), "no vars, ${unclosed");
+    }
+
+    #[test]
+    fn finds_env_refs() {
+        assert_eq!(env_refs("Bearer ${A_KEY} ${B:-x}${C}"), ["A_KEY", "B", "C"]);
+        assert!(env_refs("plain, ${unclosed").is_empty());
     }
 
     #[test]
