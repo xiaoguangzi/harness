@@ -11,6 +11,7 @@ mod glob;
 mod grep;
 mod read;
 pub mod shells;
+pub mod snapshot;
 pub mod scheduling;
 pub(crate) mod progress;
 mod wait;

@@ -90,6 +90,7 @@ async fn main() -> Result<ExitCode> {
         return Ok(setup::check_plugins(&settings, &plugin_dirs).await);
     }
     tools::bash::hide_env(settings.credential_vars());
+    tools::snapshot::start(settings.shell.snapshot.unwrap_or(true));
     let (sandbox_flag, args) = sandbox::parse_flag(args);
     sandbox::init(sandbox_flag, &settings.sandbox).await?;
     // MCP servers connect in the background: the REPL waits for them only

@@ -220,10 +220,12 @@ Interactive command panels use the available terminal width, with headings and s
 
 Each `bash` command runs in a fresh `bash -c` process in the working directory, so `cd`, `export` and `source` last only for that command. Starting one takes a few milliseconds (`/sandbox` shows what the sandbox adds), little next to a model request, so commands are not kept in a long-lived shell: they stay concurrent, a timeout kills exactly the command and what it started, and nothing one command changes leaks into the next, or into another subagent's or web task's.
 
+`bash -c` reads no startup files, so at startup the harness runs your login shell once in the background (`$SHELL -l -i -c 'env -0'`, in your home directory and without a terminal) and gives every command the variables it ends up with: the `PATH` that nvm, pyenv, conda or Homebrew set up in `~/.profile`, `~/.bashrc` or `~/.zshrc`, `JAVA_HOME` and the like, also when the harness was not started from such a shell. The first command waits for it, at most 5 seconds; if it fails or takes longer, commands run with the harness's own environment and the first one says why. `"shell": {"snapshot": false}` turns it off. MCP and language servers and hooks keep the harness's environment.
+
 Commands inherit the harness's environment, except the credentials the harness itself sends: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`, `HARNESS_WEB_TOKEN`, and the variables that providers' `api_key` and `headers` and MCP servers' `headers` refer to as `${VAR}`. A script in the repository then cannot read them (and, with the network open, send them away). What MCP servers get in their `env` stays, since tools such as `gh` often share it. To give commands one of them anyway:
 
 ```json
-{ "shell": { "keep_env": ["OPENAI_API_KEY"] } }
+{ "shell": { "keep_env": ["OPENAI_API_KEY"], "snapshot": true } }
 ```
 
 ## Background commands
@@ -576,6 +578,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
   - `scheduling.rs` — shared workspace, file and named-resource execution guards
   - `progress.rs` — tool waiting events for CLI and Web observers
   - `wait.rs` — wait for one or several background commands or subagents
+  - `snapshot.rs` — the login shell's environment, captured once at startup for the model's commands
   - `shells.rs` — background commands (`bash` `run_in_background`): each conversation's own set, the `bash_output` and `kill_shell` tools, exit reports to the inbox
   - `todo.rs` — the `todo_write` tool: the model's checklist, sent whole each time (not registered: kept for re-enabling)
   - `grep.rs` — regex search via ugrep (PCRE, honours `.gitignore`, `files_with_matches` / `content` / `count` modes)

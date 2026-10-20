@@ -221,10 +221,12 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 
 每条 `bash` 命令都在工作目录中新起一个 `bash -c` 进程运行，所以 `cd`、`export`、`source` 只对这一条命令有效。启动一条命令只需几毫秒（`/sandbox` 会显示沙箱额外增加的开销），与一次模型请求相比微不足道，因此不使用常驻 Shell：命令可以并发执行，超时只会杀掉这条命令及其启动的进程，一条命令的改动也不会影响后续命令，或其他子代理、Web 任务的命令。
 
+`bash -c` 不读取任何启动文件，所以 harness 启动时会在后台运行一次你的登录 Shell（`$SHELL -l -i -c 'env -0'`，在 home 目录中运行，不连接终端），并把它最终得到的环境变量交给每条命令：例如 nvm、pyenv、conda 或 Homebrew 在 `~/.profile`、`~/.bashrc` 或 `~/.zshrc` 中设置的 `PATH`，以及 `JAVA_HOME` 之类的变量；即使 harness 不是从这样的 Shell 启动的也一样。第一条命令会等待它完成，最多 5 秒；如果失败或超时，命令就使用 harness 自身的环境，并在第一条命令的结果中说明原因。设置 `"shell": {"snapshot": false}` 可以关闭这个功能。MCP 服务器、语言服务器和 hooks 仍使用 harness 自身的环境。
+
 命令继承 harness 的环境变量，但 harness 自己发送的凭据除外：`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`OPENAI_API_KEY`、`HARNESS_WEB_TOKEN`，以及 providers 的 `api_key`、`headers` 和 MCP 服务器的 `headers` 中以 `${VAR}` 引用的变量。这样仓库里的脚本就读不到它们（在开放网络时也就无法把它们发出去）。MCP 服务器 `env` 中引用的变量会保留，因为 `gh` 这类工具常常共用它们。如果确实要让命令拿到其中某个变量：
 
 ```json
-{ "shell": { "keep_env": ["OPENAI_API_KEY"] } }
+{ "shell": { "keep_env": ["OPENAI_API_KEY"], "snapshot": true } }
 ```
 
 ## 后台命令
@@ -577,6 +579,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
   - `scheduling.rs` — 共享工作区、文件及显式资源的执行锁
   - `progress.rs` — 交给 CLI 和 Web 的工具等待事件
   - `wait.rs` — 等待一个或多个后台命令、子代理
+  - `snapshot.rs` — 登录 Shell 的环境，启动时为模型执行的命令采集一次
   - `shells.rs` — 后台命令（`bash` 的 `run_in_background`）：每个会话各自的一组，`bash_output` 和 `kill_shell` 工具，退出时通知收件箱
   - `todo.rs` — `todo_write` 工具：模型的待办清单，每次整体发送（未注册，保留以便重新启用）
   - `grep.rs` — 通过 ugrep 的正则搜索（PCRE，遵循 `.gitignore`，`files_with_matches` / `content` / `count` 模式）

@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::Stdio;
@@ -96,103 +95,112 @@ impl Tool for BashTool {
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
-        let input: Input = match parse_input(input) {
-            Ok(i) => i,
-            Err(e) => return e,
-        };
-        if let Some(how) = changes_files(&input.command) {
-            return ToolOutput::error(format!(
-                "Refused by harness (a rule of the bash tool, not the sandbox): this command {how}. \
-                 Change files with the `edit` tool, or `write` for a new file or a complete rewrite: \
-                 they check that you read the file and show the user the change. Use bash for builds, \
-                 tests, git and running programs."
-            ));
+        super::snapshot::wait().await;
+        let mut out = execute(input).await;
+        if let Some(failure) = super::snapshot::take_failure() {
+            out.content.push_str(&format!("\n\n{failure}"));
         }
-        let access = match input.resource.as_deref() {
-            None if input.run_in_background && input.background_kind == super::shells::Kind::Service => {
-                return ToolOutput::error("A background service needs an explicit resource, e.g. service:web, so it does not lock all workspace commands indefinitely");
-            }
-            None | Some("workspace") => super::scheduling::Access::Workspace,
-            Some(key) if key.trim().is_empty() || key.trim() != key || key.len() > 200 || key.starts_with("file:") => {
-                return ToolOutput::error("resource must be a nonempty name up to 200 bytes without surrounding whitespace; file: is reserved");
-            }
-            Some(key) => super::scheduling::Access::Resource(key.trim().to_string()),
-        };
-        if input.run_in_background {
-            let Some(shells) = super::shells::current() else {
-                return ToolOutput::error("Background commands only run within a conversation");
-            };
-            let guard = super::scheduling::acquire(access).await;
-            return match shells.start(&input.command, input.background_kind, guard) {
-                Ok(id) => ToolOutput::ok(format!(
-                    "Started in the background as {id}. Read its output with bash_output, and stop it with \
-                     kill_shell. Continue independent work; use wait_tasks when you need its result. \
-                     Otherwise you will be told when it exits. Don't poll it in a loop."
-                )),
-                Err(e) => ToolOutput::error(e),
-            };
+        out
+    }
+}
+
+async fn execute(input: Value) -> ToolOutput {
+    let input: Input = match parse_input(input) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if let Some(how) = changes_files(&input.command) {
+        return ToolOutput::error(format!(
+            "Refused by harness (a rule of the bash tool, not the sandbox): this command {how}. \
+             Change files with the `edit` tool, or `write` for a new file or a complete rewrite: \
+             they check that you read the file and show the user the change. Use bash for builds, \
+             tests, git and running programs."
+        ));
+    }
+    let access = match input.resource.as_deref() {
+        None if input.run_in_background && input.background_kind == super::shells::Kind::Service => {
+            return ToolOutput::error("A background service needs an explicit resource, e.g. service:web, so it does not lock all workspace commands indefinitely");
         }
-        let _execution = super::scheduling::acquire(access).await;
-        let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
-
-        let (mut child, _sandboxed) = match spawn(&input.command) {
-            Ok(spawned) => spawned,
-            Err(e) => return ToolOutput::error(e),
+        None | Some("workspace") => super::scheduling::Access::Workspace,
+        Some(key) if key.trim().is_empty() || key.trim() != key || key.len() > 200 || key.starts_with("file:") => {
+            return ToolOutput::error("resource must be a nonempty name up to 200 bytes without surrounding whitespace; file: is reserved");
+        }
+        Some(key) => super::scheduling::Access::Resource(key.trim().to_string()),
+    };
+    if input.run_in_background {
+        let Some(shells) = super::shells::current() else {
+            return ToolOutput::error("Background commands only run within a conversation");
         };
-        // On a timeout, or when this call is dropped (the turn was
-        // cancelled), everything the command started goes too.
-        let mut group = KillGroup(child.id());
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        let (mut out, mut err) = (Capture::default(), Capture::default());
+        let guard = super::scheduling::acquire(access).await;
+        return match shells.start(&input.command, input.background_kind, guard) {
+            Ok(id) => ToolOutput::ok(format!(
+                "Started in the background as {id}. Read its output with bash_output, and stop it with \
+                 kill_shell. Continue independent work; use wait_tasks when you need its result. \
+                 Otherwise you will be told when it exits. Don't poll it in a loop."
+            )),
+            Err(e) => ToolOutput::error(e),
+        };
+    }
+    let _execution = super::scheduling::acquire(access).await;
+    let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
-        let waited = {
-            let mut reading = pin!(async { tokio::join!(out.fill(stdout), err.fill(stderr)) });
-            let mut read_done = false;
-            let waited = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-                loop {
-                    tokio::select! {
-                        _ = &mut reading, if !read_done => read_done = true,
-                        status = child.wait() => {
-                            // Jobs it left running in the background are
-                            // the command's intent; leave them be.
-                            if status.is_ok() {
-                                group.0 = None;
-                            }
-                            break status;
+    let (mut child, _sandboxed) = match spawn(&input.command) {
+        Ok(spawned) => spawned,
+        Err(e) => return ToolOutput::error(e),
+    };
+    // On a timeout, or when this call is dropped (the turn was
+    // cancelled), everything the command started goes too.
+    let mut group = KillGroup(child.id());
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let (mut out, mut err) = (Capture::default(), Capture::default());
+
+    let waited = {
+        let mut reading = pin!(async { tokio::join!(out.fill(stdout), err.fill(stderr)) });
+        let mut read_done = false;
+        let waited = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+            loop {
+                tokio::select! {
+                    _ = &mut reading, if !read_done => read_done = true,
+                    status = child.wait() => {
+                        // Jobs it left running in the background are
+                        // the command's intent; leave them be.
+                        if status.is_ok() {
+                            group.0 = None;
                         }
+                        break status;
                     }
                 }
-            })
-            .await;
-            // A background job can hold the pipes open after bash exits, so
-            // only wait a moment for the rest of the output.
-            if waited.is_ok() && !read_done {
-                let _ = tokio::time::timeout(PIPE_GRACE, reading).await;
             }
-            waited
-        };
-
-        let mut text = String::from_utf8_lossy(&out.kept).into_owned();
-        if !err.kept.is_empty() {
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str("[stderr]\n");
-            text.push_str(&String::from_utf8_lossy(&err.kept));
+        })
+        .await;
+        // A background job can hold the pipes open after bash exits, so
+        // only wait a moment for the rest of the output.
+        if waited.is_ok() && !read_done {
+            let _ = tokio::time::timeout(PIPE_GRACE, reading).await;
         }
-        let text = truncate_counting(&text, MAX_OUTPUT_BYTES, out.dropped + err.dropped);
+        waited
+    };
 
-        let status = match waited {
-            Ok(Ok(status)) => status,
-            Ok(Err(e)) => return ToolOutput::error(format!("Failed to run command: {e}")),
-            Err(_) if text.is_empty() => return ToolOutput::error(format!("Command timed out after {timeout_ms} ms")),
-            Err(_) => return ToolOutput::error(format!("{text}\n[command timed out after {timeout_ms} ms]")),
-        };
-        match status.code() {
-            Some(0) => ToolOutput::ok(if text.is_empty() { "(no output)".into() } else { text }),
-            Some(code) => ToolOutput::error(format!("{text}\n[exit code {code}]")),
-            None => ToolOutput::error(format!("{text}\n[terminated by signal]")),
+    let mut text = String::from_utf8_lossy(&out.kept).into_owned();
+    if !err.kept.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
         }
+        text.push_str("[stderr]\n");
+        text.push_str(&String::from_utf8_lossy(&err.kept));
+    }
+    let text = truncate_counting(&text, MAX_OUTPUT_BYTES, out.dropped + err.dropped);
+
+    let status = match waited {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return ToolOutput::error(format!("Failed to run command: {e}")),
+        Err(_) if text.is_empty() => return ToolOutput::error(format!("Command timed out after {timeout_ms} ms")),
+        Err(_) => return ToolOutput::error(format!("{text}\n[command timed out after {timeout_ms} ms]")),
+    };
+    match status.code() {
+        Some(0) => ToolOutput::ok(if text.is_empty() { "(no output)".into() } else { text }),
+        Some(code) => ToolOutput::error(format!("{text}\n[exit code {code}]")),
+        None => ToolOutput::error(format!("{text}\n[terminated by signal]")),
     }
 }
 
@@ -207,6 +215,8 @@ pub struct Config {
     /// Credential variables to leave in the commands' environment after all.
     #[serde(default)]
     pub keep_env: Vec<String>,
+    /// Whether commands get the login shell's environment (default true).
+    pub snapshot: Option<bool>,
 }
 
 static HIDDEN_ENV: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
@@ -218,19 +228,14 @@ pub fn hide_env(names: impl IntoIterator<Item = String>) {
     HIDDEN_ENV.write().unwrap().extend(names);
 }
 
-/// The `PATH` of the commands the model runs, when the enabled plugins'
-/// `bin/` directories add to it, and those directories.
-static EXTRA_PATH: RwLock<Option<OsString>> = RwLock::new(None);
+/// The enabled plugins' `bin/` directories, which the commands the model
+/// runs have on their `PATH`.
 static EXTRA_DIRS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
 /// Puts `dirs` on the `PATH` of the commands the model runs, after the
 /// directories already there, so they cannot shadow a system command; they
 /// replace the ones given before.
 pub fn add_to_path(dirs: Vec<PathBuf>) {
-    let current = std::env::var_os("PATH").unwrap_or_default();
-    let paths = std::env::split_paths(&current).chain(dirs.iter().cloned());
-    let path = std::env::join_paths(paths).ok().filter(|_| !dirs.is_empty());
-    *EXTRA_PATH.write().unwrap() = path;
     *EXTRA_DIRS.write().unwrap() = dirs;
 }
 
@@ -267,8 +272,17 @@ pub(super) fn spawn(command: &str) -> Result<(Child, Option<sandbox::Guard>), St
             (cmd, None)
         }
     };
-    if let Some(path) = EXTRA_PATH.read().unwrap().as_ref() {
-        cmd.env("PATH", path);
+    // The login shell's environment, then the plugins' directories after
+    // its `PATH`, then without the credentials.
+    let snapshot = super::snapshot::vars();
+    cmd.envs(snapshot.iter().map(|(name, value)| (name, value)));
+    let dirs = EXTRA_DIRS.read().unwrap();
+    if !dirs.is_empty() {
+        let base = snapshot.iter().find(|(name, _)| name == "PATH").map(|(_, v)| v.clone());
+        let base = base.or_else(|| std::env::var_os("PATH")).unwrap_or_default();
+        if let Ok(path) = std::env::join_paths(std::env::split_paths(&base).chain(dirs.iter().cloned())) {
+            cmd.env("PATH", path);
+        }
     }
     for name in HIDDEN_ENV.read().unwrap().iter() {
         cmd.env_remove(name);
