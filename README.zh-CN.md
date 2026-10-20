@@ -80,6 +80,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `sandbox` | [沙箱](#沙箱) |
 | `shell` | [模型所执行命令的环境](#命令的环境) |
 | `hooks` | [Hooks](#hooks) |
+| `statusLine` | REPL 的[状态栏](#状态栏) |
 | `enabledPlugins`、`extraKnownMarketplaces`、`pluginConfigs` | [插件](#插件plugins) |
 
 所有键都可省略，未知的键会报错。项目目录中的配置一概不读（包括项目的 `.mcp.json`）：否则仓库可以把带着你 API key 的请求发到它自己的服务器、启动 MCP 命令或 hook，或放宽沙箱。项目中的 `.harness/agents`、`.harness/skills`、`.claude/` 下的同名目录及 `.agents/skills` 仍会读取，因为它们只增加提示词（技能中的 `` !`command` `` 行与模型自己的 `bash` 命令一样运行，开启沙箱时在沙箱内）。插件的 hook 和 MCP 服务器会在沙箱外运行命令，因此只能在这里启用。旧版本读取 `~/.harness/providers.json`、`mcp.json` 和 `sandbox.json`；这些文件存在时 harness 会给出警告，其内容应移到上面对应的键下（`default_model` 改名为 `model`）。
@@ -222,6 +223,10 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/plugins [子命令]` | 打开插件管理；`/plugins update` 拉取它们的最新版本，`/plugins install`、`uninstall`、`enable`、`disable`、`configure`、`marketplace …` 与 `harness plugin` 相同（见[插件](#插件plugins)） |
 | `/reload-plugins` | 从配置重新加载插件、技能、命令、代理和 hook，供下一个会话使用：当前会话还是空的则立即生效，否则从 `/clear` 或 `/resume` 起生效 |
 | `/sandbox` | 显示沙箱允许的操作（见[沙箱](#沙箱)） |
+| `!命令` | 自己运行 `命令`，与模型的 `bash` 相同（开启沙箱时在沙箱中，但不受“禁止自行修改文件”的规则限制）；输出会显示出来，并随你的下一条消息交给模型 |
+| `/btw <问题>` | 就当前会话问一个旁支问题：模型根据已知信息回答，不调用工具，问题和回答都不会留在会话中。只发一次前缀相同的请求，所以会命中提示词缓存 |
+| `/copy [n]` | 把模型最后一条（或倒数第 `n` 条）回复复制到剪贴板：用 `pbcopy`、`wl-copy`、`xclip` 或 `xsel`，都没有时通过终端（OSC 52，终端允许时通过 SSH 也能用） |
+| `/export [文件]` | 把会话写成 Markdown 文件（默认 `harness-<会话>.md`）：提示、回复，以及每个工具调用和其结果的开头 |
 | `/<skill> [args]` | 直接运行一个技能（一次性模式同样可用：`harness /greet Bob`） |
 | `/exit`、`exit`、Ctrl-D | 退出（`exit` 或 `quit` 仅在单独占一行时生效） |
 | Esc | 中断运行中的轮次，同 Ctrl-C |
@@ -233,6 +238,16 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `@` | 打开文件菜单（见[用 `@` 附加文件](#用--附加文件)） |
 | Ctrl+V | 粘贴剪贴板中的图片（见[粘贴图片](#粘贴图片)） |
 | Ctrl+O | 打开/关闭展开的会话视图，模型运行期间同样可用 |
+
+### 状态栏
+
+[配置](#配置)中的 `statusLine`（[Claude Code 的格式](https://code.claude.com/docs/en/statusline)）会在输入框下方显示一行你自己定义的内容：
+
+```json
+{ "statusLine": { "type": "command", "command": "~/.harness/statusline.sh" } }
+```
+
+每次提示符打开时运行这个命令：通过 `sh -c` 在工作目录中运行，与 hook 一样不在沙箱中，stdin 收到 JSON：`session_id`、`transcript_path`、`cwd`、`model`（`id`、`display_name`）、`workspace`（`current_dir`、`project_dir`）、`version`、`effort`、`context_window`（`context_window_size`、`used_tokens`、`used_percentage`）和 `cost`（`total_input_tokens`、`total_output_tokens`）。显示它 5 秒内输出的第一行，保留颜色；命令失败时不显示。例如 `jq -r '"\(.model.display_name) · \(.context_window.used_percentage)% context"'`。
 
 ## 命令的环境
 
@@ -592,7 +607,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/main.rs` — 启动：配置、`harness plugin`、`harness provider` 和 `--check-plugins`、沙箱，然后是 `setup.rs` 构建的内容；最后进入 CLI 或 web 前端
 - `src/setup.rs` — 会话由什么构成：插件及其技能、代理、hook、MCP 与语言服务器（由 `/reload-plugins` 重建）、用户的 MCP 服务器、工具集和系统提示词；`--check-plugins`；后台自动更新
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
-- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）及各个无参数命令在面板中显示的内容（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
+- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`!命令`、`/btw`、`/copy` 和 `/export`（`actions.rs`）、状态栏（`status_line.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）及各个无参数命令在面板中显示的内容（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
 - `src/agent/usage.rs` — `/usage` 显示的按模型统计的 token 数，与子代理共享

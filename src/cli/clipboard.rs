@@ -2,7 +2,7 @@
 //! paths of files copied in a file manager (whose clipboard entry also
 //! carries their icons, which are not what was meant). macOS asks AppKit
 //! through `osascript`; elsewhere `wl-paste` (Wayland) or `xclip` (X11) is
-//! used.
+//! used. `/copy` writes text to it the same ways, or through the terminal.
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -32,6 +32,33 @@ pub struct Image {
 pub enum Clip {
     Image(Image),
     Files(Vec<PathBuf>),
+}
+
+/// Puts `text` on the clipboard: with `pbcopy` on macOS, `wl-copy`, `xclip`
+/// or `xsel` elsewhere, else by asking the terminal (OSC 52), which works
+/// over SSH too where the terminal allows it. Returns how.
+pub fn copy_text(text: &str) -> Result<&'static str, String> {
+    use std::io::Write;
+    let tools: &[(&'static str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"]), ("xsel", &["--clipboard", "--input"])]
+    };
+    for (program, args) in tools {
+        let Ok(mut child) = Command::new(program).args(*args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
+            continue;
+        };
+        let written = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+        if written && child.wait().is_ok_and(|status| status.success()) {
+            return Ok(program);
+        }
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Err("no clipboard tool found (pbcopy, wl-copy, xclip or xsel)".into());
+    }
+    let mut stdout = std::io::stdout().lock();
+    write!(stdout, "\x1b]52;c;{}\x07", BASE64.encode(text)).and_then(|()| stdout.flush()).map_err(|e| e.to_string())?;
+    Ok("the terminal")
 }
 
 /// What the clipboard holds: `None` when it has neither an image nor files,

@@ -1,5 +1,6 @@
 //! Terminal frontend: the interactive REPL and one-shot mode.
 
+mod actions;
 mod clipboard;
 mod diff;
 mod dialog;
@@ -14,6 +15,7 @@ mod output;
 mod repl;
 mod rewind;
 mod screen;
+pub mod status_line;
 mod text;
 mod tool_output;
 mod transcript;
@@ -49,7 +51,7 @@ use menu::Command;
 use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 21] = [
+const BUILTINS: [(&str, &str); 24] = [
     ("/help", "browse commands; Enter inserts one into the prompt"),
     ("/model", "choose main/subagent models and effort; /model <provider>/<model> switches directly"),
     ("/effort", "choose reasoning effort, or set it with /effort <level>"),
@@ -60,6 +62,9 @@ const BUILTINS: [(&str, &str); 21] = [
     ("/rewind", "go back to before an earlier prompt, with the code, the conversation or both (or Esc Esc)"),
     ("/init", "have the model write AGENTS.md, or improve it; /init <notes> says what else to cover"),
     ("/usage", "show the tokens used so far and how full the context is"),
+    ("/btw", "ask a side question about the conversation; neither it nor the answer is kept"),
+    ("/copy", "copy the model's last reply to the clipboard; /copy <n> the nth latest"),
+    ("/export", "write the conversation to a Markdown file; /export <file> names it"),
     ("/tools", "browse tool descriptions and input schemas"),
     ("/output", "browse the expanded conversation (or Ctrl+O, including while running)"),
     ("/skills", "browse skills; Enter inserts an invocation into the prompt"),
@@ -216,6 +221,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 let pending = agent.subagents().running_in_background() + agent.shells().pending();
                 if pending > 0 { out.set_status(Some(&format!("Waiting for {pending} background tasks…"))); }
                 let inbox = agent.inbox().clone();
+                status_line::refresh(agent, recorder.as_ref().map(|rec| (rec.meta().id.as_str(), rec.file())), &out);
                 let read = editor.helper().unwrap().read_box(&out, &mut typing, inbox, past);
                 let read = match agent.idle_compaction_after() {
                     Some(after) => compacting_while(read, after, agent, &out, recorder.as_mut()).await,
@@ -421,6 +427,13 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
             Input::Sandbox => print_sandbox(&out),
+            Input::Shell(command) => actions::shell(agent, &command, &out).await,
+            Input::Btw(question) => actions::side_question(agent, &question, &out).await,
+            Input::Copy(n) => actions::copy(agent, n, &out),
+            Input::Export(path) => {
+                let session = recorder.as_ref().map(|rec| rec.meta().id.clone());
+                actions::export(agent, path.as_deref(), session.as_deref(), &out);
+            }
             Input::Usage => print_usage(&out, agent),
             Input::Model(spec) => {
                 if spec.is_none() && boxed {
@@ -1001,10 +1014,10 @@ fn paste_clipboard(out: &Output) {
 
 /// Sends a line typed into the input box while a turn runs. A message goes
 /// to the model with its next request (or makes it carry on rather than
-/// end the turn); a command waits for the turn to end. Until then it is
-/// listed above the box.
+/// end the turn); a command (`/command`, `!command`) waits for the turn to
+/// end. Until then it is listed above the box.
 fn send(out: &Output, inbox: &Inbox, files: &FileTracker, text: String, images: Vec<(usize, Image)>) {
-    let queued = if text.starts_with('/') || matches!(text.as_str(), "exit" | "quit") {
+    let queued = if text.starts_with(['/', '!']) || matches!(text.as_str(), "exit" | "quit") {
         Queued { text, images, id: None, shown: Vec::new() }
     } else {
         let expanded = attachments(&text, &images, files);
@@ -1097,6 +1110,14 @@ enum Input {
     ManagePlugins(Vec<String>),
     /// `/reload-plugins`.
     ReloadPlugins,
+    /// `!command` runs it for the user.
+    Shell(String),
+    /// `/btw <question>` asks a side question.
+    Btw(String),
+    /// `/copy [n]` copies the nth latest reply.
+    Copy(usize),
+    /// `/export [file]` writes the conversation as Markdown.
+    Export(Option<String>),
     /// `/<skill> args`, before its text is read.
     Skill(Box<Skill>, String),
     Prompt(String),
@@ -1118,6 +1139,9 @@ async fn render_skill(input: Input) -> Input {
 /// Interprets a line of user input. `/<skill> args` is to load the skill's
 /// instructions directly into the prompt, saving the model a tool call.
 fn parse_input(line: &str, skills: &[Skill]) -> Input {
+    if let Some(command) = line.strip_prefix('!').map(str::trim).filter(|c| !c.is_empty()) {
+        return Input::Shell(command.to_string());
+    }
     let Some(command) = line.strip_prefix('/') else {
         return match line {
             "" => Input::Empty,
@@ -1145,6 +1169,15 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
             args => Input::ManagePlugins(args.split_whitespace().map(String::from).collect()),
         },
         "reload-plugins" => Input::ReloadPlugins,
+        "btw" => Input::Btw(args.trim().to_string()),
+        "copy" => match args.trim() {
+            "" => Input::Copy(1),
+            n => match n.parse::<usize>() {
+                Ok(n) if n > 0 => Input::Copy(n),
+                _ => Input::Error(format!("/copy takes the number of a reply, counting back from 1, not `{n}`")),
+            },
+        },
+        "export" => Input::Export(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "agents" => Input::ListAgents,
         "tasks" => Input::Tasks,
         "stop" => Input::Stop(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),

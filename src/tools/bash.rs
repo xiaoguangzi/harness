@@ -144,8 +144,21 @@ async fn execute(input: Value) -> ToolOutput {
     }
     let _execution = super::scheduling::acquire(access).await;
     let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
+    run_command(&input.command, timeout_ms).await
+}
 
-    let (mut child, _sandboxed) = match spawn(&input.command) {
+/// Runs a command the user typed at the REPL (`!command`): like one of the
+/// model's, in the sandbox when it is on, but without the rule against
+/// changing files, which is for the model.
+pub async fn run_for_user(command: &str) -> ToolOutput {
+    super::snapshot::wait().await;
+    let _execution = super::scheduling::acquire(super::scheduling::Access::Workspace).await;
+    run_command(command, DEFAULT_TIMEOUT_MS).await
+}
+
+/// Runs `command` in the foreground for at most `timeout_ms`.
+async fn run_command(command: &str, timeout_ms: u64) -> ToolOutput {
+    let (mut child, _sandboxed) = match spawn(command) {
         Ok(spawned) => spawned,
         Err(e) => return ToolOutput::error(e),
     };

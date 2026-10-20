@@ -26,6 +26,10 @@ pub use usage::UsageLog;
 
 /// Told to the model about a turn the user cancelled.
 pub const INTERRUPTED: &str = "[Interrupted by the user]";
+/// Comes before a `/btw` question.
+const SIDE_QUESTION: &str = "A side question from the user, about the conversation so far. Answer it briefly from what \
+you already know, without calling any tools; neither the question nor your answer is kept in the conversation, so \
+don't start or plan any work.";
 
 /// Receives progress events so the frontend decides how to display them.
 pub trait Observer: Send {
@@ -288,6 +292,35 @@ impl Agent {
     /// `window` tokens.
     pub fn set_compact_window(&mut self, window: Option<u64>) {
         self.compact_window = window;
+    }
+
+    /// Answers `question` from the conversation so far without adding
+    /// either to it (`/btw`): one request with the same system prompt and
+    /// tools, so it reads the prompt cache, its text streamed to `on_text`.
+    pub async fn side_question(&mut self, question: &str, on_text: &mut (dyn FnMut(&str) + Send)) -> Result<String> {
+        self.settle();
+        let definitions = self.tools.definitions();
+        let mut request = self.messages.clone();
+        let asked = json!({"type": "text", "text": format!("{SIDE_QUESTION}\n\n{question}")});
+        match request.last_mut() {
+            Some(last) if last.role == "user" => last.content.push(asked),
+            _ => request.push(Message::user(vec![asked])),
+        }
+        let (log, model) = (&self.usage, self.client.spec());
+        let mut on_event = |event: StreamEvent| match event {
+            StreamEvent::TextDelta(text) => on_text(text),
+            StreamEvent::PartialUsage(usage) => log.record(model, &usage),
+            _ => {}
+        };
+        let response = self.client.create(&self.system, &definitions, &request, &mut on_event).await?;
+        if let Some(usage) = &response.usage {
+            self.usage.record(self.client.spec(), usage);
+        }
+        let answer: String = response.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+        if answer.trim().is_empty() {
+            bail!("the model gave no answer{}", if response.stop_reason.as_deref() == Some("tool_use") { " (it tried to use a tool)" } else { "" });
+        }
+        Ok(answer)
     }
 
     /// Starts a fork's conversation with `messages`, its parent's, whose

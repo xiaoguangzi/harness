@@ -79,6 +79,7 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 | `sandbox` | the [sandbox](#sandbox) |
 | `shell` | the [environment of the model's commands](#commands-environment) |
 | `hooks` | [hooks](#hooks) |
+| `statusLine` | the REPL's [status line](#status-line) |
 | `enabledPlugins`, `extraKnownMarketplaces`, `pluginConfigs` | [plugins](#plugins) |
 
 Every key is optional, and unknown keys are an error. Nothing is read from the project directory (a project's `.mcp.json` included): a repository could otherwise send requests carrying your API keys to its own server, start MCP commands or hooks, or loosen the sandbox. The project's `.harness/agents`, `.harness/skills`, their `.claude/` counterparts and `.agents/skills` are still read, as they only add prompts (a skill's `` !`command` `` lines run like the model's own `bash` commands, in the sandbox when it is on). Plugins, whose hooks and MCP servers run commands outside it, are enabled only here. Older versions read `~/.harness/providers.json`, `mcp.json` and `sandbox.json`; the harness warns while they exist, and their contents go under the keys above (`default_model` is now `model`).
@@ -221,6 +222,10 @@ Interactive command panels use the available terminal width, with headings and s
 | `/plugins [command]` | open plugin management;  `/plugins update` fetches their latest versions, and `/plugins install`, `uninstall`, `enable`, `disable`, `configure`, `marketplace …` work as `harness plugin` does (see [Plugins](#plugins)) |
 | `/reload-plugins` | load the plugins, skills, commands, agents and hooks again from the settings, for the next conversation: at once if this one is empty, else from `/clear` or `/resume` on |
 | `/sandbox` | show what the sandbox allows (see [Sandbox](#sandbox)) |
+| `!command` | run `command` yourself, as the model's `bash` would (in the sandbox when it is on, but without the rule against commands that change files); its output is shown, and goes to the model with your next message |
+| `/btw <question>` | ask a side question about the conversation: the model answers from what it already knows, without tools, and neither the question nor the answer is kept in the conversation. One request with the same prefix, so it reads the prompt cache |
+| `/copy [n]` | copy the model's last reply (or the `n`th latest) to the clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel`, else the terminal (OSC 52, which works over SSH where the terminal allows it) |
+| `/export [file]` | write the conversation to a Markdown file (`harness-<session>.md` by default): prompts, replies, and each tool call with the start of its result |
 | `/<skill> [args]` | run a skill directly (also works one-shot: `harness /greet Bob`) |
 | `/exit`, `exit`, Ctrl-D | quit (`exit` or `quit` only when alone on the line) |
 | Esc | interrupt the running turn, like Ctrl-C |
@@ -232,6 +237,16 @@ Interactive command panels use the available terminal width, with headings and s
 | `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |
 | Ctrl+V | paste an image from the clipboard (see [Pasting images](#pasting-images)) |
 | Ctrl+O | open/close the expanded transcript, including during a running turn |
+
+### Status line
+
+`statusLine` in the [settings](#settings), in [Claude Code's format](https://code.claude.com/docs/en/statusline), puts a line of your own under the input box:
+
+```json
+{ "statusLine": { "type": "command", "command": "~/.harness/statusline.sh" } }
+```
+
+The command runs each time the prompt opens, through `sh -c` in the working directory and outside the sandbox, like a hook, with JSON on stdin: `session_id`, `transcript_path`, `cwd`, `model` (`id`, `display_name`), `workspace` (`current_dir`, `project_dir`), `version`, `effort`, `context_window` (`context_window_size`, `used_tokens`, `used_percentage`) and `cost` (`total_input_tokens`, `total_output_tokens`). The first line it prints within 5 seconds is shown, colors included; a command that fails shows nothing. For example, `jq -r '"\(.model.display_name) · \(.context_window.used_percentage)% context"'`.
 
 ## Commands' environment
 
@@ -591,7 +606,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/main.rs` — startup: settings, `harness plugin`, `harness provider` and `--check-plugins`, the sandbox, then what `setup.rs` builds; then the CLI or web frontend
 - `src/setup.rs` — what a conversation is built from: the plugins with their skills, agents, hooks, MCP and language servers (rebuilt by `/reload-plugins`), the user's MCP servers, the tool set and system prompt; `--check-plugins`; background auto-updates
 - `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section, editing it in place
-- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), `--output-format json` / `stream-json` (`json.rs`), `/rewind` (`rewind.rs`), the keyboard panels slash commands open (`dialog.rs`) and what each bare command shows in one (`commands.rs`), the `/model` panel for models and effort (`model.rs`), the spinner, input box and turn display (`output.rs`), retained tool results (`tool_output.rs`), the searchable expanded conversation (`transcript.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), shared viewport and native scrollback (`screen.rs`), prompt input, menu keys, completion, history, multi-line input, Ctrl+V and Esc Esc (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), `--output-format json` / `stream-json` (`json.rs`), `!command`, `/btw`, `/copy` and `/export` (`actions.rs`), the status line (`status_line.rs`), `/rewind` (`rewind.rs`), the keyboard panels slash commands open (`dialog.rs`) and what each bare command shows in one (`commands.rs`), the `/model` panel for models and effort (`model.rs`), the spinner, input box and turn display (`output.rs`), retained tool results (`tool_output.rs`), the searchable expanded conversation (`transcript.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), shared viewport and native scrollback (`screen.rs`), prompt input, menu keys, completion, history, multi-line input, Ctrl+V and Esc Esc (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
 - `src/agent/usage.rs` — the per-model token counts `/usage` shows, shared with the subagents

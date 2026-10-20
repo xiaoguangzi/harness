@@ -64,6 +64,9 @@ pub struct Settings {
     /// Marketplaces to find plugins in, by name, besides the official one.
     #[serde(default, rename = "extraKnownMarketplaces")]
     pub extra_known_marketplaces: BTreeMap<String, plugins::Marketplace>,
+    /// The line under the REPL's input box, from a command.
+    #[serde(rename = "statusLine")]
+    pub status_line: Option<crate::cli::status_line::Config>,
     /// Each plugin's answers to its `userConfig`, by plugin id; the
     /// sensitive ones are kept elsewhere.
     #[serde(default, rename = "pluginConfigs")]

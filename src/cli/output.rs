@@ -75,6 +75,8 @@ struct State {
     held: Option<Vec<String>>,
     /// Nothing is drawn: stdout belongs to something else (JSON output).
     silent: bool,
+    /// The status line under the input box.
+    footer: Option<String>,
 }
 
 /// Restores a usable shell cursor on normal exit and error unwinding.
@@ -134,6 +136,7 @@ impl Output {
             frame: 0,
             held: None,
             silent: false,
+            footer: None,
         };
         Self { state: Arc::new(Mutex::new(state)), styled }
     }
@@ -365,6 +368,15 @@ impl Output {
 
     /// Holds back output while the line editor reads (`true`), and prints
     /// what was held once it is done (`false`).
+    /// Shows `line` under the input box, or nothing there.
+    pub fn set_footer(&self, line: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        if state.footer != line {
+            state.footer = line;
+            self.show(&mut state, "");
+        }
+    }
+
     /// Draws nothing from now on, with `silent`.
     pub fn set_silent(&self, silent: bool) {
         self.state.lock().unwrap().silent = silent;
@@ -737,6 +749,10 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
     {
         let shown = menu.styled(&plain).unwrap_or(plain);
         rows.extend(shown.trim_start_matches('\n').split('\n').map(str::to_string));
+    } else if let Some(footer) = &state.footer {
+        // Its own colors, unless it is too wide for them.
+        let plain = text::printable(&text::strip_ansi(footer));
+        rows.push(if text::width(&plain) < width { footer.clone() } else { text::fit(&plain, width.saturating_sub(1)) });
     }
     (rows, Some(cursor))
 }
