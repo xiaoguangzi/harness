@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::grep::ugrep;
-use super::{Tool, ToolOutput, parse_input, truncate};
+use super::{Tool, ToolOutput, parse_input, spill};
 
 /// Paths listed unless `head_limit` says otherwise, and the most it may say.
 const DEFAULT_HEAD_LIMIT: usize = 100;
@@ -169,7 +169,7 @@ impl Tool for GlobTool {
                  or raise head_limit]"
             ));
         }
-        ToolOutput::ok(truncate(&text, MAX_OUTPUT_BYTES))
+        ToolOutput::ok(spill::shorten(&text, MAX_OUTPUT_BYTES, "glob"))
     }
 }
 

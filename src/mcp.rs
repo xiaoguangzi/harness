@@ -33,7 +33,7 @@ use rmcp::{RoleClient, ServiceExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::tools::{Tool, ToolOutput, ToolRegistry, truncate};
+use crate::tools::{Tool, ToolOutput, ToolRegistry, spill};
 use crate::util::expand_env;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -160,7 +160,7 @@ impl Server {
         {
             out.content = structured.to_string();
         }
-        out.content = truncate(&out.content, MAX_OUTPUT_BYTES);
+        out.content = spill::shorten(&out.content, MAX_OUTPUT_BYTES, "mcp");
         out.is_error = result.is_error.unwrap_or(false);
         out
     }

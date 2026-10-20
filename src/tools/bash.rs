@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
-use super::{Tool, ToolOutput, parse_input, truncate_counting};
+use super::spill::Capture;
+use super::{Tool, ToolOutput, parse_input};
 use crate::sandbox;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -51,7 +52,7 @@ impl Tool for BashTool {
         "Run a shell command with `bash -c` and return its stdout, stderr and exit code. \
          Each call runs in a fresh process started in the working directory, so `cd` and \
          environment changes do not persist between calls. Output longer than 30000 bytes \
-         is truncated. Use this for builds, tests, git, listing files (ls, find) and other \
+         is shortened to its start and end, and saved whole to a file the result names. Use this for builds, tests, git, listing files (ls, find) and other \
          shell work. Do not use it to read, write or search file contents: no `cat`, `head`, \
          `tail`, `sed`, `awk`, `echo >`, heredocs, `grep` or `rg` for that, and no Python, \
          Node or Perl scripts that change files. Use the `read` tool to view files, `edit` to \
@@ -152,10 +153,10 @@ async fn execute(input: Value) -> ToolOutput {
     // cancelled), everything the command started goes too.
     let mut group = KillGroup(child.id());
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-    let (mut out, mut err) = (Capture::default(), Capture::default());
+    let (mut out, mut err) = (Capture::new("bash", MAX_OUTPUT_BYTES), Capture::new("bash-stderr", MAX_OUTPUT_BYTES));
 
     let waited = {
-        let mut reading = pin!(async { tokio::join!(out.fill(stdout), err.fill(stderr)) });
+        let mut reading = pin!(async { tokio::join!(fill(&mut out, stdout), fill(&mut err, stderr)) });
         let mut read_done = false;
         let waited = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
             loop {
@@ -181,15 +182,14 @@ async fn execute(input: Value) -> ToolOutput {
         waited
     };
 
-    let mut text = String::from_utf8_lossy(&out.kept).into_owned();
-    if !err.kept.is_empty() {
+    let mut text = out.text().await;
+    if !err.is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str("[stderr]\n");
-        text.push_str(&String::from_utf8_lossy(&err.kept));
+        text.push_str(&err.text().await);
     }
-    let text = truncate_counting(&text, MAX_OUTPUT_BYTES, out.dropped + err.dropped);
 
     let status = match waited {
         Ok(Ok(status)) => status,
@@ -291,27 +291,16 @@ pub(super) fn spawn(command: &str) -> Result<(Child, Option<sandbox::Guard>), St
     child.map(|child| (child, guard)).map_err(|e| format!("Failed to spawn bash: {e}"))
 }
 
-/// The first `MAX_OUTPUT_BYTES` of a stream, and how many bytes came after.
-#[derive(Default)]
-struct Capture {
-    kept: Vec<u8>,
-    dropped: usize,
-}
-
-impl Capture {
-    /// Reads to the end, only counting what is past the cap: the stream is
-    /// still drained, so the command never blocks on a full pipe.
-    async fn fill(&mut self, stream: Option<impl AsyncRead + Unpin>) {
-        let Some(mut stream) = stream else { return };
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            let keep = n.min(MAX_OUTPUT_BYTES - self.kept.len());
-            self.kept.extend_from_slice(&buf[..keep]);
-            self.dropped += n - keep;
+/// Reads a stream to its end into `capture`, which holds only its start
+/// and end in memory: the stream is drained, so the command never blocks
+/// on a full pipe.
+async fn fill(capture: &mut Capture, stream: Option<impl AsyncRead + Unpin>) {
+    let Some(mut stream) = stream else { return };
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => capture.push(&buf[..n]).await,
         }
     }
 }
@@ -599,7 +588,13 @@ mod tests {
     async fn caps_output_while_reading() {
         let out = run(json!({"command": "head -c 1000000 /dev/zero | tr '\\0' a"})).await;
         assert!(!out.is_error);
-        assert_eq!(out.content, format!("{}\n... [truncated 970000 bytes]", "a".repeat(MAX_OUTPUT_BYTES)));
+        assert!(out.content.starts_with(&"a".repeat(MAX_OUTPUT_BYTES / 3 * 2)), "the start");
+        assert!(out.content.ends_with(&"a".repeat(MAX_OUTPUT_BYTES / 3)), "the end");
+        assert!(out.content.contains("[970000 of 1000000 bytes left out here; the whole output is in "));
+        assert!(out.content.len() < MAX_OUTPUT_BYTES + 300);
+        let path = out.content.split("is in ").nth(1).unwrap().split(": read").next().unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 1_000_000);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

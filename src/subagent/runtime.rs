@@ -21,7 +21,7 @@ use crate::agent::{Agent, Inbox, Observer, UsageLog};
 use crate::checkpoint::FileHistory;
 use crate::hooks::Hooks;
 use crate::llm::Client;
-use crate::tools::{ToolOutput, truncate};
+use crate::tools::{ToolOutput, spill, truncate};
 
 /// Subagents of one conversation that may run at once.
 pub const MAX_RUNNING: usize = 8;
@@ -476,7 +476,7 @@ impl Child {
 
 /// A run's result: the last text it wrote, or why there is none.
 fn outcome(agent: &Agent, start: usize, result: Result<()>, tool_calls: usize) -> ToolOutput {
-    let report = truncate(agent.last_text(start).trim(), MAX_RESULT_BYTES);
+    let report = spill::shorten(agent.last_text(start).trim(), MAX_RESULT_BYTES, "agent");
     match result {
         Ok(()) if report.is_empty() => ToolOutput::error("The subagent finished without a report"),
         Ok(()) => ToolOutput::ok(report),

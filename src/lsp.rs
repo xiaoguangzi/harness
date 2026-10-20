@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Notify, oneshot};
 
-use crate::tools::{Tool, ToolOutput, parse_input, truncate};
+use crate::tools::{Tool, ToolOutput, parse_input, spill};
 use crate::util::expand_env;
 
 /// How long a server may take to start, and to answer a request.
@@ -738,7 +738,7 @@ impl Tool for LspTool {
             return ToolOutput::error(e);
         }
         match self.ask(&input, &path).await {
-            Ok(text) => ToolOutput::ok(truncate(&text, MAX_OUTPUT_BYTES)),
+            Ok(text) => ToolOutput::ok(spill::shorten(&text, MAX_OUTPUT_BYTES, "lsp")),
             Err(e) => ToolOutput::error(e),
         }
     }

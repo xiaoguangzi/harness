@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 use super::glob::expand_braces;
-use super::{Tool, ToolOutput, parse_input, truncate};
+use super::{Tool, ToolOutput, parse_input, spill};
 use crate::sandbox;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -155,7 +155,7 @@ impl Tool for GrepTool {
         if total > limit {
             text.push_str(&format!("\n... [showing {limit} of {total} lines; raise head_limit or narrow the search]"));
         }
-        ToolOutput::ok(truncate(&text, MAX_OUTPUT_BYTES))
+        ToolOutput::ok(spill::shorten(&text, MAX_OUTPUT_BYTES, "grep"))
     }
 }
 

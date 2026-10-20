@@ -12,6 +12,7 @@ mod grep;
 mod read;
 pub mod shells;
 pub mod snapshot;
+pub(crate) mod spill;
 pub mod scheduling;
 pub(crate) mod progress;
 mod wait;
@@ -223,17 +224,11 @@ impl ToolRegistry {
 /// Keep at most `max` bytes of `s`, cutting on a char boundary and noting
 /// how much was dropped.
 pub(crate) fn truncate(s: &str, max: usize) -> String {
-    truncate_counting(s, max, 0)
-}
-
-/// Like [`truncate`], for text that already lost `dropped` bytes, which
-/// the note counts too.
-pub(crate) fn truncate_counting(s: &str, max: usize, dropped: usize) -> String {
     let mut end = s.len().min(max);
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    let dropped = dropped + s.len() - end;
+    let dropped = s.len() - end;
     if dropped == 0 {
         return s.to_string();
     }
