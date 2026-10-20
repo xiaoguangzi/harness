@@ -599,6 +599,7 @@ impl AgentTool {
     /// Runs `agent` as a subagent of the conversation that owns
     /// `subagents`; returns its report, or with `background` that it
     /// started.
+    #[allow(clippy::too_many_arguments)]
     async fn start(
         &self,
         subagents: &Subagents,
@@ -1019,16 +1020,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn isolated_subagents_change_files_in_a_worktree_of_their_own() {
         use crate::agent::mock::gateway;
-        let _guard = crate::util::lock_cwd();
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(repo.path()).args(args).output().unwrap().status.success());
         git(&["init", "-q"]);
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "start"]);
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(repo.path()).unwrap();
         let (client, mut requests) = gateway(move |n| match n {
             0 => (vec![json!({"type": "tool_use", "id": "a1", "name": "agent", "input": {
                 "agent_type": "general-purpose", "description": "make it", "prompt": "Make made.txt", "isolation": "worktree"}})], "tool_use", 10),
@@ -1041,9 +1038,10 @@ mod tests {
         let tool = AgentTool::new(Arc::new(vec![general_purpose()]), registry.clone(), client.clone(), Arc::new(|_: &Value| {}));
         registry.register(tool);
         let mut parent = Agent::new(client, registry, "sys");
-        let result = parent.run_turn(vec![json!({"type": "text", "text": "go"})], &mut crate::agent::tests::Notices::default()).await;
-        std::env::set_current_dir(previous).unwrap();
-        result.unwrap();
+        // The parent works in the repository, as if started there.
+        let mut notices = crate::agent::tests::Notices::default();
+        let turn = parent.run_turn(vec![json!({"type": "text", "text": "go"})], &mut notices);
+        crate::tools::workdir::scope(Some(repo.path().to_path_buf()), turn).await.unwrap();
         let _ = requests.recv().await;
         let child = requests.recv().await.unwrap();
         assert!(child["system"].as_str().unwrap().contains("/worktrees/"), "its environment names the worktree");

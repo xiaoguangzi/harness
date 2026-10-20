@@ -152,6 +152,10 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
         .route("/api/tasks/{id}/subagents", get(list_subagents))
         .route("/api/tasks/{id}/subagents/{agent_id}/stop", post(stop_subagent))
         .route("/api/tasks/{id}/permissions/{question}", post(answer_permission))
+        .route("/api/tasks/{id}/checkpoints", get(list_checkpoints))
+        .route("/api/tasks/{id}/rewind", post(rewind_task))
+        .route("/api/sessions", get(list_sessions))
+        .route("/api/sessions/{id}/resume", post(resume_session))
         .route("/api/tasks/{id}/mode", post(set_mode))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state.clone());
@@ -518,6 +522,86 @@ async fn answer_permission(
         return Err(api_error(StatusCode::NOT_FOUND, "nothing waits for that answer"));
     }
     Ok(Json(json!({"answered": question})))
+}
+
+async fn list_sessions(State(state): State<Shared>) -> ApiResult<Json<Value>> {
+    let Some(store) = crate::session::Store::default_location() else { return Ok(Json(json!([]))) };
+    let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+    let open: BTreeMap<String, u64> = state.tasks.lock().unwrap().values().filter_map(|t| Some((t.session_id()?, t.id))).collect();
+    let sessions: Vec<Value> = store
+        .list(&cwd)
+        .into_iter()
+        .filter(|m| m.messages > 0)
+        .take(50)
+        .map(|m| json!({
+            "id": m.id, "title": m.title, "model": m.model, "messages": m.messages, "updated": m.updated,
+            "task": open.get(&m.id),
+        }))
+        .collect();
+    Ok(Json(Value::Array(sessions)))
+}
+
+/// Goes on with a saved conversation in a new task, on the main agent; a
+/// task that has it open already is returned instead.
+async fn resume_session(State(state): State<Shared>, Path(session): Path<String>) -> ApiResult<Json<Value>> {
+    if let Some(task) = state.tasks.lock().unwrap().values().find(|t| t.session_id().as_deref() == Some(session.as_str())) {
+        return Ok(Json(task.summary()));
+    }
+    let store = crate::session::Store::default_location().ok_or_else(|| bad_request("no home directory to find saved sessions in"))?;
+    let (meta, messages) = store.load(&session).map_err(|e| api_error(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    let files = FileTracker::default();
+    let mut agent = {
+        let live = state.live.read().unwrap();
+        let client = live.client()?;
+        let client = client.switch(&meta.model).unwrap_or_else(|_| client.clone());
+        let tools = task_tools(&live, None, &files);
+        let system = crate::prompt::main(&tools);
+        Agent::new(client, tools, system)
+    };
+    agent.restore(messages);
+    let mut notes = Vec::new();
+    if let Some(dir) = crate::checkpoint::session_dir(&meta.id)
+        && let Err(e) = agent.file_history().load(dir, agent.messages())
+    {
+        notes.push(format!("its checkpoints were not loaded: {e:#}"));
+    }
+    let id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    let task = Task::resumed(id, files, agent, state.forks.clone(), store, meta);
+    {
+        let agent = task.agent.lock().await;
+        task.replay(&agent);
+    }
+    for note in notes {
+        task.push(json!({"type": "hook", "message": note}));
+    }
+    state.tasks.lock().unwrap().insert(id, task.clone());
+    Ok(Json(task.summary()))
+}
+
+async fn list_checkpoints(State(state): State<Shared>, Path(id): Path<u64>) -> ApiResult<Json<Value>> {
+    let task = find_task(&state, id)?;
+    let agent = task.agent.try_lock().map_err(|_| api_error(StatusCode::CONFLICT, "the task is running"))?;
+    Ok(Json(Value::Array(task.checkpoints(&agent))))
+}
+
+#[derive(Deserialize)]
+struct Rewind {
+    /// The checkpoint's `message`.
+    message: usize,
+    #[serde(default)]
+    code: bool,
+    #[serde(default)]
+    conversation: bool,
+}
+
+async fn rewind_task(State(state): State<Shared>, Path(id): Path<u64>, Json(req): Json<Rewind>) -> ApiResult<Json<Value>> {
+    let task = find_task(&state, id)?;
+    if !req.code && !req.conversation {
+        return Err(bad_request("say what to restore: code, conversation or both"));
+    }
+    let mut agent = task.agent.try_lock().map_err(|_| api_error(StatusCode::CONFLICT, "cannot rewind while the task runs"))?;
+    let prompt = task.rewind(&mut agent, req.message, req.code, req.conversation).map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(json!({"prompt": prompt})))
 }
 
 #[derive(Deserialize)]

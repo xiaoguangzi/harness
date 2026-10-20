@@ -15,6 +15,7 @@ use tokio::task::AbortHandle;
 use crate::agent::{Agent, Inbox, Observer};
 use crate::hooks::{Event, Hooks};
 use crate::llm::Client;
+use crate::session::{self, Recorder, Store};
 use crate::permissions::{Answer, Asker, Request};
 use crate::skills::Skill;
 use crate::subagent::{AgentDef, Forks, Subagents};
@@ -98,6 +99,61 @@ pub struct Task {
     /// Calls waiting for the user's approval, by question id.
     questions: Mutex<std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<Answer>>>,
     next_question: std::sync::atomic::AtomicU64,
+    /// Where the conversation is saved, as the REPL's are; `None` without
+    /// a home directory.
+    recorder: Mutex<Option<Recorder>>,
+}
+
+/// The events that show `messages`, a conversation saved or rewound, as the
+/// live ones showed it.
+pub fn history_events(messages: &[crate::llm::Message]) -> Vec<Value> {
+    let results: std::collections::HashMap<&str, &Value> = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| b["type"] == "tool_result")
+        .filter_map(|b| Some((b["tool_use_id"].as_str()?, b)))
+        .collect();
+    let mut events = Vec::new();
+    for message in messages {
+        if crate::agent::is_compacted(message) {
+            events.push(json!({"type": "note", "text": "✻ 会话在这里压缩过"}));
+            continue;
+        }
+        if message.role == "user" {
+            if message.content.iter().any(|b| b["type"] == "tool_result") {
+                continue;
+            }
+            let prompt = message.content.iter().rev().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str())
+                .find(|t| !t.starts_with('<') && *t != crate::agent::INTERRUPTED);
+            if let Some(prompt) = prompt {
+                events.push(json!({"type": "user", "text": prompt, "attachments": [], "warnings": []}));
+            }
+            continue;
+        }
+        for block in &message.content {
+            match block["type"].as_str() {
+                Some("text") => {
+                    events.push(json!({"type": "text", "text": block["text"]}));
+                    events.push(json!({"type": "text_end"}));
+                }
+                Some("tool_use") => {
+                    let (id, name) = (block["id"].as_str().unwrap_or_default(), block["name"].as_str().unwrap_or_default());
+                    events.push(json!({"type": "tool_call", "id": id, "name": name, "input": block["input"]}));
+                    if let Some(result) = results.get(id) {
+                        let text = match &result["content"] {
+                            Value::String(text) => text.clone(),
+                            Value::Array(items) => items.iter().filter_map(|i| i["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                            _ => String::new(),
+                        };
+                        let content = crate::tools::truncate(&text, MAX_EVENT_RESULT_BYTES);
+                        events.push(json!({"type": "tool_result", "id": id, "name": name, "content": content, "is_error": result["is_error"] == true}));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    events
 }
 
 /// Asks about a task's tool calls in the browser: a `permission` event in
@@ -141,6 +197,36 @@ impl Task {
     /// A task for `agent`. Its subagents' progress goes to the task's log,
     /// and a background subagent's report starts a turn when none runs.
     pub fn new(id: u64, title: String, def: Option<AgentDef>, files: FileTracker, agent: Agent, forks: Forks) -> Arc<Self> {
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        let recorder = Store::default_location().map(|store| Recorder::new(store, cwd));
+        Self::recording(id, title, def, files, agent, forks, recorder)
+    }
+
+    /// A task for `agent` that goes on with the saved conversation `meta`,
+    /// which `agent` holds.
+    pub fn resumed(id: u64, files: FileTracker, agent: Agent, forks: Forks, store: Store, meta: session::Meta) -> Arc<Self> {
+        let title = if meta.title.is_empty() { "(untitled)".to_string() } else { meta.title.clone() };
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        let mut recorder = Recorder::new(store, cwd);
+        recorder.resume(meta);
+        let task = Self::recording(id, title, None, files, agent, forks, Some(recorder));
+        task.meta.lock().unwrap().turns = 0;
+        task
+    }
+
+    fn recording(
+        id: u64,
+        title: String,
+        def: Option<AgentDef>,
+        files: FileTracker,
+        agent: Agent,
+        forks: Forks,
+        recorder: Option<Recorder>,
+    ) -> Arc<Self> {
+        if let Some(rec) = &recorder {
+            agent.hooks().set_session(&rec.meta().id, Some(rec.file()));
+            agent.file_history().set_dir(crate::checkpoint::session_dir(&rec.meta().id));
+        }
         let created = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let meta = Meta { status: Status::Idle, model: agent.model().to_string(), turns: 0, handle: None };
         Arc::new_cyclic(|task: &Weak<Task>| {
@@ -176,8 +262,67 @@ impl Task {
                 permissions,
                 questions: Mutex::new(std::collections::BTreeMap::new()),
                 next_question: std::sync::atomic::AtomicU64::new(1),
+                recorder: Mutex::new(recorder),
             }
         })
+    }
+
+    /// The saved session the task records to.
+    pub fn session_id(&self) -> Option<String> {
+        self.recorder.lock().unwrap().as_ref().map(|rec| rec.meta().id.clone())
+    }
+
+    /// Saves the conversation, and its checkpoints, as they are now.
+    fn save(&self, agent: &Agent) {
+        let mut recorder = self.recorder.lock().unwrap();
+        let Some(rec) = recorder.as_mut() else { return };
+        if rec.meta().title.is_empty() {
+            rec.set_title(&self.title);
+        }
+        if let Err(e) = rec.save(agent.messages(), agent.model()).and_then(|()| agent.file_history().save()) {
+            drop(recorder);
+            self.push(json!({"type": "hook", "message": format!("the conversation was not saved: {e:#}")}));
+        }
+    }
+
+    /// Shows the conversation `agent` holds now from the start: a `reset`
+    /// event, which clears what the UI shows, then its messages as events.
+    pub fn replay(&self, agent: &Agent) {
+        self.push(json!({"type": "reset"}));
+        for event in history_events(agent.messages()) {
+            self.push(event);
+        }
+    }
+
+    /// The prompts the conversation can go back to before, the most recent
+    /// first.
+    pub fn checkpoints(&self, agent: &Agent) -> Vec<Value> {
+        agent.file_history().checkpoints().iter().rev().map(|c| json!({
+            "message": c.message,
+            "prompt": c.prompt,
+            "time": c.time,
+            "files": c.files.len(),
+        })).collect()
+    }
+
+    /// Goes back to before the prompt at `message` (`agent` is the task's,
+    /// locked): the files `edit` and `write` changed since, with `code`,
+    /// and the conversation, with `conversation`, whose prompt comes back.
+    pub fn rewind(&self, agent: &mut Agent, message: usize, code: bool, conversation: bool) -> anyhow::Result<Option<String>> {
+        if !agent.file_history().checkpoints().iter().any(|c| c.message == message) {
+            anyhow::bail!("there is no prompt to go back to there");
+        }
+        if code {
+            let changes = agent.file_history().changes(message)?;
+            crate::checkpoint::restore(&changes)?;
+            self.push(json!({"type": "hook", "message": format!("restored {} files as they were before that prompt", changes.len())}));
+        }
+        let prompt = if conversation { agent.rewind(message) } else { None };
+        if prompt.is_some() {
+            self.replay(agent);
+        }
+        self.save(agent);
+        Ok(prompt)
     }
 
     /// Answers question `id` about a tool call; false if nothing waits
@@ -206,6 +351,7 @@ impl Task {
             "active": meta.handle.is_some(),
             "pending_tasks": self.subagents.running_in_background() + self.shells.pending(),
             "permission_mode": self.permissions.mode().as_str(),
+            "session_id": self.session_id(),
         })
     }
 
@@ -300,6 +446,8 @@ impl Task {
                 }
             };
             let compact_after = result.as_ref().ok().and_then(|_| agent.idle_compaction_after());
+            agent.settle();
+            task.save(&agent);
             drop(agent);
             task.finish(result);
             // Reports that arrived as the turn ended get a turn of their own.

@@ -205,6 +205,11 @@ details.tool.err { border-color: color-mix(in srgb, var(--err) 38%, var(--line))
 details.tool.subagent { border-left: 3px solid var(--accent); }
 .sub { color: var(--muted); font: 12px var(--mono); padding-left: 12px; border-left: 2px solid var(--line-strong); }
 .note { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.saved { margin-top: 14px; display: flex; flex-direction: column; gap: 4px; }
+.saved-item { text-align: left; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; cursor: pointer; color: var(--text); font: inherit; }
+.saved-item:hover { border-color: var(--line-strong); }
+.card.rewind { display: flex; flex-direction: column; gap: 10px; margin: 0 0 12px; }
+.rewind-item { border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 4px; }
 .note.permission { color: var(--text); font-size: 13px; border: 1px solid var(--warn); background: var(--warn-soft); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
 .note.err { color: var(--err); white-space: pre-wrap; }
 .note.hook { color: var(--warn); white-space: pre-wrap; }
@@ -551,6 +556,16 @@ function showNewTask() {
     if (!e.shiftKey || e.ctrlKey || e.metaKey) { e.preventDefault(); go(); }
   });
   const noModel = info && !info.config.active;
+  const savedSessions = h("div", { class: "saved" });
+  api("GET", "/api/sessions").then(list => {
+    if (!list.length) return;
+    savedSessions.replaceChildren(h("label", {}, "继续之前的会话"),
+      ...list.slice(0, 8).map(s => h("button", { class: "saved-item", title: s.id, onclick: async () => {
+        try { const t = await api("POST", `/api/sessions/${encodeURIComponent(s.id)}/resume`); openTask(t.id); }
+        catch (e) { toast(e.message, true); } } },
+        h("span", {}, s.title || "(未命名)"),
+        h("span", { class: "muted" }, ` · ${s.messages} 条消息 · ${s.model}` + (s.task ? " · 已打开" : "")))));
+  }).catch(() => {});
   document.getElementById("task-view").replaceChildren(h("div", { class: "col" },
     h("div", { class: "hero" },
       h("div", { class: "hero-inner" },
@@ -558,7 +573,7 @@ function showNewTask() {
         h("div", { class: "hero-mark", "aria-hidden": "true" }),
         h("h2", {}, "开始一个新任务"),
         h("p", {}, "在下方输入并发送即可。@路径 附加文件，/技能名 调用 skill。"),
-        h("label", {}, "执行者"), chips, agentHint)),
+        h("label", {}, "执行者"), chips, agentHint, savedSessions)),
     h("div", { class: "newtask-composer" },
       h("div", { class: "composer-card" }, prompt,
         h("div", { class: "composer-foot" },
@@ -608,6 +623,7 @@ function openTask(id) {
         h("button", { class: "btn", onclick: async () => {
           try { await api("POST", `/api/tasks/${id}/model`, { model: model.value }); toast("已切换模型"); refreshTasks(); }
           catch (e) { toast(e.message, true); } } }, "切换模型"),
+        h("button", { class: "btn", onclick: () => showRewind(id, input) }, "回退…"),
         h("label", { style: "margin:0" }, "权限模式"), modeSelect,
         h("button", { class: "btn", onclick: async () => {
           try { await api("POST", `/api/tasks/${id}/mode`, { mode: modeSelect.value }); toast("已切换权限模式"); refreshTasks(); }
@@ -707,6 +723,32 @@ function permissionCard(ev) {
   return el;
 }
 
+/** Lists the task's prompts to go back to before, and does it. */
+async function showRewind(id, input) {
+  let list;
+  try { list = await api("GET", `/api/tasks/${id}/checkpoints`); } catch (e) { toast(e.message, true); return; }
+  if (!list.length) { toast("还没有可以回退到的提示"); return; }
+  const rewind = async (c, code, conversation) => {
+    try {
+      const r = await api("POST", `/api/tasks/${id}/rewind`, { message: c.message, code, conversation });
+      if (r.prompt) { input.value = r.prompt; input.focus(); }
+      panel.remove(); toast("已回退");
+    } catch (e) { toast(e.message, true); }
+  };
+  const panel = h("div", { class: "card rewind" },
+    h("div", { class: "row", style: "justify-content:space-between;align-items:center" },
+      h("strong", {}, "回退到某个提示之前"), h("button", { class: "btn", onclick: () => panel.remove() }, "关闭")),
+    ...list.map(c => h("div", { class: "rewind-item" },
+      h("div", {}, c.prompt.split("\n")[0].slice(0, 120)),
+      h("div", { class: "muted" }, c.files ? `之后改了 ${c.files} 个文件` : "之后没有改文件"),
+      h("div", { class: "row" },
+        h("button", { class: "btn", onclick: () => rewind(c, true, true) }, "代码和会话"),
+        h("button", { class: "btn", onclick: () => rewind(c, false, true) }, "只回退会话"),
+        c.files ? h("button", { class: "btn", onclick: () => rewind(c, true, false) }, "只恢复代码") : null))));
+  transcript.append(panel);
+  panel.scrollIntoView({ block: "nearest" });
+}
+
 function renderEvent(ev) {
   stickToBottom(() => {
     switch (ev.type) {
@@ -751,6 +793,8 @@ function renderEvent(ev) {
         transcript.append(h("div", { class: "note hook" }, "⚑ " + ev.message)); break;
       case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台任务有了结果，继续")); break;
       case "permission": assistantEl = null; transcript.append(permissionCard(ev)); break;
+      case "reset": transcript.replaceChildren(); pending = []; assistantEl = null; subagents = new Map(); break;
+      case "note": assistantEl = null; transcript.append(h("div", { class: "note" }, ev.text)); break;
       case "permission_answered": {
         const q = questions.get(ev.id);
         if (q) { q.buttons.replaceChildren(h("span", { class: "muted" }, { allow: "已允许", always: "已允许（本会话）", deny: "已拒绝", dropped: "调用已取消" }[ev.answer] || ev.answer)); questions.delete(ev.id); }

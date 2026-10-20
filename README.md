@@ -107,7 +107,9 @@ The server starts even without a usable provider, so the first model can be conf
 | `POST /api/tasks/{id}/messages` `{prompt}`, `/model` `{model}`, `/cancel`; `DELETE /api/tasks/{id}` | drive a task |
 | `GET /api/tasks/{id}/subagents`, `POST /api/tasks/{id}/subagents/{agent_id}/stop` | list / stop the task's subagents |
 | `POST /api/tasks/{id}/permissions/{question}` `{answer, message?}`, `/mode` `{mode}` | answer a `permission` event (`allow`, `always`, `deny`), or set the task's [permission mode](#permissions) |
-| `GET /api/tasks/{id}/events` | server-sent events: the task's log replayed, then live (resumes via `Last-Event-ID`) |
+| `GET /api/tasks/{id}/events` | server-sent events: the task's log replayed, then live (resumes via `Last-Event-ID`); a `reset` event means what came before no longer shows (after a rewind) |
+| `GET /api/tasks/{id}/checkpoints`, `POST /api/tasks/{id}/rewind` `{message, code, conversation}` | the prompts a task can go back to before, and going back |
+| `GET /api/sessions`, `POST /api/sessions/{id}/resume` | this directory's saved conversations, and going on with one in a task |
 
 ## LLM gateways
 
@@ -315,7 +317,7 @@ Every REPL and one-shot conversation is saved after each turn to `~/.harness/ses
 | `harness -r <id>` / `--resume=<id>` | resume that one; a unique prefix of the id is enough |
 | `/resume`, `/resume <id>` | the same from inside the REPL |
 
-They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r <id> "..."` (a one-shot `--resume` needs the id). A resumed conversation continues under its id, on the model it last used if that is still configured, and in the REPL its last turns are shown again. Reasoning blocks are kept, so they are sent back to the model that produced them. The read tracking of `edit` and `write` is not saved: the model reads a file again before changing it. Web UI tasks are not saved.
+They combine with one-shot mode: `harness -c "now run the tests"` or `harness -r <id> "..."` (a one-shot `--resume` needs the id). A resumed conversation continues under its id, on the model it last used if that is still configured, and in the REPL its last turns are shown again. Reasoning blocks are kept, so they are sent back to the model that produced them. The read tracking of `edit` and `write` is not saved: the model reads a file again before changing it. Web UI tasks are saved the same way, after each turn: the web UI lists this directory's saved conversations when you start a task and goes on with one in a new task (on the main agent), showing what it had so far; one already open in a task opens that task.
 
 ## Rewinding
 
@@ -331,7 +333,7 @@ As in Claude Code, every prompt you send in the REPL is a checkpoint: before `ed
 - Messages sent from the input box while a turn runs belong to that turn's prompt; a turn for a background subagent's report makes no checkpoint.
 - A compaction removes the earlier checkpoints with the conversation they belong to: only prompts after it can be rewound to.
 - After rewinding the conversation, the model reads files again before changing them.
-- Checkpoints are saved with the session, the kept versions in `~/.harness/file-history/<id>/` (readable by their owner only), so they still work after `--continue` or `/resume`. A conversation rewound to its first prompt is no longer saved. The web UI has no rewind.
+- Checkpoints are saved with the session, the kept versions in `~/.harness/file-history/<id>/` (readable by their owner only), so they still work after `--continue` or `/resume`. A conversation rewound to its first prompt is no longer saved. In the web UI, `回退…` under a task's `⋯` lists its prompts and goes back to before one, with the code, the conversation or both; the prompt goes back into the message box.
 
 ## Permissions
 

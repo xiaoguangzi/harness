@@ -108,7 +108,9 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `POST /api/tasks/{id}/messages` `{prompt}`、`/model` `{model}`、`/cancel`；`DELETE /api/tasks/{id}` | 驱动任务 |
 | `GET /api/tasks/{id}/subagents`、`POST /api/tasks/{id}/subagents/{agent_id}/stop` | 列出 / 停止该任务的子代理 |
 | `POST /api/tasks/{id}/permissions/{question}` `{answer, message?}`、`/mode` `{mode}` | 回答 `permission` 事件（`allow`、`always`、`deny`），或设置该任务的[权限模式](#权限) |
-| `GET /api/tasks/{id}/events` | server-sent events：先回放该任务的日志，再实时推送（可通过 `Last-Event-ID` 恢复） |
+| `GET /api/tasks/{id}/events` | server-sent events：先回放该任务的日志，再实时推送（可通过 `Last-Event-ID` 恢复）；`reset` 事件表示之前的内容不再显示（回退之后） |
+| `GET /api/tasks/{id}/checkpoints`、`POST /api/tasks/{id}/rewind` `{message, code, conversation}` | 任务可以回到的提示，以及执行回退 |
+| `GET /api/sessions`、`POST /api/sessions/{id}/resume` | 这个目录下保存的会话，以及在任务中继续其中一个 |
 
 ## LLM 网关
 
@@ -316,7 +318,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 | `harness -r <id>` / `--resume=<id>` | 继续指定会话；id 的唯一前缀即可 |
 | `/resume`、`/resume <id>` | 在 REPL 内做同样的事 |
 
-它们可以与一次性模式组合：`harness -c "now run the tests"` 或 `harness -r <id> "..."`（一次性模式下 `--resume` 需要给出 id）。恢复的会话沿用原来的 id；若上次使用的模型仍在配置中，则切换回该模型；在 REPL 中会重新显示最后几轮。推理块会被保留，因此仍会发回给产生它的模型。`edit` 和 `write` 的已读记录不会保存：模型在修改文件前需要重新读取。Web UI 的任务不会保存。
+它们可以与一次性模式组合：`harness -c "now run the tests"` 或 `harness -r <id> "..."`（一次性模式下 `--resume` 需要给出 id）。恢复的会话沿用原来的 id；若上次使用的模型仍在配置中，则切换回该模型；在 REPL 中会重新显示最后几轮。推理块会被保留，因此仍会发回给产生它的模型。`edit` 和 `write` 的已读记录不会保存：模型在修改文件前需要重新读取。Web UI 的任务也以同样方式在每轮之后保存：新建任务时，web UI 会列出这个目录下保存的会话，可以在新任务中（主代理上）继续其中一个，并显示它之前的内容；已经在某个任务中打开的会话会直接打开那个任务。
 
 ## 回退
 
@@ -332,7 +334,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 - 一轮运行期间从输入框发送的消息属于这一轮的提示；为后台子代理的报告运行的一轮不产生检查点。
 - 上下文压缩会连同之前的对话一起移除更早的检查点：只能回退到压缩之后的提示。
 - 回退对话之后，模型在修改文件前需要重新读取。
-- 检查点随会话一起保存，保留的文件版本在 `~/.harness/file-history/<id>/`（仅所有者可读），因此 `--continue` 或 `/resume` 之后仍然可用。回退到第一条提示的会话不再保存。Web UI 不支持回退。
+- 检查点随会话一起保存，保留的文件版本在 `~/.harness/file-history/<id>/`（仅所有者可读），因此 `--continue` 或 `/resume` 之后仍然可用。回退到第一条提示的会话不再保存。在 web UI 中，任务 `⋯` 菜单里的 `回退…` 会列出它的提示，可以回到其中一个之前，恢复代码、会话或两者；该提示会回到消息输入框中。
 
 ## 权限
 
