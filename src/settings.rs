@@ -55,6 +55,8 @@ pub struct Settings {
     #[serde(default)]
     pub sandbox: sandbox::Config,
     #[serde(default)]
+    pub permissions: crate::permissions::Config,
+    #[serde(default)]
     pub shell: bash::Config,
     #[serde(default)]
     pub hooks: hooks::Config,

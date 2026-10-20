@@ -24,6 +24,7 @@ harness "list the files"                # one-shot
 harness --continue                      # resume the latest conversation here (see below)
 harness --web                           # web UI at http://localhost:8787 (see below)
 harness --sandbox                       # run the model's commands in an OS sandbox (see below)
+harness --permission-mode default       # ask before tool calls that change things (see below)
 harness --plugin-dir ./my-plugin        # load a plugin from a directory for this run (see below)
 harness provider add relay              # add an LLM gateway, asking for its URL, key and models (see below)
 harness plugin install fmt@team         # install a plugin (see below; harness plugin help)
@@ -77,6 +78,7 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 | `idle_compaction`, `idle_compaction_min_tokens` | [idle compaction](#compaction) |
 | `mcpServers` | [MCP servers](#mcp-servers) |
 | `sandbox` | the [sandbox](#sandbox) |
+| `permissions` | which tool calls ask first, or are refused: [permissions](#permissions) |
 | `shell` | the [environment of the model's commands](#commands-environment) |
 | `hooks` | [hooks](#hooks) |
 | `statusLine` | the REPL's [status line](#status-line) |
@@ -104,6 +106,7 @@ The server starts even without a usable provider, so the first model can be conf
 | `GET/POST /api/tasks` `{prompt, agent?, model?, title?}` | list / create tasks |
 | `POST /api/tasks/{id}/messages` `{prompt}`, `/model` `{model}`, `/cancel`; `DELETE /api/tasks/{id}` | drive a task |
 | `GET /api/tasks/{id}/subagents`, `POST /api/tasks/{id}/subagents/{agent_id}/stop` | list / stop the task's subagents |
+| `POST /api/tasks/{id}/permissions/{question}` `{answer, message?}`, `/mode` `{mode}` | answer a `permission` event (`allow`, `always`, `deny`), or set the task's [permission mode](#permissions) |
 | `GET /api/tasks/{id}/events` | server-sent events: the task's log replayed, then live (resumes via `Last-Event-ID`) |
 
 ## LLM gateways
@@ -224,6 +227,7 @@ Interactive command panels use the available terminal width, with headings and s
 | `/plugins [command]` | open plugin management;  `/plugins update` fetches their latest versions, and `/plugins install`, `uninstall`, `enable`, `disable`, `configure`, `marketplace …` work as `harness plugin` does (see [Plugins](#plugins)) |
 | `/reload-plugins` | load the plugins, skills, commands, agents and hooks again from the settings, for the next conversation: at once if this one is empty, else from `/clear` or `/resume` on |
 | `/sandbox` | show what the sandbox allows (see [Sandbox](#sandbox)) |
+| `/permissions [mode\|rules]` | choose the [permission mode](#permissions), set it (`/permissions plan`), or list the rules |
 | `!command` | run `command` yourself, as the model's `bash` would (in the sandbox when it is on, but without the rule against commands that change files); its output is shown, and goes to the model with your next message |
 | `/btw <question>` | ask a side question about the conversation: the model answers from what it already knows, without tools, and neither the question nor the answer is kept in the conversation. One request with the same prefix, so it reads the prompt cache |
 | `/copy [n]` | copy the model's last reply (or the `n`th latest) to the clipboard: `pbcopy`, `wl-copy`, `xclip` or `xsel`, else the terminal (OSC 52, which works over SSH where the terminal allows it) |
@@ -232,6 +236,7 @@ Interactive command panels use the available terminal width, with headings and s
 | `/exit`, `exit`, Ctrl-D | quit (`exit` or `quit` only when alone on the line) |
 | Esc | interrupt the running turn, like Ctrl-C |
 | Esc Esc | at an empty prompt: `/rewind` |
+| Shift+Tab | the next [permission mode](#permissions): default, accept edits, plan, bypass permissions |
 | ↑ while a turn runs | take the queued messages the model has not got yet back into the input box, to edit |
 | Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted. At the prompt, press it twice to quit |
 | `\` at line end, Alt+Enter | continue the message on a new line (Shift+Enter also works when the terminal sends a distinct key sequence) |
@@ -328,6 +333,35 @@ As in Claude Code, every prompt you send in the REPL is a checkpoint: before `ed
 - After rewinding the conversation, the model reads files again before changing them.
 - Checkpoints are saved with the session, the kept versions in `~/.harness/file-history/<id>/` (readable by their owner only), so they still work after `--continue` or `/resume`. A conversation rewound to its first prompt is no longer saved. The web UI has no rewind.
 
+## Permissions
+
+By default the harness runs every tool call without asking, as before; the OS [sandbox](#sandbox) is what contains the model's commands. The `permissions` section of the [settings](#settings), in Claude Code's format, can make it ask first, or refuse:
+
+```json
+{
+  "permissions": {
+    "defaultMode": "default",
+    "allow": ["Bash(cargo test:*)", "Bash(git status)", "mcp__exa"],
+    "ask": ["Bash(git push:*)"],
+    "deny": ["Read(.env)", "Bash(rm -rf:*)", "mcp__gh__delete*"]
+  }
+}
+```
+
+- Rules take Claude Code's permission syntax, as hooks' `if` does: a tool by its name or Claude Code's (`Bash`, `Edit`, `read`), with what its command starts with (`git commit:*`; each part of a compound command counts) or what its path matches (`src/**`) in parentheses. `mcp__<server>` is all of that server's tools, and a trailing `*` any tool whose name starts so.
+- A deny rule refuses a call in every mode, a PreToolUse hook's `allow` included. Then an ask rule (or a hook's `ask`) asks, in every mode. Then an allow rule, or one you allowed for the session, lets it run. Otherwise the mode decides:
+
+| Mode | |
+|---|---|
+| `bypassPermissions` (default) | everything runs |
+| `default` | what only reads runs (`read`, `grep`, `glob`, `lsp`, MCP tools marked read-only), and in the sandbox `bash` too (`"auto_allow_bash": false` in the `sandbox` section asks for it as well); the rest asks |
+| `acceptEdits` | as `default`, and `edit` and `write` run for files in the working directory |
+| `plan` | only what reads runs; the rest is refused, and the model is told to research and present a plan. Leaving plan mode tells it it may go ahead |
+
+- The tools that start or wait for other work (`agent`, `message_agent`, `stop_agent`, `wait_tasks`, `bash_output`, `kill_shell`) never ask; the calls of the subagents they start do, as subagents share their conversation's permissions and mode. A background subagent's question shows like the main agent's.
+- In the REPL a question takes the input box's place: `Allow bash(make)?` with what it needs asking for (an edit's lines too), and 1 to allow it, 2 to allow it and calls like it for the session (`Bash(make:*)`, `Edit`), or 3 or Esc to refuse it, telling the model to do something else. In the web UI it shows in the task with buttons. A `PermissionRequest` [hook](#hooks) runs first and may decide instead. Where no one can be asked (one-shot mode, redirected input, a forked skill), the call is refused, and the model is told how it could be allowed.
+- Shift+Tab, `/permissions` or `--permission-mode MODE` change the mode; a mode other than the starting one shows under the input box. The web UI sets it per task under `⋯`.
+
 ## Sandbox
 
 `harness --sandbox` (or `HARNESS_SANDBOX=1`, or `"enabled": true` in the settings' `sandbox` section) runs the model's `bash` commands and `grep` / `glob` searches in an OS sandbox: Seatbelt (`sandbox-exec`, built in) on macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux (`apt install bubblewrap` / `dnf install bubblewrap`; it needs unprivileged user namespaces, which some containers lack). `--no-sandbox` or `HARNESS_SANDBOX=0` turns it off for one run. If the sandbox cannot start, the harness exits rather than run without it.
@@ -414,16 +448,17 @@ Hooks run your own commands at points of the agent loop: to block dangerous comm
 | `SessionStart` | before the first request of a conversation, and after `/clear`, `/resume` or a compaction | `startup`, `clear`, `resume`, `compact` | add context |
 | `SessionEnd` | when a conversation that sent a request ends: before `/clear` or `/resume` replaces it, when you quit the REPL, at the end of a one-shot run, when its web task is deleted | `clear`, `resume`, `prompt_input_exit`, `other` | nothing; it gets 1.5 s unless it sets `timeout` (at most 60 s) |
 | `Notification` | when the REPL's prompt, or a web task, has waited 60 s for you after a turn | `idle_prompt` | nothing; it gets `notification_type` and `message`, e.g. to show a desktop notification |
+| `PermissionRequest` | before you are asked about a tool call (see [Permissions](#permissions)) | tool name | decide instead of you: `hookSpecificOutput.decision.behavior` `"allow"` or `"deny"` (with a `message` for the model); it gets `permission_suggestions` too |
 
-- A hook runs as `sh -c <command>` in the working directory, outside the sandbox, with `$CLAUDE_PROJECT_DIR` and `$HARNESS_PROJECT_DIR` set to it. With `args` (a list of strings), `command` is started directly with them instead, without a shell, so nothing in them is expanded or split (a plugin's `${CLAUDE_PLUGIN_ROOT}` and the like are still replaced). It gets the event as JSON on stdin: `session_id`, `transcript_path` (the saved session file), `cwd`, `hook_event_name`, `model`, `permission_mode` (always `bypassPermissions`: the harness never asks before running a tool), `agent_id` and `agent_type` in a subagent, and the event's own fields (`tool_name`, `tool_use_id`, `tool_input`, `tool_response` or `error`; `prompt`; `stop_hook_active`, `last_assistant_message`; `trigger`, `custom_instructions`, `compact_summary`; `source`, `reason`).
+- A hook runs as `sh -c <command>` in the working directory, outside the sandbox, with `$CLAUDE_PROJECT_DIR` and `$HARNESS_PROJECT_DIR` set to it. With `args` (a list of strings), `command` is started directly with them instead, without a shell, so nothing in them is expanded or split (a plugin's `${CLAUDE_PLUGIN_ROOT}` and the like are still replaced). It gets the event as JSON on stdin: `session_id`, `transcript_path` (the saved session file), `cwd`, `hook_event_name`, `model`, `permission_mode` (the conversation's [permission mode](#permissions)), `agent_id` and `agent_type` in a subagent, and the event's own fields (`tool_name`, `tool_use_id`, `tool_input`, `tool_response` or `error`; `prompt`; `stop_hook_active`, `last_assistant_message`; `trigger`, `custom_instructions`, `compact_summary`; `source`, `reason`).
 - Exit code 0: stdout is read as JSON if it starts with `{` (`continue` / `stopReason`, `systemMessage`, `decision` / `reason`, `hookSpecificOutput`), otherwise it is context for the model for `SessionStart`, `SubagentStart` and `UserPromptSubmit`, and ignored for the rest. Exit code 2 blocks, with stderr as the reason. Another exit code, a timeout (`timeout`, in seconds, default 600), a command that cannot start or bad JSON is shown to you and changes nothing, unless the command hook sets `"onFailure": "block"`: then a failure blocks as exit code 2 would, for a guard that must not be skipped when it breaks. `continue: false` ends the turn.
 - Tools also match, and appear to hooks, under their Claude Code names: `bash` is `Bash`, `read` / `edit` / `write` / `grep` / `glob` / `lsp` are `Read` / `Edit` / `Write` / `Grep` / `Glob` / `LSP`, `agent` is `Agent` (or `Task`); MCP tools keep `mcp__<server>__<tool>`. A matcher made of names (`Edit|Write`) matches them exactly, anything else is a regular expression (`mcp__fs__.*`), and an empty one or `*` matches everything. The file tools' `path` also comes as `file_path`, and an `updatedInput` may use either.
-- `permissionDecision: "ask"` refuses the call, as there is no one to ask.
+- `permissionDecision: "ask"` makes the call ask the user (see [Permissions](#permissions)), and `"allow"` lets it run without asking, unless a deny rule refuses it.
 - A `prompt` hook (`{"type": "prompt", "prompt": "…", "model": "…", "timeout": 30}`) asks a model instead of running a command: the conversation's, or `model` when it names one the providers know (Claude Code's `haiku` and the like do not). The event's input JSON goes in place of `$ARGUMENTS` in the prompt (after it, without one), and the model answers `{"ok": true}` or `{"ok": false, "reason": "…"}`; `ok: false` acts like exit code 2 with the reason, so a Stop prompt hook sends the model back to work. It gets 30 s unless it sets `timeout`; its requests are not counted in `/usage`.
 - All the hooks matching an event run at once, at most 12 at a time; a command listed twice runs once. Hooks run in subagents too (`SubagentStop` instead of `Stop`) and in web tasks.
 - What hooks tell the model arrives in `<hook-feedback>` blocks; what they have for you (a `systemMessage`, a refusal, a failure) shows as a `⚑` line.
 - `if` narrows a hook of a tool event to some calls, in Claude Code's permission syntax: `Bash(git commit:*)` or `Bash(git push *)` (the command, or a part of a compound one, starts so; `*` matches anything), `Edit(src/**/*.ts)` (the file path), or a tool's name alone. A hook with `async: true` runs in the background without holding up the call; what it has for the model goes with the next request. With `asyncRewake: true` it does too, and if it exits with code 2 the model is woken with its `rewakeMessage` and the hook's reason, in a turn of its own if it is idle.
-- Only `command` and `prompt` hooks and the events above are supported; other hook types (`http`, `agent`, `mcp_tool`) and other events (`PermissionRequest`, …) are an error in the settings (a [plugin](#plugins)'s are left out with a warning). Hooks come only from the settings file and the plugins it enables, so a repository cannot add any; changes apply on the next start, or to the next conversation after `/reload-plugins`.
+- Only `command` and `prompt` hooks and the events above are supported; other hook types (`http`, `agent`, `mcp_tool`) and other events (`Elicitation`, …) are an error in the settings (a [plugin](#plugins)'s are left out with a warning). Hooks come only from the settings file and the plugins it enables, so a repository cannot add any; changes apply on the next start, or to the next conversation after `/reload-plugins`.
 
 ## Project notes
 
@@ -608,7 +643,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/main.rs` — startup: settings, `harness plugin`, `harness provider` and `--check-plugins`, the sandbox, then what `setup.rs` builds; then the CLI or web frontend
 - `src/setup.rs` — what a conversation is built from: the plugins with their skills, agents, hooks, MCP and language servers (rebuilt by `/reload-plugins`), the user's MCP servers, the tool set and system prompt; `--check-plugins`; background auto-updates
 - `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section, editing it in place
-- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), `--output-format json` / `stream-json` (`json.rs`), `!command`, `/btw`, `/copy` and `/export` (`actions.rs`), the status line (`status_line.rs`), `/rewind` (`rewind.rs`), the keyboard panels slash commands open (`dialog.rs`) and what each bare command shows in one (`commands.rs`), the `/model` panel for models and effort (`model.rs`), the spinner, input box and turn display (`output.rs`), retained tool results (`tool_output.rs`), the searchable expanded conversation (`transcript.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), shared viewport and native scrollback (`screen.rs`), prompt input, menu keys, completion, history, multi-line input, Ctrl+V and Esc Esc (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
+- `src/cli/` — terminal frontend: the REPL and one-shot mode (`mod.rs`), `--output-format json` / `stream-json` (`json.rs`), `!command`, `/btw`, `/copy` and `/export` (`actions.rs`), asking about tool calls (`approve.rs`), the status line (`status_line.rs`), `/rewind` (`rewind.rs`), the keyboard panels slash commands open (`dialog.rs`) and what each bare command shows in one (`commands.rs`), the `/model` panel for models and effort (`model.rs`), the spinner, input box and turn display (`output.rs`), retained tool results (`tool_output.rs`), the searchable expanded conversation (`transcript.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the menu under the prompt: commands, project file search (`menu.rs`), shared viewport and native scrollback (`screen.rs`), prompt input, menu keys, completion, history, multi-line input, Ctrl+V and Esc Esc (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
 - `src/agent.rs` — agent loop: request → run tools (concurrently) → send results → repeat until `end_turn`; the inbox that hands the model what arrives meanwhile, such as background subagent reports
 - `src/agent/usage.rs` — the per-model token counts `/usage` shows, shared with the subagents
@@ -623,6 +658,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
 - `src/checkpoint.rs` — checkpoints for `/rewind`: the files `edit` and `write` change, kept as they were before each prompt, saved with the session; restoring them
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks; pasted images' blocks
+- `src/permissions.rs` — permissions: the settings' rules, the modes, which calls run, ask or are refused, and asking through the frontend
 - `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read`, `edit` and `write` check
 - `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
 - `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox

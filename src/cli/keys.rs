@@ -53,6 +53,8 @@ pub enum Key {
     PasteImage,
     /// Ctrl+O: inspect the full output of tool calls.
     ToolOutput,
+    /// Shift+Tab: the next permission mode.
+    BackTab,
     /// A terminal position report, ignored by the owned viewport.
     Position(usize),
 }
@@ -320,6 +322,7 @@ fn parse_csi(buf: &[u8]) -> Parsed {
         (_, b'H') | (b"1" | b"7", b'~') => Key::Home,
         (_, b'F') | (b"4" | b"8", b'~') => Key::End,
         (b"3", b'~') => Key::Delete,
+        (_, b'Z') => Key::BackTab,
         (b"5", b'~') => Key::PageUp,
         (b"6", b'~') => Key::PageDown,
         // A cursor position report, `row;col R`.

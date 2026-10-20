@@ -1,6 +1,7 @@
 //! Terminal frontend: the interactive REPL and one-shot mode.
 
 mod actions;
+mod approve;
 mod clipboard;
 mod diff;
 mod dialog;
@@ -51,7 +52,7 @@ use menu::Command;
 use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-const BUILTINS: [(&str, &str); 24] = [
+const BUILTINS: [(&str, &str); 25] = [
     ("/help", "browse commands; Enter inserts one into the prompt"),
     ("/model", "choose main/subagent models and effort; /model <provider>/<model> switches directly"),
     ("/effort", "choose reasoning effort, or set it with /effort <level>"),
@@ -75,6 +76,7 @@ const BUILTINS: [(&str, &str); 24] = [
     ("/plugins", "manage plugins; /plugins install|uninstall|enable|disable|update|marketplace … also works"),
     ("/reload-plugins", "load plugins, skills, agents and hooks again, for the next conversation"),
     ("/sandbox", "show what the sandbox allows commands to do"),
+    ("/permissions", "choose the permission mode (or Shift+Tab); /permissions <mode> sets it, /permissions rules lists the rules"),
     ("/exit", "quit (or exit, Ctrl-D)"),
 ];
 
@@ -97,6 +99,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
         out.set_silent(true);
     }
     out.spawn_spinner();
+    out.set_permissions(agent.permissions().clone());
     let mut term = Terminal::new(out.clone());
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
     let mut recorder = Store::default_location().map(|store| Recorder::new(store, cwd));
@@ -107,6 +110,9 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
 
     let boxed = !one_shot && std::io::stdin().is_terminal() && out.interactive();
     let _screen = boxed.then(|| out.enter_screen());
+    if boxed {
+        agent.permissions().set_asker(Some(approve::TerminalAsker::new(out.clone())));
+    }
     if !one_shot {
         print_banner(agent, &skills, env, &out);
     }
@@ -473,6 +479,15 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                     Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
                 }
             }
+            Input::Permissions(None) => show_permissions(agent, &out),
+            Input::Permissions(Some(arg)) if arg == "rules" => show_permissions(agent, &out),
+            Input::Permissions(Some(arg)) => match crate::permissions::Mode::parse(&arg) {
+                Ok(mode) => {
+                    agent.permissions().set_mode(mode);
+                    out.line(format!("permission mode: {} — {}", out.paint("1", mode.as_str()), mode.describe()));
+                }
+                Err(e) => out.line(out.paint("31", &e)),
+            },
             Input::Effort(None) => {
                 out.line(format!("effort: {}", out.paint("1", agent.client().effort().as_str())));
                 out.line(out.paint("2", "set with /effort low|medium|high|xhigh|max, or /effort auto"));
@@ -902,12 +917,14 @@ async fn run_shown(
     let inbox = agent.inbox().clone();
     let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
     let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut _routed = None;
     let mut keys = match input.as_mut() {
         Some(input) => {
             out.open_input(std::mem::take(input.typing), inbox.clone());
+            _routed = Some(out.route_keys());
             let typed = out.clone();
             KeyWatch::for_prompt(move |key| {
-                if typed.tool_output_key(&key) { return; }
+                if typed.question_key(&key) || typed.tool_output_key(&key) { return; }
                 if key == Key::Esc { let _ = interrupt_tx.send(()); }
                 else { type_key(&typed, key, &tx); }
             })
@@ -1110,6 +1127,9 @@ enum Input {
     ManagePlugins(Vec<String>),
     /// `/reload-plugins`.
     ReloadPlugins,
+    /// `/permissions` chooses the mode, `/permissions <mode>` sets it,
+    /// `/permissions rules` lists the rules.
+    Permissions(Option<String>),
     /// `!command` runs it for the user.
     Shell(String),
     /// `/btw <question>` asks a side question.
@@ -1170,6 +1190,7 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
         },
         "reload-plugins" => Input::ReloadPlugins,
         "btw" => Input::Btw(args.trim().to_string()),
+        "permissions" => Input::Permissions(Some(args.trim()).filter(|a| !a.is_empty()).map(String::from)),
         "copy" => match args.trim() {
             "" => Input::Copy(1),
             n => match n.parse::<usize>() {
@@ -1198,6 +1219,18 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
             None => Input::Error(format!("unknown command /{name} (try /help)")),
         },
     }
+}
+
+/// The permission mode and rules, line by line.
+fn show_permissions(agent: &Agent, out: &Output) {
+    let mode = agent.permissions().mode();
+    out.line(format!("permission mode: {} — {}", out.paint("1", mode.as_str()), mode.describe()));
+    for (kind, rules) in agent.permissions().rules() {
+        if !rules.is_empty() {
+            out.line(format!("  {}: {}", out.paint("2", kind), rules.join(", ")));
+        }
+    }
+    out.line(out.paint("2", "change it with /permissions <mode> or Shift+Tab; rules go in `permissions` in ~/.harness/settings.json"));
 }
 
 fn print_banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {

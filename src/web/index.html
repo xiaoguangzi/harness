@@ -205,6 +205,7 @@ details.tool.err { border-color: color-mix(in srgb, var(--err) 38%, var(--line))
 details.tool.subagent { border-left: 3px solid var(--accent); }
 .sub { color: var(--muted); font: 12px var(--mono); padding-left: 12px; border-left: 2px solid var(--line-strong); }
 .note { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.note.permission { color: var(--text); font-size: 13px; border: 1px solid var(--warn); background: var(--warn-soft); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
 .note.err { color: var(--err); white-space: pre-wrap; }
 .note.hook { color: var(--warn); white-space: pre-wrap; }
 
@@ -592,6 +593,9 @@ function openTask(id) {
   });
 
   const model = modelSelect(t.model, undefined, { id: "task-model", title: "切换本任务的模型" });
+  const modeSelect = h("select", { id: "task-mode", title: "哪些工具调用要先问你" },
+    ...Object.entries(MODES).map(([value, label]) => h("option", { value }, label)));
+  modeSelect.value = t.permission_mode || "bypassPermissions";
   const head = h("div", { class: "taskhead" },
     h("span", { class: "title", id: "task-title" }, t.title),
     h("span", { class: "badge " + t.status, id: "task-status" }, STATUS[t.status] || t.status),
@@ -604,6 +608,10 @@ function openTask(id) {
         h("button", { class: "btn", onclick: async () => {
           try { await api("POST", `/api/tasks/${id}/model`, { model: model.value }); toast("已切换模型"); refreshTasks(); }
           catch (e) { toast(e.message, true); } } }, "切换模型"),
+        h("label", { style: "margin:0" }, "权限模式"), modeSelect,
+        h("button", { class: "btn", onclick: async () => {
+          try { await api("POST", `/api/tasks/${id}/mode`, { mode: modeSelect.value }); toast("已切换权限模式"); refreshTasks(); }
+          catch (e) { toast(e.message, true); } } }, "切换权限模式"),
         h("button", { class: "btn danger", onclick: async e => {
           const b = e.currentTarget;
           if (b.dataset.armed !== "1") { b.dataset.armed = "1"; b.textContent = "再点一次确认删除"; setTimeout(() => { b.dataset.armed = ""; b.textContent = "删除任务"; }, 3000); return; }
@@ -633,6 +641,8 @@ function updateTaskHead(t) {
   document.getElementById("task-cancel").disabled = t.status !== "running" && t.status !== "waiting";
   const m = document.getElementById("task-model");
   if (m && document.activeElement !== m) setModel(m, t.model);
+  const pm = document.getElementById("task-mode");
+  if (pm && document.activeElement !== pm && t.permission_mode) pm.value = t.permission_mode;
 }
 
 function stickToBottom(fn) {
@@ -668,6 +678,33 @@ function subagentCard(ev) {
   subagents.set(ev.id, card);
   transcript.append(el);
   return card;
+}
+
+const MODES = {
+  default: "default：有改动的调用先问",
+  acceptEdits: "acceptEdits：直接改文件，其他改动先问",
+  plan: "plan：只读和规划，拒绝改动",
+  bypassPermissions: "bypassPermissions：都不问",
+};
+/** Tool calls waiting for an answer, by question id. */
+const questions = new Map();
+
+function permissionCard(ev) {
+  const owner = currentTask;
+  const answer = async (value) => {
+    try { await api("POST", `/api/tasks/${owner}/permissions/${ev.id}`, { answer: value }); }
+    catch (err) { toast(err.message, true); }
+  };
+  const buttons = h("div", { class: "row" },
+    h("button", { class: "btn primary", onclick: () => answer("allow") }, "允许"),
+    h("button", { class: "btn", onclick: () => answer("always") }, "本会话都允许 " + ev.suggestion),
+    h("button", { class: "btn danger", onclick: () => answer("deny") }, "拒绝"));
+  const el = h("div", { class: "note permission" },
+    h("div", {}, `？允许 ${ev.tool} ${toolSummary(ev.tool, ev.input)}` + (ev.agent ? `（来自子代理 ${ev.agent}）` : "")),
+    h("div", { class: "muted" }, "需要确认：" + ev.reason),
+    buttons);
+  questions.set(ev.id, { el, buttons });
+  return el;
 }
 
 function renderEvent(ev) {
@@ -713,6 +750,13 @@ function renderEvent(ev) {
       case "hook": assistantEl = null;
         transcript.append(h("div", { class: "note hook" }, "⚑ " + ev.message)); break;
       case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台任务有了结果，继续")); break;
+      case "permission": assistantEl = null; transcript.append(permissionCard(ev)); break;
+      case "permission_answered": {
+        const q = questions.get(ev.id);
+        if (q) { q.buttons.replaceChildren(h("span", { class: "muted" }, { allow: "已允许", always: "已允许（本会话）", deny: "已拒绝", dropped: "调用已取消" }[ev.answer] || ev.answer)); questions.delete(ev.id); }
+        break;
+      }
+      case "permission_mode": transcript.append(h("div", { class: "note" }, "权限模式切换为 " + ev.mode)); break;
       case "idle_compact": assistantEl = null; transcript.append(h("div", { class: "note" }, "✻ 任务空闲，在提示词缓存过期前压缩会话")); break;
       case "compact_start": assistantEl = null; transcript.append(h("div", { class: "note" }, "✻ 正在压缩会话…")); break;
       case "compact": assistantEl = null;

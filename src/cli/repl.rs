@@ -67,6 +67,8 @@ impl ReplHelper {
         out.set_menu(Some(self.menu.clone()));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let watch = KeyWatch::for_prompt(move |key| { let _ = tx.send(key); });
+        // A background subagent's call may need approval meanwhile.
+        let _routed = out.route_keys();
         let mut tick = tokio::time::interval(Duration::from_millis(50));
         let mut history_at = history.len();
         let mut saved = String::new();
@@ -82,7 +84,7 @@ impl ReplHelper {
                     continue;
                 }
             };
-            if out.tool_output_key(&key) { continue; }
+            if out.question_key(&key) || out.tool_output_key(&key) { continue; }
             if key == Key::PasteImage {
                 super::paste_clipboard(out);
                 continue;

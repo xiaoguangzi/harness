@@ -151,6 +151,8 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
         .route("/api/tasks/{id}/events", get(task_events))
         .route("/api/tasks/{id}/subagents", get(list_subagents))
         .route("/api/tasks/{id}/subagents/{agent_id}/stop", post(stop_subagent))
+        .route("/api/tasks/{id}/permissions/{question}", post(answer_permission))
+        .route("/api/tasks/{id}/mode", post(set_mode))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state.clone());
 
@@ -490,6 +492,45 @@ async fn stop_subagent(
     let task = find_task(&state, id)?;
     let stopped = task.subagents.stop(&agent_id, true).map_err(|e| api_error(StatusCode::NOT_FOUND, format!("{e:#}")))?;
     Ok(Json(json!({"stopped": stopped})))
+}
+
+#[derive(Deserialize)]
+struct PermissionAnswer {
+    /// `allow`, `always` or `deny`.
+    answer: String,
+    message: Option<String>,
+}
+
+async fn answer_permission(
+    State(state): State<Shared>,
+    Path((id, question)): Path<(u64, u64)>,
+    Json(req): Json<PermissionAnswer>,
+) -> ApiResult<Json<Value>> {
+    use crate::permissions::Answer;
+    let task = find_task(&state, id)?;
+    let answer = match req.answer.as_str() {
+        "allow" => Answer::Allow,
+        "always" => Answer::AllowAlways,
+        "deny" => Answer::Deny(req.message.filter(|m| !m.trim().is_empty())),
+        other => return Err(bad_request(format!("unknown answer `{other}` (allow, always or deny)"))),
+    };
+    if !task.answer(question, answer) {
+        return Err(api_error(StatusCode::NOT_FOUND, "nothing waits for that answer"));
+    }
+    Ok(Json(json!({"answered": question})))
+}
+
+#[derive(Deserialize)]
+struct SetMode {
+    mode: String,
+}
+
+async fn set_mode(State(state): State<Shared>, Path(id): Path<u64>, Json(req): Json<SetMode>) -> ApiResult<Json<Value>> {
+    let task = find_task(&state, id)?;
+    let mode = crate::permissions::Mode::parse(&req.mode).map_err(bad_request)?;
+    task.permissions.set_mode(mode);
+    task.push(json!({"type": "permission_mode", "mode": mode.as_str()}));
+    Ok(Json(task.summary()))
 }
 
 #[derive(Deserialize)]

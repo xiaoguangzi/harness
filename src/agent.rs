@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 use crate::checkpoint::FileHistory;
 use crate::hooks::{self, Event, Hooks, Outcome};
 use crate::llm::{Client, Message, StreamEvent, Usage};
+use crate::permissions::{Decision, Mode, Permissions, Request};
 use crate::subagent::Subagents;
 use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
@@ -26,6 +27,12 @@ pub use usage::UsageLog;
 
 /// Told to the model about a turn the user cancelled.
 pub const INTERRUPTED: &str = "[Interrupted by the user]";
+/// Tells the model plan mode went on or off.
+const PLAN_ON: &str = "<permission-mode>Plan mode is on: research with the tools that only read, then present a plan for \
+the user to approve. Don't change files or run commands that change things; such calls are refused until the user \
+turns plan mode off.</permission-mode>";
+const PLAN_OFF: &str = "<permission-mode>Plan mode is off: you may change things now, such as carrying out the plan \
+the user approved.</permission-mode>";
 /// Comes before a `/btw` question.
 const SIDE_QUESTION: &str = "A side question from the user, about the conversation so far. Answer it briefly from what \
 you already know, without calling any tools; neither the question nor your answer is kept in the conversation, so \
@@ -247,6 +254,10 @@ pub struct Agent {
     in_session: bool,
     /// Compacts as if the context window were at most this big.
     compact_window: Option<u64>,
+    /// Which tool calls run, ask or are refused; shared with the subagents.
+    permissions: Arc<Permissions>,
+    /// The permission mode the model was last told about, if any.
+    told_mode: Option<Mode>,
 }
 
 impl Agent {
@@ -254,9 +265,11 @@ impl Agent {
         let inbox = Arc::new(Inbox::default());
         let usage = Arc::new(UsageLog::default());
         let history = Arc::new(FileHistory::default());
+        let permissions = Arc::new(Permissions::default());
         let mut hooks = Hooks::default();
         hooks.set_client(client.clone());
         hooks.set_inbox(inbox.clone());
+        hooks.set_permissions(permissions.clone());
         let subagents = Arc::new(Subagents::new(inbox.clone(), usage.clone(), history.clone(), hooks.clone()));
         let shells = Arc::new(Shells::new(inbox.clone()));
         Self {
@@ -279,6 +292,36 @@ impl Agent {
             session_start: Some("startup"),
             in_session: false,
             compact_window: None,
+            permissions,
+            told_mode: None,
+        }
+    }
+
+    /// Which tool calls run, ask the user or are refused.
+    pub fn permissions(&self) -> &Arc<Permissions> {
+        &self.permissions
+    }
+
+    /// Uses `permissions` from now on, as do the subagents started after.
+    #[cfg(test)]
+    pub fn set_permissions(&mut self, permissions: Arc<Permissions>) {
+        self.hooks.set_permissions(permissions.clone());
+        self.subagents.set_hooks(self.hooks.clone());
+        self.permissions = permissions;
+    }
+
+    /// Tells the model about a change to or from plan mode with the next
+    /// request, once per change.
+    fn tell_mode(&mut self) {
+        let mode = self.permissions.mode();
+        let was = self.told_mode.replace(mode);
+        if was == Some(mode) || self.hooks.is_subagent() {
+            return;
+        }
+        if mode == Mode::Plan {
+            self.inbox.push(PLAN_ON.to_string(), false);
+        } else if was == Some(Mode::Plan) {
+            self.inbox.push(PLAN_OFF.to_string(), false);
         }
     }
 
@@ -378,7 +421,12 @@ impl Agent {
     }
 
     /// Runs `hooks` instead, e.g. a subagent's; its subagents get them too.
+    /// A subagent's hooks bring its parent's permissions.
     pub fn set_hooks(&mut self, mut hooks: Hooks) {
+        match hooks.permissions() {
+            Some(permissions) => self.permissions = permissions.clone(),
+            None => hooks.set_permissions(self.permissions.clone()),
+        }
         hooks.set_client(self.client.clone());
         hooks.set_inbox(self.inbox.clone());
         self.subagents.set_hooks(hooks.clone());
@@ -430,6 +478,7 @@ impl Agent {
         self.messages.clear();
         self.turn_start = None;
         self.context = None;
+        self.told_mode = None;
         self.session_start = Some("clear");
         if self.checkpoints {
             self.history.clear();
@@ -501,6 +550,7 @@ impl Agent {
         if !content.is_empty() && !self.hooks.is_subagent() {
             self.prompt_hooks(&typed, &mut content, observer).await?;
         }
+        self.tell_mode();
         let arrived = self.inbox.take();
         if content.is_empty() && arrived.is_empty() {
             return Ok(());
@@ -732,7 +782,7 @@ impl Agent {
             // PreToolUse hooks see every call first; they may refuse one or
             // change its input.
             let invalid = &response.invalid_tool_inputs;
-            let (tools, hooks, model) = (&self.tools, &self.hooks, self.client.spec());
+            let (tools, hooks, model, permissions) = (&self.tools, &self.hooks, self.client.spec(), &*self.permissions);
             let checks = join_all(tool_uses.iter().map(|t| async {
                 let id = t["id"].as_str().unwrap_or("");
                 if invalid.contains_key(id) {
@@ -767,6 +817,9 @@ impl Agent {
                             return (ToolOutput::error("The call was not run: a hook stopped the turn"), check, None);
                         }
                         let input = check.updated_input.clone().unwrap_or_else(|| t["input"].clone());
+                        if let Err(reason) = permitted(permissions, tools, hooks, name, &input, &check, model).await {
+                            return (ToolOutput::error(reason), check, None);
+                        }
                         let mut out = tools.run(name, input.clone()).await;
                         let post = hooks.post_tool_use(name, id, &input, &out, model).await;
                         let event = if out.is_error { Event::PostToolUseFailure } else { Event::PostToolUse };
@@ -837,6 +890,36 @@ impl Agent {
 }
 
 /// The prompt in a user message's `content`: its last text block.
+/// Whether the call of `name` with `input` may run: what the permission
+/// rules and mode say, after PreToolUse hooks (`check`), and if they say to
+/// ask, PermissionRequest hooks or the user. `Err` is what the model is
+/// told when it does not run.
+async fn permitted(
+    permissions: &Permissions,
+    tools: &ToolRegistry,
+    hooks: &Hooks,
+    name: &str,
+    input: &Value,
+    check: &Outcome,
+    model: &str,
+) -> Result<(), String> {
+    let reason = match permissions.decide(name, tools.get(name).map(|t| t.as_ref()), input, check.permission.as_ref()) {
+        Decision::Allow => return Ok(()),
+        Decision::Deny(reason) => return Err(reason),
+        Decision::Ask(reason) => reason,
+    };
+    let suggestion = crate::permissions::suggestion(name, input);
+    let hooked = hooks.permission_request(name, input, &suggestion, model).await;
+    if let Some(reason) = hooked.block {
+        return Err(format!("A PermissionRequest hook denied this call: {reason}"));
+    }
+    if hooked.permission == Some(crate::permissions::HookDecision::Allow) {
+        return Ok(());
+    }
+    let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestion, agent: hooks.subagent_label() };
+    permissions.ask(request).await
+}
+
 fn prompt_text(content: &[Value]) -> String {
     let text = content.iter().rev().find(|b| b["type"] == "text").and_then(|b| b["text"].as_str());
     text.unwrap_or_default().to_string()
@@ -971,6 +1054,61 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("has a secret"), "{error}");
         assert!(agent.messages().is_empty());
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn calls_that_need_approval_ask_or_are_refused() {
+        let _guard = crate::util::lock_cwd();
+        use crate::permissions::{Answer, Asker, Mode, Permissions};
+        use compact::tests::texts;
+        let bash = |id: &str, command: &str| json!({"type": "tool_use", "id": id, "name": "bash", "input": {"command": command}});
+        let (client, mut requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![bash("t1", "echo one"), bash("t2", "echo two")], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let mut agent = Agent::new(client, ToolRegistry::with_defaults(crate::tools::FileTracker::default()), "sys");
+        let config = serde_json::from_value(json!({"defaultMode": "plan", "allow": ["Bash(echo two:*)"]})).unwrap();
+        agent.set_permissions(Arc::new(Permissions::with_config(Arc::new(config))));
+        agent.run_turn(vec![text("go")], &mut Notices::default()).await.unwrap();
+        let first = requests.recv().await.unwrap();
+        assert!(texts(&first["messages"][0]).iter().any(|t| t.starts_with("<permission-mode>Plan mode is on")), "the model is told");
+        let results = &requests.recv().await.unwrap()["messages"][2]["content"];
+        assert!(results[0]["content"].as_str().unwrap().contains("Plan mode is on"), "{results}");
+        assert_eq!(results[1]["content"], "two\n", "an allow rule lets it run");
+
+        struct Yes;
+        #[async_trait::async_trait]
+        impl Asker for Yes {
+            async fn ask(&self, _: &crate::permissions::Request) -> Option<Answer> {
+                Some(Answer::Allow)
+            }
+        }
+        agent.permissions().set_mode(Mode::Default);
+        let (client, mut requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![bash("t3", "echo three")], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        agent.set_client(client);
+        agent.run_turn(vec![text("again")], &mut Notices::default()).await.unwrap();
+        let first = requests.recv().await.unwrap();
+        let last = first["messages"].as_array().unwrap().last().unwrap().clone();
+        assert!(texts(&last).iter().any(|t| t.starts_with("<permission-mode>Plan mode is off")), "{last}");
+        let result = requests.recv().await.unwrap()["messages"].as_array().unwrap().last().unwrap()["content"][0].clone();
+        assert!(result["content"].as_str().unwrap().contains("cannot be asked for here"), "no one to ask: {result}");
+        agent.permissions().set_asker(Some(Arc::new(Yes)));
+        let (client, mut requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![bash("t4", "echo four")], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        agent.set_client(client);
+        agent.run_turn(vec![text("once more")], &mut Notices::default()).await.unwrap();
+        let _ = requests.recv().await;
+        let result = requests.recv().await.unwrap()["messages"].as_array().unwrap().last().unwrap()["content"][0].clone();
+        assert_eq!(result["content"], "four\n", "the user said yes");
     }
 
     #[tokio::test]

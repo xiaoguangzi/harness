@@ -1038,7 +1038,7 @@ mod tests {
         ("agents/reviewer.md", "---\ndescription: Reviews\ntools: Read, Grep, Glob, LS\nmodel: sonnet\n---\nUse ${CLAUDE_PLUGIN_ROOT}.\n"),
         (
             "hooks/hooks.json",
-            r#"{"description": "x", "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/fmt.sh\""}]}], "PermissionRequest": []}}"#,
+            r#"{"description": "x", "hooks": {"PostToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/fmt.sh\""}]}], "Elicitation": []}}"#,
         ),
         (".mcp.json", r#"{"db": {"command": "${CLAUDE_PLUGIN_ROOT}/server", "args": ["--data", "${CLAUDE_PLUGIN_DATA}"]}}"#),
         (".lsp.json", r#"{"c": {"command": "${CLAUDE_PLUGIN_ROOT}/bin/lsp", "extensionToLanguage": {".c": "c", ".h": "c"}}}"#),
@@ -1080,7 +1080,7 @@ mod tests {
         assert_eq!(loaded.mcp_servers.keys().collect::<Vec<_>>(), ["plugin:kit:db"]);
         assert_eq!(loaded.bin_dirs, [root.join("bin")]);
         assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
-        assert!(loaded.warnings[0].starts_with("plugin kit@inline: hook event `PermissionRequest`"));
+        assert!(loaded.warnings[0].starts_with("plugin kit@inline: hook event `Elicitation`"));
         assert_eq!(plugin.warnings.len(), 1);
         assert!(home.join("data/kit-inline").is_dir());
     }

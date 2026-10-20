@@ -7,6 +7,7 @@ mod lsp;
 mod mcp;
 mod mentions;
 mod plugins;
+mod permissions;
 mod prompt;
 mod sandbox;
 mod session;
@@ -46,6 +47,7 @@ Options:
       --plugin-dir DIR Load the plugin in DIR as well (repeatable)
       --check-plugins Load the plugins, report what loaded and what not, and exit
       --bare          Start without plugins, hooks, MCP servers, skills, custom agents and AGENTS.md
+      --permission-mode MODE  default, acceptEdits, plan or bypassPermissions (see the permissions settings)
       --output-format FORMAT  One-shot output: text (default), json or stream-json
   -h, --help          Print this help
   -V, --version       Print the version
@@ -89,6 +91,11 @@ async fn main() -> Result<ExitCode> {
         util::set_bare();
         settings.strip_for_bare();
     }
+    let (mode, args) = permissions::parse_flag(args)?;
+    if let Some(mode) = mode {
+        settings.permissions.default_mode = Some(mode);
+    }
+    permissions::set(std::mem::take(&mut settings.permissions));
     for file in settings::legacy_files() {
         eprintln!("\x1b[33m{} is no longer read; move its settings into ~/.harness/settings.json\x1b[0m", file.display());
     }

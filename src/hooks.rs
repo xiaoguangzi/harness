@@ -33,6 +33,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::agent::Inbox;
+use crate::permissions::HookDecision;
 use crate::llm::{Client, Message};
 use crate::skills::PluginDirs;
 use crate::tools::{KillGroup, ToolOutput};
@@ -69,6 +70,7 @@ pub enum Event {
     SessionStart,
     SessionEnd,
     Notification,
+    PermissionRequest,
 }
 
 impl Event {
@@ -86,6 +88,7 @@ impl Event {
             Event::SessionStart => "SessionStart",
             Event::SessionEnd => "SessionEnd",
             Event::Notification => "Notification",
+            Event::PermissionRequest => "PermissionRequest",
         }
     }
 
@@ -190,7 +193,7 @@ struct RawHandler {
 /// An `if` rule, in Claude Code's permission syntax: `Bash(git commit:*)`,
 /// `Edit(src/**/*.ts)`, or a tool's name alone.
 #[derive(Debug, Clone)]
-struct Condition {
+pub(crate) struct Condition {
     tool: String,
     /// What the command (for `Bash`) or the file path (for the file tools)
     /// must match.
@@ -198,7 +201,7 @@ struct Condition {
 }
 
 impl Condition {
-    fn parse(rule: &str) -> Result<Self, String> {
+    pub(crate) fn parse(rule: &str) -> Result<Self, String> {
         let rule = rule.trim();
         let (tool, pattern) = match rule.split_once('(') {
             None => (rule, None),
@@ -217,7 +220,7 @@ impl Condition {
 
     /// Whether the call of the tool named `names` (with its aliases) with
     /// `input` (as hooks see it) is one the rule is for.
-    fn matches(&self, names: &[&str], input: &Value) -> bool {
+    pub(crate) fn matches(&self, names: &[&str], input: &Value) -> bool {
         if !names.iter().any(|n| *n == self.tool) {
             return false;
         }
@@ -387,18 +390,18 @@ fn aliases(tool: &str) -> &'static [&'static str] {
 }
 
 /// The tool's name and aliases, for matching.
-fn tool_names(tool: &str) -> Vec<&str> {
+pub(crate) fn tool_names(tool: &str) -> Vec<&str> {
     std::iter::once(tool).chain(aliases(tool).iter().copied()).collect()
 }
 
 /// The tool's name as hooks see it.
-fn hook_tool_name(tool: &str) -> &str {
+pub(crate) fn hook_tool_name(tool: &str) -> &str {
     aliases(tool).first().copied().unwrap_or(tool)
 }
 
 /// The tool input as hooks see it: the file tools' `path` also as
 /// `file_path`.
-fn input_for_hook(tool: &str, input: &Value) -> Value {
+pub(crate) fn input_for_hook(tool: &str, input: &Value) -> Value {
     let mut input = input.clone();
     if FILE_TOOLS.contains(&tool)
         && let Some(object) = input.as_object_mut()
@@ -520,6 +523,8 @@ pub struct Hooks {
     client: Option<Client>,
     /// The conversation's inbox, where background hooks' answers go.
     inbox: Option<Arc<Inbox>>,
+    /// The conversation's permissions, whose mode hooks are told.
+    permissions: Option<Arc<crate::permissions::Permissions>>,
 }
 
 impl Default for Hooks {
@@ -546,6 +551,9 @@ pub struct Outcome {
     pub updated_input: Option<Value>,
     /// A PostToolUse hook's `updatedToolOutput`.
     pub updated_output: Option<String>,
+    /// A PreToolUse hook's `permissionDecision` of `allow` or `ask`, or a
+    /// PermissionRequest hook's `allow` (its `deny` blocks).
+    pub permission: Option<crate::permissions::HookDecision>,
 }
 
 /// How a hook process ended.
@@ -558,7 +566,12 @@ struct Reply {
 impl Hooks {
     pub fn with_config(config: Arc<Config>) -> Self {
         let session = Session { id: crate::session::new_id(), transcript: None };
-        Self { config, session: Arc::new(Mutex::new(session)), subagent: None, client: None, inbox: None }
+        Self { config, session: Arc::new(Mutex::new(session)), subagent: None, client: None, inbox: None, permissions: None }
+    }
+
+    /// Tells hooks the permission mode of `permissions`, the conversation's.
+    pub fn set_permissions(&mut self, permissions: Arc<crate::permissions::Permissions>) {
+        self.permissions = Some(permissions);
     }
 
     /// Has prompt hooks ask `client`'s model.
@@ -585,6 +598,15 @@ impl Hooks {
         self.subagent.is_some()
     }
 
+    /// The subagent these hooks are for, as `type agent_id`.
+    pub fn subagent_label(&self) -> Option<String> {
+        self.subagent.as_ref().map(|(id, agent_type)| format!("{agent_type} {id}"))
+    }
+
+    pub fn permissions(&self) -> Option<&Arc<crate::permissions::Permissions>> {
+        self.permissions.as_ref()
+    }
+
     /// `Stop`, or `SubagentStop` for a subagent.
     pub fn stop_event(&self) -> Event {
         if self.is_subagent() { Event::SubagentStop } else { Event::Stop }
@@ -599,6 +621,17 @@ impl Hooks {
         let mut outcome = self.run(Event::PreToolUse, &tool_names(tool), fields, model).await;
         outcome.updated_input = outcome.updated_input.map(|input| input_from_hook(tool, input));
         outcome
+    }
+
+    /// `PermissionRequest` before the user is asked about a call: a hook
+    /// may allow it (`permission`) or deny it (`block`) instead.
+    pub async fn permission_request(&self, tool: &str, input: &Value, suggestion: &str, model: &str) -> Outcome {
+        let fields = json!({
+            "tool_name": hook_tool_name(tool),
+            "tool_input": input_for_hook(tool, input),
+            "permission_suggestions": [{"type": "addRules", "rules": [suggestion], "behavior": "allow", "destination": "session"}],
+        });
+        self.run(Event::PermissionRequest, &tool_names(tool), fields, model).await
     }
 
     /// `PostToolUse` after a call that succeeded, `PostToolUseFailure`
@@ -790,8 +823,7 @@ impl Hooks {
             "transcript_path": session.transcript.as_ref().map(|p| p.display().to_string()),
             "cwd": cwd,
             "hook_event_name": event.as_str(),
-            // The harness never asks before running a tool.
-            "permission_mode": "bypassPermissions",
+            "permission_mode": self.permissions.as_ref().map_or("bypassPermissions", |p| p.mode().as_str()),
             "model": model,
         });
         if let Some((id, agent_type)) = &self.subagent {
@@ -860,11 +892,22 @@ impl Outcome {
         let why = specific["permissionDecisionReason"].as_str().filter(|r| !r.trim().is_empty()).or(reason);
         match specific["permissionDecision"].as_str() {
             Some("deny") => self.block(why.unwrap_or("denied by a hook")),
-            // There is no one to ask: the call is refused.
-            Some("ask") => self.block(&format!(
-                "{} (the hook asked for the user's approval, which the harness cannot ask for)",
-                why.unwrap_or("needs approval")
-            )),
+            Some("ask") => {
+                let reason = format!("a {} hook asks for it: {}", event.as_str(), why.unwrap_or("it needs approval"));
+                self.permission.get_or_insert(HookDecision::Ask(reason));
+            }
+            Some("allow") => {
+                self.permission.get_or_insert(HookDecision::Allow);
+            }
+            _ => {}
+        }
+        // A PermissionRequest hook's answer.
+        let decision = &specific["decision"];
+        match decision["behavior"].as_str() {
+            Some("allow") => {
+                self.permission.get_or_insert(HookDecision::Allow);
+            }
+            Some("deny") => self.block(decision["message"].as_str().filter(|m| !m.trim().is_empty()).unwrap_or("denied by a hook")),
             _ => {}
         }
         if let Some(context) = specific["additionalContext"].as_str().filter(|c| !c.trim().is_empty()) {
@@ -998,7 +1041,6 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(config.len(), 2);
         let bad = [
-            json!({"PermissionRequest": []}),
             json!({"PreCompact": [{"hooks": [{"type": "command", "command": "y", "statusMessage": "z"}]}]}),
             json!({"Stop": [{"hooks": [{"type": "prompt", "command": "y"}]}]}),
             json!({"Stop": [{"hooks": [{"type": "http", "url": "y"}]}]}),
@@ -1188,6 +1230,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_hook_that_runs_too_long_is_killed() {
         let _guard = crate::util::lock_cwd();
         let h = hooks(json!({"Stop": [{"hooks": [{"type": "command", "command": "sleep 30", "timeout": 1}]}]}));
@@ -1209,13 +1252,13 @@ pub(crate) mod tests {
                 {"type": "command", "command": "printf", "args": ["%s|%s", "${CLAUDE_PLUGIN_ROOT}", "$CLAUDE_PLUGIN_OPTION_TOKEN"]},
                 {"type": "agent", "prompt": "is this ok?"}
             ]}],
-            "PermissionRequest": [{"hooks": [{"type": "command", "command": "true"}]}],
+            "Elicitation": [{"hooks": [{"type": "command", "command": "true"}]}],
             "Notification": [{"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "cat >&2; exit 1"}]}]
         });
         let mut warnings = Vec::new();
         let config = plugin_config(&events, &plugin, &mut warnings);
         assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("`PermissionRequest`")) && warnings.iter().any(|w| w.contains("`agent`")));
+        assert!(warnings.iter().any(|w| w.contains("`Elicitation`")) && warnings.iter().any(|w| w.contains("`agent`")));
         let hooks = Hooks::with_config(Arc::new(config));
         let mut context = hooks.user_prompt_submit("hi", "m").await.context;
         context.sort();

@@ -77,10 +77,26 @@ struct State {
     silent: bool,
     /// The status line under the input box.
     footer: Option<String>,
+    /// A tool call waiting for the user's approval, in the input box's place.
+    question: Option<super::approve::Question>,
+    /// How many key readers hand keys to [`Output::question_key`] now.
+    routed: usize,
+    /// The conversation's permissions, whose mode shows under the box.
+    permissions: Option<Arc<crate::permissions::Permissions>>,
 }
 
 /// Restores a usable shell cursor on normal exit and error unwinding.
 pub struct ScreenGuard(Output);
+
+/// A key reader handing keys to the questions, while it lives.
+pub(super) struct RoutedKeys(Output);
+
+impl Drop for RoutedKeys {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.routed = state.routed.saturating_sub(1);
+    }
+}
 
 pub struct ScreenHandoff {
     out: Output,
@@ -137,6 +153,9 @@ impl Output {
             held: None,
             silent: false,
             footer: None,
+            question: None,
+            routed: 0,
+            permissions: None,
         };
         Self { state: Arc::new(Mutex::new(state)), styled }
     }
@@ -266,6 +285,48 @@ impl Output {
 
     /// Routes inspector keys before composer editing or turn interruption.
     /// Uses the existing key reader, so opening it never pauses the agent.
+    /// Hands `key` to the question waiting for an answer, if there is
+    /// one; Shift+Tab goes to the next permission mode. True if it was
+    /// taken.
+    pub fn question_key(&self, key: &Key) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if *key == Key::BackTab && let Some(permissions) = &state.permissions {
+            permissions.set_mode(permissions.mode().next());
+            self.show(&mut state, "");
+            return true;
+        }
+        let Some(question) = state.question.as_mut() else { return false };
+        if question.key(key) {
+            state.question = None;
+        }
+        self.show(&mut state, "");
+        true
+    }
+
+    pub(super) fn set_question(&self, question: Option<super::approve::Question>) {
+        let mut state = self.state.lock().unwrap();
+        state.question = question;
+        self.show(&mut state, "");
+    }
+
+    /// Whether some key reader hands keys to the questions now.
+    pub(super) fn keys_routed(&self) -> bool {
+        self.state.lock().unwrap().routed > 0
+    }
+
+    /// Counts a key reader that hands keys to [`Output::question_key`],
+    /// until the guard is dropped.
+    pub(super) fn route_keys(&self) -> RoutedKeys {
+        self.state.lock().unwrap().routed += 1;
+        RoutedKeys(self.clone())
+    }
+
+    /// Shows `permissions`' mode under the input box, and has Shift+Tab
+    /// change it.
+    pub fn set_permissions(&self, permissions: Arc<crate::permissions::Permissions>) {
+        self.state.lock().unwrap().permissions = Some(permissions);
+    }
+
     pub fn tool_output_key(&self, key: &Key) -> bool {
         let mut state = self.state.lock().unwrap();
         if key == &Key::ToolOutput && state.panel.is_none() {
@@ -725,6 +786,13 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
             rows.push(format!("\x1b[2m  ⎿ {detail}\x1b[0m"));
         }
     }
+    if let Some(question) = &state.question {
+        if !rows.is_empty() {
+            rows.push(String::new());
+        }
+        rows.extend(question.render(width, &paint));
+        return (rows, None);
+    }
     let Some(input) = &state.input else { return (rows, None) };
     if !rows.is_empty() {
         rows.push(String::new());
@@ -749,12 +817,32 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
     {
         let shown = menu.styled(&plain).unwrap_or(plain);
         rows.extend(shown.trim_start_matches('\n').split('\n').map(str::to_string));
-    } else if let Some(footer) = &state.footer {
-        // Its own colors, unless it is too wide for them.
-        let plain = text::printable(&text::strip_ansi(footer));
-        rows.push(if text::width(&plain) < width { footer.clone() } else { text::fit(&plain, width.saturating_sub(1)) });
+    } else {
+        if let Some(line) = state.permissions.as_ref().and_then(|p| mode_line(p)) {
+            rows.push(paint("2", &text::fit(&line, width.saturating_sub(1))));
+        }
+        if let Some(footer) = &state.footer {
+            // Its own colors, unless it is too wide for them.
+            let plain = text::printable(&text::strip_ansi(footer));
+            rows.push(if text::width(&plain) < width { footer.clone() } else { text::fit(&plain, width.saturating_sub(1)) });
+        }
     }
     (rows, Some(cursor))
+}
+
+/// The permission mode under the input box, unless it is the one asking
+/// for nothing that the settings start in.
+fn mode_line(permissions: &crate::permissions::Permissions) -> Option<String> {
+    use crate::permissions::Mode;
+    let mode = permissions.mode();
+    let label = match mode {
+        Mode::BypassPermissions if permissions.default_mode() == Mode::BypassPermissions => return None,
+        Mode::BypassPermissions => "⏵⏵ bypass permissions on",
+        Mode::AcceptEdits => "⏵⏵ accept edits on",
+        Mode::Plan => "⏸ plan mode on",
+        Mode::Default => "◇ asking before changes",
+    };
+    Some(format!("  {label} (shift+tab to cycle)"))
 }
 
 /// Erases the rows under the output, from `cursor_row` of them, leaving the

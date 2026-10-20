@@ -29,6 +29,14 @@ pub async fn interactive(
             }
             None
         }
+        Input::Permissions(None) => {
+            use crate::permissions::Mode;
+            let rules: Vec<String> = agent.permissions().rules().into_iter().filter(|(_, r)| !r.is_empty()).map(|(kind, r)| format!("{kind}: {}", r.join(", "))).collect();
+            let items = Mode::ALL.iter().map(|m| Item::new(m.as_str(), m.describe()).details(rules.clone())).collect();
+            let current = Mode::ALL.iter().position(|m| *m == agent.permissions().mode()).unwrap_or(0);
+            let i = dialog::choose(out, "Permission mode", "Which tool calls ask first; Shift+Tab cycles them too", Keys { enter: "apply", esc: "cancel" }, items, current).await?;
+            Some(Input::Permissions(Some(Mode::ALL[i].as_str().to_string())))
+        }
         Input::Effort(None) => {
             let mut items = vec![Item::new("auto", format!("Use configured effort (currently {})", agent.client().effort().as_str()))];
             items.extend(llm::Effort::ALL.iter().map(|e| Item::new(e.as_str(), effort_help(*e))));

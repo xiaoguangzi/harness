@@ -50,6 +50,9 @@ pub struct Config {
     allow_write: Vec<String>,
     #[serde(default)]
     deny_read: Vec<String>,
+    /// Whether `bash` runs without asking in the permission modes that
+    /// ask, since the sandbox contains it. Default: true.
+    auto_allow_bash: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,6 +107,7 @@ pub struct Sandbox {
     /// Sorted from shallow to deep, so later rules take precedence, as in
     /// a Seatbelt profile and the order of bwrap's mounts.
     rules: Vec<Rule>,
+    auto_allow_bash: bool,
     /// How long starting `true` in it took at startup: what the sandbox
     /// adds to each command.
     startup: Duration,
@@ -195,7 +199,8 @@ impl Sandbox {
             }
         }
         unique.sort_by_key(|r| r.path.components().count());
-        Self { backend, cwd, network: config.network, rules: unique, startup: Duration::ZERO }
+        let auto_allow_bash = config.auto_allow_bash.unwrap_or(true);
+        Self { backend, cwd, network: config.network, rules: unique, auto_allow_bash, startup: Duration::ZERO }
     }
 
     /// Runs `true` in the sandbox, to fail at startup rather than on every
@@ -402,6 +407,11 @@ impl Sandbox {
         }
         items.push(("network", if self.network { "allowed" } else { "loopback only" }.into()));
         items
+    }
+
+    /// Whether `bash` runs without asking, contained by the sandbox.
+    pub fn auto_allows_bash(&self) -> bool {
+        self.auto_allow_bash
     }
 
     /// What the sandbox adds to each command, as measured at startup. Not

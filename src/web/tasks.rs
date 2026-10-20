@@ -15,6 +15,7 @@ use tokio::task::AbortHandle;
 use crate::agent::{Agent, Inbox, Observer};
 use crate::hooks::{Event, Hooks};
 use crate::llm::Client;
+use crate::permissions::{Answer, Asker, Request};
 use crate::skills::Skill;
 use crate::subagent::{AgentDef, Forks, Subagents};
 use crate::tools::{FileTracker, ToolOutput};
@@ -92,6 +93,48 @@ pub struct Task {
     meta: Mutex<Meta>,
     log: Mutex<Vec<Arc<str>>>,
     tx: broadcast::Sender<Sequenced>,
+    /// The agent's permissions, which the UI's mode menu changes.
+    pub permissions: Arc<crate::permissions::Permissions>,
+    /// Calls waiting for the user's approval, by question id.
+    questions: Mutex<std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<Answer>>>,
+    next_question: std::sync::atomic::AtomicU64,
+}
+
+/// Asks about a task's tool calls in the browser: a `permission` event in
+/// the task's log, answered through `answer`.
+struct WebAsker(Weak<Task>);
+
+#[async_trait::async_trait]
+impl Asker for WebAsker {
+    async fn ask(&self, request: &Request) -> Option<Answer> {
+        let task = self.0.upgrade()?;
+        let id = task.next_question.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        task.questions.lock().unwrap().insert(id, tx);
+        task.push(json!({
+            "type": "permission",
+            "id": id,
+            "tool": request.tool,
+            "input": request.input,
+            "reason": request.reason,
+            "suggestion": request.suggestion,
+            "agent": request.agent,
+        }));
+        drop(task);
+        // Unanswered when the call is dropped: the question goes.
+        struct Forget(Weak<Task>, u64);
+        impl Drop for Forget {
+            fn drop(&mut self) {
+                if let Some(task) = self.0.upgrade()
+                    && task.questions.lock().unwrap().remove(&self.1).is_some()
+                {
+                    task.push(json!({"type": "permission_answered", "id": self.1, "answer": "dropped"}));
+                }
+            }
+        }
+        let _forget = Forget(self.0.clone(), id);
+        rx.await.ok()
+    }
 }
 
 impl Task {
@@ -107,6 +150,8 @@ impl Task {
                     task.push(event.clone());
                 }
             }));
+            let permissions = agent.permissions().clone();
+            permissions.set_asker(Some(Arc::new(WebAsker(task.clone()))));
             let wake = task.clone();
             agent.inbox().on_wake(move || {
                 if let Some(task) = wake.upgrade() {
@@ -128,8 +173,24 @@ impl Task {
                 meta: Mutex::new(meta),
                 log: Mutex::new(Vec::new()),
                 tx: broadcast::channel(1024).0,
+                permissions,
+                questions: Mutex::new(std::collections::BTreeMap::new()),
+                next_question: std::sync::atomic::AtomicU64::new(1),
             }
         })
+    }
+
+    /// Answers question `id` about a tool call; false if nothing waits
+    /// for it.
+    pub fn answer(&self, id: u64, answer: Answer) -> bool {
+        let Some(tx) = self.questions.lock().unwrap().remove(&id) else { return false };
+        let name = match &answer {
+            Answer::Allow => "allow",
+            Answer::AllowAlways => "always",
+            Answer::Deny(_) => "deny",
+        };
+        self.push(json!({"type": "permission_answered", "id": id, "answer": name}));
+        tx.send(answer).is_ok()
     }
 
     pub fn summary(&self) -> Value {
@@ -144,6 +205,7 @@ impl Task {
             "created": self.created,
             "active": meta.handle.is_some(),
             "pending_tasks": self.subagents.running_in_background() + self.shells.pending(),
+            "permission_mode": self.permissions.mode().as_str(),
         })
     }
 

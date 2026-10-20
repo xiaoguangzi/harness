@@ -25,6 +25,7 @@ harness "list the files"                # 一次性模式
 harness --continue                      # 继续当前目录最近的会话（见下文）
 harness --web                           # Web UI，地址 http://localhost:8787（见下文）
 harness --sandbox                       # 在操作系统沙箱中运行模型的命令（见下文）
+harness --permission-mode default       # 运行会改动东西的工具调用前先询问（见下文）
 harness --plugin-dir ./my-plugin        # 本次运行额外加载某个目录中的插件（见下文）
 harness provider add relay              # 添加 LLM 网关，会询问 URL、密钥和模型（见下文）
 harness plugin install fmt@team         # 安装插件（见下文；harness plugin help）
@@ -78,6 +79,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `idle_compaction`、`idle_compaction_min_tokens` | [空闲压缩](#上下文压缩) |
 | `mcpServers` | [MCP 服务器](#mcp-服务器) |
 | `sandbox` | [沙箱](#沙箱) |
+| `permissions` | 哪些工具调用先询问或被拒绝：[权限](#权限) |
 | `shell` | [模型所执行命令的环境](#命令的环境) |
 | `hooks` | [Hooks](#hooks) |
 | `statusLine` | REPL 的[状态栏](#状态栏) |
@@ -105,6 +107,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `GET/POST /api/tasks` `{prompt, agent?, model?, title?}` | 列出 / 创建任务 |
 | `POST /api/tasks/{id}/messages` `{prompt}`、`/model` `{model}`、`/cancel`；`DELETE /api/tasks/{id}` | 驱动任务 |
 | `GET /api/tasks/{id}/subagents`、`POST /api/tasks/{id}/subagents/{agent_id}/stop` | 列出 / 停止该任务的子代理 |
+| `POST /api/tasks/{id}/permissions/{question}` `{answer, message?}`、`/mode` `{mode}` | 回答 `permission` 事件（`allow`、`always`、`deny`），或设置该任务的[权限模式](#权限) |
 | `GET /api/tasks/{id}/events` | server-sent events：先回放该任务的日志，再实时推送（可通过 `Last-Event-ID` 恢复） |
 
 ## LLM 网关
@@ -225,6 +228,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/plugins [子命令]` | 打开插件管理；`/plugins update` 拉取它们的最新版本，`/plugins install`、`uninstall`、`enable`、`disable`、`configure`、`marketplace …` 与 `harness plugin` 相同（见[插件](#插件plugins)） |
 | `/reload-plugins` | 从配置重新加载插件、技能、命令、代理和 hook，供下一个会话使用：当前会话还是空的则立即生效，否则从 `/clear` 或 `/resume` 起生效 |
 | `/sandbox` | 显示沙箱允许的操作（见[沙箱](#沙箱)） |
+| `/permissions [模式\|rules]` | 选择[权限模式](#权限)、直接设置（`/permissions plan`），或列出规则 |
 | `!命令` | 自己运行 `命令`，与模型的 `bash` 相同（开启沙箱时在沙箱中，但不受“禁止自行修改文件”的规则限制）；输出会显示出来，并随你的下一条消息交给模型 |
 | `/btw <问题>` | 就当前会话问一个旁支问题：模型根据已知信息回答，不调用工具，问题和回答都不会留在会话中。只发一次前缀相同的请求，所以会命中提示词缓存 |
 | `/copy [n]` | 把模型最后一条（或倒数第 `n` 条）回复复制到剪贴板：用 `pbcopy`、`wl-copy`、`xclip` 或 `xsel`，都没有时通过终端（OSC 52，终端允许时通过 SSH 也能用） |
@@ -233,6 +237,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/exit`、`exit`、Ctrl-D | 退出（`exit` 或 `quit` 仅在单独占一行时生效） |
 | Esc | 中断运行中的轮次，同 Ctrl-C |
 | Esc Esc | 在空的提示符下：`/rewind` |
+| Shift+Tab | 切换到下一个[权限模式](#权限)：default、accept edits、plan、bypass permissions |
 | 一轮运行期间按 ↑ | 把模型尚未拿到的排队消息取回输入框，以便修改 |
 | Ctrl-C | 中断运行中的轮次：运行中的命令被终止，并告知模型请求已被中断。在提示符处连按两次退出 |
 | 行尾 `\`、Alt+Enter | 在新行继续这条消息；终端能发送独立键序列时也支持 Shift+Enter |
@@ -329,6 +334,35 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 - 回退对话之后，模型在修改文件前需要重新读取。
 - 检查点随会话一起保存，保留的文件版本在 `~/.harness/file-history/<id>/`（仅所有者可读），因此 `--continue` 或 `/resume` 之后仍然可用。回退到第一条提示的会话不再保存。Web UI 不支持回退。
 
+## 权限
+
+默认情况下 harness 和以前一样，运行每个工具调用都不询问；约束模型命令的是操作系统[沙箱](#沙箱)。[配置](#配置)中的 `permissions` 部分（Claude Code 的格式）可以让它先询问，或者直接拒绝：
+
+```json
+{
+  "permissions": {
+    "defaultMode": "default",
+    "allow": ["Bash(cargo test:*)", "Bash(git status)", "mcp__exa"],
+    "ask": ["Bash(git push:*)"],
+    "deny": ["Read(.env)", "Bash(rm -rf:*)", "mcp__gh__delete*"]
+  }
+}
+```
+
+- 规则使用 Claude Code 的权限语法，与 hook 的 `if` 相同：用工具名或 Claude Code 的叫法（`Bash`、`Edit`、`read`），括号里写命令的开头（`git commit:*`；复合命令的每一部分都算）或路径要匹配的模式（`src/**`）。`mcp__<服务器>` 表示该服务器的所有工具，末尾的 `*` 表示名字以此开头的工具。
+- deny 规则在任何模式下都拒绝调用，即使 PreToolUse hook 给了 `allow`。其次，ask 规则（或 hook 的 `ask`）在任何模式下都会询问。再次，allow 规则或你在本会话中允许过的规则会直接放行。都不匹配时由模式决定：
+
+| 模式 | |
+|---|---|
+| `bypassPermissions`（默认） | 全部运行 |
+| `default` | 只读的调用直接运行（`read`、`grep`、`glob`、`lsp`、标记为只读的 MCP 工具），开启沙箱时 `bash` 也直接运行（在 `sandbox` 部分设置 `"auto_allow_bash": false` 则它也要询问）；其余都要询问 |
+| `acceptEdits` | 同 `default`，另外工作目录中文件的 `edit` 和 `write` 直接运行 |
+| `plan` | 只运行只读的调用，其余都拒绝，并告诉模型先调研、再给出计划；离开 plan 模式时会告诉它可以动手了 |
+
+- 启动或等待其他工作的工具（`agent`、`message_agent`、`stop_agent`、`wait_tasks`、`bash_output`、`kill_shell`）从不询问；它们启动的子代理的调用会询问，因为子代理共享所在会话的权限和模式。后台子代理的询问和主代理的一样显示。
+- 在 REPL 中，询问会占据输入框的位置：显示 `Allow bash(make)?` 和需要询问的原因（编辑还会显示改动的行），按 1 允许，按 2 允许并在本会话中放行同类调用（如 `Bash(make:*)`、`Edit`），按 3 或 Esc 拒绝并让模型换个做法。在 web UI 中，询问显示在任务里，带有按钮。会先运行 `PermissionRequest` [hook](#hooks)，它可以代你决定。无法询问时（一次性模式、重定向的输入、fork 运行的技能），调用会被拒绝，并告诉模型怎样才能被允许。
+- 用 Shift+Tab、`/permissions` 或 `--permission-mode 模式` 切换模式；当前模式不是启动时的模式时，会显示在输入框下方。web UI 在 `⋯` 菜单中按任务设置。
+
 ## 沙箱
 
 `harness --sandbox`（或 `HARNESS_SANDBOX=1`，或在配置的 `sandbox` 部分写 `"enabled": true`）让模型的 `bash` 命令和 `grep` / `glob` 搜索在操作系统沙箱里运行：macOS 用系统自带的 Seatbelt（`sandbox-exec`），Linux 用 [bubblewrap](https://github.com/containers/bubblewrap)（`apt install bubblewrap` / `dnf install bubblewrap`；它需要非特权用户命名空间，有些容器里没有）。`--no-sandbox` 或 `HARNESS_SANDBOX=0` 可以单次关闭。沙箱无法启动时，harness 直接退出，不会在没有沙箱的情况下运行。
@@ -415,16 +449,17 @@ Hooks 在 agent 循环的特定时机运行你自己的命令：拦截危险命�
 | `SessionStart` | 会话的第一个请求之前，以及 `/clear`、`/resume` 或压缩之后 | `startup`、`clear`、`resume`、`compact` | 补充上下文 |
 | `SessionEnd` | 发过请求的会话结束时：`/clear` 或 `/resume` 替换它之前、退出 REPL 时、one-shot 运行结束时、删除其 web 任务时 | `clear`、`resume`、`prompt_input_exit`、`other` | 不影响执行；默认只有 1.5 秒，可用 `timeout` 设置（最多 60 秒） |
 | `Notification` | 一个回合结束后，REPL 提示符或 web 任务等你输入已满 60 秒时 | `idle_prompt` | 不影响执行；会收到 `notification_type` 和 `message`，可用来弹出桌面通知 |
+| `PermissionRequest` | 就某个工具调用询问你之前（见[权限](#权限)） | 工具名 | 代你决定：`hookSpecificOutput.decision.behavior` 为 `"allow"` 或 `"deny"`（可带给模型的 `message`）；它还会收到 `permission_suggestions` |
 
-- hook 以 `sh -c <command>` 在工作目录中运行，不在沙箱内，`$CLAUDE_PROJECT_DIR` 和 `$HARNESS_PROJECT_DIR` 都设为工作目录。给出 `args`（字符串列表）时，`command` 带着这些参数直接启动、不经过 shell，参数不会被展开或切分（插件 hook 中的 `${CLAUDE_PLUGIN_ROOT}` 等仍会替换）。事件以 JSON 从 stdin 传入：`session_id`、`transcript_path`（保存的会话文件）、`cwd`、`hook_event_name`、`model`、`permission_mode`（固定为 `bypassPermissions`：harness 运行工具前从不询问）、子代理中的 `agent_id` 和 `agent_type`，以及事件自己的字段（`tool_name`、`tool_use_id`、`tool_input`、`tool_response` 或 `error`；`prompt`；`stop_hook_active`、`last_assistant_message`；`trigger`、`custom_instructions`、`compact_summary`；`source`、`reason`）。
+- hook 以 `sh -c <command>` 在工作目录中运行，不在沙箱内，`$CLAUDE_PROJECT_DIR` 和 `$HARNESS_PROJECT_DIR` 都设为工作目录。给出 `args`（字符串列表）时，`command` 带着这些参数直接启动、不经过 shell，参数不会被展开或切分（插件 hook 中的 `${CLAUDE_PLUGIN_ROOT}` 等仍会替换）。事件以 JSON 从 stdin 传入：`session_id`、`transcript_path`（保存的会话文件）、`cwd`、`hook_event_name`、`model`、`permission_mode`（会话的[权限模式](#权限)）、子代理中的 `agent_id` 和 `agent_type`，以及事件自己的字段（`tool_name`、`tool_use_id`、`tool_input`、`tool_response` 或 `error`；`prompt`；`stop_hook_active`、`last_assistant_message`；`trigger`、`custom_instructions`、`compact_summary`；`source`、`reason`）。
 - 退出码 0：stdout 以 `{` 开头时按 JSON 读取（`continue` / `stopReason`、`systemMessage`、`decision` / `reason`、`hookSpecificOutput`），否则对 `SessionStart`、`SubagentStart` 和 `UserPromptSubmit` 作为给模型的上下文，对其他事件忽略。退出码 2 表示拦截，stderr 是原因。其他退出码、超时（`timeout`，单位秒，默认 600）、命令无法启动或无效 JSON 会显示给你，不影响执行；除非 command hook 设置了 `"onFailure": "block"`：这时失败与退出码 2 一样会拦截，适合出错时也不能被绕过的守卫脚本。`continue: false` 结束当前回合。
 - 工具也可以用 Claude Code 的名字匹配，hook 看到的也是这些名字：`bash` 是 `Bash`，`read` / `edit` / `write` / `grep` / `glob` / `lsp` 是 `Read` / `Edit` / `Write` / `Grep` / `Glob` / `LSP`，`agent` 是 `Agent`（或 `Task`）；MCP 工具仍是 `mcp__<server>__<tool>`。只由名字组成的 matcher（`Edit|Write`）做精确匹配，其他的按正则表达式匹配（`mcp__fs__.*`），空串或 `*` 匹配全部。文件工具的 `path` 也会以 `file_path` 给出，`updatedInput` 用哪个都可以。
-- `permissionDecision: "ask"` 会拒绝调用，因为没有人可以询问。
+- `permissionDecision: "ask"` 会让这次调用先询问用户（见[权限](#权限)），`"allow"` 则不询问直接运行，除非被 deny 规则拒绝。
 - `prompt` 类型的 hook（`{"type": "prompt", "prompt": "…", "model": "…", "timeout": 30}`）不运行命令，而是询问模型：当前会话的模型，或者 `model` 指定的、provider 认识的模型（Claude Code 的 `haiku` 之类别名不算）。事件的输入 JSON 替换 prompt 中的 `$ARGUMENTS`（没有占位符时附在末尾），模型回答 `{"ok": true}` 或 `{"ok": false, "reason": "…"}`；`ok: false` 等同于退出码 2 加上该原因，所以 Stop 上的 prompt hook 能让模型继续干活。默认 30 秒，可用 `timeout` 设置；它的请求不计入 `/usage`。
 - 匹配同一事件的所有 hook 同时运行，最多同时 12 个；同一条命令列出两次只运行一次。hooks 在子代理（用 `SubagentStop` 代替 `Stop`）和 web 任务中同样生效。
 - hook 给模型的内容放在 `<hook-feedback>` 块中；给你的内容（`systemMessage`、拒绝原因、运行失败）显示为 `⚑` 开头的一行。
 - `if` 用 Claude Code 的权限规则语法把工具事件的 hook 限定到部分调用：`Bash(git commit:*)` 或 `Bash(git push *)`（命令，或复合命令中的某一段，以此开头；`*` 匹配任意内容）、`Edit(src/**/*.ts)`（文件路径），或只写工具名。`async: true` 的 hook 在后台运行，不阻塞调用；它给模型的内容随下一个请求发出。`asyncRewake: true` 同样在后台运行，若以退出码 2 结束，则用 `rewakeMessage` 加上 hook 给出的原因唤醒模型，模型空闲时会单独开一个回合。
-- 只支持 `command` 和 `prompt` 类型的 hook 以及上面这些事件；其他 hook 类型（`http`、`agent`、`mcp_tool`）以及其他事件（`PermissionRequest` 等）在配置中会报错（[插件](#插件plugins)中的则给出警告并略过）。hooks 只来自配置文件及其启用的插件，仓库无法自行添加；修改在下次启动时生效，或在 `/reload-plugins` 后对下一个会话生效。
+- 只支持 `command` 和 `prompt` 类型的 hook 以及上面这些事件；其他 hook 类型（`http`、`agent`、`mcp_tool`）以及其他事件（`Elicitation` 等）在配置中会报错（[插件](#插件plugins)中的则给出警告并略过）。hooks 只来自配置文件及其启用的插件，仓库无法自行添加；修改在下次启动时生效，或在 `/reload-plugins` 后对下一个会话生效。
 
 ## 项目说明
 
@@ -609,7 +644,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/main.rs` — 启动：配置、`harness plugin`、`harness provider` 和 `--check-plugins`、沙箱，然后是 `setup.rs` 构建的内容；最后进入 CLI 或 web 前端
 - `src/setup.rs` — 会话由什么构成：插件及其技能、代理、hook、MCP 与语言服务器（由 `/reload-plugins` 重建）、用户的 MCP 服务器、工具集和系统提示词；`--check-plugins`；后台自动更新
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
-- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`!命令`、`/btw`、`/copy` 和 `/export`（`actions.rs`）、状态栏（`status_line.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）及各个无参数命令在面板中显示的内容（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
+- `src/cli/` — 终端前端：REPL 和一次性模式（`mod.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`!命令`、`/btw`、`/copy` 和 `/export`（`actions.rs`）、询问工具调用（`approve.rs`）、状态栏（`status_line.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）及各个无参数命令在面板中显示的内容（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、旋转指示器、输入框与轮次显示（`output.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent.rs` — 代理循环：请求 → 并发运行工具 → 发送结果 → 循环直到 `end_turn`；收件箱，把期间到达的内容（如后台子代理的报告）交给模型
 - `src/agent/usage.rs` — `/usage` 显示的按模型统计的 token 数，与子代理共享
@@ -624,6 +659,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
 - `src/checkpoint.rs` — `/rewind` 的检查点：`edit` 和 `write` 修改的文件在每条提示之前的版本，随会话保存；恢复它们
 - `src/mentions.rs` — `@路径` 的解析与展开为附件块；粘贴图片的附件块
+- `src/permissions.rs` — 权限：配置中的规则、各个模式、哪些调用直接运行、询问或拒绝，以及通过前端询问
 - `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read`、`edit` 和 `write` 检查的路径规则
 - `src/subagent.rs` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具
 - `src/subagent/runtime.rs` — 一个会话的子代理：前台与后台运行、后续追问、停止、向主代理收件箱报告
