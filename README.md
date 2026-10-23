@@ -153,7 +153,7 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 | `prompt_cache` | Anthropic automatic prompt caching; default on |
 | `prompt_cache_ttl` | Anthropic only: how long the cache keeps the conversation after its last use, `5m` (default) or `1h`. Writing to the 1-hour cache costs twice the input price rather than 1.25 times, which pays off when you often pause between 5 minutes and an hour |
 | `gzip` | gzip-compress request bodies of 1 KiB or more; default on for `api.anthropic.com`, off for gateways, many of which reject it |
-| `tool_search` | Anthropic only: once the MCP tools' definitions come to about 10k tokens, they are sent with `defer_loading` and the model finds the ones it needs with the server-side tool search tool, which keeps them out of the context until then (the built-in tools stay loaded). Default on for `api.anthropic.com`, off for gateways; a provider that answers such a request with HTTP 400 or 422 gets it again without tool search, and if that works, no more tool search for the rest of the run |
+| `tool_search` | Anthropic only: [defer MCP tools](#deferred-tools) behind the `tool_search` tool once their definitions would take a tenth of the context window. Default on for `api.anthropic.com`, off for gateways; a provider that answers such a request with HTTP 400 or 422 gets it again with every tool in full, and if that works, so for the rest of the run |
 | `models` | per-model overrides; listed models show in `/model` and Tab completion |
 | `price` | per model: what its tokens cost in dollars per million, `{"input": 1.25, "output": 10, "cache_read": 0.125}` (`cache_write` too; by default a tenth and 1.25 times the input price, twice it with the 1-hour cache), for the estimate `/usage` shows. Claude models have their list prices built in |
 
@@ -412,6 +412,15 @@ Declare servers under `mcpServers` in the [settings](#settings), in the same sha
 - `/reload-plugins` keeps the plugins' servers whose config did not change running, rather than starting them again.
 - Tools are exposed as `mcp__<server>__<tool>`. Text, embedded text resources and PNG/JPEG/GIF/WebP images are passed back to the model.
 - A stdio server's stderr goes to `$TMPDIR/harness-mcp-<server>.log`.
+- `"alwaysLoad": true` keeps a server's tools loaded even when the others are [deferred](#deferred-tools).
+
+### Deferred tools
+
+Many MCP tools can take much of the context before any work starts. Once their definitions would take a tenth of the context window, and the provider has `tool_search` on, a conversation defers them, as Claude Code does: they are sent with `defer_loading`, so the API leaves their descriptions and schemas out of the context, and the model is told only their names, in a `<deferred-tools>` message. It loads the ones it needs with the `tool_search` tool (`ToolSearch` to hooks): by name (`select:mcp__gh__create_issue,mcp__gh__list_issues`), by prefix (`mcp__gh`), or by keywords (`github issue`, `+slack send` to require `slack` in the name). The search runs locally, and its result is `tool_reference` blocks, which the API replaces with the full definitions; the tool list never changes, so the prompt cache keeps its prefix.
+
+- The conversation decides once, before its first request, and keeps to it until `/clear`; a resumed or forked conversation that deferred tools goes on doing so. Subagents decide for their own tools.
+- The model is told again when the deferred tools change and after a compaction, with the tools it had loaded, to load again.
+- Without `defer_loading` (an OpenAI provider, or after a provider refused it), every tool is sent in full and what `tool_search` loaded is told as text, so a conversation carries on across `/model` switches.
 
 ## Hooks
 

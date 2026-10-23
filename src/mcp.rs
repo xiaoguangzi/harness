@@ -60,6 +60,10 @@ pub struct ServerConfig {
     url: Option<String>,
     #[serde(default)]
     pub(crate) headers: BTreeMap<String, String>,
+    /// Its tools are always sent in full, never deferred behind
+    /// `tool_search`.
+    #[serde(rename = "alwaysLoad", default)]
+    always_load: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -336,6 +340,10 @@ impl Tool for McpTool {
     /// Trusts the server's `readOnlyHint`; unannotated tools count as writes.
     fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    fn deferred(&self) -> bool {
+        !self.server.config.always_load
     }
 
     async fn run(&self, input: Value) -> ToolOutput {

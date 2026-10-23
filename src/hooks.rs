@@ -374,6 +374,7 @@ pub(crate) const ALIASES: &[(&str, &[&str])] = &[
     ("read", &["Read"]),
     ("skill", &["Skill"]),
     ("stop_agent", &["TaskStop"]),
+    ("tool_search", &["ToolSearch"]),
     ("write", &["Write"]),
 ];
 

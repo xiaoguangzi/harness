@@ -2,6 +2,7 @@
 //! results back, and repeat until the model ends its turn.
 
 mod compact;
+mod deferred;
 mod usage;
 
 use std::sync::{Arc, Mutex};
@@ -258,6 +259,9 @@ pub struct Agent {
     permissions: Arc<Permissions>,
     /// The permission mode the model was last told about, if any.
     told_mode: Option<Mode>,
+    /// Whether this conversation defers tools behind `tool_search`, once
+    /// decided (see `deferred`).
+    tool_search: Option<bool>,
 }
 
 impl Agent {
@@ -294,6 +298,7 @@ impl Agent {
             compact_window: None,
             permissions,
             told_mode: None,
+            tool_search: None,
         }
     }
 
@@ -396,6 +401,10 @@ impl Agent {
     /// Replaces the tool set, e.g. after the providers were reloaded.
     pub fn set_tools(&mut self, tools: ToolRegistry) {
         self.tools = tools;
+        // The model hears of any change to the deferred tools with the next prompt.
+        if self.tool_search.is_some() {
+            self.sync_tool_search(&[]);
+        }
     }
 
     /// Replaces the system prompt, for a new conversation.
@@ -479,6 +488,7 @@ impl Agent {
         self.turn_start = None;
         self.context = None;
         self.told_mode = None;
+        self.tool_search = None;
         self.session_start = Some("clear");
         if self.checkpoints {
             self.history.clear();
@@ -559,9 +569,11 @@ impl Agent {
         if let Some(prompt) = prompt.filter(|_| self.checkpoints) {
             self.history.begin(self.messages.len(), prompt);
         }
+        // Tool results that arrived for a fork must come first.
+        let notice = self.sync_tool_search(&[]);
         self.turn_start = Some(self.messages.len());
         (self.compactions, self.turn_compacted) = (0, false);
-        self.messages.push(Message::user(arrived.iter().cloned().chain(content).collect()));
+        self.messages.push(Message::user(arrived.iter().cloned().chain(notice).chain(content).collect()));
         let (subagents, client, shells) = (self.subagents.clone(), self.client.clone(), self.shells.clone());
         let nested = self.hooks.is_subagent();
         let history = self.history.clone();

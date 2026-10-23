@@ -140,11 +140,7 @@ pub fn history_events(messages: &[crate::llm::Message]) -> Vec<Value> {
                     let (id, name) = (block["id"].as_str().unwrap_or_default(), block["name"].as_str().unwrap_or_default());
                     events.push(json!({"type": "tool_call", "id": id, "name": name, "input": block["input"]}));
                     if let Some(result) = results.get(id) {
-                        let text = match &result["content"] {
-                            Value::String(text) => text.clone(),
-                            Value::Array(items) => items.iter().filter_map(|i| i["text"].as_str()).collect::<Vec<_>>().join("\n"),
-                            _ => String::new(),
-                        };
+                        let text = crate::tools::result_text(&result["content"]);
                         let content = crate::tools::truncate(&text, MAX_EVENT_RESULT_BYTES);
                         events.push(json!({"type": "tool_result", "id": id, "name": name, "content": content, "is_error": result["is_error"] == true}));
                     }

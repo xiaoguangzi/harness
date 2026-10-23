@@ -154,7 +154,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `prompt_cache` | Anthropic 自动提示词缓存；默认开启 |
 | `prompt_cache_ttl` | 仅 Anthropic：缓存在最后一次使用后保留多久，`5m`（默认）或 `1h`。写入 1 小时缓存的价格是输入价的 2 倍而不是 1.25 倍，常在 5 分钟到 1 小时之间停顿时更划算 |
 | `gzip` | 用 gzip 压缩 1 KiB 及以上的请求体；`api.anthropic.com` 默认开启，网关默认关闭，因为很多网关不接受 |
-| `tool_search` | 仅 Anthropic：MCP 工具定义合计约 1 万 token 以上时，以 `defer_loading` 发送，模型用服务端的 tool search 工具查找需要的工具，在那之前它们不占上下文（内置工具始终加载）。`api.anthropic.com` 默认开启，网关默认关闭；provider 对这样的请求返回 HTTP 400 或 422 时，会去掉 tool search 再发一次，成功的话本次运行剩下的时间里不再对它使用 tool search |
+| `tool_search` | 仅 Anthropic：MCP 工具定义会占上下文窗口十分之一以上时，把它们[延迟加载](#延迟加载的工具)到 `tool_search` 工具之后。`api.anthropic.com` 默认开启，网关默认关闭；provider 对这样的请求返回 HTTP 400 或 422 时，会把所有工具完整发送再试一次，成功的话本次运行剩下的时间里都这样发送 |
 | `models` | 按模型的覆盖项；列出的模型会显示在 `/model` 和 Tab 补全中 |
 | `price` | 按模型设置：每百万 token 的美元价格，`{"input": 1.25, "output": 10, "cache_read": 0.125}`（也可设 `cache_write`；默认缓存读取为输入价的十分之一、写入为 1.25 倍，1 小时缓存为 2 倍），用于 `/usage` 显示的费用估算。Claude 模型内置了官方价格 |
 
@@ -413,6 +413,15 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 - `/reload-plugins` 会保留配置没有变化的插件 MCP 服务器继续运行，不会重新启动它们。
 - 工具以 `mcp__<server>__<tool>` 形式暴露。文本、内嵌文本资源和 PNG/JPEG/GIF/WebP 图片会传回给模型。
 - stdio 服务器的 stderr 写入 `$TMPDIR/harness-mcp-<server>.log`。
+- `"alwaysLoad": true` 让一个服务器的工具始终完整加载，即使其他工具被[延迟加载](#延迟加载的工具)。
+
+### 延迟加载的工具
+
+MCP 工具一多，还没开始干活就会占掉大量上下文。当它们的定义会占上下文窗口十分之一以上、且 provider 开启了 `tool_search` 时，对话会像 Claude Code 一样延迟加载它们：这些工具带 `defer_loading` 发送，API 不把它们的描述和 schema 放进上下文，模型只在一条 `<deferred-tools>` 消息里看到它们的名字。需要哪个，模型就用 `tool_search` 工具（hook 里叫 `ToolSearch`）加载：按名字（`select:mcp__gh__create_issue,mcp__gh__list_issues`）、按前缀（`mcp__gh`）或按关键词（`github issue`；`+slack send` 要求名字里有 `slack`）。搜索在本地进行，结果是 `tool_reference` 块，API 会把它们替换成完整定义；工具列表始终不变，prompt cache 的前缀也就不变。
+
+- 对话在第一次请求前决定一次，直到 `/clear` 都保持不变；恢复或 fork 出来的对话，如果原来延迟了工具，会继续这样做。子代理按自己的工具单独决定。
+- 延迟的工具有变化时、以及 compact 之后，会再告诉模型一次，并列出它之前加载过、需要重新加载的工具。
+- 不使用 `defer_loading` 时（OpenAI provider，或 provider 拒绝了它之后），所有工具都完整发送，`tool_search` 加载了什么以文本告诉模型，所以 `/model` 切换后对话照常继续。
 
 ## Hooks
 

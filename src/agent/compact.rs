@@ -104,9 +104,13 @@ impl Agent {
         match self.context {
             Some((len, tokens)) if len <= self.messages.len() => tokens + estimate_messages(&self.messages[len..]),
             _ => {
+                // Deferred tools take only their names until they are loaded.
                 let tools: u64 = definitions
                     .iter()
-                    .map(|d| estimate_text(&d.name) + estimate_text(&d.description) + estimate(&d.input_schema))
+                    .map(|d| match d.defer_loading {
+                        true => estimate_text(&d.name),
+                        false => estimate_text(&d.name) + estimate_text(&d.description) + estimate(&d.input_schema),
+                    })
                     .sum();
                 estimate_text(&self.system) + tools + estimate_messages(&self.messages)
             }
@@ -297,8 +301,13 @@ impl Agent {
         if self.checkpoints {
             self.history.rebase((pending == 1).then(|| self.messages.len() - 1), 1);
         }
+        let loaded = super::deferred::loaded(history);
         let pending = self.messages.pop().filter(|_| pending == 1);
         self.messages = vec![Message::user(content)];
+        // The deferred tools, and those loaded, went with the history.
+        if let Some(notice) = self.sync_tool_search(&loaded) {
+            self.messages[0].content.push(notice);
+        }
         self.messages.extend(pending);
         self.context = None;
         self.session_start = Some("compact");
@@ -361,7 +370,8 @@ fn kept_user_messages(history: &[Message]) -> Vec<String> {
         .filter_map(|b| b["text"].as_str().filter(|_| b["type"] == "text"))
         .filter(|t| !t.is_empty() && *t != INTERRUPTED)
         .filter(|t| {
-            !["<file ", "<directory ", "<subagent-notification>", "<shell-notification>", "The files read most recently", TODO_PREFIX, TOOLS_PREFIX]
+            // A compaction tells the model about the deferred tools anew.
+            !["<file ", "<directory ", "<subagent-notification>", "<shell-notification>", "The files read most recently", TODO_PREFIX, TOOLS_PREFIX, super::deferred::NOTICE_START]
                 .iter()
                 .any(|p| t.starts_with(p))
         });
@@ -520,6 +530,14 @@ pub(crate) mod tests {
     pub(crate) async fn gateway(
         reply: impl Fn(usize) -> (Vec<Value>, &'static str, u64) + Send + Sync + 'static,
     ) -> (crate::llm::Client, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        gateway_with(json!({}), reply).await
+    }
+
+    /// [`gateway`], with `settings` added to the provider's.
+    pub(crate) async fn gateway_with(
+        settings: Value,
+        reply: impl Fn(usize) -> (Vec<Value>, &'static str, u64) + Send + Sync + 'static,
+    ) -> (crate::llm::Client, tokio::sync::mpsc::UnboundedReceiver<Value>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let reply = std::sync::Arc::new(reply);
@@ -558,10 +576,12 @@ pub(crate) mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let config = crate::llm::config::tests::file(json!({"model": "mock/main", "providers": {
-            "mock": {"protocol": "anthropic", "base_url": url, "api_key": "fixture-only",
-                "context_window": 10_000, "max_tokens": 1_000}
-        }}));
+        let mut provider = json!({"protocol": "anthropic", "base_url": url, "api_key": "fixture-only",
+            "context_window": 10_000, "max_tokens": 1_000});
+        for (key, value) in settings.as_object().into_iter().flatten() {
+            provider[key] = value.clone();
+        }
+        let config = crate::llm::config::tests::file(json!({"model": "mock/main", "providers": {"mock": provider}}));
         let providers = crate::llm::Providers::from_parts(&config, &crate::llm::config::tests::no_env).unwrap();
         (crate::llm::Client::new(providers).unwrap(), rx)
     }

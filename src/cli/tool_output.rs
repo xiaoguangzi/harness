@@ -91,12 +91,7 @@ pub(super) fn restore(messages: &[Message]) -> Vec<Record> {
             Some("tool_result") => {
                 let id = block["tool_use_id"].as_str().unwrap_or("");
                 if let Some(record) = records.iter_mut().rev().find(|r| r.id == id) {
-                    let content = match &block["content"] {
-                        Value::String(s) => s.clone(),
-                        Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
-                        _ => String::new(),
-                    };
-                    let mut output = ToolOutput::ok(content);
+                    let mut output = ToolOutput::ok(crate::tools::result_text(&block["content"]));
                     output.is_error = block["is_error"].as_bool().unwrap_or(false);
                     if let Value::Array(blocks) = &block["content"] {
                         output.images = blocks.iter().filter(|b| matches!(b["type"].as_str(), Some("image" | "document"))).cloned().collect();

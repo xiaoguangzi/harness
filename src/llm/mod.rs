@@ -79,6 +79,9 @@ pub struct ToolDef {
     /// Whether the tool validates its own input strictly, so the API may
     /// stream it unbuffered (Anthropic `eager_input_streaming`).
     pub eager_input_streaming: bool,
+    /// Whether the model loads it with `tool_search` before calling it
+    /// (Anthropic `defer_loading`); other protocols send it in full.
+    pub defer_loading: bool,
 }
 
 /// A complete response, normalized to Anthropic vocabulary.
@@ -201,6 +204,13 @@ impl Client {
         self.providers.target(&self.spec).map_or(u32::MAX, |t| t.context_window()).into()
     }
 
+    /// Whether this model's requests may defer tools for `tool_search`
+    /// to load: an Anthropic provider with `tool_search` on, which has not
+    /// refused it.
+    pub fn tool_search(&self) -> bool {
+        self.providers.target(&self.spec).is_ok_and(|t| anthropic::defers(&t))
+    }
+
     /// Overrides the configured effort, or restores it with `None`. Kept
     /// across [`Client::switch`].
     pub fn set_effort(&mut self, effort: Option<Effort>) {
@@ -246,6 +256,23 @@ impl Client {
 /// in it may be sent back.
 fn same_source(message: &Message, spec: &str) -> bool {
     message.source.as_deref() == Some(spec)
+}
+
+/// The names of the tools a tool result's `content` loads, in its
+/// `tool_reference` blocks.
+fn references(content: &Value) -> Vec<&str> {
+    let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
+    blocks.iter().filter(|b| b["type"] == "tool_reference").filter_map(|b| b["tool_name"].as_str()).collect()
+}
+
+/// A tool result's `content` with no `tool_reference` blocks, for a
+/// request that sends every tool in full: what they loaded, as text.
+fn references_as_text(content: &Value) -> Value {
+    let names = references(content);
+    if names.is_empty() {
+        return content.clone();
+    }
+    Value::String(format!("Loaded {}; they can be called now.", names.join(", ")))
 }
 
 /// Strictly parses streamed tool input. An empty input means no arguments.

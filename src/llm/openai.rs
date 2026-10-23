@@ -21,7 +21,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::config::Target;
-use super::{Message, Response, StreamEvent, ToolDef, Usage, http, parse_tool_input, same_source};
+use super::{Message, Response, StreamEvent, ToolDef, Usage, http, parse_tool_input, references_as_text, same_source};
 
 pub(super) async fn create(
     http_client: &reqwest::Client,
@@ -117,7 +117,8 @@ fn user_items(message: &Message, input: &mut Vec<Value>) {
     for block in &message.content {
         match block["type"].as_str().unwrap_or("") {
             "tool_result" => {
-                let (text, images) = split_tool_result(&block["content"]);
+                // Every tool is sent in full: what `tool_search` loaded is text.
+                let (text, images) = split_tool_result(&references_as_text(&block["content"]));
                 let output = if block["is_error"] == true { format!("Error: {text}") } else { text };
                 input.push(json!({"type": "function_call_output", "call_id": block["tool_use_id"], "output": output}));
                 result_files.extend(images);
@@ -426,6 +427,14 @@ mod tests {
     }
 
     #[test]
+    fn tells_what_tool_search_loaded_as_text() {
+        let loaded = json!([{"type": "tool_reference", "tool_name": "mcp__gh__issues"}]);
+        let messages = [Message::user(vec![json!({"type": "tool_result", "tool_use_id": "call_1", "content": loaded})])];
+        let input = to_input(&messages, "gw/gpt-5");
+        assert_eq!(input[0]["output"], "Loaded mcp__gh__issues; they can be called now.");
+    }
+
+    #[test]
     fn builds_body_with_tools_and_extra_body() {
         let p = providers();
         let target = p.target("gw/gpt-5").unwrap();
@@ -434,6 +443,7 @@ mod tests {
             description: "search".into(),
             input_schema: json!({"type": "object"}),
             eager_input_streaming: true,
+            defer_loading: true,
         }];
         let body = build_body(&target, "sys", &tools, &[Message::user(vec![json!({"type": "text", "text": "hi"})])]);
         assert_eq!(body["model"], "gpt-5");

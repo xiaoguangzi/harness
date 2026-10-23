@@ -19,6 +19,7 @@ pub(crate) mod progress;
 mod wait;
 #[allow(dead_code)] // `todo_write` isn't registered; see `with_defaults`
 pub mod todo;
+pub mod tool_search;
 mod write;
 
 pub use bash::BashTool;
@@ -55,6 +56,9 @@ pub struct ToolOutput {
     /// A file the tool changed, for the frontend to show as a diff; not
     /// sent to the model.
     pub change: Option<Box<FileChange>>,
+    /// Deferred tools to load, sent as `tool_reference` blocks in place of
+    /// the text, which is then only for the user (see [`tool_search`]).
+    pub references: Vec<String>,
 }
 
 /// A file's contents before and after a tool changed it.
@@ -68,11 +72,11 @@ pub struct FileChange {
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false, images: Vec::new(), change: None }
+        Self { content: content.into(), is_error: false, images: Vec::new(), change: None, references: Vec::new() }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true, images: Vec::new(), change: None }
+        Self { content: content.into(), is_error: true, images: Vec::new(), change: None, references: Vec::new() }
     }
 
     pub fn with_change(self, change: FileChange) -> Self {
@@ -81,6 +85,9 @@ impl ToolOutput {
 
     /// The `content` field of the `tool_result` block.
     pub fn to_result_content(&self) -> Value {
+        if !self.references.is_empty() {
+            return self.references.iter().map(|name| json!({"type": "tool_reference", "tool_name": name})).collect();
+        }
         if self.images.is_empty() {
             return Value::String(self.content.clone());
         }
@@ -90,6 +97,20 @@ impl ToolOutput {
         }
         blocks.extend(self.images.iter().cloned());
         Value::Array(blocks)
+    }
+}
+
+/// The text of a `tool_result` block's `content`, to show it again: its
+/// text blocks, or what `tool_search` loaded.
+pub fn result_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) if blocks.iter().any(|b| b["type"] == "tool_reference") => {
+            let names: Vec<&str> = blocks.iter().filter_map(|b| b["tool_name"].as_str()).collect();
+            format!("Loaded {}", names.join(", "))
+        }
+        Value::Array(blocks) => blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -106,6 +127,12 @@ pub trait Tool: Send + Sync {
     /// Whether the tool never modifies anything. Read-only agents only get
     /// tools that return true; unknown tools default to false.
     fn read_only(&self) -> bool {
+        false
+    }
+    /// Whether the tool may be deferred: once the definitions of such tools
+    /// would take much of the context, the model sees only their names
+    /// until it loads them with [`tool_search`].
+    fn deferred(&self) -> bool {
         false
     }
     /// Read-only tools may overlap. Unknown mutations own the workspace.
@@ -199,16 +226,16 @@ impl ToolRegistry {
     /// no longer validates the input, so built-in tools deserialize into a
     /// strict struct before running; MCP tools, whose schemas are arbitrary,
     /// leave it off so the API validates their input.
+    ///
+    /// With `tool_search` registered, the tools that may be deferred are.
     pub fn definitions(&self) -> Vec<ToolDef> {
-        self.tools
-            .values()
-            .map(|t| ToolDef {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                input_schema: t.input_schema(),
-                eager_input_streaming: t.eager_input_streaming(),
-            })
-            .collect()
+        let search = self.tools.contains_key(tool_search::NAME);
+        self.tools.values().map(|t| definition(t.as_ref(), search && t.deferred())).collect()
+    }
+
+    /// The definitions of the tools that may be deferred.
+    pub fn deferrable(&self) -> Vec<ToolDef> {
+        self.tools.values().filter(|t| t.deferred()).map(|t| definition(t.as_ref(), true)).collect()
     }
 
     pub async fn run(&self, name: &str, input: Value) -> ToolOutput {
@@ -219,6 +246,16 @@ impl ToolRegistry {
             }
             None => ToolOutput::error(format!("Unknown tool: {name}")),
         }
+    }
+}
+
+fn definition(tool: &dyn Tool, defer_loading: bool) -> ToolDef {
+    ToolDef {
+        name: tool.name().to_string(),
+        description: tool.description().to_string(),
+        input_schema: tool.input_schema(),
+        eager_input_streaming: tool.eager_input_streaming(),
+        defer_loading,
     }
 }
 
