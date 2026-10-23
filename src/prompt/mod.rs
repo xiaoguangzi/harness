@@ -293,19 +293,41 @@ fn notes_text(path: &Path, label: &str, limit: usize) -> Option<String> {
 
 /// The local date as `YYYY-MM-DD`.
 fn today() -> Option<String> {
+    let tm = local_time()?;
+    Some(format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday))
+}
+
+/// The local time as `YYYY-MM-DD HH:MM:SS +HH:MM`.
+pub fn timestamp() -> Option<String> {
+    let tm = local_time()?;
+    let offset = tm.tm_gmtoff / 60;
+    let sign = if offset < 0 { '-' } else { '+' };
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {sign}{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        offset.abs() / 60,
+        offset.abs() % 60
+    ))
+}
+
+fn local_time() -> Option<libc::tm> {
     let now = libc::time_t::try_from(
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs(),
     )
     .ok()?;
     // SAFETY: `tm` is plain data, and `localtime_r` only writes into it.
-    let tm = unsafe {
+    unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&now, &mut tm).is_null() {
             return None;
         }
-        tm
-    };
-    Some(format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday))
+        Some(tm)
+    }
 }
 
 #[cfg(test)]
@@ -413,5 +435,13 @@ mod tests {
         let date = today().unwrap();
         assert_eq!(date.len(), 10, "{date}");
         assert!(date.starts_with("20"), "{date}");
+    }
+
+    #[test]
+    fn timestamp_has_time_and_offset() {
+        let stamp = timestamp().unwrap();
+        assert_eq!(stamp.len(), 26, "{stamp}");
+        assert!(stamp.starts_with("20"), "{stamp}");
+        assert!(matches!(stamp.as_bytes()[20], b'+' | b'-'), "{stamp}");
     }
 }

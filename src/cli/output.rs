@@ -224,6 +224,7 @@ impl Output {
             for block in &message.content {
                 match block["type"].as_str() {
                     Some("tool_use") => { state.transcript.push(Entry::Tool(index)); index += 1; }
+                    Some("text") if crate::agent::is_timestamp(block) => {}
                     Some("text" | "thinking") => {
                         let thinking = block["type"] == "thinking";
                         let content = block[if thinking { "thinking" } else { "text" }].as_str().unwrap_or("");
@@ -695,7 +696,7 @@ pub fn replay(out: &Output, messages: &[Message]) {
             continue;
         }
         if m.role == "user" {
-            let prompt = m.content.iter().rev().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).find(|t| *t != INTERRUPTED);
+            let prompt = m.content.iter().rev().filter(|b| b["type"] == "text" && !crate::agent::is_timestamp(b)).filter_map(|b| b["text"].as_str()).find(|t| *t != INTERRUPTED);
             if let Some(prompt) = prompt.filter(|_| !m.content.iter().any(|b| b["type"] == "tool_result")) {
                 gap(&mut tools);
                 let lines: Vec<&str> = prompt.lines().collect();

@@ -8,7 +8,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::*;
-use crate::agent::{INTERRUPTED, Inbox, Observer};
+use crate::agent::mock::texts as sent;
+use crate::agent::{INTERRUPTED, Inbox, Observer, is_timestamp};
 use crate::llm::Providers;
 use crate::llm::config::tests::{file, no_env};
 
@@ -186,7 +187,7 @@ async fn foreground_reports_come_back_as_text_and_can_be_continued() {
         let body = mock.next().await;
         assert_eq!(messages(&body), 3, "it keeps its context");
         assert_eq!(body["messages"][1]["content"][0]["text"], "first report");
-        assert_eq!(body["messages"][2]["content"][0]["text"], "and then?");
+        assert_eq!(sent(&body["messages"][2]), ["and then?"]);
         assert_eq!(body["model"], "switched");
         id
     })
@@ -233,7 +234,7 @@ async fn background_reports_arrive_after_the_turn_and_wake_the_parent() {
         bodies.push(mock.next().await);
     }
     let last = bodies.iter().find(|b| b["system"] == "parent" && messages(b) == 5).unwrap();
-    let note = last["messages"][4]["content"][0]["text"].as_str().unwrap();
+    let note = &sent(&last["messages"][4])[0];
     assert!(note.contains("<status>completed</status>") && note.contains("child evidence"), "{note}");
     // With nothing waiting, a turn without a prompt does nothing.
     parent.run_turn(Vec::new(), &mut Quiet).await.unwrap();
@@ -268,7 +269,7 @@ async fn a_running_subagent_reads_messages_at_its_next_step() {
     let body = mock.next().await;
     assert_eq!(messages(&body), 3);
     assert_eq!(body["messages"][1]["content"][0]["text"], "covered the code");
-    assert!(body["messages"][2]["content"][0]["text"].as_str().unwrap().contains("also check the tests"));
+    assert!(sent(&body["messages"][2])[0].contains("also check the tests"));
     assert!(texts(&parent).contains("covered the code and the tests"));
 }
 
@@ -291,8 +292,8 @@ async fn stopped_subagents_keep_their_conversation() {
         let out = tools.run("message_agent", json!({"agent_id": id, "message": "retry", "run_in_background": true})).await;
         assert!(out.content.contains("in the background"), "{}", out.content);
         let body = mock.next().await;
-        assert_eq!(body["messages"][0]["content"][1]["text"], INTERRUPTED, "the stopped run is noted");
-        assert_eq!(body["messages"][1]["content"][0]["text"], "retry");
+        assert_eq!(sent(&body["messages"][0])[1], INTERRUPTED, "the stopped run is noted");
+        assert_eq!(sent(&body["messages"][1]), ["retry"]);
 
         let out = tools.run("stop_agent", json!({"agent_id": id})).await;
         assert!(out.content.starts_with("Stopped"), "{}", out.content);
@@ -382,14 +383,14 @@ async fn what_arrives_goes_with_the_next_request() {
     late.await.unwrap();
 
     let first = mock.next().await;
-    assert_eq!(first["messages"][0]["content"], json!([
-        {"type": "text", "text": "waiting before"}, {"type": "text", "text": "hi"}
-    ]));
+    // Each request notes the time first.
+    assert!(is_timestamp(&first["messages"][0]["content"][0]), "{first}");
+    assert_eq!(sent(&first["messages"][0]), ["waiting before", "hi"]);
     // After the tool results; then the turn carries on instead of ending.
     let second = mock.next().await;
     assert_eq!(second["messages"][2]["content"][1], json!({"type": "text", "text": "a report arrived"}));
     let third = mock.next().await;
-    assert_eq!(third["messages"][4]["content"], json!([{"type": "text", "text": "arrived while answering"}]));
+    assert_eq!(sent(&third["messages"][4]), ["arrived while answering"]);
     assert_eq!(agent.last_text(0), "second answer");
     assert!(agent.inbox().take().is_empty());
 }

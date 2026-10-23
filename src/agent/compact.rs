@@ -371,7 +371,7 @@ fn kept_user_messages(history: &[Message]) -> Vec<String> {
         .filter(|t| !t.is_empty() && *t != INTERRUPTED)
         .filter(|t| {
             // A compaction tells the model about the deferred tools anew.
-            !["<file ", "<directory ", "<subagent-notification>", "<shell-notification>", "The files read most recently", TODO_PREFIX, TOOLS_PREFIX, super::deferred::NOTICE_START]
+            !["<file ", "<directory ", "<subagent-notification>", "<shell-notification>", "The files read most recently", TODO_PREFIX, TOOLS_PREFIX, super::deferred::NOTICE_START, super::TIMESTAMP_START]
                 .iter()
                 .any(|p| t.starts_with(p))
         });
@@ -599,8 +599,10 @@ pub(crate) mod tests {
         }
     }
 
+    /// The texts of a message sent, without the time it was stamped with.
     pub(crate) fn texts(message: &Value) -> Vec<String> {
-        message["content"].as_array().unwrap().iter().filter_map(|b| b["text"].as_str().map(String::from)).collect()
+        let blocks = message["content"].as_array().unwrap().iter().filter(|b| !crate::agent::is_timestamp(b));
+        blocks.filter_map(|b| b["text"].as_str().map(String::from)).collect()
     }
 
     #[tokio::test]
