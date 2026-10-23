@@ -599,7 +599,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// The texts of a message sent, without the time it was stamped with.
+    /// The texts of a message sent, without the time a prompt is stamped with.
     pub(crate) fn texts(message: &Value) -> Vec<String> {
         let blocks = message["content"].as_array().unwrap().iter().filter(|b| !crate::agent::is_timestamp(b));
         blocks.filter_map(|b| b["text"].as_str().map(String::from)).collect()

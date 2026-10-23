@@ -383,14 +383,15 @@ async fn what_arrives_goes_with_the_next_request() {
     late.await.unwrap();
 
     let first = mock.next().await;
-    // Each request notes the time first.
-    assert!(is_timestamp(&first["messages"][0]["content"][0]), "{first}");
+    // The prompt notes the time; tool results and what arrives later don't.
+    assert!(is_timestamp(&first["messages"][0]["content"][1]), "{first}");
     assert_eq!(sent(&first["messages"][0]), ["waiting before", "hi"]);
     // After the tool results; then the turn carries on instead of ending.
     let second = mock.next().await;
+    assert_eq!(second["messages"][2]["content"].as_array().unwrap().len(), 2, "{second}");
     assert_eq!(second["messages"][2]["content"][1], json!({"type": "text", "text": "a report arrived"}));
     let third = mock.next().await;
-    assert_eq!(sent(&third["messages"][4]), ["arrived while answering"]);
+    assert_eq!(third["messages"][4]["content"], json!([{"type": "text", "text": "arrived while answering"}]));
     assert_eq!(agent.last_text(0), "second answer");
     assert!(agent.inbox().take().is_empty());
 }

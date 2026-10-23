@@ -34,7 +34,7 @@ the user to approve. Don't change files or run commands that change things; such
 turns plan mode off.</permission-mode>";
 const PLAN_OFF: &str = "<permission-mode>Plan mode is off: you may change things now, such as carrying out the plan \
 the user approved.</permission-mode>";
-/// Starts the block that tells the model the time of a request.
+/// Starts the block that tells the model when the user sent a message.
 pub const TIMESTAMP_START: &str = "<timestamp>";
 /// Comes before a `/btw` question.
 const SIDE_QUESTION: &str = "A side question from the user, about the conversation so far. Answer it briefly from what \
@@ -559,6 +559,12 @@ impl Agent {
         // What the user typed: hooks see a `/command` before it was expanded.
         let typed = self.next_prompt.take().unwrap_or_else(|| prompt_text(&content));
         let prompt = (!content.is_empty()).then(|| typed.clone());
+        // What the user sends notes the time; tool results don't. It is kept
+        // in the history and the system prompt stays as it was, so the
+        // cached prefix of the conversation still applies.
+        let stamp = prompt.as_ref().and_then(|_| crate::prompt::timestamp()).map(|now| {
+            json!({"type": "text", "text": format!("{TIMESTAMP_START}{now}</timestamp>")})
+        });
         if !content.is_empty() && !self.hooks.is_subagent() {
             self.prompt_hooks(&typed, &mut content, observer).await?;
         }
@@ -575,7 +581,7 @@ impl Agent {
         let notice = self.sync_tool_search(&[]);
         self.turn_start = Some(self.messages.len());
         (self.compactions, self.turn_compacted) = (0, false);
-        self.messages.push(Message::user(arrived.iter().cloned().chain(notice).chain(content).collect()));
+        self.messages.push(Message::user(arrived.iter().cloned().chain(notice).chain(stamp).chain(content).collect()));
         let (subagents, client, shells) = (self.subagents.clone(), self.client.clone(), self.shells.clone());
         let nested = self.hooks.is_subagent();
         let history = self.history.clone();
@@ -700,24 +706,6 @@ impl Agent {
         }
     }
 
-    /// Tells the model the time of this request in its newest user message,
-    /// once. That message has not been sent yet and the system prompt stays
-    /// as it was, so the cached prefix of the conversation still applies.
-    fn stamp_time(&mut self) {
-        let Some(last) = self.messages.last_mut().filter(|m| m.role == "user") else { return };
-        if last.content.iter().any(is_timestamp) {
-            return;
-        }
-        let Some(now) = crate::prompt::timestamp() else { return };
-        let block = json!({"type": "text", "text": format!("{TIMESTAMP_START}{now}</timestamp>")});
-        // Tool results must come first in their message.
-        if last.content.iter().any(|b| b["type"] == "tool_result") {
-            last.content.push(block);
-        } else {
-            last.content.insert(0, block);
-        }
-    }
-
     async fn run_loop(&mut self, observer: &mut dyn Observer) -> Result<()> {
         let definitions = self.tools.definitions();
         // Whether a Stop hook already kept this turn going.
@@ -734,7 +722,6 @@ impl Agent {
             }
             self.compact_if_full(&definitions, observer).await?;
             self.session_hooks(observer).await;
-            self.stamp_time();
             observer.on_request_start();
             let (log, model) = (&self.usage, self.client.spec());
             let mut on_event = |event: StreamEvent| match event {
@@ -953,7 +940,7 @@ async fn permitted(
     permissions.ask(request).await
 }
 
-/// Whether `block` is the time [`Agent`] noted for a request.
+/// Whether `block` is the time [`Agent`] noted for a user's message.
 pub fn is_timestamp(block: &Value) -> bool {
     block["type"] == "text" && block["text"].as_str().is_some_and(|t| t.starts_with(TIMESTAMP_START))
 }
@@ -997,25 +984,6 @@ pub(crate) mod tests {
         a.repair_after_interrupt();
         assert_eq!(a.messages.len(), 1);
         assert_eq!(a.messages[0].content, vec![text("do it"), text(INTERRUPTED)]);
-    }
-
-    #[test]
-    fn each_request_is_stamped_once_without_changing_what_was_sent() {
-        let mut a = agent(vec![Message::user(vec![text("do it")])]);
-        a.stamp_time();
-        let first = a.messages[0].content.clone();
-        assert!(is_timestamp(&first[0]) && first[1] == text("do it"), "{first:?}");
-        a.stamp_time();
-        assert_eq!(a.messages[0].content, first);
-
-        let call = json!({"type": "tool_use", "id": "t1", "name": "read", "input": {}});
-        a.messages.push(Message { role: "assistant", content: vec![call], source: None });
-        let result = json!({"type": "tool_result", "tool_use_id": "t1", "content": "ok"});
-        a.messages.push(Message::user(vec![result.clone()]));
-        a.stamp_time();
-        assert_eq!(a.messages[0].content, first);
-        let last = &a.messages[2].content;
-        assert!(last[0] == result && is_timestamp(&last[1]), "{last:?}");
     }
 
     #[test]
