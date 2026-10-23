@@ -264,6 +264,9 @@ pub struct Agent {
     /// Whether this conversation defers tools behind `tool_search`, once
     /// decided (see `deferred`).
     tool_search: Option<bool>,
+    /// A model chosen while a turn ran, switched to when the next one
+    /// starts: a turn's requests stay on one model.
+    switch_to: Arc<Mutex<Option<Client>>>,
 }
 
 impl Agent {
@@ -301,6 +304,7 @@ impl Agent {
             permissions,
             told_mode: None,
             tool_search: None,
+            switch_to: Arc::default(),
         }
     }
 
@@ -394,6 +398,19 @@ impl Agent {
     pub fn set_client(&mut self, client: Client) {
         self.hooks.set_client(client.clone());
         self.client = client;
+    }
+
+    /// Where a model chosen while a turn runs waits for the next turn.
+    pub fn switch_to(&self) -> &Arc<Mutex<Option<Client>>> {
+        &self.switch_to
+    }
+
+    /// Switches to the model waiting in [`Agent::switch_to`], if any.
+    pub fn switch_now(&mut self) {
+        let next = self.switch_to.lock().unwrap().take();
+        if let Some(client) = next {
+            self.set_client(client);
+        }
     }
 
     pub fn tools(&self) -> &ToolRegistry {
@@ -556,6 +573,7 @@ impl Agent {
     /// up (see `compact`).
     pub async fn run_turn(&mut self, mut content: Vec<Value>, observer: &mut dyn Observer) -> Result<()> {
         self.settle();
+        self.switch_now();
         // What the user typed: hooks see a `/command` before it was expanded.
         let typed = self.next_prompt.take().unwrap_or_else(|| prompt_text(&content));
         let prompt = (!content.is_empty()).then(|| typed.clone());
@@ -1002,6 +1020,17 @@ pub(crate) mod tests {
                 text(INTERRUPTED),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_model_chosen_during_a_turn_is_used_from_the_next() {
+        let (client, mut requests) = compact::tests::gateway(|_| (vec![text("done")], "end_turn", 100)).await;
+        let mut agent = Agent::new(client.clone(), ToolRegistry::default(), "sys");
+        *agent.switch_to().lock().unwrap() = Some(client.switch("mock/other").unwrap());
+        assert_eq!(agent.model(), "mock/main", "not before a turn starts");
+        agent.run_turn(vec![text("go")], &mut Notices::default()).await.unwrap();
+        assert_eq!(requests.recv().await.unwrap()["model"], "other");
+        assert_eq!(agent.model(), "mock/other");
     }
 
     #[derive(Default)]

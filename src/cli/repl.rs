@@ -16,7 +16,8 @@ use rustyline::{
 };
 
 use super::clipboard::{self, Clip, Image};
-use super::input;
+use super::input::{self, Draft};
+use super::keys::Key;
 use super::menu::{Command, Kind, Menu, list_dir, mention_at_end};
 use super::text;
 use crate::agent::Inbox;
@@ -60,7 +61,7 @@ impl ReplHelper {
         inbox: Arc<Inbox>,
         history: Vec<String>,
     ) -> Result<Option<(String, Vec<(usize, Image)>)>, rustyline::error::ReadlineError> {
-        use super::keys::{Key, KeyWatch};
+        use super::keys::KeyWatch;
         use rustyline::error::ReadlineError;
         self.menu.forget_files();
         out.open_input(std::mem::take(typing), inbox.clone());
@@ -104,28 +105,8 @@ impl ReplHelper {
                     return None;
                 }
                 last_esc = None;
-                if let Some(line) = draft.at_end()
-                    && let Some((kind, items, selected)) = self.menu.selection(line)
-                {
-                    let choice = items[selected].text.clone();
-                    match (&key, kind) {
-                        (Key::Up | Key::Down, _) if items.len() > 1 => {
-                            self.menu.step(line, if key == Key::Up { -1 } else { 1 });
-                            return None;
-                        }
-                        (Key::Tab, Kind::Command) => {
-                            draft.complete(0, &format!("{choice} "));
-                            return None;
-                        }
-                        (Key::Enter, Kind::Command) => {
-                            draft.set_text(&choice);
-                        }
-                        (Key::Tab | Key::Enter, Kind::File { start }) if key == Key::Tab || line[start..] != choice => {
-                            draft.complete(start, &file_text(&choice));
-                            return None;
-                        }
-                        _ => {}
-                    }
+                if menu_key(&self.menu, draft, &key) {
+                    return None;
                 }
                 match key {
                     Key::Enter => draft.submit().map(|message| Ok(Some(message))),
@@ -198,6 +179,11 @@ impl ReplHelper {
     /// The images pasted into the last line read, by number.
     pub fn take_images(&self) -> Vec<(usize, Image)> {
         std::mem::take(&mut self.pasted.lock().unwrap().images)
+    }
+
+    /// The menu, to show under the box while a turn runs too.
+    pub fn menu(&self) -> Arc<Menu> {
+        self.menu.clone()
     }
 
     /// The command Enter picked from the menu for the last line read.
@@ -352,6 +338,34 @@ pub(super) fn spaced(line: &str, pos: usize, text: &str) -> String {
     let before = line[..pos].chars().next_back().is_some_and(|c| !c.is_whitespace());
     let after = !line[pos..].starts_with(char::is_whitespace);
     format!("{}{text}{}", if before { " " } else { "" }, if after { " " } else { "" })
+}
+
+/// Acts on `menu` for `key` while it shows under `draft`; true if that is
+/// all the key does. Enter on a command types the one selected, and is
+/// left to send it.
+pub(super) fn menu_key(menu: &Menu, draft: &mut Draft, key: &Key) -> bool {
+    let Some(line) = draft.at_end() else { return false };
+    let Some((kind, items, selected)) = menu.selection(line) else { return false };
+    let choice = items[selected].text.clone();
+    match (key, kind) {
+        (Key::Up | Key::Down, _) if items.len() > 1 => {
+            menu.step(line, if *key == Key::Up { -1 } else { 1 });
+            true
+        }
+        (Key::Tab, Kind::Command) => {
+            draft.complete(0, &format!("{choice} "));
+            true
+        }
+        (Key::Enter, Kind::Command) => {
+            draft.set_text(&choice);
+            false
+        }
+        (Key::Tab | Key::Enter, Kind::File { start }) if *key == Key::Tab || line[start..] != choice => {
+            draft.complete(start, &file_text(&choice));
+            true
+        }
+        _ => false,
+    }
 }
 
 /// What choosing `path` types: a directory stays open for its entries, a

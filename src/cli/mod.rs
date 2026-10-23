@@ -44,11 +44,12 @@ use crate::skills::Skill;
 use crate::subagent::AgentDef;
 use crate::tools::FileTracker;
 use clipboard::{Clip, Image};
+use commands::View;
 use input::{Queued, Typing};
 use keys::{Key, KeyWatch};
 pub use output::Output;
 use output::{Terminal, TurnEnd};
-use menu::Command;
+use menu::{Command, Menu};
 use repl::ReplHelper;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
@@ -206,7 +207,8 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
         // input box is still on its way: the model answers first.
         if agent.inbox().wants_turn() {
             finish_mcp(agent, env, &out).await;
-            let input = boxed.then_some(TurnInput { typing: &mut typing, files });
+            let menu = editor.helper().map(ReplHelper::menu);
+            let input = boxed.then(|| TurnInput { typing: &mut typing, files, env, skills: &skills, menu });
             let _ = run_shown(agent, Vec::new(), None, &out, &mut term, recorder.as_mut(), input).await;
             remember_sent(&mut editor, &mut typing);
             out.line("");
@@ -306,14 +308,17 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
         if !matches!(input, Input::Exit | Input::Empty) {
             finish_mcp(agent, env, &out).await;
         }
-        let input = if boxed && line.split_whitespace().count() == 1 {
-            let Some(input) = commands::interactive(input, agent, env, &skills, &out, &mut typing).await else { continue };
+        let panel = boxed && line.split_whitespace().count() == 1;
+        let input = if panel {
+            let Some(input) = commands::interactive(input, &View::of(agent), env, &skills, &out, &mut typing).await else {
+                agent.switch_now();
+                continue;
+            };
             input
         } else { input };
         match input {
             Input::Empty => {}
             Input::Exit => break,
-            Input::Help => print_help(&out, &skills),
             Input::Clear => {
                 show_hook_notices(&out, agent.end_session("clear").await);
                 agent.clear();
@@ -373,10 +378,7 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 Ok(false) => {}
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
-            Input::ListSkills => print_skills(&out, &skills),
-            Input::ListTools => print_tools(&out, agent),
             Input::ToolOutput => out.show_tool_output(boxed),
-            Input::ListMcp => print_mcp(&out, env.mcp_statuses()),
             Input::Plugins { update: false } => print_plugins(&out, &env.ext.plugins),
             Input::Plugins { update: true } => update_plugins(&env.ext.plugins, &out).await,
             Input::ManagePlugins(args) => {
@@ -410,29 +412,6 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 }
                 Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
             },
-            Input::ListAgents => print_agents(&out, &env.ext.agent_defs),
-            Input::Tasks => print_tasks(&out, &agent.subagents().list(), &agent.shells().list()),
-            Input::Stop(None) => {
-                let stopped = agent.subagents().stop_all();
-                let killed = agent.shells().stop_all();
-                let note = format!(
-                    "stopped {stopped} {} and {killed} {}",
-                    text::plural(stopped, "subagent"),
-                    text::plural(killed, "background command")
-                );
-                out.line(out.paint("2", &note));
-            }
-            Input::Stop(Some(id)) if id.starts_with("shell_") => match agent.shells().stop(&id) {
-                Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
-                Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
-                Err(e) => out.line(out.paint("31", &e)),
-            },
-            Input::Stop(Some(id)) => match agent.subagents().stop(&id, true) {
-                Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
-                Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
-                Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
-            },
-            Input::Sandbox => print_sandbox(&out),
             Input::Shell(command) => actions::shell(agent, &command, &out).await,
             Input::Btw(question) => actions::side_question(agent, &question, &out).await,
             Input::Copy(n) => actions::copy(agent, n, &out),
@@ -440,31 +419,8 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                 let session = recorder.as_ref().map(|rec| rec.meta().id.clone());
                 actions::export(agent, path.as_deref(), session.as_deref(), &out);
             }
+            Input::Usage if panel => commands::usage(agent, &out).await,
             Input::Usage => print_usage(&out, agent),
-            Input::Model(spec) => {
-                if spec.is_none() && boxed {
-                    if let Some(client) = model::pick(&out, agent.client()).await {
-                        out.line(format!("model: {}", out.paint("1", client.spec())));
-                        out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
-                        out.line(format!("effort: {}", out.paint("1", client.effort().as_str())));
-                        agent.set_client(client);
-                    }
-                    continue;
-                }
-                let spec = match spec {
-                    None => { print_models(&out, agent); None }
-                    spec => spec,
-                };
-                if let Some(spec) = spec {
-                    match agent.client().switch(&spec) {
-                        Ok(client) => {
-                            out.line(format!("model: {}", out.paint("1", client.spec())));
-                            agent.set_client(client);
-                        }
-                        Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
-                    }
-                }
-            }
             Input::Providers(args) => {
                 let handoff = out.handoff();
                 let managed = tokio::task::block_in_place(|| llm::manage::run(&args, &mut plugins::manage::TerminalAsk));
@@ -479,30 +435,11 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
                     Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
                 }
             }
-            Input::Permissions(None) => show_permissions(agent, &out),
-            Input::Permissions(Some(arg)) if arg == "rules" => show_permissions(agent, &out),
-            Input::Permissions(Some(arg)) => match crate::permissions::Mode::parse(&arg) {
-                Ok(mode) => {
-                    agent.permissions().set_mode(mode);
-                    out.line(format!("permission mode: {} — {}", out.paint("1", mode.as_str()), mode.describe()));
-                }
-                Err(e) => out.line(out.paint("31", &e)),
-            },
-            Input::Effort(None) => {
-                out.line(format!("effort: {}", out.paint("1", agent.client().effort().as_str())));
-                out.line(out.paint("2", "set with /effort low|medium|high|xhigh|max, or /effort auto"));
-            }
-            Input::Effort(Some(level)) => {
-                let mut client = agent.client().clone();
-                client.set_effort(level);
-                out.line(format!("effort: {}", out.paint("1", client.effort().as_str())));
-                agent.set_client(client);
-            }
-            Input::Error(e) => out.line(out.paint("31", &e)),
             // A skill that runs in a subagent: its report goes to the model.
             Input::Skill(skill, args) => match run_fork(agent, env, &skill, &args, &out).await {
                 Ok(prompt) => {
-                    let input = boxed.then_some(TurnInput { typing: &mut typing, files });
+                    let menu = editor.helper().map(ReplHelper::menu);
+                    let input = boxed.then(|| TurnInput { typing: &mut typing, files, env, skills: &skills, menu });
                     let attached = attachments(&line, &images, files);
                     let _ = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut(), input).await;
                     remember_sent(&mut editor, &mut typing);
@@ -514,11 +451,16 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
             Input::Prompt(prompt) => {
                 // The turn's outcome is already shown.
                 let attached = attachments(&line, &images, files);
-                let input = boxed.then_some(TurnInput { typing: &mut typing, files });
+                let menu = editor.helper().map(ReplHelper::menu);
+                let input = boxed.then(|| TurnInput { typing: &mut typing, files, env, skills: &skills, menu });
                 let _ = submit(agent, &line, &prompt, attached, &out, &mut term, recorder.as_mut(), input).await;
                 remember_sent(&mut editor, &mut typing);
                 out.line("");
                 answered = true;
+            }
+            input => {
+                run_command(input, &View::of(agent), env, &skills, &out).await;
+                agent.switch_now();
             }
         }
     }
@@ -530,6 +472,104 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
         let _ = editor.save_history(path);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Whether `input` leaves the conversation as it is, so that typed while a
+/// turn runs it runs at once, beside the turn, as in Claude Code. Other
+/// commands wait for the turn to end.
+fn runs_during_turn(input: &Input) -> bool {
+    matches!(
+        input,
+        Input::Help
+            | Input::ListSkills
+            | Input::ListTools
+            | Input::ListMcp
+            | Input::ListAgents
+            | Input::Tasks
+            | Input::Stop(_)
+            | Input::Sandbox
+            | Input::Model(_)
+            | Input::Effort(_)
+            | Input::Permissions(_)
+            | Input::Error(_)
+    )
+}
+
+/// Runs a command that [`runs_during_turn`], once its panel, if any, is
+/// done. A model chosen goes to `view`, for the agent to switch to.
+async fn run_command(input: Input, view: &View, env: &Env, skills: &[Skill], out: &Output) {
+    match input {
+        Input::Help => print_help(out, skills),
+        Input::ListSkills => print_skills(out, skills),
+        Input::ListTools => print_tools(out, &view.tools),
+        Input::ListMcp => print_mcp(out, env.mcp_statuses()),
+        Input::ListAgents => print_agents(out, &env.ext.agent_defs),
+        Input::Tasks => print_tasks(out, &view.subagents.list(), &view.shells.list()),
+        Input::Stop(None) => {
+            let stopped = view.subagents.stop_all();
+            let killed = view.shells.stop_all();
+            let note = format!(
+                "stopped {stopped} {} and {killed} {}",
+                text::plural(stopped, "subagent"),
+                text::plural(killed, "background command")
+            );
+            out.line(out.paint("2", &note));
+        }
+        Input::Stop(Some(id)) if id.starts_with("shell_") => match view.shells.stop(&id) {
+            Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
+            Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
+            Err(e) => out.line(out.paint("31", &e)),
+        },
+        Input::Stop(Some(id)) => match view.subagents.stop(&id, true) {
+            Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
+            Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
+            Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+        },
+        Input::Sandbox => print_sandbox(out),
+        Input::Model(None) => print_models(out, &view.client()),
+        Input::Model(Some(spec)) => match view.client().switch(&spec) {
+            Ok(client) => {
+                out.line(format!("model: {}", out.paint("1", client.spec())));
+                view.set_client(client, out);
+            }
+            Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+        },
+        Input::Permissions(None) => show_permissions(&view.permissions, out),
+        Input::Permissions(Some(arg)) if arg == "rules" => show_permissions(&view.permissions, out),
+        Input::Permissions(Some(arg)) => match crate::permissions::Mode::parse(&arg) {
+            Ok(mode) => {
+                view.permissions.set_mode(mode);
+                out.line(format!("permission mode: {} — {}", out.paint("1", mode.as_str()), mode.describe()));
+            }
+            Err(e) => out.line(out.paint("31", &e)),
+        },
+        Input::Effort(None) => {
+            out.line(format!("effort: {}", out.paint("1", view.client().effort().as_str())));
+            out.line(out.paint("2", "set with /effort low|medium|high|xhigh|max, or /effort auto"));
+        }
+        Input::Effort(Some(level)) => {
+            let mut client = view.client();
+            client.set_effort(level);
+            out.line(format!("effort: {}", out.paint("1", client.effort().as_str())));
+            view.set_client(client, out);
+        }
+        Input::Error(e) => out.line(out.paint("31", &e)),
+        _ => unreachable!("only commands that leave the conversation as it is run here"),
+    }
+}
+
+/// Runs `input`, typed while a turn runs, beside the turn: through its
+/// panel if `panel`, which takes the keys from the turn's key reader.
+/// What the panel types goes into the box under the turn.
+async fn command_during_turn(input: Input, panel: bool, view: View, env: &Env, skills: &[Skill], out: Output) {
+    let mut typing = Typing::default();
+    let input = if panel { commands::interactive(input, &view, env, skills, &out, &mut typing).await } else { Some(input) };
+    if let Some(input) = input {
+        run_command(input, &view, env, skills, &out).await;
+    }
+    if !typing.draft.is_empty() {
+        out.edit_input(|t| t.draft.set_text(typing.draft.text()));
+    }
 }
 
 /// What the menu under the prompt offers.
@@ -894,14 +934,20 @@ async fn submit(
 struct TurnInput<'a> {
     typing: &'a mut Typing,
     files: &'a FileTracker,
+    /// For the commands that run beside the turn.
+    env: &'a Env,
+    skills: &'a [Skill],
+    menu: Option<Arc<Menu>>,
 }
 
 /// Runs a turn until it ends or Ctrl-C or Esc interrupts it; empty `content`
 /// runs one for what waits in the agent's inbox. The turn's progress and
 /// outcome are shown, and the conversation is saved after it, titled
 /// `title` if it is new. With `input`, the input box stays under the
-/// output meanwhile; if the turn is cut short, the messages sent from it
-/// that the model never got go back into it.
+/// output meanwhile, with the command menu; if the turn is cut short, the
+/// messages sent from it that the model never got go back into it.
+/// Commands that [`runs_during_turn`] sent from it run at once, one at a
+/// time; a panel one opens outlives the turn until it is closed.
 async fn run_shown(
     agent: &mut Agent,
     content: Vec<Value>,
@@ -921,16 +967,21 @@ async fn run_shown(
     let mut keys = match input.as_mut() {
         Some(input) => {
             out.open_input(std::mem::take(input.typing), inbox.clone());
+            if let Some(menu) = &input.menu { menu.forget_files(); }
+            out.set_menu(input.menu.clone());
             _routed = Some(out.route_keys());
-            let typed = out.clone();
+            let (typed, menu) = (out.clone(), input.menu.clone());
             KeyWatch::for_prompt(move |key| {
-                if typed.question_key(&key) || typed.tool_output_key(&key) { return; }
+                if typed.question_key(&key) || typed.panel_key(&key) || typed.tool_output_key(&key) { return; }
                 if key == Key::Esc { let _ = interrupt_tx.send(()); }
-                else { type_key(&typed, key, &tx); }
+                else { type_key(&typed, menu.as_deref(), key, &tx); }
             })
         }
         None => KeyWatch::start(),
     };
+    let mut view = View::of(agent);
+    view.running = true;
+    let mut command: Option<std::pin::Pin<Box<dyn Future<Output = ()> + '_>>> = None;
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     // Dropping the turn cancels it: running commands are killed, and the
@@ -943,15 +994,28 @@ async fn run_shown(
             _ = keys.pressed() => break Err(TurnEnd::Interrupted),
             Some(()) = interrupt_rx.recv() => break Err(TurnEnd::Interrupted),
             Some((text, images)) = sent.recv() => {
-                if let Some(input) = &input {
-                    send(out, &inbox, input.files, text, images);
+                let Some(input) = &input else { continue };
+                match text.starts_with('/').then(|| parse_input(&text, input.skills)) {
+                    Some(parsed) if command.is_none() && runs_during_turn(&parsed) => {
+                        out.lines(&prompt_lines(out, &text));
+                        out.edit_input(|typing| typing.sent.push(text.clone()));
+                        let panel = text.split_whitespace().count() == 1;
+                        let (view, out) = (view.clone(), out.clone());
+                        command = Some(Box::pin(command_during_turn(parsed, panel, view, input.env, input.skills, out)));
+                    }
+                    _ => send(out, &inbox, input.files, text, images),
                 }
             }
+            () = async { command.as_mut().unwrap().await }, if command.is_some() => command = None,
         }
     };
     drop(turn);
+    if let Some(command) = command {
+        command.await;
+    }
     drop(keys);
     if let Some(input) = input {
+        if input.menu.is_some() { out.set_menu(None); }
         *input.typing = out.close_input();
         if result.is_err() {
             input.typing.recall(&inbox);
@@ -996,9 +1060,20 @@ async fn compact_shown(
     result
 }
 
-/// Types `key` into the input box. Enter hands what it holds to `tx`.
-fn type_key(out: &Output, key: Key, tx: &tokio::sync::mpsc::UnboundedSender<(String, Vec<(usize, Image)>)>) {
+/// Types `key` into the input box, or acts on `menu` under it. Enter hands
+/// what the box holds to `tx`.
+fn type_key(
+    out: &Output,
+    menu: Option<&Menu>,
+    key: Key,
+    tx: &tokio::sync::mpsc::UnboundedSender<(String, Vec<(usize, Image)>)>,
+) {
     if out.tool_output_key(&key) { return; }
+    if let Some(menu) = menu
+        && out.edit_input(|typing| repl::menu_key(menu, &mut typing.draft, &key)) == Some(true)
+    {
+        return;
+    }
     match key {
         Key::Enter => {
             if let Some(Some(message)) = out.edit_input(|typing| typing.draft.submit()) {
@@ -1222,10 +1297,10 @@ fn parse_input(line: &str, skills: &[Skill]) -> Input {
 }
 
 /// The permission mode and rules, line by line.
-fn show_permissions(agent: &Agent, out: &Output) {
-    let mode = agent.permissions().mode();
+fn show_permissions(permissions: &crate::permissions::Permissions, out: &Output) {
+    let mode = permissions.mode();
     out.line(format!("permission mode: {} — {}", out.paint("1", mode.as_str()), mode.describe()));
-    for (kind, rules) in agent.permissions().rules() {
+    for (kind, rules) in permissions.rules() {
         if !rules.is_empty() {
             out.line(format!("  {}: {}", out.paint("2", kind), rules.join(", ")));
         }
@@ -1301,8 +1376,8 @@ fn print_help(out: &Output, skills: &[Skill]) {
     }
 }
 
-fn print_tools(out: &Output, agent: &Agent) {
-    let tools = agent.tools().definitions();
+fn print_tools(out: &Output, tools: &crate::tools::ToolRegistry) {
+    let tools = tools.definitions();
     let name_width = tools.iter().map(|t| text::width(&t.name)).max().unwrap_or(0);
     let room = text::terminal_width().saturating_sub(name_width + 5);
     for tool in tools {
@@ -1396,17 +1471,17 @@ fn print_skills(out: &Output, skills: &[Skill]) {
     }
 }
 
-fn print_models(out: &Output, agent: &Agent) {
-    let providers = agent.client().providers();
-    out.line(format!("current: {}", out.paint("1", agent.model())));
-    out.line(format!("subagents: {}", agent.client().subagent_model().unwrap_or("follow main model")));
-    out.line(format!("effort: {}", agent.client().effort().as_str()));
+fn print_models(out: &Output, client: &llm::Client) {
+    let providers = client.providers();
+    out.line(format!("current: {}", out.paint("1", client.spec())));
+    out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
+    out.line(format!("effort: {}", client.effort().as_str()));
     for name in providers.names() {
         let protocol = providers.protocol_of(name).map_or("?", llm::Protocol::as_str);
         out.line(format!("provider {} ({protocol})", out.paint("1", name)));
     }
     for m in providers.listed_models() {
-        let mark = if m == agent.model() { out.paint("32", "●") } else { " ".to_string() };
+        let mark = if m == client.spec() { out.paint("32", "●") } else { " ".to_string() };
         out.line(format!(" {mark} {m}"));
     }
     out.line(out.paint("90", "switch with /model <provider>/<model>; any model name the gateway accepts works"));
@@ -1550,6 +1625,18 @@ mod tests {
         let attached = attachments("compare [Image #2] with [Image #10]", &images, &FileTracker::default());
         let labels: Vec<&str> = attached.attachments.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(labels, vec!["[Image #2] (image, 1 B)", "[Image #10] (image, 1 B)"]);
+    }
+
+    #[test]
+    fn commands_that_leave_the_conversation_run_during_a_turn() {
+        let now = ["/model", "/model gw/m", "/effort high", "/permissions plan", "/tasks", "/stop", "/help", "/models"];
+        for line in now {
+            assert!(runs_during_turn(&parse_input(line, &[])), "{line}");
+        }
+        let later = ["/clear", "/compact", "/rewind", "/resume", "/usage", "/btw why", "/reload-plugins", "/exit", "!ls"];
+        for line in later {
+            assert!(!runs_during_turn(&parse_input(line, &[])), "{line}");
+        }
     }
 
     #[tokio::test]

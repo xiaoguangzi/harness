@@ -81,6 +81,8 @@ struct State {
     question: Option<super::approve::Question>,
     /// How many key readers hand keys to [`Output::question_key`] now.
     routed: usize,
+    /// Where those readers hand keys while a panel is open over a turn.
+    panel_keys: Option<tokio::sync::mpsc::UnboundedSender<Key>>,
     /// The conversation's permissions, whose mode shows under the box.
     permissions: Option<Arc<crate::permissions::Permissions>>,
 }
@@ -155,6 +157,7 @@ impl Output {
             footer: None,
             question: None,
             routed: 0,
+            panel_keys: None,
             permissions: None,
         };
         Self { state: Arc::new(Mutex::new(state)), styled }
@@ -313,6 +316,28 @@ impl Output {
     /// Whether some key reader hands keys to the questions now.
     pub(super) fn keys_routed(&self) -> bool {
         self.state.lock().unwrap().routed > 0
+    }
+
+    /// Has the key readers counted by [`Output::route_keys`] hand keys to
+    /// `keys` rather than read them itself, so a panel opens while
+    /// a turn runs; false if no such reader runs.
+    pub(super) fn borrow_keys(&self, keys: tokio::sync::mpsc::UnboundedSender<Key>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.routed == 0 {
+            return false;
+        }
+        state.panel_keys = Some(keys);
+        true
+    }
+
+    pub(super) fn return_keys(&self) {
+        self.state.lock().unwrap().panel_keys = None;
+    }
+
+    /// Hands `key` to the panel open over a turn; false if none is.
+    pub(super) fn panel_key(&self, key: &Key) -> bool {
+        let state = self.state.lock().unwrap();
+        state.panel_keys.as_ref().is_some_and(|keys| keys.send(key.clone()).is_ok())
     }
 
     /// Counts a key reader that hands keys to [`Output::question_key`],

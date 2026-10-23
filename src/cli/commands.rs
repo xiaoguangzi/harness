@@ -1,12 +1,60 @@
 //! Interactive entry points for commands that used to print a list or usage text.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use super::{Input, Output, BUILTINS, effort_help, output};
 use super::dialog::{self, Item, Keys};
 use super::input::Typing;
 use super::text;
-use crate::{agent::Agent, llm, settings::Settings, setup::Env, skills::Skill};
+use crate::agent::Agent;
+use crate::llm::{self, Client};
+use crate::permissions::Permissions;
+use crate::subagent::Subagents;
+use crate::tools::{ToolRegistry, shells::Shells};
+use crate::{settings::Settings, setup::Env, skills::Skill};
+
+/// What commands see of a conversation, and change in it, without holding
+/// its `Agent`: a turn may be running with it.
+#[derive(Clone)]
+pub struct View {
+    client: Client,
+    switch_to: Arc<Mutex<Option<Client>>>,
+    pub permissions: Arc<Permissions>,
+    pub tools: ToolRegistry,
+    pub subagents: Arc<Subagents>,
+    pub shells: Arc<Shells>,
+    /// Whether a turn runs: a model chosen meanwhile is used from the next.
+    pub running: bool,
+}
+
+impl View {
+    pub fn of(agent: &Agent) -> Self {
+        Self {
+            client: agent.client().clone(),
+            switch_to: agent.switch_to().clone(),
+            permissions: agent.permissions().clone(),
+            tools: agent.tools().clone(),
+            subagents: agent.subagents().clone(),
+            shells: agent.shells().clone(),
+            running: false,
+        }
+    }
+
+    /// The model in use, or the one chosen to switch to.
+    pub fn client(&self) -> Client {
+        self.switch_to.lock().unwrap().clone().unwrap_or_else(|| self.client.clone())
+    }
+
+    /// Has the conversation go on with `client`; while a turn runs, from
+    /// the next one.
+    pub fn set_client(&self, client: Client, out: &Output) {
+        if self.running {
+            out.line(out.paint("2", "used from the next message; this one goes on as it began"));
+        }
+        *self.switch_to.lock().unwrap() = Some(client);
+    }
+}
 
 const SELECT: Keys = Keys { enter: "select", esc: "cancel" };
 const BACK: Keys = Keys { enter: "select", esc: "back" };
@@ -14,7 +62,7 @@ const BACK: Keys = Keys { enter: "select", esc: "back" };
 /// Returns the selected action, or `None` when the command was handled/cancelled.
 /// Commands with explicit arguments bypass these menus in the regular dispatcher.
 pub async fn interactive(
-    input: Input, agent: &Agent, env: &Env, skills: &[Skill], out: &Output, typing: &mut Typing,
+    input: Input, view: &View, env: &Env, skills: &[Skill], out: &Output, typing: &mut Typing,
 ) -> Option<Input> {
     match input {
         Input::Help => {
@@ -31,16 +79,25 @@ pub async fn interactive(
         }
         Input::Permissions(None) => {
             use crate::permissions::Mode;
-            let rules: Vec<String> = agent.permissions().rules().into_iter().filter(|(_, r)| !r.is_empty()).map(|(kind, r)| format!("{kind}: {}", r.join(", "))).collect();
+            let rules: Vec<String> = view.permissions.rules().into_iter().filter(|(_, r)| !r.is_empty()).map(|(kind, r)| format!("{kind}: {}", r.join(", "))).collect();
             let items = Mode::ALL.iter().map(|m| Item::new(m.as_str(), m.describe()).details(rules.clone())).collect();
-            let current = Mode::ALL.iter().position(|m| *m == agent.permissions().mode()).unwrap_or(0);
+            let current = Mode::ALL.iter().position(|m| *m == view.permissions.mode()).unwrap_or(0);
             let i = dialog::choose(out, "Permission mode", "Which tool calls ask first; Shift+Tab cycles them too", Keys { enter: "apply", esc: "cancel" }, items, current).await?;
             Some(Input::Permissions(Some(Mode::ALL[i].as_str().to_string())))
         }
+        Input::Model(None) => {
+            let client = super::model::pick(out, &view.client()).await?;
+            out.line(format!("model: {}", out.paint("1", client.spec())));
+            out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
+            out.line(format!("effort: {}", out.paint("1", client.effort().as_str())));
+            view.set_client(client, out);
+            None
+        }
         Input::Effort(None) => {
-            let mut items = vec![Item::new("auto", format!("Use configured effort (currently {})", agent.client().effort().as_str()))];
+            let client = view.client();
+            let mut items = vec![Item::new("auto", format!("Use configured effort (currently {})", client.effort().as_str()))];
             items.extend(llm::Effort::ALL.iter().map(|e| Item::new(e.as_str(), effort_help(*e))));
-            let initial = agent.client().effort_override().and_then(|e| llm::Effort::ALL.iter().position(|level| *level == e)).map_or(0, |i| i + 1);
+            let initial = client.effort_override().and_then(|e| llm::Effort::ALL.iter().position(|level| *level == e)).map_or(0, |i| i + 1);
             let i = dialog::choose(out, "Reasoning effort", "Applies to this session; /model changes the same setting", Keys { enter: "apply", esc: "cancel" }, items, initial).await?;
             Some(Input::Effort(Some(i.checked_sub(1).map(|i| llm::Effort::ALL[i]))))
         }
@@ -57,7 +114,7 @@ pub async fn interactive(
             None
         }
         Input::ListTools => {
-            let items = agent.tools().definitions().into_iter().map(|t| {
+            let items = view.tools.definitions().into_iter().map(|t| {
                 let schema = serde_json::to_string_pretty(&t.input_schema).unwrap_or_default();
                 Item::new(t.name, t.description).details(std::iter::once("Input schema:".into()).chain(schema.lines().map(String::from)))
             }).collect();
@@ -65,10 +122,11 @@ pub async fn interactive(
             None
         }
         Input::ListAgents => {
+            let client = view.client();
             let items = env.ext.agent_defs.iter().map(|d| Item::new(&d.name, &d.description).details(vec![
                 format!("Access: {}", d.permission.as_str()),
                 format!("Tools: {}", d.tools.as_ref().map_or("all permitted".into(), |t| t.join(", "))),
-                format!("Model: {}", d.model.as_deref().or(agent.client().subagent_model()).unwrap_or(agent.model())),
+                format!("Model: {}", d.model.as_deref().or(client.subagent_model()).unwrap_or(client.spec())),
                 format!("Source: {}", d.path.as_ref().map_or("built-in".into(), |p| p.display().to_string())),
                 d.prompt.clone(),
             ])).collect();
@@ -87,18 +145,6 @@ pub async fn interactive(
             dialog::inspect(out, "MCP servers", "Servers, their tools and connection errors", items).await;
             None
         }
-        Input::Usage => {
-            let mut items = vec![Item::new("Current context", format!("{} / {} tokens (about {}%)", output::tokens(agent.context_tokens()), output::tokens(agent.client().context_window()), agent.context_tokens().saturating_mul(100) / agent.client().context_window().max(1)))];
-            items.extend(agent.usage().models().into_iter().map(|(model, t)| Item::new(model, format!("{} {} · {} output tokens", t.requests, text::plural(t.requests as usize, "request"), output::tokens(t.usage.output_tokens))).details(vec![
-                format!("Input: {}", t.usage.input_tokens), format!("Cache reads: {}", t.usage.cache_read_tokens),
-                format!("Cache writes: {}", t.usage.cache_write_tokens), format!("Output: {}", t.usage.output_tokens),
-            ])));
-            if let Some(cost) = super::usage_cost(agent) {
-                items.push(Item::new("Cost", cost));
-            }
-            dialog::inspect(out, "Usage", "This conversation, by model", items).await;
-            None
-        }
         Input::Sandbox => {
             let items = crate::sandbox::active().map_or_else(
                 || vec![Item::new("Sandbox is off", "Start with --sandbox to enable it; this view does not change permissions")],
@@ -110,17 +156,30 @@ pub async fn interactive(
             dialog::inspect(out, "Sandbox", "What commands may do; read-only", items).await;
             None
         }
-        Input::Stop(None) => stop(agent, out).await,
-        Input::Tasks => tasks(agent, out).await,
-        Input::Providers(args) if args.is_empty() => providers(agent, out).await,
+        Input::Stop(None) => stop(view, out).await,
+        Input::Tasks => tasks(view, out).await,
+        Input::Providers(args) if args.is_empty() => providers(view, out).await,
         Input::Plugins { update: false } => plugins(env, out).await,
         input => Some(input),
     }
 }
 
-fn task_items(agent: &Agent, running_only: bool) -> Vec<(String, Item, bool)> {
+/// `/usage` as a panel: the context's size, and the tokens used by model.
+pub async fn usage(agent: &Agent, out: &Output) {
+    let mut items = vec![Item::new("Current context", format!("{} / {} tokens (about {}%)", output::tokens(agent.context_tokens()), output::tokens(agent.client().context_window()), agent.context_tokens().saturating_mul(100) / agent.client().context_window().max(1)))];
+    items.extend(agent.usage().models().into_iter().map(|(model, t)| Item::new(model, format!("{} {} · {} output tokens", t.requests, text::plural(t.requests as usize, "request"), output::tokens(t.usage.output_tokens))).details(vec![
+        format!("Input: {}", t.usage.input_tokens), format!("Cache reads: {}", t.usage.cache_read_tokens),
+        format!("Cache writes: {}", t.usage.cache_write_tokens), format!("Output: {}", t.usage.output_tokens),
+    ])));
+    if let Some(cost) = super::usage_cost(agent) {
+        items.push(Item::new("Cost", cost));
+    }
+    dialog::inspect(out, "Usage", "This conversation, by model", items).await;
+}
+
+fn task_items(view: &View, running_only: bool) -> Vec<(String, Item, bool)> {
     let mut items = Vec::new();
-    for s in agent.subagents().list() {
+    for s in view.subagents.list() {
         let running = s["status"] == "running";
         if running_only && !running { continue; }
         let id = s["id"].as_str().unwrap_or("").to_string();
@@ -129,7 +188,7 @@ fn task_items(agent: &Agent, running_only: bool) -> Vec<(String, Item, bool)> {
                 format!("Latest call: {}", s["last_call"].as_str().unwrap_or("—")), format!("Background: {}", s["background"])]);
         items.push((id, item, running));
     }
-    for (id, command, running) in agent.shells().list() {
+    for (id, command, running) in view.shells.list() {
         if running_only && !running { continue; }
         let item = Item::new(format!("{id} · background command"), if running { "running" } else { "ended" }).details(command.lines().map(String::from));
         items.push((id, item, running));
@@ -137,8 +196,8 @@ fn task_items(agent: &Agent, running_only: bool) -> Vec<(String, Item, bool)> {
     items
 }
 
-async fn stop(agent: &Agent, out: &Output) -> Option<Input> {
-    let tasks = task_items(agent, true);
+async fn stop(view: &View, out: &Output) -> Option<Input> {
+    let tasks = task_items(view, true);
     if tasks.is_empty() {
         out.line(out.paint("2", "no running tasks"));
         return None;
@@ -149,9 +208,9 @@ async fn stop(agent: &Agent, out: &Output) -> Option<Input> {
     Some(Input::Stop(tasks.get(i).map(|(id, _, _)| id.clone())))
 }
 
-async fn tasks(agent: &Agent, out: &Output) -> Option<Input> {
+async fn tasks(view: &View, out: &Output) -> Option<Input> {
     loop {
-        let tasks = task_items(agent, false);
+        let tasks = task_items(view, false);
         if tasks.is_empty() {
             out.line(out.paint("2", "no subagents or background commands in this conversation"));
             return None;
@@ -166,8 +225,9 @@ async fn tasks(agent: &Agent, out: &Output) -> Option<Input> {
     }
 }
 
-fn provider_items(agent: &Agent) -> Vec<Item> {
-    let providers = agent.client().providers();
+fn provider_items(view: &View) -> Vec<Item> {
+    let client = view.client();
+    let providers = client.providers();
     providers.names().into_iter().map(|name| {
         let config = providers.provider(name).unwrap();
         Item::new(name, format!("{} · {} listed {}", config.protocol.as_str(), config.models.len(), text::plural(config.models.len(), "model"))).details(
@@ -177,7 +237,7 @@ fn provider_items(agent: &Agent) -> Vec<Item> {
     }).collect()
 }
 
-async fn providers(agent: &Agent, out: &Output) -> Option<Input> {
+async fn providers(view: &View, out: &Output) -> Option<Input> {
     let actions = vec![
         Item::new("Inspect providers", "Browse configured providers, protocols and models"),
         Item::new("Add provider", "Enter a name, then configure its protocol, URL, key and models"),
@@ -190,7 +250,7 @@ async fn providers(agent: &Agent, out: &Output) -> Option<Input> {
     loop {
         let action = dialog::choose(out, "Providers", "Changes are saved to the settings file", SELECT, actions.clone(), 0).await?;
         match action {
-            0 => dialog::inspect(out, "Provider details", "", provider_items(agent)).await,
+            0 => dialog::inspect(out, "Provider details", "", provider_items(view)).await,
             1 => {
                 let Some(name) = dialog::input(out, "Add provider", "Provider name (letters, digits, dots, underscores or hyphens)").await else { continue };
                 return Some(Input::Providers(vec!["add".into(), name]));
@@ -212,7 +272,7 @@ async fn providers(agent: &Agent, out: &Output) -> Option<Input> {
             3 | 5 => {
                 // A model can be removed only from the providers in the
                 // settings file, not from those set up by environment variables.
-                let models = if action == 3 { agent.client().providers().listed_models() } else {
+                let models = if action == 3 { view.client().providers().listed_models() } else {
                     load_settings(out)?.providers.into_iter()
                         .flat_map(|(name, p)| p.models.into_keys().map(move |m| format!("{name}/{m}"))).collect()
                 };

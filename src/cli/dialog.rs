@@ -51,13 +51,18 @@ pub(super) async fn run<P: Panel + 'static, R>(
 ) -> Option<R> {
     struct Guard(Output);
     impl Drop for Guard {
-        fn drop(&mut self) { self.0.set_panel(None); }
+        fn drop(&mut self) {
+            self.0.return_keys();
+            self.0.set_panel(None);
+        }
     }
     let panel = Arc::new(Mutex::new(panel));
     let _guard = Guard(out.clone());
     out.set_panel(Some(panel.clone()));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let watch = KeyWatch::for_prompt(move |key| { let _ = tx.send(key); });
+    // Over a running turn, its key reader hands the keys over: two would
+    // take turns at stdin.
+    let watch = (!out.borrow_keys(tx.clone())).then(|| KeyWatch::for_prompt(move |key| { let _ = tx.send(key); }));
     let result = loop {
         let key = tokio::select! {
             _ = tokio::signal::ctrl_c() => break None,
