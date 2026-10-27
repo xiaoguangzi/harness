@@ -5,6 +5,7 @@ use std::time::Duration;
 use similar::{ChangeTag, TextDiff};
 
 use super::text;
+use super::style::{DIM, GREEN, RED};
 use crate::tools::FileChange;
 
 /// Unchanged lines kept around each change.
@@ -45,11 +46,11 @@ pub fn render(change: &FileChange, width: usize, paint: impl Fn(&str, &str) -> S
     let mut lines = vec![summary];
     for row in &rows {
         let (n, mark, line, sgr) = match row {
-            Row::Context(n, l) => (n, ' ', l, "2"),
-            Row::Removed(n, l) => (n, '-', l, "31"),
-            Row::Added(n, l) => (n, '+', l, "32"),
+            Row::Context(n, l) => (n, ' ', l, DIM),
+            Row::Removed(n, l) => (n, '-', l, RED),
+            Row::Added(n, l) => (n, '+', l, GREEN),
             Row::Gap => {
-                lines.push(paint("2", &format!("{:>number_width$}", "⋮")));
+                lines.push(paint(DIM, &format!("{:>number_width$}", "⋮")));
                 continue;
             }
         };
@@ -57,7 +58,7 @@ pub fn render(change: &FileChange, width: usize, paint: impl Fn(&str, &str) -> S
         lines.push(paint(sgr, &line));
     }
     if hidden > 0 {
-        lines.push(paint("2", &format!("… +{hidden} more lines")));
+        lines.push(paint(DIM, &format!("… +{hidden} more lines")));
     }
     lines
 }

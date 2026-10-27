@@ -4,6 +4,7 @@
 use serde_json::Value;
 
 use super::{Output, text};
+use super::style::{BOLD, DIM, GREEN, RED};
 
 /// Lines of a tool result shown under its call.
 const RESULT_LINES: usize = 3;
@@ -12,14 +13,14 @@ const RESULT_LINES: usize = 3;
 fn todo_lines(out: &Output, input: &Value) -> Vec<String> {
     let items = crate::tools::todo::items(input);
     let done = items.iter().filter(|(status, _)| *status == "completed").count();
-    let mut lines = vec![format!("{} {}", out.paint("32", "●"), out.paint("1", &format!("Todos ({done}/{})", items.len())))];
+    let mut lines = vec![format!("{} {}", out.paint(GREEN, "●"), out.paint(BOLD, &format!("Todos ({done}/{})", items.len())))];
     let width = text::terminal_width().saturating_sub(8);
     for (i, (status, content)) in items.iter().enumerate() {
-        let lead = out.paint("2", if i == 0 { "  ⎿ " } else { "    " });
+        let lead = out.paint(DIM, if i == 0 { "  ⎿ " } else { "    " });
         let content = text::fit(&text::printable(content), width);
         let item = match *status {
-            "completed" => out.paint("2", &format!("✔ {content}")),
-            "in_progress" => out.paint("1", &format!("◼ {content}")),
+            "completed" => out.paint(DIM, &format!("✔ {content}")),
+            "in_progress" => out.paint(BOLD, &format!("◼ {content}")),
             _ => format!("☐ {content}"),
         };
         lines.push(format!("{lead}{item}"));
@@ -60,7 +61,7 @@ pub(super) fn call_lines(out: &Output, name: &str, input: &Value, width: usize) 
     if name == "todo_write" {
         return todo_lines(out, input);
     }
-    vec![format!("{} {}", out.paint("32", "●"), call_label(name, input, width.saturating_sub(4)))]
+    vec![format!("{} {}", out.paint(GREEN, "●"), call_label(name, input, width.saturating_sub(4)))]
 }
 
 /// A tool result under its call, `⎿ ` then indented, red when it failed.
@@ -69,7 +70,7 @@ pub(super) fn result_block(out: &Output, name: &str, content: &str, is_error: bo
     if name == "todo_write" && !is_error {
         return Vec::new();
     }
-    let color = if is_error { "31" } else { "2" };
+    let color = if is_error { RED } else { DIM };
     result_lines(name, content, is_error, width.saturating_sub(6))
         .iter()
         .enumerate()

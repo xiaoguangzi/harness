@@ -12,6 +12,7 @@ use super::keys::Key;
 use super::Output;
 use super::calls::call_label;
 use super::text;
+use super::style::{BOLD, CYAN, DIM, GREEN, QUESTION, RED};
 use crate::permissions::{Answer, Asker, Request};
 
 /// Lines of an edit shown with the question, for each side.
@@ -85,17 +86,17 @@ impl Question {
     }
 
     pub fn render(&self, width: usize, paint: &dyn Fn(&str, &str) -> String) -> Vec<String> {
-        let mut rows = vec![paint("2", &super::input::rule(width))];
-        rows.push(format!("{} {}", paint("1;33", "?"), paint("1", &text::fit(&text::printable(&self.title), width.saturating_sub(3)))));
+        let mut rows = vec![paint(DIM, &super::input::rule(width))];
+        rows.push(format!("{} {}", paint(QUESTION, "?"), paint(BOLD, &text::fit(&text::printable(&self.title), width.saturating_sub(3)))));
         for line in &self.detail {
-            let sgr = if line.starts_with("- ") { "31" } else if line.starts_with("+ ") { "32" } else { "2" };
+            let sgr = if line.starts_with("- ") { RED } else if line.starts_with("+ ") { GREEN } else { DIM };
             rows.push(format!("  {}", paint(sgr, &text::fit(&text::printable(line), width.saturating_sub(3)))));
         }
         for (i, option) in self.options.iter().enumerate() {
             let label = text::fit(&format!("{}. {option}", i + 1), width.saturating_sub(5));
-            rows.push(if i == self.selected { format!("{} {}", paint("36", "❯"), paint("36", &label)) } else { format!("  {label}") });
+            rows.push(if i == self.selected { format!("{} {}", paint(CYAN, "❯"), paint(CYAN, &label)) } else { format!("  {label}") });
         }
-        rows.push(paint("2", &super::input::rule(width)));
+        rows.push(paint(DIM, &super::input::rule(width)));
         rows
     }
 }

@@ -9,6 +9,7 @@ use super::clipboard::Image;
 use super::keys::Key;
 use super::repl::spaced;
 use super::text;
+use super::style::{ACCENT, DIM};
 use crate::agent::Inbox;
 use crate::mentions;
 
@@ -21,7 +22,6 @@ const PLACEHOLDER: &str = "Type a message; the model reads it at its next step";
 /// Shown in the empty box instead while messages are queued.
 const EDIT_HINT: &str = "Press ↑ to edit queued messages";
 pub const PROMPT: &str = "❯ ";
-pub const PROMPT_SGR: &str = "1;35";
 
 /// The rule above and below the box, a column short of the terminal's
 /// width so it never wraps.
@@ -214,10 +214,10 @@ impl Draft {
         placeholder: &str,
         paint: impl Fn(&str, &str) -> String,
     ) -> (Vec<String>, (usize, usize)) {
-        let prompt = paint(PROMPT_SGR, PROMPT.trim_end()) + " ";
+        let prompt = paint(ACCENT, PROMPT.trim_end()) + " ";
         let room = width.saturating_sub(3).max(1);
         if self.text.is_empty() {
-            return (vec![format!("{prompt}{}", paint("2", &text::fit(placeholder, room)))], (0, 2));
+            return (vec![format!("{prompt}{}", paint(DIM, &text::fit(placeholder, room)))], (0, 2));
         }
         let (mut rows, mut row, mut used) = (Vec::new(), String::new(), 0);
         let mut cursor = (0, 0);
@@ -306,11 +306,11 @@ impl Typing {
             .map(|q| {
                 let line = text::printable(q.text.lines().next().unwrap_or(""));
                 let more = if q.text.contains('\n') { " …" } else { "" };
-                paint("2", &format!("{PROMPT}{}{more}", text::fit(&line, room.saturating_sub(text::width(more)))))
+                paint(DIM, &format!("{PROMPT}{}{more}", text::fit(&line, room.saturating_sub(text::width(more)))))
             })
             .collect();
         if first > 0 {
-            rows.insert(0, paint("2", &format!("  … {first} more queued")));
+            rows.insert(0, paint(DIM, &format!("  … {first} more queued")));
         }
         rows
     }

@@ -4,6 +4,7 @@ use super::{text, tool_output::Record};
 use super::input::Draft;
 use super::keys::Key;
 use super::dialog::Frame;
+use super::style::{ACCENT, BOLD, DIM, PLAIN};
 
 pub(super) enum Entry {
     Text { label: &'static str, content: String },
@@ -43,8 +44,8 @@ impl Transcript {
             };
             match entry {
                 Entry::Text { label, content } => {
-                    add(label, if *label == "❯ You" { "1;35" } else { "1" });
-                    add(content, if *label == "Thinking" { "2" } else { "0" });
+                    add(label, if *label == "❯ You" { ACCENT } else { BOLD });
+                    add(content, if *label == "Thinking" { DIM } else { PLAIN });
                 }
                 Entry::Tool(index) => {
                     if let Some(record) = records.get(*index) {
@@ -52,7 +53,7 @@ impl Transcript {
                     }
                 }
             }
-            add("", "0");
+            add("", PLAIN);
         }
         lines
     }
@@ -151,12 +152,12 @@ impl Transcript {
         let count = height.saturating_sub(4).max(1);
         let lines = self.lines(entries, records, room);
         let start = self.start(&lines, count);
-        let mut rows = vec![paint("1;35", &text::fit("  Detailed transcript", room)), String::new()];
+        let mut rows = vec![paint(ACCENT, &text::fit("  Detailed transcript", room)), String::new()];
         for (line, sgr, _, _) in lines.iter().skip(start).take(count) {
             let matched = !self.query.is_empty() && line.to_lowercase().contains(&self.query.to_lowercase());
             rows.push(paint(if matched { "30;43" } else { sgr }, &text::clip(line, room)));
         }
-        if lines.is_empty() { rows.push(paint("2", &text::fit("  No conversation yet", room))); }
+        if lines.is_empty() { rows.push(paint(DIM, &text::fit("  No conversation yet", room))); }
         while rows.len() < height.saturating_sub(2) { rows.push(String::new()); }
         let range = if lines.is_empty() { "0 lines".into() }
             else if room < 65 { format!("{}–{}/{}", start + 1, (start + count).min(lines.len()), lines.len()) }
@@ -171,7 +172,7 @@ impl Transcript {
             format!(" · {hits} matches")
         };
         let inputs = if room < 65 { "i inputs".into() } else { format!("i {input}") };
-        rows.push(paint("2", &text::fit(&format!("  {range} · {mode}{matches} · {inputs}"), room)));
+        rows.push(paint(DIM, &text::fit(&format!("  {range} · {mode}{matches} · {inputs}"), room)));
         let mut cursor = None;
         if let Some(draft) = &self.search {
             rows.push(text::clip(&format!("  /{}", text::printable(draft.text())), room));
@@ -182,7 +183,7 @@ impl Transcript {
             } else if room >= 60 { "  ↑↓/jk · PgUp/PgDn · / search · Esc/Ctrl+O close" }
                 else if room >= 32 { "  ↑↓ · / find · Ctrl+O close" }
                 else { "  ↑↓ · Ctrl+O close" };
-            rows.push(paint("2", &text::fit(hint, room)));
+            rows.push(paint(DIM, &text::fit(hint, room)));
         }
         if rows.len() > height { rows.truncate(height); cursor = None; }
         (rows, cursor)

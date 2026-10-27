@@ -6,6 +6,7 @@ use super::Output;
 use super::input::Draft;
 use super::keys::Key;
 use super::text;
+use super::style::{ACCENT, DIM, PLAIN, RED};
 use crate::llm::{Client, Effort};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -120,17 +121,17 @@ impl Picker {
         let width = width.saturating_sub(1).max(3);
         let room = width.saturating_sub(2);
         let row = |content: String| format!("  {}", text::clip(&content, room));
-        let mut rows = vec![row(paint("1;35", "Model settings"))];
-        let main = if self.target == Target::Main { paint("1;35", "[ Main model ]") } else { paint("2", "  Main model  ") };
-        let sub = if self.target == Target::Subagents { paint("1;35", "[ Subagents ]") } else { paint("2", "  Subagents  ") };
-        rows.push(row(format!("{main}  {sub}  {}", paint("2", "Tab to switch"))));
+        let mut rows = vec![row(paint(ACCENT, "Model settings"))];
+        let main = if self.target == Target::Main { paint(ACCENT, "[ Main model ]") } else { paint(DIM, "  Main model  ") };
+        let sub = if self.target == Target::Subagents { paint(ACCENT, "[ Subagents ]") } else { paint(DIM, "  Subagents  ") };
+        rows.push(row(format!("{main}  {sub}  {}", paint(DIM, "Tab to switch"))));
         rows.push(row(format!("Main: {}", text::fit_tail(&text::printable(self.pending.spec()), room.saturating_sub(6)))));
         let sub = self.pending.subagent_model().map_or_else(
             || format!("follow main ({})", self.pending.spec()), String::from,
         );
         rows.push(row(format!("Subagents: {}", text::fit_tail(&text::printable(&sub), room.saturating_sub(11)))));
         rows.push(String::new());
-        let query = if self.query.is_empty() { paint("2", "type to filter models") } else { text::printable(self.query.text()) };
+        let query = if self.query.is_empty() { paint(DIM, "type to filter models") } else { text::printable(self.query.text()) };
         let cursor = (rows.len(), (10 + text::width(&self.query.text()[..self.query.position()])).min(width - 1));
         rows.push(row(format!("Search: {query}")));
         let choices = self.choices();
@@ -144,36 +145,36 @@ impl Picker {
             let name = choice.as_deref().unwrap_or("Follow main model");
             let suffix = if current { " ● current" } else { "" };
             let name = text::fit_tail(&text::printable(name), room.saturating_sub(2 + text::width(suffix)));
-            rows.push(row(paint(if i == self.selected { "1;35" } else { "0" }, &format!("{mark} {name}{suffix}"))));
+            rows.push(row(paint(if i == self.selected { ACCENT } else { PLAIN }, &format!("{mark} {name}{suffix}"))));
         }
-        if choices.is_empty() { rows.push(row(paint("2", "No matching models"))); }
+        if choices.is_empty() { rows.push(row(paint(DIM, "No matching models"))); }
         while rows.len() < list_at + count { rows.push(String::new()); }
         let range = if choices.len() > count { format!("{}–{} of {} models", start + 1, (start + count).min(choices.len()), choices.len()) } else { String::new() };
-        rows.push(row(paint("2", &range)));
+        rows.push(row(paint(DIM, &range)));
         let preview = match self.target {
             Target::Subagents => self.pending.subagent_model().and_then(|spec| self.pending.switch(spec).ok()).unwrap_or_else(|| self.pending.clone()),
             Target::Main => self.pending.clone(),
         };
         let protocol = preview.spec().split_once('/').and_then(|(p, _)| preview.providers().protocol_of(p)).map_or("?", |p| p.as_str());
-        rows.push(row(paint("2", &format!("{protocol} · configured context {} · max output {}", amount(preview.context_window()), amount(preview.max_tokens())))));
+        rows.push(row(paint(DIM, &format!("{protocol} · configured context {} · max output {}", amount(preview.context_window()), amount(preview.max_tokens())))));
         rows.push(String::new());
         let mut effort = std::iter::once("auto").chain(Effort::ALL.iter().map(|e| e.as_str())).enumerate().map(|(i, name)| {
-            if i == self.effort_index() { paint("1;35", &format!("[{name}]")) } else { paint("2", name) }
+            if i == self.effort_index() { paint(ACCENT, &format!("[{name}]")) } else { paint(DIM, name) }
         }).collect::<Vec<_>>().join("  ");
         if text::width(&effort) + 8 > room {
             let selected = self.pending.effort_override().map_or("auto", |e| e.as_str());
-            effort = format!("← {} →", paint("1;35", &format!("[{selected}]")));
+            effort = format!("← {} →", paint(ACCENT, &format!("[{selected}]")));
         }
         rows.push(row(format!("Effort: {effort}")));
         let help = match self.pending.effort_override() {
             Some(effort) => format!("{} · {}", effort.as_str(), super::parse::effort_help(effort)),
             None => format!("auto → {} · uses each model's configured effort", preview.effort().as_str()),
         };
-        rows.push(row(paint("2", &help)));
+        rows.push(row(paint(DIM, &help)));
         let note = match &self.error {
-            Some(error) => paint("31", &text::printable(error)),
-            None if self.target == Target::Subagents => paint("2", "New agents only; agent-specific models take priority"),
-            None => paint("2", "Preview only · Enter applies to this session"),
+            Some(error) => paint(RED, &text::printable(error)),
+            None if self.target == Target::Subagents => paint(DIM, "New agents only; agent-specific models take priority"),
+            None => paint(DIM, "Preview only · Enter applies to this session"),
         };
         rows.push(row(note));
         let controls = if room >= 55 {
@@ -181,7 +182,7 @@ impl Picker {
         } else {
             ["↑/↓ model · ←/→ effort", "Tab target · Enter apply · Esc cancel"]
         };
-        for control in controls { rows.push(row(paint("2", control))); }
+        for control in controls { rows.push(row(paint(DIM, control))); }
         (rows, Some(cursor))
     }
 }

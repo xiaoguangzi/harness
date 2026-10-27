@@ -9,6 +9,7 @@ use super::calls::{call_label, call_lines, result_block};
 use super::markdown::Markdown;
 use super::output::{elapsed, tokens};
 use super::{Output, diff, text};
+use super::style::{DIM, YELLOW};
 use crate::agent::Observer;
 use crate::llm::{Usage, retry_reason};
 use crate::tools::ToolOutput;
@@ -106,7 +107,7 @@ impl Terminal {
         for (_, index) in std::mem::take(&mut self.pending) {
             let (name, input) = self.out.record_result(index, None);
             let mut lines = call_lines(&self.out, &name, &input, text::terminal_width());
-            lines.push(self.out.paint("33", "  ⎿ Interrupted · no result received"));
+            lines.push(self.out.paint(YELLOW, "  ⎿ Interrupted · no result received"));
             self.out.lines(&lines);
         }
         self.out.set_status(None);
@@ -131,10 +132,10 @@ impl Terminal {
         self.out.line("");
         match result {
             Ok(()) => {}
-            Err(TurnEnd::Interrupted) => self.out.line(self.out.paint("33", "■ Interrupted")),
-            Err(TurnEnd::Failed(e)) => self.out.line(self.out.paint("31", &format!("✗ {e:#}"))),
+            Err(TurnEnd::Interrupted) => self.out.warn("■ Interrupted"),
+            Err(TurnEnd::Failed(e)) => self.out.error(format!("✗ {e:#}")),
         }
-        self.out.line(self.out.paint("2", &format!("✻ {}", stats.join(" · "))));
+        self.out.note(format!("✻ {}", stats.join(" · ")));
     }
 
     /// Switches the status to `phase`, noting how long any reasoning took.
@@ -152,7 +153,7 @@ impl Terminal {
         let took = since.elapsed();
         if took >= NOTABLE_THINKING && self.out.presented() {
             self.separate(Block::Tools);
-            self.out.line(self.out.paint("2", &format!("∴ Thought for {}", elapsed(took.as_secs()))));
+            self.out.note(format!("∴ Thought for {}", elapsed(took.as_secs())));
         }
     }
 
@@ -215,11 +216,11 @@ impl Observer for IdleCompaction<'_> {
         self.out.set_status(None);
         let note = format!("✻ Compacted the idle conversation: context {} → about {}", tokens(before), tokens(after));
         self.out.compaction_note(&note);
-        self.out.line(self.out.paint("2", &note));
+        self.out.note(&note);
     }
 
     fn on_hook(&mut self, message: &str) {
-        self.out.line(self.out.paint("33", &format!("⚑ {message}")));
+        self.out.warn(format!("⚑ {message}"));
     }
 }
 
@@ -353,7 +354,7 @@ impl Observer for Terminal {
             Some(change) if !output.is_error => diff::render(change, width.saturating_sub(6), |sgr, s| self.out.paint(sgr, s))
                 .into_iter()
                 .enumerate()
-                .map(|(i, line)| if i == 0 { self.out.paint("2", &format!("  ⎿ {line}")) } else { format!("    {line}") })
+                .map(|(i, line)| if i == 0 { self.out.paint(DIM, &format!("  ⎿ {line}")) } else { format!("    {line}") })
                 .collect(),
             _ => result_block(&self.out, name, &output.content, output.is_error, width),
         };
@@ -379,7 +380,7 @@ impl Observer for Terminal {
         self.separate(Block::Tools);
         let mut what = what.to_string();
         what[..1].make_ascii_uppercase();
-        self.out.line(self.out.paint("33", &format!("↻ {what} {detail}")));
+        self.out.warn(format!("↻ {what} {detail}"));
     }
 
     fn on_compact_start(&mut self) {
@@ -395,7 +396,7 @@ impl Observer for Terminal {
         self.end_text();
         self.separate(Block::Tools);
         for line in message.lines() {
-            self.out.line(self.out.paint("33", &format!("⚑ {}", text::printable(line))));
+            self.out.warn(format!("⚑ {}", text::printable(line)));
         }
     }
 
@@ -407,7 +408,7 @@ impl Observer for Terminal {
             eprintln!("{note}");
         } else {
             self.separate(Block::Tools);
-            self.out.line(self.out.paint("2", &note));
+            self.out.note(&note);
         }
         self.enter(Phase::Waiting, WAITING);
     }

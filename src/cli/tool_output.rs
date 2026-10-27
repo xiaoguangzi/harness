@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::dialog::Item;
 use super::calls::call_label;
+use super::style::{DIM, GREEN, PLAIN, RED, YELLOW};
 use crate::llm::Message;
 use crate::tools::ToolOutput;
 
@@ -20,32 +21,32 @@ pub(super) struct Record {
 impl Record {
     /// Human-readable result first; protocol details are opt-in.
     pub fn expanded(&self, inputs: bool) -> Vec<(String, &'static str)> {
-        let color = if self.is_error { "31" } else if self.interrupted { "33" } else { "32" };
+        let color = if self.is_error { RED } else if self.interrupted { YELLOW } else { GREEN };
         let mut lines = vec![(format!("● {}", call_label(&self.name, &self.input, usize::MAX)), color)];
         // The compact label keeps only the first command line.
         if let Some(command) = self.input["command"].as_str() {
-            for line in command.lines().skip(1) { lines.push((format!("  {line}"), "0")); }
+            for line in command.lines().skip(1) { lines.push((format!("  {line}"), PLAIN)); }
         }
         if inputs {
-            lines.push((format!("  Call ID: {}", self.id), "2"));
-            lines.push(("  Input:".into(), "2"));
+            lines.push((format!("  Call ID: {}", self.id), DIM));
+            lines.push(("  Input:".into(), DIM));
             for line in serde_json::to_string_pretty(&self.input).unwrap_or_default().lines() {
-                lines.push((format!("    {line}"), "2"));
+                lines.push((format!("    {line}"), DIM));
             }
         }
         match &self.content {
             Some(content) if !content.is_empty() => {
                 for (i, line) in content.split_terminator('\n').enumerate() {
                     lines.push((format!("{}{}", if i == 0 { "  ⎿ " } else { "    " }, line),
-                        if self.is_error { "31" } else { "0" }));
+                        if self.is_error { RED } else { PLAIN }));
                 }
             }
-            Some(_) => lines.push(("  ⎿ (no output)".into(), "2")),
+            Some(_) => lines.push(("  ⎿ (no output)".into(), DIM)),
             None => lines.push((if self.interrupted { "  ⎿ Interrupted · no result received" }
-                else { "  ⎿ Running · waiting for result" }.into(), "2")),
+                else { "  ⎿ Running · waiting for result" }.into(), DIM)),
         }
         if self.attachments > 0 {
-            lines.push((format!("    {} image/document attachments", self.attachments), "2"));
+            lines.push((format!("    {} image/document attachments", self.attachments), DIM));
         }
         lines
     }

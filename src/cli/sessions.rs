@@ -8,6 +8,7 @@ use serde_json::Value;
 use super::calls::{call_lines, result_block};
 use super::markdown::Markdown;
 use super::{Output, dialog, input, text};
+use super::style::{ACCENT, BOLD, DIM};
 use crate::agent::{Agent, INTERRUPTED};
 use crate::checkpoint;
 use crate::llm::Message;
@@ -26,7 +27,7 @@ pub(super) async fn pick(rec: &Recorder, out: &Output, boxed: bool) -> Result<Op
     let sessions: Vec<session::Meta> =
         rec.store().list(&rec.meta().cwd).into_iter().filter(|m| m.id != rec.meta().id).take(LISTED).collect();
     if sessions.is_empty() {
-        out.line(out.paint("2", "no saved conversations in this directory"));
+        out.note("no saved conversations in this directory");
         return Ok(None);
     }
     let now = session::now();
@@ -47,10 +48,10 @@ pub(super) async fn pick(rec: &Recorder, out: &Output, boxed: bool) -> Result<Op
         let room = width.saturating_sub(4 + 10 + text::width(&info) + 2);
         out.line(format!(
             "{} {}  {}{}",
-            out.paint("1", &format!("{:>3}", i + 1)),
-            out.paint("2", &format!("{when:>9}")),
+            out.paint(BOLD, &format!("{:>3}", i + 1)),
+            out.paint(DIM, &format!("{when:>9}")),
             text::fit(&text::printable(title), room.max(20)),
-            out.paint("2", &info),
+            out.paint(DIM, &info),
         ));
     }
     let mut editor = rustyline::DefaultEditor::new()?;
@@ -99,11 +100,11 @@ pub(super) async fn resume(agent: &mut Agent, rec: &mut Recorder, id: &str, out:
     if show {
         replay(out, agent.messages());
         let title = if rec.meta().title.is_empty() { "conversation" } else { rec.meta().title.as_str() };
-        out.line(out.paint("2", &format!("resumed {} · {} · {}", text::printable(title), rec.meta().id, agent.model())));
+        out.note(format!("resumed {} · {} · {}", text::printable(title), rec.meta().id, agent.model()));
         out.line("");
     }
     for note in notes {
-        out.line(out.paint("33", &note));
+        out.warn(&note);
     }
     Ok(())
 }
@@ -121,7 +122,7 @@ fn replay(out: &Output, messages: &[Message]) {
         .collect();
     let first = starts.len().saturating_sub(REPLAYED_TURNS);
     if first > 0 {
-        out.line(out.paint("2", &format!("… {first} earlier turns")));
+        out.note(format!("… {first} earlier turns"));
         out.line("");
     }
     let width = text::terminal_width();
@@ -136,12 +137,12 @@ fn replay(out: &Output, messages: &[Message]) {
     for m in &messages[starts.get(first).copied().unwrap_or(messages.len())..] {
         if m.content.iter().any(|b| b["type"] == "text" && b["text"] == INTERRUPTED) {
             gap(&mut tools);
-            out.line(out.paint("33", "■ Interrupted"));
+            out.warn("■ Interrupted");
             out.line("");
         }
         if crate::agent::is_compacted(m) {
             gap(&mut tools);
-            out.line(out.paint("2", "✻ Conversation compacted"));
+            out.note("✻ Conversation compacted");
             out.line("");
             continue;
         }
@@ -151,11 +152,11 @@ fn replay(out: &Output, messages: &[Message]) {
                 gap(&mut tools);
                 let lines: Vec<&str> = prompt.lines().collect();
                 for (i, line) in lines.iter().take(PROMPT_LINES).enumerate() {
-                    let lead = if i == 0 { out.paint(input::PROMPT_SGR, input::PROMPT) } else { "  ".to_string() };
+                    let lead = if i == 0 { out.paint(ACCENT, input::PROMPT) } else { "  ".to_string() };
                     out.line(format!("{lead}{}", text::fit(&text::printable(line), width.saturating_sub(3))));
                 }
                 if lines.len() > PROMPT_LINES {
-                    out.line(out.paint("2", &format!("  … +{} lines", lines.len() - PROMPT_LINES)));
+                    out.note(format!("  … +{} lines", lines.len() - PROMPT_LINES));
                 }
                 out.line("");
             }
@@ -200,7 +201,7 @@ fn replay(out: &Output, messages: &[Message]) {
         for call in m.content.iter().filter(|b| b["type"] == "tool_use") {
             if call["id"].as_str().is_some_and(|id| calls.contains_key(id)) {
                 out.lines(&call_lines(out, call["name"].as_str().unwrap_or(""), &call["input"], width));
-                out.line(out.paint("33", "  ⎿ No saved result"));
+                out.warn("  ⎿ No saved result");
             }
         }
     }
@@ -209,7 +210,7 @@ fn replay(out: &Output, messages: &[Message]) {
 /// Shows what SessionEnd hooks had for the user.
 pub(super) fn show_hook_notices(out: &Output, notices: Vec<String>) {
     for notice in notices {
-        out.line(out.paint("33", &format!("⚑ {}", text::printable(&notice))));
+        out.warn(format!("⚑ {}", text::printable(&notice)));
     }
 }
 
@@ -223,7 +224,7 @@ pub(super) fn attach(agent: &Agent, rec: &Recorder) {
 /// Saves the conversation and its checkpoints.
 pub(super) fn save(agent: &Agent, rec: &mut Recorder, out: &Output) {
     if let Err(e) = rec.save(agent.messages(), agent.model()).and_then(|()| agent.file_history().save()) {
-        out.line(out.paint("33", &format!("conversation not saved: {e:#}")));
+        out.warn(format!("conversation not saved: {e:#}"));
     }
 }
 

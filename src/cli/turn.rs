@@ -13,6 +13,7 @@ use super::menu::Menu;
 use super::terminal::{Terminal, TurnEnd};
 use super::parse::parse_input;
 use super::{Output, repl, sessions};
+use super::style::{ACCENT, DIM, YELLOW};
 use crate::agent::{Agent, Inbox};
 use crate::mentions;
 use crate::session::Recorder;
@@ -196,14 +197,14 @@ pub(super) fn attachments(line: &str, images: &[(usize, Image)], files: &FileTra
 /// `text` the way the conversation shows a prompt: behind `❯`, with the
 /// lines after the first indented.
 pub(super) fn prompt_lines(out: &Output, text: &str) -> Vec<String> {
-    let lead = out.paint(input::PROMPT_SGR, input::PROMPT);
+    let lead = out.paint(ACCENT, input::PROMPT);
     text.lines().enumerate().map(|(i, line)| format!("{}{line}", if i == 0 { &lead } else { "  " })).collect()
 }
 
 /// Lines saying what is attached to a prompt, and what could not be.
 fn attachment_lines(out: &Output, expanded: &mentions::Expanded) -> Vec<String> {
-    let attached = expanded.attachments.iter().map(|a| out.paint("2", &format!("  + {}", a.label)));
-    attached.chain(expanded.warnings.iter().map(|w| out.paint("33", &format!("  ! {w}")))).collect()
+    let attached = expanded.attachments.iter().map(|a| out.paint(DIM, &format!("  + {}", a.label)));
+    attached.chain(expanded.warnings.iter().map(|w| out.paint(YELLOW, &format!("  ! {w}")))).collect()
 }
 
 /// Types `key` into the input box, or acts on `menu` under it. Enter hands

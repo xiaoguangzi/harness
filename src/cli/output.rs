@@ -16,6 +16,7 @@ use super::screen::Screen;
 use super::text;
 use super::tool_output::{self, Record};
 use super::transcript::{Entry, Transcript};
+use super::style::{DIM, GREEN, RED, YELLOW};
 use crate::agent::Inbox;
 use crate::llm::Message;
 use crate::tools::ToolOutput;
@@ -633,6 +634,21 @@ impl Output {
         self.lines(&[line]);
     }
 
+    /// Prints `text` dim: a note on what happened.
+    pub fn note(&self, text: impl AsRef<str>) {
+        self.line(self.paint(DIM, text.as_ref()));
+    }
+
+    /// Prints `text` in yellow: something to notice, such as a warning.
+    pub fn warn(&self, text: impl AsRef<str>) {
+        self.line(self.paint(YELLOW, text.as_ref()));
+    }
+
+    /// Prints `text` in red: what failed.
+    pub fn error(&self, text: impl AsRef<str>) {
+        self.line(self.paint(RED, text.as_ref()));
+    }
+
     /// Shows a subagent's progress: a foreground one's tool calls, indented
     /// under its `agent` call, and how a background one ended. A background
     /// one's tool calls are left out, as they would interleave with
@@ -645,14 +661,14 @@ impl Output {
                 let prefix = format!("    ◦ {} › ", text::fit(label, 32));
                 let room = text::terminal_width().saturating_sub(text::width(&prefix) + 1);
                 let call = call_label(event["tool"].as_str().unwrap_or(""), &event["input"], room);
-                self.line(self.paint("2", &format!("{prefix}{call}")));
+                self.note(format!("{prefix}{call}"));
             }
             Some("subagent_status") if background => {
                 let status = event["status"].as_str().unwrap_or("");
                 let color = match status {
-                    "completed" => "32",
-                    "failed" => "31",
-                    "stopped" => "33",
+                    "completed" => GREEN,
+                    "failed" => RED,
+                    "stopped" => YELLOW,
                     _ => return,
                 };
                 let detail = format!(
@@ -662,7 +678,7 @@ impl Output {
                     elapsed(event["seconds"].as_u64().unwrap_or(0)),
                 );
                 let prefix = format!("  ◦ {} › ", text::fit(label, 48));
-                self.line(format!("{}{}{}", self.paint("2", &prefix), self.paint(color, status), self.paint("2", &detail)));
+                self.line(format!("{}{}{}", self.paint(DIM, &prefix), self.paint(color, status), self.paint(DIM, &detail)));
             }
             _ => {}
         }
@@ -720,7 +736,7 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
         rows.push(String::new());
     }
     rows.extend(input.typing.queued_rows(width, &paint));
-    let rule = paint("2", &input::rule(width));
+    let rule = paint(DIM, &input::rule(width));
     rows.push(rule.clone());
     let (draft, (row, col)) = if state.menu.is_some() {
         input.typing.draft.render(width, "Type a message · / commands · @ files", &paint)
@@ -731,7 +747,7 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
     rows.extend(draft);
     rows.push(rule);
     if let Some(notice) = &input.notice {
-        rows.push(paint("33", &format!("  {}", text::printable(notice))));
+        rows.push(paint(YELLOW, &format!("  {}", text::printable(notice))));
     }
     if let Some(menu) = &state.menu
         && let Some(line) = input.typing.draft.at_end()
@@ -741,7 +757,7 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
         rows.extend(shown.trim_start_matches('\n').split('\n').map(str::to_string));
     } else {
         if let Some(line) = state.permissions.as_ref().and_then(|p| mode_line(p)) {
-            rows.push(paint("2", &text::fit(&line, width.saturating_sub(1))));
+            rows.push(paint(DIM, &text::fit(&line, width.saturating_sub(1))));
         }
         if let Some(footer) = &state.footer {
             // Its own colors, unless it is too wide for them.

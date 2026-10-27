@@ -10,6 +10,7 @@ use super::markdown::Markdown;
 use super::Output;
 use super::calls::call_label;
 use super::text;
+use super::style::{DIM, RED};
 use crate::agent::Agent;
 use crate::llm::Message;
 
@@ -28,15 +29,15 @@ pub async fn shell(agent: &Agent, command: &str, out: &Output) {
     };
     out.set_status(None);
     let Some(output) = output else {
-        out.line(out.paint("33", "■ Interrupted"));
+        out.warn("■ Interrupted");
         return;
     };
     let lines: Vec<&str> = output.content.lines().collect();
     for line in lines.iter().take(SHOWN_LINES) {
-        out.line(format!("  {}", out.paint(if output.is_error { "31" } else { "2" }, &text::printable(line))));
+        out.line(format!("  {}", out.paint(if output.is_error { RED } else { DIM }, &text::printable(line))));
     }
     if lines.len() > SHOWN_LINES {
-        out.line(out.paint("2", &format!("  … {} more lines", lines.len() - SHOWN_LINES)));
+        out.note(format!("  … {} more lines", lines.len() - SHOWN_LINES));
     }
     agent.inbox().push(
         format!(
@@ -46,14 +47,14 @@ pub async fn shell(agent: &Agent, command: &str, out: &Output) {
         ),
         false,
     );
-    out.line(out.paint("2", "  (the output goes to the model with your next message)"));
+    out.note("  (the output goes to the model with your next message)");
 }
 
 /// Answers a side question (`/btw`) from the conversation so far, without
 /// adding it or the answer to the conversation.
 pub async fn side_question(agent: &mut Agent, question: &str, out: &Output) {
     if question.trim().is_empty() {
-        out.line(out.paint("33", "usage: /btw <question>"));
+        out.warn("usage: /btw <question>");
         return;
     }
     out.set_status(Some("Answering on the side…"));
@@ -63,7 +64,7 @@ pub async fn side_question(agent: &mut Agent, question: &str, out: &Output) {
         let lines = markdown.push(text);
         if !lines.is_empty() && !started {
             started = true;
-            out.line(out.paint("2", "  btw ›"));
+            out.note("  btw ›");
         }
         out.lines(&lines.iter().map(|l| format!("    {l}")).collect::<Vec<_>>());
     };
@@ -76,13 +77,13 @@ pub async fn side_question(agent: &mut Agent, question: &str, out: &Output) {
     match answer {
         Some(Ok(_)) => {
             if !started {
-                out.line(out.paint("2", "  btw ›"));
+                out.note("  btw ›");
             }
             out.lines(&rest);
-            out.line(out.paint("2", "  (not kept in the conversation)"));
+            out.note("  (not kept in the conversation)");
         }
-        Some(Err(e)) => out.line(out.paint("31", &format!("/btw failed: {e:#}"))),
-        None => out.line(out.paint("33", "■ Interrupted")),
+        Some(Err(e)) => out.error(format!("/btw failed: {e:#}")),
+        None => out.warn("■ Interrupted"),
     }
 }
 
@@ -96,12 +97,12 @@ pub fn copy(agent: &Agent, n: usize, out: &Output) {
         .filter(|text| !text.trim().is_empty())
         .collect();
     let Some(reply) = replies.len().checked_sub(n).and_then(|i| replies.get(i)) else {
-        out.line(out.paint("33", if replies.is_empty() { "no reply to copy yet" } else { "there is no such reply" }));
+        out.warn(if replies.is_empty() { "no reply to copy yet" } else { "there is no such reply" });
         return;
     };
     match super::clipboard::copy_text(reply.trim()) {
-        Ok(how) => out.line(out.paint("2", &format!("copied the reply ({} characters) through {how}", reply.trim().chars().count()))),
-        Err(e) => out.line(out.paint("31", &format!("could not copy: {e}"))),
+        Ok(how) => out.note(format!("copied the reply ({} characters) through {how}", reply.trim().chars().count())),
+        Err(e) => out.error(format!("could not copy: {e}")),
     }
 }
 
@@ -109,7 +110,7 @@ pub fn copy(agent: &Agent, n: usize, out: &Output) {
 /// `harness-<session>.md` in the working directory.
 pub fn export(agent: &Agent, path: Option<&str>, session: Option<&str>, out: &Output) {
     if agent.messages().is_empty() {
-        out.line(out.paint("33", "nothing to export yet"));
+        out.warn("nothing to export yet");
         return;
     }
     let path = match path {
@@ -117,8 +118,8 @@ pub fn export(agent: &Agent, path: Option<&str>, session: Option<&str>, out: &Ou
         None => PathBuf::from(format!("harness-{}.md", session.unwrap_or("conversation"))),
     };
     match std::fs::write(&path, markdown(agent.messages())) {
-        Ok(()) => out.line(out.paint("2", &format!("exported the conversation to {}", path.display()))),
-        Err(e) => out.line(out.paint("31", &format!("could not write {}: {e}", path.display()))),
+        Ok(()) => out.note(format!("exported the conversation to {}", path.display())),
+        Err(e) => out.error(format!("could not write {}: {e}", path.display())),
     }
 }
 

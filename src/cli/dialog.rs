@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use super::{Output, text};
 use super::input::Draft;
 use super::keys::{Key, KeyWatch};
+use super::style::{ACCENT, DIM, PLAIN};
 
 pub type Frame = (Vec<String>, Option<(usize, usize)>);
 
@@ -135,10 +136,10 @@ impl Panel for TextInput {
     fn render(&self, width: usize, _height: usize, paint: &dyn Fn(&str, &str) -> String) -> Frame {
         let room = room(width);
         let row = |content: String| format!("  {}", text::clip(&content, room));
-        let rows = vec![row(paint("1;35", &text::printable(&self.title))),
-            row(paint("2", &text::printable(&self.prompt))), String::new(),
+        let rows = vec![row(paint(ACCENT, &text::printable(&self.title))),
+            row(paint(DIM, &text::printable(&self.prompt))), String::new(),
             row(format!("❯ {}", text::printable(self.draft.text()))),
-            row(paint("2", "Enter continue · Esc cancel"))];
+            row(paint(DIM, "Enter continue · Esc cancel"))];
         let cursor = (3, (4 + text::width(&self.draft.text()[..self.draft.position()])).min(room + 1));
         (rows, Some(cursor))
     }
@@ -247,13 +248,13 @@ impl List {
         let count = self.detail_rows(height);
         let start = self.offset.min(lines.len().saturating_sub(count));
         for line in lines.iter().skip(start).take(count) { rows.push(row(line.clone())); }
-        if lines.is_empty() { rows.push(row(paint("2", "No details"))); }
+        if lines.is_empty() { rows.push(row(paint(DIM, "No details"))); }
         let range = if lines.len() > count {
             format!("{}–{} of {} lines", start + 1, (start + count).min(lines.len()), lines.len())
         } else { String::new() };
-        rows.push(row(paint("2", &range)));
+        rows.push(row(paint(DIM, &range)));
         let keys = if self.back { format!("↑/↓ scroll · Tab/Esc back · Enter {}", self.keys.enter) } else { "↑/↓ scroll · Enter/Esc close".into() };
-        rows.push(row(paint("2", &keys)));
+        rows.push(row(paint(DIM, &keys)));
         (rows, None)
     }
 }
@@ -262,13 +263,13 @@ impl Panel for List {
     fn render(&self, width: usize, height: usize, paint: &dyn Fn(&str, &str) -> String) -> Frame {
         let room = room(width);
         let row = |content: String| format!("  {}", text::clip(&content, room));
-        let mut rows = vec![row(paint("1;35", &text::fit(&text::printable(&self.title), room)))];
-        if !self.subtitle.is_empty() { rows.push(row(paint("2", &text::fit(&text::printable(&self.subtitle), room)))); }
+        let mut rows = vec![row(paint(ACCENT, &text::fit(&text::printable(&self.title), room)))];
+        if !self.subtitle.is_empty() { rows.push(row(paint(DIM, &text::fit(&text::printable(&self.subtitle), room)))); }
         rows.push(String::new());
         if self.detail {
             return self.render_detail(rows, room, height, paint);
         }
-        let query = if self.query.is_empty() { paint("2", "type to filter") } else { text::printable(self.query.text()) };
+        let query = if self.query.is_empty() { paint(DIM, "type to filter") } else { text::printable(self.query.text()) };
         let cursor = (rows.len(), (10 + text::width(&self.query.text()[..self.query.position()])).min(room + 1));
         rows.push(row(format!("Search: {query}")));
 
@@ -287,30 +288,30 @@ impl Panel for List {
         let start = window(&self.top, selected, count, filtered.len());
         for (position, i) in filtered.iter().enumerate().skip(start).take(count) {
             let item = &self.items[*i];
-            let (mark, style) = if position == selected { ("❯", "1;35") } else { (" ", "0") };
+            let (mark, style) = if position == selected { ("❯", ACCENT) } else { (" ", PLAIN) };
             let label = text::fit(&text::printable(&item.label), if beside { label_width } else { room.saturating_sub(2) });
             let mut line = paint(style, &format!("{mark} {}", if beside { text::pad(&label, label_width) } else { label }));
             if beside && !item.description.is_empty() {
                 let first = item.description.lines().next().unwrap_or("");
-                line = format!("{line}  {}", paint("2", &text::fit(&text::printable(first), description_room)));
+                line = format!("{line}  {}", paint(DIM, &text::fit(&text::printable(first), description_room)));
             }
             rows.push(row(line));
         }
-        if filtered.is_empty() { rows.push(row(paint("2", if self.items.is_empty() { "No items available" } else { "No matching items" }))); }
+        if filtered.is_empty() { rows.push(row(paint(DIM, if self.items.is_empty() { "No items available" } else { "No matching items" }))); }
         while rows.len() < self.header_rows() + 1 + count { rows.push(String::new()); }
         rows.push(String::new());
 
         let summary: Vec<String> = self.current().map(|i| &self.items[i]).filter(|item| !fits(item)).map(|item| {
             item.description.split('\n').flat_map(|s| text::wrap(&text::printable(s), room)).take(summary_rows).collect()
         }).unwrap_or_default();
-        for i in 0..summary_rows { rows.push(summary.get(i).map_or_else(String::new, |line| row(paint("2", line)))); }
+        for i in 0..summary_rows { rows.push(summary.get(i).map_or_else(String::new, |line| row(paint(DIM, line)))); }
 
         let shown = if filtered.len() > count {
             format!("{}–{} of {}", start + 1, start + count, filtered.len())
         } else { filtered.len().to_string() };
         let noun = if self.query.is_empty() { if filtered.len() == 1 { " item" } else { " items" } } else { " matching" };
-        rows.push(row(paint("2", &format!("{shown}{noun} · ↑/↓ select · Tab details"))));
-        rows.push(row(paint("2", &format!("Enter {} · Esc {}", self.keys.enter, self.keys.esc))));
+        rows.push(row(paint(DIM, &format!("{shown}{noun} · ↑/↓ select · Tab details"))));
+        rows.push(row(paint(DIM, &format!("Enter {} · Esc {}", self.keys.enter, self.keys.esc))));
         (rows, Some(cursor))
     }
 }

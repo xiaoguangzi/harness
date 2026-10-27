@@ -8,6 +8,7 @@ use rustyline::error::ReadlineError;
 use super::dialog::{Item, Keys, choose};
 use super::input::Typing;
 use super::{Output, diff, text};
+use super::style::{BOLD, DIM, GREEN, RED};
 use crate::agent::Agent;
 use crate::checkpoint::{self, Change};
 use crate::session;
@@ -37,7 +38,7 @@ const CHOICES: [(Restore, &str); 3] = [
 pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, boxed: bool) -> Result<bool> {
     let checkpoints = agent.file_history().checkpoints();
     if checkpoints.is_empty() {
-        out.line(out.paint("2", "no earlier prompts to rewind to"));
+        out.note("no earlier prompts to rewind to");
         return Ok(false);
     }
     let listed: Vec<_> = checkpoints.iter().rev().take(LISTED).collect();
@@ -52,10 +53,10 @@ pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, bo
         let room = width.saturating_sub(4 + 10 + text::width(&info) + 2);
         out.line(format!(
             "{} {}  {}{}",
-            out.paint("1", &format!("{:>3}", i + 1)),
-            out.paint("2", &format!("{when:>9}")),
+            out.paint(BOLD, &format!("{:>3}", i + 1)),
+            out.paint(DIM, &format!("{when:>9}")),
             text::fit(&text::printable(first_line(&c.prompt)), room.max(20)),
-            out.paint("2", &info),
+            out.paint(DIM, &info),
         ));
     }
     let picked = if boxed {
@@ -75,12 +76,12 @@ pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, bo
 
     let changes = agent.file_history().changes(checkpoint.message);
     if !boxed { match &changes {
-        Ok(changes) if changes.is_empty() => out.line(out.paint("2", "  the code is as it was then")),
+        Ok(changes) if changes.is_empty() => out.note("  the code is as it was then"),
         Ok(changes) => out.lines(&change_lines(out, changes)),
-        Err(e) => out.line(out.paint("33", &format!("  the code cannot be restored: {e:#}"))),
+        Err(e) => out.warn(format!("  the code cannot be restored: {e:#}")),
     } }
     for (i, (_, label)) in CHOICES.iter().enumerate().filter(|_| !boxed) {
-        out.line(format!("{} {label}", out.paint("1", &format!("{:>3}", i + 1))));
+        out.line(format!("{} {label}", out.paint(BOLD, &format!("{:>3}", i + 1))));
     }
     let picked = if boxed {
         restore_choice(out, &changes).await
@@ -101,7 +102,7 @@ pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, bo
         typing.draft.set_text(&prompt);
         done.push("rewound the conversation; the prompt is back in the input box".to_string());
     }
-    out.line(out.paint("2", &done.join(" · ")));
+    out.note(done.join(" · "));
     Ok(true)
 }
 
@@ -109,7 +110,7 @@ pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, bo
 fn ask(out: &Output, question: &str, max: usize) -> Result<Option<usize>> {
     let mut editor = rustyline::DefaultEditor::new()?;
     let handoff = out.handoff();
-    let read = tokio::task::block_in_place(|| editor.readline(&out.paint("2", question)));
+    let read = tokio::task::block_in_place(|| editor.readline(&out.paint(DIM, question)));
     drop(handoff);
     let answer = match read {
         Ok(answer) => answer,
@@ -134,7 +135,7 @@ fn change_lines(out: &Output, changes: &[Change]) -> Vec<String> {
         lines.push(format!("    {}  {}", text::printable(&path.display().to_string()), what_changes(out, change)));
     }
     if changes.len() > LISTED_FILES {
-        lines.push(out.paint("2", &format!("    … and {} more", changes.len() - LISTED_FILES)));
+        lines.push(out.paint(DIM, &format!("    … and {} more", changes.len() - LISTED_FILES)));
     }
     lines
 }
@@ -168,14 +169,14 @@ async fn restore_choice(out: &Output, changes: &Result<Vec<Change>>) -> Option<R
 /// `+3 -1`, `removed` or `recreated`, for a file going back.
 fn what_changes(out: &Output, change: &Change) -> String {
     let (Some(before), Some(now)) = (&change.before, &change.now) else {
-        return out.paint("2", if change.before.is_none() { "removed" } else { "recreated" });
+        return out.paint(DIM, if change.before.is_none() { "removed" } else { "recreated" });
     };
     match (std::str::from_utf8(now), std::str::from_utf8(before)) {
         (Ok(now), Ok(before)) => {
             let (added, removed) = diff::line_counts(now, before);
-            format!("{} {}", out.paint("32", &format!("+{added}")), out.paint("31", &format!("-{removed}")))
+            format!("{} {}", out.paint(GREEN, &format!("+{added}")), out.paint(RED, &format!("-{removed}")))
         }
-        _ => out.paint("2", "binary"),
+        _ => out.paint(DIM, "binary"),
     }
 }
 

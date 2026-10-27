@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::parse::{BUILTINS, help_keys};
 use super::{Output, output, text};
+use super::style::{ACCENT, BOLD, CYAN, DIM, GRAY, GREEN, RED, YELLOW};
 use crate::agent::Agent;
 use crate::llm;
 use crate::mcp;
@@ -32,42 +33,36 @@ pub(super) fn banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {
         1 => " · 1 plugin".to_string(),
         n => format!(" · {n} plugins"),
     };
-    let effort = out.paint("2", &format!(" · {} effort", agent.client().effort().as_str()));
-    out.line(format!("{} {}{effort}", out.paint("1;35", "✻ harness"), out.paint("1", agent.model())));
-    out.line(out.paint(
-        "2",
-        &format!(
-            "  {cwd} · {} tools · {} skills · {servers}{plugins}{}",
-            agent.tools().names().count(),
-            skills.len(),
-            if crate::sandbox::active().is_some() { " · sandboxed" } else { "" }
-        ),
-    ));
-    out.line(out.paint("2", "  / for commands · @ for files · Ctrl+O for transcript · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt"));
+    let effort = out.paint(DIM, &format!(" · {} effort", agent.client().effort().as_str()));
+    out.line(format!("{} {}{effort}", out.paint(ACCENT, "✻ harness"), out.paint(BOLD, agent.model())));
+    let sandboxed = if crate::sandbox::active().is_some() { " · sandboxed" } else { "" };
+    let tools = agent.tools().names().count();
+    out.note(format!("  {cwd} · {tools} tools · {} skills · {servers}{plugins}{sandboxed}", skills.len()));
+    out.note("  / for commands · @ for files · Ctrl+O for transcript · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt");
     out.line("");
 }
 
 pub(super) fn help(out: &Output, skills: &[Skill]) {
     let keys = help_keys();
     for (key, what) in BUILTINS.iter().chain(&keys) {
-        out.line(format!("  {} {what}", out.paint("1", &text::pad(key, 16))));
+        out.line(format!("  {} {what}", out.paint(BOLD, &text::pad(key, 16))));
     }
     let names: Vec<String> = skills.iter().filter(|s| s.user_invocable).map(|s| format!("/{}", s.name)).collect();
     if !names.is_empty() {
-        out.line(format!("  {}", out.paint("2", &format!("skills: {}", names.join(" ")))));
+        out.line(format!("  {}", out.paint(DIM, &format!("skills: {}", names.join(" ")))));
     }
 }
 
 /// The permission mode and rules, line by line.
 pub(super) fn permissions(permissions: &Permissions, out: &Output) {
     let mode = permissions.mode();
-    out.line(format!("permission mode: {} — {}", out.paint("1", mode.as_str()), mode.describe()));
+    out.line(format!("permission mode: {} — {}", out.paint(BOLD, mode.as_str()), mode.describe()));
     for (kind, rules) in permissions.rules() {
         if !rules.is_empty() {
-            out.line(format!("  {}: {}", out.paint("2", kind), rules.join(", ")));
+            out.line(format!("  {}: {}", out.paint(DIM, kind), rules.join(", ")));
         }
     }
-    out.line(out.paint("2", "change it with /permissions <mode> or Shift+Tab; rules go in `permissions` in ~/.harness/settings.json"));
+    out.note("change it with /permissions <mode> or Shift+Tab; rules go in `permissions` in ~/.harness/settings.json");
 }
 
 pub(super) fn tools(out: &Output, tools: &ToolRegistry) {
@@ -76,7 +71,7 @@ pub(super) fn tools(out: &Output, tools: &ToolRegistry) {
     let room = text::terminal_width().saturating_sub(name_width + 5);
     for tool in tools {
         let summary = tool.description.split(". ").next().unwrap_or("").trim_end_matches('.');
-        out.line(format!("  {}  {}", out.paint("1", &text::pad(&tool.name, name_width)), out.paint("2", &text::fit(summary, room))));
+        out.line(format!("  {}  {}", out.paint(BOLD, &text::pad(&tool.name, name_width)), out.paint(DIM, &text::fit(summary, room))));
     }
 }
 
@@ -87,7 +82,7 @@ pub(super) fn sandbox(out: &Output) {
     };
     let startup = ("startup", format!("{} per command (measured at launch)", crate::util::short_duration(sandbox.startup())));
     for (label, value) in sandbox.describe().into_iter().chain([startup]) {
-        out.line(format!("  {} {value}", out.paint("1", &text::pad(label, 10))));
+        out.line(format!("  {} {value}", out.paint(BOLD, &text::pad(label, 10))));
     }
 }
 
@@ -120,12 +115,12 @@ pub(super) fn usage(out: &Output, agent: &Agent) {
             "cache write",
             "output"
         );
-        out.line(format!("  {}", out.paint("2", &header)));
+        out.line(format!("  {}", out.paint(DIM, &header)));
         for (model, t) in &models {
             let u = &t.usage;
             out.line(format!(
                 "  {}  {:>8}  {:>9}  {:>10}  {:>11}  {:>9}",
-                out.paint("1", &text::pad(model, width)),
+                out.paint(BOLD, &text::pad(model, width)),
                 t.requests,
                 output::tokens(u.input_tokens),
                 output::tokens(u.cache_read_tokens),
@@ -136,10 +131,10 @@ pub(super) fn usage(out: &Output, agent: &Agent) {
         let input: u64 = models.iter().map(|(_, t)| t.usage.input_tokens).sum();
         let cached: u64 = models.iter().map(|(_, t)| t.usage.cache_read_tokens).sum();
         if let Some(percent) = (cached * 100).checked_div(input) {
-            out.line(format!("  {}", out.paint("2", &format!("{percent}% of input tokens came from the prompt cache"))));
+            out.line(format!("  {}", out.paint(DIM, &format!("{percent}% of input tokens came from the prompt cache"))));
         }
         if let Some(cost) = usage_cost(agent) {
-            out.line(format!("  {}", out.paint("2", &cost)));
+            out.line(format!("  {}", out.paint(DIM, &cost)));
         }
     }
     let used = agent.context_tokens();
@@ -160,26 +155,26 @@ pub(super) fn skills(out: &Output, skills: &[Skill]) {
         );
     }
     for s in skills {
-        out.line(format!("{}  {}", out.paint("1", &s.name), s.description));
-        out.line(format!("  {}", out.paint("90", &s.dir.display().to_string())));
+        out.line(format!("{}  {}", out.paint(BOLD, &s.name), s.description));
+        out.line(format!("  {}", out.paint(GRAY, &s.dir.display().to_string())));
     }
 }
 
 pub(super) fn models(out: &Output, client: &llm::Client) {
     let providers = client.providers();
-    out.line(format!("current: {}", out.paint("1", client.spec())));
+    out.line(format!("current: {}", out.paint(BOLD, client.spec())));
     out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
     out.line(format!("effort: {}", client.effort().as_str()));
     for name in providers.names() {
         let protocol = providers.protocol_of(name).map_or("?", llm::Protocol::as_str);
-        out.line(format!("provider {} ({protocol})", out.paint("1", name)));
+        out.line(format!("provider {} ({protocol})", out.paint(BOLD, name)));
     }
     for m in providers.listed_models() {
-        let mark = if m == client.spec() { out.paint("32", "●") } else { " ".to_string() };
+        let mark = if m == client.spec() { out.paint(GREEN, "●") } else { " ".to_string() };
         out.line(format!(" {mark} {m}"));
     }
-    out.line(out.paint("90", "switch with /model <provider>/<model>; any model name the gateway accepts works"));
-    out.line(out.paint("90", "add a provider with /provider add <name>, a model with /provider model add <provider>/<model>"));
+    out.line(out.paint(GRAY, "switch with /model <provider>/<model>; any model name the gateway accepts works"));
+    out.line(out.paint(GRAY, "add a provider with /provider add <name>, a model with /provider model add <provider>/<model>"));
 }
 
 pub(super) fn agents(out: &Output, defs: &[AgentDef]) {
@@ -188,9 +183,9 @@ pub(super) fn agents(out: &Output, defs: &[AgentDef]) {
         let tools = d.tools.as_ref().map_or("all permitted".to_string(), |t| t.join(", "));
         let source = d.path.as_ref().map_or("built-in".to_string(), |p| p.display().to_string());
         let model = d.model.as_ref().map_or(String::new(), |m| format!(" · model {m}"));
-        out.line(format!("{}  [{access}; tools: {tools}]", out.paint("1", &d.name)));
+        out.line(format!("{}  [{access}; tools: {tools}]", out.paint(BOLD, &d.name)));
         out.line(format!("  {}", d.description));
-        out.line(format!("  {}", out.paint("90", &format!("{source}{model}"))));
+        out.line(format!("  {}", out.paint(GRAY, &format!("{source}{model}"))));
     }
 }
 
@@ -202,10 +197,10 @@ pub(super) fn tasks(out: &Output, subagents: &[Value], shells: &[(String, String
     for s in subagents {
         let status = s["status"].as_str().unwrap_or("");
         let color = match status {
-            "running" => "36",
-            "completed" => "32",
-            "failed" => "31",
-            _ => "33",
+            "running" => CYAN,
+            "completed" => GREEN,
+            "failed" => RED,
+            _ => YELLOW,
         };
         let mut info = vec![
             s["model"].as_str().unwrap_or("").to_string(),
@@ -220,18 +215,18 @@ pub(super) fn tasks(out: &Output, subagents: &[Value], shells: &[(String, String
         }
         out.line(format!(
             "  {}  {}  {}  {}",
-            out.paint("1", s["id"].as_str().unwrap_or("")),
+            out.paint(BOLD, s["id"].as_str().unwrap_or("")),
             out.paint(color, &text::pad(status, 9)),
             text::printable(s["label"].as_str().unwrap_or("")),
-            out.paint("2", &info.join(" · "))
+            out.paint(DIM, &info.join(" · "))
         ));
     }
     for (id, command, running) in shells {
-        let (color, status) = if *running { ("36", "running") } else { ("2", "ended") };
+        let (color, status) = if *running { (CYAN, "running") } else { (DIM, "ended") };
         let command = text::fit(&text::printable(command.lines().next().unwrap_or("")), 80);
-        out.line(format!("  {}  {}  {}", out.paint("1", id), out.paint(color, &text::pad(status, 9)), out.paint("2", &format!("$ {command}"))));
+        out.line(format!("  {}  {}  {}", out.paint(BOLD, id), out.paint(color, &text::pad(status, 9)), out.paint(DIM, &format!("$ {command}"))));
     }
-    out.line(out.paint("90", "stop one with /stop <id>, or every running one with /stop"));
+    out.line(out.paint(GRAY, "stop one with /stop <id>, or every running one with /stop"));
 }
 
 pub(super) fn plugins(out: &Output, plugins: &Plugins) {
@@ -239,49 +234,49 @@ pub(super) fn plugins(out: &Output, plugins: &Plugins) {
         out.line("no plugins enabled (`enabledPlugins` in ~/.harness/settings.json, or --plugin-dir)");
     }
     for p in &plugins.list {
-        let version = p.version.as_ref().map_or(String::new(), |v| format!(" {}", out.paint("2", &format!("v{v}"))));
+        let version = p.version.as_ref().map_or(String::new(), |v| format!(" {}", out.paint(DIM, &format!("v{v}"))));
         match &p.outcome {
             Ok(parts) => {
                 let parts = if parts.is_empty() { "nothing the harness can use".to_string() } else { parts.join(", ") };
-                out.line(format!("{} {}{version}  {parts}", out.paint("32", "●"), out.paint("1", &p.id)));
+                out.line(format!("{} {}{version}  {parts}", out.paint(GREEN, "●"), out.paint(BOLD, &p.id)));
             }
-            Err(e) => out.line(format!("{} {}  {e}", out.paint("31", "●"), out.paint("1", &p.id))),
+            Err(e) => out.line(format!("{} {}  {e}", out.paint(RED, "●"), out.paint(BOLD, &p.id))),
         }
         if let Some(description) = &p.description {
             out.line(format!("    {description}"));
         }
         if let Some(root) = &p.root {
-            out.line(format!("    {}", out.paint("90", &root.display().to_string())));
+            out.line(format!("    {}", out.paint(GRAY, &root.display().to_string())));
         }
         for warning in &p.warnings {
-            out.line(format!("    {}", out.paint("33", &format!("! {warning}"))));
+            out.line(format!("    {}", out.paint(YELLOW, &format!("! {warning}"))));
         }
         if !p.ignored.is_empty() {
-            out.line(format!("    {}", out.paint("2", &format!("not used: {}", p.ignored.join("; ")))));
+            out.line(format!("    {}", out.paint(DIM, &format!("not used: {}", p.ignored.join("; ")))));
         }
     }
-    out.line(out.paint("90", "manage them with /plugins install|uninstall|enable|disable|configure|marketplace … (see /plugins help)"));
+    out.line(out.paint(GRAY, "manage them with /plugins install|uninstall|enable|disable|configure|marketplace … (see /plugins help)"));
 }
 
 /// Pulls the latest of every plugin and marketplace cloned from git.
 pub(super) async fn update_plugins(plugins: &Plugins, out: &Output) {
     let plugins = plugins.clone();
-    out.line(out.paint("2", "updating plugins…"));
+    out.note("updating plugins…");
     let lines = match tokio::task::spawn_blocking(move || plugins.update()).await {
         Ok(lines) => lines,
         Err(e) => vec![Err(e.to_string())],
     };
     if lines.is_empty() {
-        out.line(out.paint("2", "no plugins come from git repositories"));
+        out.note("no plugins come from git repositories");
         return;
     }
     for line in lines {
         match line {
             Ok(line) => out.line(line),
-            Err(e) => out.line(out.paint("31", &e)),
+            Err(e) => out.error(&e),
         }
     }
-    out.line(out.paint("2", "/reload-plugins (or a restart) uses the new versions"));
+    out.note("/reload-plugins (or a restart) uses the new versions");
 }
 
 pub(super) fn mcp<'a>(out: &Output, statuses: impl Iterator<Item = &'a mcp::Status>) {
@@ -293,13 +288,13 @@ pub(super) fn mcp<'a>(out: &Output, statuses: impl Iterator<Item = &'a mcp::Stat
         let took = crate::util::short_duration(status.took);
         match &status.outcome {
             Ok(tools) => {
-                out.line(format!("{} {} ({} tools, connected in {took})", out.paint("32", "●"), status.name, tools.len()));
+                out.line(format!("{} {} ({} tools, connected in {took})", out.paint(GREEN, "●"), status.name, tools.len()));
                 for t in tools {
                     out.line(format!("    {t}"));
                 }
             }
-            Err(e) => out.line(format!("{} {} failed after {took}: {e}", out.paint("31", "●"), status.name)),
+            Err(e) => out.line(format!("{} {} failed after {took}: {e}", out.paint(RED, "●"), status.name)),
         }
-        out.line(format!("    {}", out.paint("90", &format!("log: {}", mcp::log_path(&status.name).display()))));
+        out.line(format!("    {}", out.paint(GRAY, &format!("log: {}", mcp::log_path(&status.name).display()))));
     }
 }

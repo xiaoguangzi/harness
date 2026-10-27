@@ -22,6 +22,7 @@ mod rewind;
 mod screen;
 mod sessions;
 pub mod status_line;
+mod style;
 mod terminal;
 mod text;
 mod tool_output;
@@ -55,6 +56,7 @@ pub use output::Output;
 use parse::{Input, parse_input, render_skill};
 use repl::ReplHelper;
 use sessions::show_hook_notices;
+use style::{BOLD, YELLOW};
 use terminal::Terminal;
 use turn::TurnInput;
 
@@ -217,7 +219,7 @@ impl<'a> Repl<'a> {
                     1 => "; a subagent is still running".to_string(),
                     n => format!("; {n} subagents are still running"),
                 };
-                self.out.line(self.out.paint("2", &format!("(press Ctrl-C again or Ctrl-D to exit{note})")));
+                self.out.note(format!("(press Ctrl-C again or Ctrl-D to exit{note})"));
                 Ok(Read::Again)
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => Ok(Read::Quit),
@@ -327,7 +329,7 @@ impl<'a> Repl<'a> {
             // A skill that runs in a subagent: its report goes to the model.
             Input::Skill(skill, args) => match turn::run_fork(self.agent, self.env, &skill, &args, &self.out).await {
                 Ok(prompt) => self.prompt(line, &prompt, images).await,
-                Err(e) => self.out.line(self.out.paint("31", &e)),
+                Err(e) => self.out.error(&e),
             },
             Input::Prompt(prompt) => self.prompt(line, &prompt, images).await,
             input => {
@@ -369,7 +371,7 @@ impl<'a> Repl<'a> {
         self.agent.clear();
         self.out.restore_tool_output(self.agent.messages());
         if apply_reload(self.agent, self.env, &mut self.skills, self.editor.helper()).await {
-            self.out.line(self.out.paint("2", "the reloaded plugins apply from here"));
+            self.out.note("the reloaded plugins apply from here");
         } else {
             refresh_system(self.agent);
         }
@@ -377,12 +379,12 @@ impl<'a> Repl<'a> {
             rec.restart();
             sessions::attach(self.agent, rec);
         }
-        self.out.line(self.out.paint("2", "conversation cleared"));
+        self.out.note("conversation cleared");
     }
 
     async fn compact(&mut self, focus: Option<&str>) {
         if self.agent.messages().is_empty() {
-            self.out.line(self.out.paint("2", "nothing to compact yet"));
+            self.out.note("nothing to compact yet");
             return;
         }
         let _ = turn::compact_shown(self.agent, focus, &self.out, &mut self.term, self.recorder.as_mut()).await;
@@ -392,7 +394,7 @@ impl<'a> Repl<'a> {
     /// `/resume [id]`: replaces the conversation with a saved one.
     async fn resume(&mut self, id: Option<String>) {
         let Some(rec) = self.recorder.as_mut() else {
-            self.out.line(self.out.paint("31", "no home directory to find saved sessions in"));
+            self.out.error("no home directory to find saved sessions in");
             return;
         };
         let id = match id {
@@ -413,7 +415,7 @@ impl<'a> Repl<'a> {
             Err(e) => Err(e),
         };
         if let Err(e) = resumed {
-            self.out.line(self.out.paint("31", &format!("{e:#}")));
+            self.out.error(format!("{e:#}"));
         }
     }
 
@@ -426,7 +428,7 @@ impl<'a> Repl<'a> {
                 }
             }
             Ok(false) => {}
-            Err(e) => self.out.line(self.out.paint("31", &format!("{e:#}"))),
+            Err(e) => self.out.error(format!("{e:#}")),
         }
     }
 
@@ -434,12 +436,12 @@ impl<'a> Repl<'a> {
     fn manage_plugins(&self, args: &[String]) {
         match on_terminal(&self.out, || plugins::manage::run(args, &mut plugins::manage::TerminalAsk)) {
             Ok(lines) => self.out.lines(&lines),
-            Err(e) => self.out.line(self.out.paint("31", &format!("{e:#}"))),
+            Err(e) => self.out.error(format!("{e:#}")),
         }
         let lists = matches!(args.first().map(String::as_str), Some("list" | "help") | None)
             || matches!(args.get(..2), Some([a, b]) if a == "marketplace" && b == "list");
         if !lists {
-            self.out.line(self.out.paint("2", "run /reload-plugins to use the change"));
+            self.out.note("run /reload-plugins to use the change");
         }
     }
 
@@ -449,21 +451,21 @@ impl<'a> Repl<'a> {
         let lines = match self.env.reload().await {
             Ok(lines) => lines,
             Err(e) => {
-                self.out.line(self.out.paint("31", &format!("{e:#}")));
+                self.out.error(format!("{e:#}"));
                 return;
             }
         };
         for (i, line) in lines.iter().enumerate() {
-            self.out.line(if i == 0 { line.clone() } else { self.out.paint("33", line) });
+            self.out.line(if i == 0 { line.clone() } else { self.out.paint(YELLOW, line) });
         }
         if self.agent.messages().is_empty() {
             apply_reload(self.agent, self.env, &mut self.skills, self.editor.helper()).await;
             if let Some(rec) = self.recorder.as_ref() {
                 sessions::attach(self.agent, rec);
             }
-            self.out.line(self.out.paint("2", "they apply from the next message"));
+            self.out.note("they apply from the next message");
         } else {
-            self.out.line(self.out.paint("2", "they apply to the next conversation: /clear starts one"));
+            self.out.note("they apply to the next conversation: /clear starts one");
         }
     }
 
@@ -477,7 +479,7 @@ impl<'a> Repl<'a> {
                     reload_providers(self.agent, &self.skills, self.editor.helper(), &self.out);
                 }
             }
-            Err(e) => self.out.line(self.out.paint("31", &format!("{e:#}"))),
+            Err(e) => self.out.error(format!("{e:#}")),
         }
     }
 }
@@ -537,14 +539,14 @@ fn reload_providers(agent: &mut Agent, skills: &[Skill], helper: Option<&ReplHel
         Ok(providers) => {
             let client = agent.client().with_providers(providers);
             if client.spec() != agent.model() {
-                out.line(format!("model: {}", out.paint("1", client.spec())));
+                out.line(format!("model: {}", out.paint(BOLD, client.spec())));
             }
             agent.set_client(client);
             if let Some(helper) = helper {
                 helper.set_commands(menu_commands(agent, skills));
             }
         }
-        Err(_) => out.line(out.paint("2", "this conversation keeps the providers it had")),
+        Err(_) => out.note("this conversation keeps the providers it had"),
     }
 }
 
@@ -564,7 +566,7 @@ async fn finish_mcp(agent: &mut Agent, env: &mut Env, out: &Output) {
     let warnings = env.wait_mcp().await;
     out.set_status(None);
     for w in warnings.into_iter().chain(env.unknown_agent_tools(agent.client())) {
-        out.line(out.paint("33", &w));
+        out.warn(&w);
     }
     let (tools, system) = env.conversation(agent.client());
     agent.set_tools(tools);
@@ -590,7 +592,7 @@ async fn compacting_while<T>(
                     sessions::save(agent, rec, out);
                 }
             }
-            Err(e) => out.line(out.paint("31", &format!("could not compact the idle conversation: {e:#}"))),
+            Err(e) => out.error(format!("could not compact the idle conversation: {e:#}")),
         }
     };
     tokio::pin!(read, compact);

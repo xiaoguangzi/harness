@@ -8,6 +8,7 @@ use super::dialog::{self, Item, Keys};
 use super::input::Typing;
 use super::parse::{BUILTINS, Input, effort_help, help_keys};
 use super::{Output, output, print, text};
+use super::style::BOLD;
 use crate::agent::Agent;
 use crate::llm::{self, Client};
 use crate::permissions::{Mode, Permissions};
@@ -51,7 +52,7 @@ impl View {
     /// the next one.
     pub fn set_client(&self, client: Client, out: &Output) {
         if self.running {
-            out.line(out.paint("2", "used from the next message; this one goes on as it began"));
+            out.note("used from the next message; this one goes on as it began");
         }
         *self.switch_to.lock().unwrap() = Some(client);
     }
@@ -96,47 +97,47 @@ pub(super) async fn run(input: Input, view: &View, env: &Env, skills: &[Skill], 
                 text::plural(stopped, "subagent"),
                 text::plural(killed, "background command")
             );
-            out.line(out.paint("2", &note));
+            out.note(&note);
         }
         Input::Stop(Some(id)) if id.starts_with("shell_") => match view.shells.stop(&id) {
-            Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
-            Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
-            Err(e) => out.line(out.paint("31", &e)),
+            Ok(true) => out.note(format!("stopped {id}")),
+            Ok(false) => out.note(format!("{id} is not running")),
+            Err(e) => out.error(&e),
         },
         Input::Stop(Some(id)) => match view.subagents.stop(&id, true) {
-            Ok(true) => out.line(out.paint("2", &format!("stopped {id}"))),
-            Ok(false) => out.line(out.paint("2", &format!("{id} is not running"))),
-            Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+            Ok(true) => out.note(format!("stopped {id}")),
+            Ok(false) => out.note(format!("{id} is not running")),
+            Err(e) => out.error(format!("{e:#}")),
         },
         Input::Sandbox => print::sandbox(out),
         Input::Model(None) => print::models(out, &view.client()),
         Input::Model(Some(spec)) => match view.client().switch(&spec) {
             Ok(client) => {
-                out.line(format!("model: {}", out.paint("1", client.spec())));
+                out.line(format!("model: {}", out.paint(BOLD, client.spec())));
                 view.set_client(client, out);
             }
-            Err(e) => out.line(out.paint("31", &format!("{e:#}"))),
+            Err(e) => out.error(format!("{e:#}")),
         },
         Input::Permissions(None) => print::permissions(&view.permissions, out),
         Input::Permissions(Some(arg)) if arg == "rules" => print::permissions(&view.permissions, out),
         Input::Permissions(Some(arg)) => match Mode::parse(&arg) {
             Ok(mode) => {
                 view.permissions.set_mode(mode);
-                out.line(format!("permission mode: {} — {}", out.paint("1", mode.as_str()), mode.describe()));
+                out.line(format!("permission mode: {} — {}", out.paint(BOLD, mode.as_str()), mode.describe()));
             }
-            Err(e) => out.line(out.paint("31", &e)),
+            Err(e) => out.error(&e),
         },
         Input::Effort(None) => {
-            out.line(format!("effort: {}", out.paint("1", view.client().effort().as_str())));
-            out.line(out.paint("2", "set with /effort low|medium|high|xhigh|max, or /effort auto"));
+            out.line(format!("effort: {}", out.paint(BOLD, view.client().effort().as_str())));
+            out.note("set with /effort low|medium|high|xhigh|max, or /effort auto");
         }
         Input::Effort(Some(level)) => {
             let mut client = view.client();
             client.set_effort(level);
-            out.line(format!("effort: {}", out.paint("1", client.effort().as_str())));
+            out.line(format!("effort: {}", out.paint(BOLD, client.effort().as_str())));
             view.set_client(client, out);
         }
-        Input::Error(e) => out.line(out.paint("31", &e)),
+        Input::Error(e) => out.error(&e),
         _ => unreachable!("only commands that leave the conversation as it is run here"),
     }
 }
@@ -203,9 +204,9 @@ pub(super) async fn interactive(
         }
         Input::Model(None) => {
             let client = super::model::pick(out, &view.client()).await?;
-            out.line(format!("model: {}", out.paint("1", client.spec())));
+            out.line(format!("model: {}", out.paint(BOLD, client.spec())));
             out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
-            out.line(format!("effort: {}", out.paint("1", client.effort().as_str())));
+            out.line(format!("effort: {}", out.paint(BOLD, client.effort().as_str())));
             view.set_client(client, out);
             None
         }
@@ -357,7 +358,7 @@ fn task_items(view: &View, running_only: bool) -> Vec<(String, Item, bool)> {
 async fn stop(view: &View, out: &Output) -> Option<Input> {
     let tasks = task_items(view, true);
     if tasks.is_empty() {
-        out.line(out.paint("2", "no running tasks"));
+        out.note("no running tasks");
         return None;
     }
     let mut items: Vec<_> = tasks.iter().map(|(_, item, _)| item.clone()).collect();
@@ -374,7 +375,7 @@ async fn tasks(view: &View, out: &Output) -> Option<Input> {
     loop {
         let tasks = task_items(view, false);
         if tasks.is_empty() {
-            out.line(out.paint("2", "no subagents or background commands in this conversation"));
+            out.note("no subagents or background commands in this conversation");
             return None;
         }
         let items = tasks.iter().map(|(_, item, _)| item.clone()).collect();
@@ -536,7 +537,7 @@ async fn plugins(env: &Env, out: &Output) -> Option<Input> {
 
 /// The settings file, or `None` after showing why it can't be read.
 fn load_settings(out: &Output) -> Option<Settings> {
-    Settings::load().map_err(|e| out.line(out.paint("31", &format!("{e:#}")))).ok()
+    Settings::load().map_err(|e| out.error(format!("{e:#}"))).ok()
 }
 
 #[cfg(test)]
