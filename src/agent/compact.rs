@@ -214,94 +214,18 @@ impl Agent {
             observer.on_hook(&format!("A PreCompact hook kept the conversation from being compacted{reason}"));
             return Ok(false);
         }
-        let history = &self.messages[..self.messages.len() - pending];
+        let replaced = &self.messages[..self.messages.len() - pending];
         let before = self.context_size(definitions);
         observer.on_compact_start();
+        let summary = self.summarize(replaced, focus, definitions, observer).await?;
+        let content = self.compacted(replaced, &summary);
 
-        let mut prompt = PROMPT.to_string();
-        if let Some(focus) = focus.map(str::trim).filter(|f| !f.is_empty()) {
-            prompt.push_str(&format!("\n\nThe user asked the summary to focus on: {focus}"));
-        }
-        let mut request = history.to_vec();
-        let prompt = json!({"type": "text", "text": prompt});
-        match request.last_mut() {
-            Some(last) if last.role == "user" => last.content.push(prompt),
-            _ => request.push(Message::user(vec![prompt])),
-        }
-        // The summary is not shown as it streams.
-        let (log, model) = (&self.usage, self.client.spec());
-        let mut on_event = |event: StreamEvent| match event {
-            StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
-            StreamEvent::PartialUsage(usage) => log.record(model, &usage),
-            _ => {}
-        };
-        let response = loop {
-            match self.client.create(&self.system, definitions, &request, &mut on_event).await {
-                // Too long even to summarize: leave out the oldest part.
-                Err(e) if is_context_overflow(&e) && drop_oldest(&mut request) => {}
-                Err(e) => return Err(e.context("compacting the conversation")),
-                Ok(response) => break response,
-            }
-        };
-        if let Some(usage) = &response.usage {
-            self.usage.record(self.client.spec(), usage);
-        }
-        let summary: String =
-            response.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
-        match response.stop_reason.as_deref() {
-            Some("tool_use") => bail!("compacting the conversation: the model called a tool instead of summarizing"),
-            Some("max_tokens") => bail!("compacting the conversation: the summary hit max_tokens"),
-            Some("refusal") => bail!("compacting the conversation: the model declined to summarize"),
-            _ if summary.trim().is_empty() => bail!("compacting the conversation: the model wrote no summary"),
-            _ => {}
-        }
-
-        let mut content: Vec<Value> =
-            kept_user_messages(history).into_iter().map(|text| json!({"type": "text", "text": text})).collect();
-        content.push(json!({"type": "text", "text": format!("{SUMMARY_PREFIX}\n\n<summary>\n{}\n</summary>", summary.trim())}));
-        if let Some(calls) = tool_counts(history) {
-            content.push(json!({"type": "text", "text": format!("{TOOLS_PREFIX} {calls}.")}));
-        }
-        // The latest todo list goes on as it was.
-        let todos = history
-            .iter()
-            .rev()
-            .flat_map(|m| m.content.iter().rev())
-            .find(|b| b["type"] == "tool_use" && b["name"] == "todo_write")
-            .map(|b| crate::tools::todo::checklist(&b["input"]))
-            .filter(|list| !list.is_empty());
-        if let Some(list) = todos {
-            content.push(json!({"type": "text", "text": format!("{TODO_PREFIX}\n{list}")}));
-        }
-        // The files it read last, as they are now. The model no longer sees
-        // the others, so it must read them again before changing them.
-        if let Some(files) = self.tools.files() {
-            let mut kept = Vec::new();
-            let mut blocks = Vec::new();
-            // About four bytes a token.
-            let mut room = (self.context_window() / 100 * REATTACHED_PERCENT * 4) as usize;
-            for path in files.recent(REATTACHED_FILES) {
-                if room < 1_000 {
-                    break;
-                }
-                if let Some(block) = crate::mentions::reattach(&path, room.min(REATTACHED_FILE_BYTES), files) {
-                    room = room.saturating_sub(block["text"].as_str().map_or(0, str::len));
-                    blocks.push(block);
-                    kept.push(path);
-                }
-            }
-            files.retain(&kept);
-            if !blocks.is_empty() {
-                content.push(json!({"type": "text", "text": "The files read most recently, as they are now:"}));
-                content.extend(blocks);
-            }
-        }
         // Only a prompt not answered yet, kept after the summary, can still
         // be rewound to.
         if self.checkpoints {
             self.history.rebase((pending == 1).then(|| self.messages.len() - 1), 1);
         }
-        let loaded = super::deferred::loaded(history);
+        let loaded = super::deferred::loaded(replaced);
         let pending = self.messages.pop().filter(|_| pending == 1);
         self.messages = vec![Message::user(content)];
         // The deferred tools, and those loaded, went with the history.
@@ -318,9 +242,101 @@ impl Agent {
             self.turn_compacted |= self.messages.len() == 1;
         }
         observer.on_compact_end(before, self.context_size(definitions));
-        let outcome = self.hooks.post_compact(trigger, summary.trim(), self.client.spec()).await;
+        let outcome = self.hooks.post_compact(trigger, &summary, self.client.spec()).await;
         super::show_notices(&outcome, observer);
         Ok(true)
+    }
+
+    /// Asks the model to summarize `history`, with what the user asked it
+    /// to `focus` on; a request too long even for that leaves out the
+    /// oldest part. The summary is not shown as it streams.
+    async fn summarize(
+        &self,
+        history: &[Message],
+        focus: Option<&str>,
+        definitions: &[ToolDef],
+        observer: &mut dyn Observer,
+    ) -> Result<String> {
+        let mut prompt = PROMPT.to_string();
+        if let Some(focus) = focus.map(str::trim).filter(|f| !f.is_empty()) {
+            prompt.push_str(&format!("\n\nThe user asked the summary to focus on: {focus}"));
+        }
+        let mut request = history.to_vec();
+        let prompt = json!({"type": "text", "text": prompt});
+        match request.last_mut() {
+            Some(last) if last.role == "user" => last.content.push(prompt),
+            _ => request.push(Message::user(vec![prompt])),
+        }
+        let (log, model) = (&self.usage, self.client.spec());
+        let mut on_event = |event: StreamEvent| match event {
+            StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
+            StreamEvent::PartialUsage(usage) => log.record(model, &usage),
+            _ => {}
+        };
+        let response = loop {
+            match self.client.create(&self.system, definitions, &request, &mut on_event).await {
+                Err(e) if is_context_overflow(&e) && drop_oldest(&mut request) => {}
+                Err(e) => return Err(e.context("compacting the conversation")),
+                Ok(response) => break response,
+            }
+        };
+        if let Some(usage) = &response.usage {
+            self.usage.record(self.client.spec(), usage);
+        }
+        let summary: String =
+            response.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+        match response.stop_reason.as_deref() {
+            Some("tool_use") => bail!("compacting the conversation: the model called a tool instead of summarizing"),
+            Some("max_tokens") => bail!("compacting the conversation: the summary hit max_tokens"),
+            Some("refusal") => bail!("compacting the conversation: the model declined to summarize"),
+            _ if summary.trim().is_empty() => bail!("compacting the conversation: the model wrote no summary"),
+            _ => Ok(summary.trim().to_string()),
+        }
+    }
+
+    /// The content of the message that replaces `history`: the user's own
+    /// messages from it, the `summary`, how many tool calls it had, the
+    /// latest todo list, and the files read most recently.
+    fn compacted(&self, history: &[Message], summary: &str) -> Vec<Value> {
+        let mut content: Vec<Value> =
+            kept_user_messages(history).into_iter().map(|text| json!({"type": "text", "text": text})).collect();
+        content.push(json!({"type": "text", "text": format!("{SUMMARY_PREFIX}\n\n<summary>\n{summary}\n</summary>")}));
+        if let Some(calls) = tool_counts(history) {
+            content.push(json!({"type": "text", "text": format!("{TOOLS_PREFIX} {calls}.")}));
+        }
+        // The latest todo list goes on as it was.
+        if let Some(list) = latest_todos(history) {
+            content.push(json!({"type": "text", "text": format!("{TODO_PREFIX}\n{list}")}));
+        }
+        content.extend(self.reattach_files());
+        content
+    }
+
+    /// The files read last, as they are now, after a line saying so. The
+    /// model no longer sees the others, so it must read them again before
+    /// changing them: the tracker forgets them.
+    fn reattach_files(&self) -> Vec<Value> {
+        let Some(files) = self.tools.files() else { return Vec::new() };
+        let mut kept = Vec::new();
+        let mut blocks = Vec::new();
+        // About four bytes a token.
+        let mut room = (self.context_window() / 100 * REATTACHED_PERCENT * 4) as usize;
+        for path in files.recent(REATTACHED_FILES) {
+            if room < 1_000 {
+                break;
+            }
+            if let Some(block) = crate::mentions::reattach(&path, room.min(REATTACHED_FILE_BYTES), files) {
+                room = room.saturating_sub(block["text"].as_str().map_or(0, str::len));
+                blocks.push(block);
+                kept.push(path);
+            }
+        }
+        files.retain(&kept);
+        if blocks.is_empty() {
+            return blocks;
+        }
+        let intro = json!({"type": "text", "text": "The files read most recently, as they are now:"});
+        std::iter::once(intro).chain(blocks).collect()
     }
 }
 
@@ -342,15 +358,12 @@ fn context_limit(window: u64, max_tokens: u64) -> u64 {
     window.saturating_sub(max_tokens + window / 100 * MARGIN_PERCENT).max(window / 2)
 }
 
-/// The text of the user's own messages, oldest first, as much as fits in
-/// [`KEPT_USER_BYTES`] counting from the newest; the one that crosses the
-/// limit is cut. Attachments, tool results, earlier summaries and reports
-/// from subagents are left out.
 /// How many calls of each tool `history` has, most called first:
 /// `bash ×12, read ×30`; `None` without any.
 fn tool_counts(history: &[Message]) -> Option<String> {
     let mut counts: Vec<(&str, usize)> = Vec::new();
-    for name in history.iter().flat_map(|m| &m.content).filter(|b| b["type"] == "tool_use").filter_map(|b| b["name"].as_str()) {
+    let calls = history.iter().flat_map(|m| &m.content).filter(|b| b["type"] == "tool_use");
+    for name in calls.filter_map(|b| b["name"].as_str()) {
         match counts.iter_mut().find(|(n, _)| *n == name) {
             Some((_, count)) => *count += 1,
             None => counts.push((name, 1)),
@@ -361,6 +374,38 @@ fn tool_counts(history: &[Message]) -> Option<String> {
     (!listed.is_empty()).then(|| listed.join(", "))
 }
 
+/// The latest todo list in `history`, as a checklist; `None` if there is
+/// none, or it is empty.
+fn latest_todos(history: &[Message]) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .flat_map(|m| m.content.iter().rev())
+        .find(|b| b["type"] == "tool_use" && b["name"] == "todo_write")
+        .map(|b| crate::tools::todo::checklist(&b["input"]))
+        .filter(|list| !list.is_empty())
+}
+
+/// How the text blocks of user messages start that are not the user's own:
+/// attachments, reports from subagents and background commands, and what
+/// the harness adds. A compaction tells the model about the deferred tools
+/// anew.
+const NOT_TYPED: [&str; 9] = [
+    "<file ",
+    "<directory ",
+    "<subagent-notification>",
+    "<shell-notification>",
+    "The files read most recently",
+    TODO_PREFIX,
+    TOOLS_PREFIX,
+    super::deferred::NOTICE_START,
+    super::TIMESTAMP_START,
+];
+
+/// The text of the user's own messages, oldest first, as much as fits in
+/// [`KEPT_USER_BYTES`] counting from the newest; the one that crosses the
+/// limit is cut. Attachments, tool results, earlier summaries and reports
+/// from subagents are left out.
 fn kept_user_messages(history: &[Message]) -> Vec<String> {
     let texts = history
         .iter()
@@ -369,12 +414,7 @@ fn kept_user_messages(history: &[Message]) -> Vec<String> {
         .filter(|b| !is_summary(b))
         .filter_map(|b| b["text"].as_str().filter(|_| b["type"] == "text"))
         .filter(|t| !t.is_empty() && *t != INTERRUPTED)
-        .filter(|t| {
-            // A compaction tells the model about the deferred tools anew.
-            !["<file ", "<directory ", "<subagent-notification>", "<shell-notification>", "The files read most recently", TODO_PREFIX, TOOLS_PREFIX, super::deferred::NOTICE_START, super::TIMESTAMP_START]
-                .iter()
-                .any(|p| t.starts_with(p))
-        });
+        .filter(|t| !NOT_TYPED.iter().any(|p| t.starts_with(p)));
     let mut kept = Vec::new();
     let mut room = KEPT_USER_BYTES;
     for text in texts.collect::<Vec<_>>().into_iter().rev() {
