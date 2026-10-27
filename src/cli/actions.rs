@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use super::markdown::Markdown;
-use super::output::{Output, call_label};
+use super::Output;
+use super::calls::call_label;
 use super::text;
 use crate::agent::Agent;
 use crate::llm::Message;

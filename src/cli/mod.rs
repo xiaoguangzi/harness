@@ -2,6 +2,7 @@
 
 mod actions;
 mod approve;
+mod calls;
 mod clipboard;
 mod commands;
 mod dialog;
@@ -21,6 +22,7 @@ mod rewind;
 mod screen;
 mod sessions;
 pub mod status_line;
+mod terminal;
 mod text;
 mod tool_output;
 mod transcript;
@@ -50,10 +52,10 @@ use commands::View;
 use input::Typing;
 use menu::Command;
 pub use output::Output;
-use output::Terminal;
 use parse::{Input, parse_input, render_skill};
 use repl::ReplHelper;
 use sessions::show_hook_notices;
+use terminal::Terminal;
 use turn::TurnInput;
 
 /// How long the prompt waits after a turn before Notification hooks hear
@@ -581,7 +583,7 @@ async fn compacting_while<T>(
 ) -> T {
     let compact = async {
         tokio::time::sleep(after).await;
-        let mut observer = output::IdleCompaction::new(out);
+        let mut observer = terminal::IdleCompaction::new(out);
         match agent.compact_when_idle(&mut observer).await {
             Ok(()) => {
                 if let Some(rec) = recorder {

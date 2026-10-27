@@ -10,7 +10,7 @@ use super::commands::{self, View};
 use super::input::{self, Queued, Typing};
 use super::keys::{Key, KeyWatch};
 use super::menu::Menu;
-use super::output::{Terminal, TurnEnd};
+use super::terminal::{Terminal, TurnEnd};
 use super::parse::parse_input;
 use super::{Output, repl, sessions};
 use crate::agent::{Agent, Inbox};

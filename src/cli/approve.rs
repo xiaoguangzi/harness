@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 use super::keys::Key;
-use super::output::{Output, call_label};
+use super::Output;
+use super::calls::call_label;
 use super::text;
 use crate::permissions::{Answer, Asker, Request};
 

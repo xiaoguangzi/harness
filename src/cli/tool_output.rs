@@ -3,7 +3,7 @@
 use serde_json::Value;
 
 use super::dialog::Item;
-use super::output::call_label;
+use super::calls::call_label;
 use crate::llm::Message;
 use crate::tools::ToolOutput;
 

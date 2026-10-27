@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::keys::KeyWatch;
-use super::output::{Terminal, TurnEnd};
+use super::terminal::{Terminal, TurnEnd};
 use super::parse::{Input, parse_input, render_skill};
 use super::sessions::{self, show_hook_notices};
 use super::{Output, finish_mcp, json, text, turn};
