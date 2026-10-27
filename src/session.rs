@@ -49,7 +49,7 @@ impl Store {
 
     /// `~/.harness/sessions`, or nothing without a home directory.
     pub fn default_location() -> Option<Self> {
-        std::env::var_os("HOME").map(|h| Self::new(Path::new(&h).join(".harness/sessions")))
+        crate::util::harness_home().map(|dir| Self::new(dir.join("sessions")))
     }
 
     fn path(&self, id: &str) -> PathBuf {

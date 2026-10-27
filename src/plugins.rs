@@ -220,8 +220,8 @@ pub fn parse_flag(args: Vec<String>) -> Result<(Vec<PathBuf>, Vec<String>)> {
 /// `~/.harness/plugins`: the clones, the plugins' data directories, and
 /// the sensitive answers to their settings.
 pub fn home() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => Path::new(&home).join(".harness/plugins"),
+    match crate::util::harness_home() {
+        Some(dir) => dir.join("plugins"),
         None => std::env::temp_dir().join("harness-plugins"),
     }
 }

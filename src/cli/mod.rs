@@ -622,5 +622,5 @@ fn notify_when_idle(hooks: &Hooks, model: &str) -> tokio::task::JoinHandle<()> {
 }
 
 fn history_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".harness/history"))
+    crate::util::harness_home().map(|dir| dir.join("history"))
 }

@@ -1,5 +1,6 @@
-//! Small helpers shared by the config loaders.
+//! Small helpers shared across the crate.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
@@ -15,6 +16,12 @@ pub fn set_bare() {
 
 pub fn bare() -> bool {
     BARE.load(Ordering::Relaxed)
+}
+
+/// `~/.harness`, where the harness keeps its settings and what it saves;
+/// `None` without a home directory.
+pub fn harness_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| Path::new(&home).join(".harness"))
 }
 
 /// Held by tests that change the process-wide working directory, and by

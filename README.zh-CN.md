@@ -655,7 +655,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 
 - `src/main.rs` — 启动：配置、`harness plugin`、`harness provider` 和 `--check-plugins`、沙箱，然后是 `setup.rs` 构建的内容；最后进入 CLI 或 web 前端
 - `src/setup.rs` — 会话由什么构成：插件及其技能、代理、hook、MCP 与语言服务器（由 `/reload-plugins` 重建）、用户的 MCP 服务器、工具集和系统提示词；`--check-plugins`；后台自动更新
-- `src/util.rs` — 共享的小工具：`${VAR}` 展开、JSON 合并、截短文本与时长、`--bare`、工作目录锁
+- `src/util.rs` — 共享的小工具：`~/.harness` 的位置、`${VAR}` 展开、JSON 合并、截短文本与时长、`--bare`、工作目录锁
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
 - `src/cli/` — 终端前端：启动与 REPL 主循环（`mod.rs`）、一次性模式（`one_shot.rs`）、内置命令及输入行的解析（`parse.rs`）、运行一轮并在其下保留输入框（`turn.rs`）、选择、恢复（并重新显示其结尾）和保存会话（`sessions.rs`）、命令逐行打印的内容（`print.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`!命令`、`/btw`、`/copy` 和 `/export`（`actions.rs`）、询问工具调用（`approve.rs`）、状态栏（`status_line.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）、各个无参数命令在面板中显示的内容及在一轮运行期间执行命令（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、共享的标准输出句柄，让旋转指示器和输入框始终画在输出下方（`output.rs`）、实时显示一轮的进度（`terminal.rs`）、工具调用及其结果的显示方式（`calls.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、在调用下方以带行号的 diff 显示文件改动（`diff.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、着色用的具名颜色与样式（`style.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）

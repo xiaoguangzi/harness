@@ -106,7 +106,7 @@ pub fn parse_flag(args: Vec<String>) -> Result<(Option<PathBuf>, Vec<String>)> {
 /// `~/.harness/settings.json`. Call once, before [`path`].
 pub fn set_path(flag: Option<PathBuf>) {
     let env = std::env::var_os("HARNESS_SETTINGS").filter(|v| !v.is_empty()).map(PathBuf::from);
-    let home = || std::env::var_os("HOME").map(|h| Path::new(&h).join(".harness/settings.json"));
+    let home = || crate::util::harness_home().map(|dir| dir.join("settings.json"));
     let _ = PATH.set(flag.or(env).or_else(home));
 }
 
@@ -215,8 +215,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 /// settings don't silently stop applying.
 pub fn legacy_files() -> Vec<PathBuf> {
     let mut files = vec![PathBuf::from(".harness/providers.json")];
-    if let Some(home) = std::env::var_os("HOME") {
-        let dir = Path::new(&home).join(".harness");
+    if let Some(dir) = crate::util::harness_home() {
         files.extend(["providers.json", "mcp.json", "sandbox.json"].map(|f| dir.join(f)));
     }
     files.retain(|f| f.exists());

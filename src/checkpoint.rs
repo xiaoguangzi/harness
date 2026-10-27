@@ -42,7 +42,7 @@ pub async fn before_change(path: &Path) {
 
 /// `~/.harness/file-history/<id>`, where a saved session's checkpoints go.
 pub fn session_dir(id: &str) -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| Path::new(&h).join(".harness/file-history").join(id))
+    crate::util::harness_home().map(|dir| dir.join("file-history").join(id))
 }
 
 /// A prompt the conversation can be rewound to.

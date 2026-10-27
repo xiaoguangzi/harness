@@ -240,8 +240,7 @@ fn user_notes() -> String {
     if crate::util::bare() {
         return String::new();
     }
-    let Some(home) = std::env::var_os("HOME") else { return String::new() };
-    let path = Path::new(&home).join(".harness/AGENTS.md");
+    let Some(path) = crate::util::harness_home().map(|dir| dir.join("AGENTS.md")) else { return String::new() };
     let Some(shown) = notes_text(&path, &format!("`{}`", path.display()), OTHER_NOTES_LIMIT) else {
         return String::new();
     };
