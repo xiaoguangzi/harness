@@ -68,16 +68,14 @@ async fn main() -> Result<ExitCode> {
     }
     let (settings_path, args) = settings::parse_flag(args)?;
     settings::set_path(settings_path);
-    if matches!(args.first().map(String::as_str), Some("plugin" | "plugins")) {
-        let lines = tokio::task::block_in_place(|| plugins::manage::run(&args[1..], &mut plugins::manage::TerminalAsk))?;
-        for line in lines {
-            println!("{line}");
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    if matches!(args.first().map(String::as_str), Some("provider" | "providers")) {
-        let lines = llm::manage::run(&args[1..], &mut plugins::manage::TerminalAsk)?;
-        for line in lines {
+    let ask = &mut plugins::manage::TerminalAsk;
+    let managed = match args.first().map(String::as_str) {
+        Some("plugin" | "plugins") => Some(tokio::task::block_in_place(|| plugins::manage::run(&args[1..], ask))),
+        Some("provider" | "providers") => Some(llm::manage::run(&args[1..], ask)),
+        _ => None,
+    };
+    if let Some(lines) = managed {
+        for line in lines? {
             println!("{line}");
         }
         return Ok(ExitCode::SUCCESS);
@@ -97,7 +95,7 @@ async fn main() -> Result<ExitCode> {
     }
     permissions::set(std::mem::take(&mut settings.permissions));
     for file in settings::legacy_files() {
-        eprintln!("\x1b[33m{} is no longer read; move its settings into ~/.harness/settings.json\x1b[0m", file.display());
+        warn(format!("{} is no longer read; move its settings into ~/.harness/settings.json", file.display()));
     }
     if args.iter().any(|a| a == "--check-plugins") {
         if args.len() > 1 {
@@ -115,9 +113,7 @@ async fn main() -> Result<ExitCode> {
     // once the first prompt is in.
     let user_mcp = mcp::Servers::connect(&settings.mcp_servers, &[]);
     let mut ext = Extensions::load(&mut settings, &plugin_dirs, &[]);
-    for w in &ext.warnings {
-        eprintln!("\x1b[33m{w}\x1b[0m");
-    }
+    ext.warnings.iter().for_each(warn);
     ext.activate();
     if !bare {
         setup::auto_update(std::mem::take(&mut ext.auto_update));
@@ -137,39 +133,14 @@ async fn main() -> Result<ExitCode> {
         Arc::new(move |event: &Value| out.subagent_event(event))
     };
     let mut env = Env::new(ext, user_mcp, reporter, plugin_dirs);
-
     if let Some(addr) = web_addr {
-        for w in env.wait_mcp().await {
-            eprintln!("\x1b[33m{w}\x1b[0m");
-        }
-        let mcp_status = env
-            .mcp_statuses()
-            .map(|s| match &s.outcome {
-                Ok(tools) => serde_json::json!({"name": s.name, "tools": tools, "connect_ms": s.took.as_millis() as u64}),
-                Err(e) => serde_json::json!({"name": s.name, "error": e, "connect_ms": s.took.as_millis() as u64}),
-            })
-            .collect();
-        let setup = web::Setup {
-            providers,
-            tools: env.base_tools(),
-            skills: env.ext.skills.clone(),
-            agent_defs: env.ext.agent_defs.clone(),
-            mcp: Value::Array(mcp_status),
-            plugins: env.ext.plugins.to_json(),
-            reporter: env.reporter.clone(),
-            forks: env.forks.clone(),
-        };
-        let result = web::serve(&addr, setup).await;
-        env.shutdown().await;
-        return result.map(|()| ExitCode::SUCCESS);
+        return serve_web(&addr, env, providers).await;
     }
 
     let client = Client::new(providers?)?;
     // With MCP servers still connecting, the REPL checks once they are in.
     if env.mcp_connecting().is_none() {
-        for w in env.unknown_agent_tools(&client) {
-            eprintln!("\x1b[33m{w}\x1b[0m");
-        }
+        env.unknown_agent_tools(&client).iter().for_each(warn);
     }
     let (registry, system) = env.conversation(&client);
     let mut agent = Agent::new(client, registry, system);
@@ -178,4 +149,34 @@ async fn main() -> Result<ExitCode> {
     drop(agent);
     env.shutdown().await;
     result
+}
+
+/// Runs the web UI on `addr` until it stops, once the MCP servers are in.
+async fn serve_web(addr: &str, mut env: Env, providers: Result<Providers>) -> Result<ExitCode> {
+    env.wait_mcp().await.iter().for_each(warn);
+    let mcp = env.mcp_statuses().map(|s| {
+        let connect_ms = s.took.as_millis() as u64;
+        match &s.outcome {
+            Ok(tools) => serde_json::json!({"name": s.name, "tools": tools, "connect_ms": connect_ms}),
+            Err(e) => serde_json::json!({"name": s.name, "error": e, "connect_ms": connect_ms}),
+        }
+    });
+    let setup = web::Setup {
+        providers,
+        tools: env.base_tools(),
+        skills: env.ext.skills.clone(),
+        agent_defs: env.ext.agent_defs.clone(),
+        mcp: Value::Array(mcp.collect()),
+        plugins: env.ext.plugins.to_json(),
+        reporter: env.reporter.clone(),
+        forks: env.forks.clone(),
+    };
+    let result = web::serve(addr, setup).await;
+    env.shutdown().await;
+    result.map(|()| ExitCode::SUCCESS)
+}
+
+/// A warning at startup, in yellow on stderr.
+fn warn(text: impl std::fmt::Display) {
+    eprintln!("\x1b[33m{text}\x1b[0m");
 }
