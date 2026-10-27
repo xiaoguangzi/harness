@@ -171,133 +171,156 @@ pub(super) async fn interactive(
     typing: &mut Typing,
 ) -> Option<Input> {
     match input {
-        Input::Help => {
-            let mut items: Vec<_> = BUILTINS.iter().map(|(name, description)| Item::new(*name, *description)).collect();
-            let skills = skills.iter().filter(|s| s.user_invocable);
-            items.extend(skills.map(|s| Item::new(format!("/{}", s.name), &s.description)));
-            let keyboard = items.len();
-            let keys: Vec<_> = help_keys().iter().map(|(key, description)| format!("{key}: {description}")).collect();
-            items.push(
-                Item::new("Keyboard shortcuts", "Browse composer, interrupt and rewind shortcuts").details(keys.clone()),
-            );
-            let about = "Built-in commands, skills and keyboard shortcuts";
-            let insert = Keys { enter: "insert", esc: "cancel" };
-            while let Some(i) = dialog::choose(out, "Commands", about, insert, items.clone(), 0).await {
-                if i == keyboard {
-                    dialog::document(out, "Keyboard shortcuts", keys.clone()).await;
-                } else {
-                    typing.draft.set_text(&items[i].label);
-                    break;
-                }
-            }
-            None
-        }
-        Input::Permissions(None) => {
-            let rules = view.permissions.rules().into_iter().filter(|(_, r)| !r.is_empty());
-            let rules: Vec<String> = rules.map(|(kind, r)| format!("{kind}: {}", r.join(", "))).collect();
-            let items = Mode::ALL.iter().map(|m| Item::new(m.as_str(), m.describe()).details(rules.clone())).collect();
-            let current = Mode::ALL.iter().position(|m| *m == view.permissions.mode()).unwrap_or(0);
-            let about = "Which tool calls ask first; Shift+Tab cycles them too";
-            let keys = Keys { enter: "apply", esc: "cancel" };
-            let i = dialog::choose(out, "Permission mode", about, keys, items, current).await?;
-            Some(Input::Permissions(Some(Mode::ALL[i].as_str().to_string())))
-        }
-        Input::Model(None) => {
-            let client = super::model::pick(out, &view.client()).await?;
-            out.line(format!("model: {}", out.paint(BOLD, client.spec())));
-            out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
-            out.line(format!("effort: {}", out.paint(BOLD, client.effort().as_str())));
-            view.set_client(client, out);
-            None
-        }
-        Input::Effort(None) => {
-            let client = view.client();
-            let configured = format!("Use configured effort (currently {})", client.effort().as_str());
-            let mut items = vec![Item::new("auto", configured)];
-            items.extend(llm::Effort::ALL.iter().map(|e| Item::new(e.as_str(), effort_help(*e))));
-            let chosen = client.effort_override().and_then(|e| llm::Effort::ALL.iter().position(|level| *level == e));
-            let about = "Applies to this session; /model changes the same setting";
-            let keys = Keys { enter: "apply", esc: "cancel" };
-            let i = dialog::choose(out, "Reasoning effort", about, keys, items, chosen.map_or(0, |i| i + 1)).await?;
-            Some(Input::Effort(Some(i.checked_sub(1).map(|i| llm::Effort::ALL[i]))))
-        }
-        Input::ListSkills => {
-            let items = skills.iter().map(|s| {
-                Item::new(format!("/{}", s.name), &s.description).details(vec![
-                    format!("Source: {}", s.dir.display()),
-                    format!("User invocable: {} · model invocable: {}", s.user_invocable, s.model_invocable),
-                    format!("Runs in a subagent: {}", s.fork.is_some()),
-                ])
-            });
-            let about = "Discovered skills; only user-invocable ones go into the prompt";
-            let keys = Keys { enter: "insert", esc: "cancel" };
-            if let Some(i) = dialog::choose(out, "Skills", about, keys, items.collect(), 0).await
-                && skills[i].user_invocable
-            {
-                typing.draft.set_text(&format!("/{} ", skills[i].name));
-            }
-            None
-        }
-        Input::ListTools => {
-            let items = view.tools.definitions().into_iter().map(|t| {
-                let schema = serde_json::to_string_pretty(&t.input_schema).unwrap_or_default();
-                let details = std::iter::once("Input schema:".into()).chain(schema.lines().map(String::from));
-                Item::new(t.name, t.description).details(details)
-            });
-            dialog::inspect(out, "Tools", "What the model can call, with input schemas", items.collect()).await;
-            None
-        }
-        Input::ListAgents => {
-            let client = view.client();
-            let items = env.ext.agent_defs.iter().map(|d| {
-                Item::new(&d.name, &d.description).details(vec![
-                    format!("Access: {}", d.permission.as_str()),
-                    format!("Tools: {}", d.tools.as_ref().map_or("all permitted".into(), |t| t.join(", "))),
-                    format!("Model: {}", d.model.as_deref().or(client.subagent_model()).unwrap_or(client.spec())),
-                    format!("Source: {}", d.path.as_ref().map_or("built-in".into(), |p| p.display().to_string())),
-                    d.prompt.clone(),
-                ])
-            });
-            dialog::inspect(out, "Agent types", "Subagent types the model can start", items.collect()).await;
-            None
-        }
-        Input::ListMcp => {
-            let items = env.mcp_statuses().map(|s| {
-                let took = crate::util::short_duration(s.took);
-                let (description, details) = match &s.outcome {
-                    Ok(tools) => {
-                        let count = format!("{} {}", tools.len(), text::plural(tools.len(), "tool"));
-                        (format!("Connected in {took} · {count}"), tools.clone())
-                    }
-                    Err(e) => (format!("Connection failed after {took}"), vec![e.clone()]),
-                };
-                let log = format!("Log: {}", crate::mcp::log_path(&s.name).display());
-                Item::new(&s.name, description).details(details.into_iter().chain(std::iter::once(log)))
-            });
-            dialog::inspect(out, "MCP servers", "Servers, their tools and connection errors", items.collect()).await;
-            None
-        }
-        Input::Sandbox => {
-            let items = match crate::sandbox::active() {
-                None => vec![Item::new(
-                    "Sandbox is off",
-                    "Start with --sandbox to enable it; this view does not change permissions",
-                )],
-                Some(s) => {
-                    let per_command = crate::util::short_duration(s.startup());
-                    let startup = ("startup", format!("{per_command} per command (measured at launch)"));
-                    s.describe().into_iter().chain([startup]).map(|(label, value)| Item::new(label, value)).collect()
-                }
-            };
-            dialog::inspect(out, "Sandbox", "What commands may do; read-only", items).await;
-            None
-        }
+        Input::Help => help(skills, out, typing).await,
+        Input::Permissions(None) => choose_mode(view, out).await,
+        Input::Model(None) => choose_model(view, out).await,
+        Input::Effort(None) => choose_effort(view, out).await,
+        Input::ListSkills => pick_skill(skills, out, typing).await,
+        Input::ListTools => browse(out, "Tools", "What the model can call, with input schemas", tool_items(view)).await,
+        Input::ListAgents => browse(out, "Agent types", "Subagent types the model can start", agent_items(view, env)).await,
+        Input::ListMcp => browse(out, "MCP servers", "Servers, their tools and connection errors", mcp_items(env)).await,
+        Input::Sandbox => browse(out, "Sandbox", "What commands may do; read-only", sandbox_items()).await,
         Input::Stop(None) => stop(view, out).await,
         Input::Tasks => tasks(view, out).await,
         Input::Providers(args) if args.is_empty() => providers(view, out).await,
         Input::Plugins { update: false } => plugins(env, out).await,
         input => Some(input),
     }
+}
+
+/// Shows `items` in a panel to look through; nothing runs after it.
+async fn browse(out: &Output, title: &str, about: &str, items: Vec<Item>) -> Option<Input> {
+    dialog::inspect(out, title, about, items).await;
+    None
+}
+
+/// `/help`: the commands, skills and keys; Enter puts a command in the
+/// prompt.
+async fn help(skills: &[Skill], out: &Output, typing: &mut Typing) -> Option<Input> {
+    let mut items: Vec<_> = BUILTINS.iter().map(|(name, description)| Item::new(*name, *description)).collect();
+    let skills = skills.iter().filter(|s| s.user_invocable);
+    items.extend(skills.map(|s| Item::new(format!("/{}", s.name), &s.description)));
+    let keyboard = items.len();
+    let keys: Vec<_> = help_keys().iter().map(|(key, description)| format!("{key}: {description}")).collect();
+    items.push(Item::new("Keyboard shortcuts", "Browse composer, interrupt and rewind shortcuts").details(keys.clone()));
+    let about = "Built-in commands, skills and keyboard shortcuts";
+    let insert = Keys { enter: "insert", esc: "cancel" };
+    while let Some(i) = dialog::choose(out, "Commands", about, insert, items.clone(), 0).await {
+        if i == keyboard {
+            dialog::document(out, "Keyboard shortcuts", keys.clone()).await;
+        } else {
+            typing.draft.set_text(&items[i].label);
+            break;
+        }
+    }
+    None
+}
+
+/// `/permissions`: the mode to set, with the rules beside each.
+async fn choose_mode(view: &View, out: &Output) -> Option<Input> {
+    let rules = view.permissions.rules().into_iter().filter(|(_, r)| !r.is_empty());
+    let rules: Vec<String> = rules.map(|(kind, r)| format!("{kind}: {}", r.join(", "))).collect();
+    let items = Mode::ALL.iter().map(|m| Item::new(m.as_str(), m.describe()).details(rules.clone())).collect();
+    let current = Mode::ALL.iter().position(|m| *m == view.permissions.mode()).unwrap_or(0);
+    let about = "Which tool calls ask first; Shift+Tab cycles them too";
+    let keys = Keys { enter: "apply", esc: "cancel" };
+    let i = dialog::choose(out, "Permission mode", about, keys, items, current).await?;
+    Some(Input::Permissions(Some(Mode::ALL[i].as_str().to_string())))
+}
+
+/// `/model`: the main and subagent models and the effort, all at once.
+async fn choose_model(view: &View, out: &Output) -> Option<Input> {
+    let client = super::model::pick(out, &view.client()).await?;
+    out.line(format!("model: {}", out.paint(BOLD, client.spec())));
+    out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
+    out.line(format!("effort: {}", out.paint(BOLD, client.effort().as_str())));
+    view.set_client(client, out);
+    None
+}
+
+/// `/effort`: a level, or the configured one.
+async fn choose_effort(view: &View, out: &Output) -> Option<Input> {
+    let client = view.client();
+    let configured = format!("Use configured effort (currently {})", client.effort().as_str());
+    let mut items = vec![Item::new("auto", configured)];
+    items.extend(llm::Effort::ALL.iter().map(|e| Item::new(e.as_str(), effort_help(*e))));
+    let chosen = client.effort_override().and_then(|e| llm::Effort::ALL.iter().position(|level| *level == e));
+    let about = "Applies to this session; /model changes the same setting";
+    let keys = Keys { enter: "apply", esc: "cancel" };
+    let i = dialog::choose(out, "Reasoning effort", about, keys, items, chosen.map_or(0, |i| i + 1)).await?;
+    Some(Input::Effort(Some(i.checked_sub(1).map(|i| llm::Effort::ALL[i]))))
+}
+
+/// `/skills`: Enter puts a user-invocable one in the prompt.
+async fn pick_skill(skills: &[Skill], out: &Output, typing: &mut Typing) -> Option<Input> {
+    let items = skills.iter().map(|s| {
+        Item::new(format!("/{}", s.name), &s.description).details(vec![
+            format!("Source: {}", s.dir.display()),
+            format!("User invocable: {} · model invocable: {}", s.user_invocable, s.model_invocable),
+            format!("Runs in a subagent: {}", s.fork.is_some()),
+        ])
+    });
+    let about = "Discovered skills; only user-invocable ones go into the prompt";
+    let keys = Keys { enter: "insert", esc: "cancel" };
+    if let Some(i) = dialog::choose(out, "Skills", about, keys, items.collect(), 0).await
+        && skills[i].user_invocable
+    {
+        typing.draft.set_text(&format!("/{} ", skills[i].name));
+    }
+    None
+}
+
+/// `/tools`: each tool with its input schema.
+fn tool_items(view: &View) -> Vec<Item> {
+    let items = view.tools.definitions().into_iter().map(|t| {
+        let schema = serde_json::to_string_pretty(&t.input_schema).unwrap_or_default();
+        let details = std::iter::once("Input schema:".into()).chain(schema.lines().map(String::from));
+        Item::new(t.name, t.description).details(details)
+    });
+    items.collect()
+}
+
+/// `/agents`: the subagent types, with their access, tools, model and
+/// prompt.
+fn agent_items(view: &View, env: &Env) -> Vec<Item> {
+    let client = view.client();
+    let items = env.ext.agent_defs.iter().map(|d| {
+        Item::new(&d.name, &d.description).details(vec![
+            format!("Access: {}", d.permission.as_str()),
+            format!("Tools: {}", d.tools.as_ref().map_or("all permitted".into(), |t| t.join(", "))),
+            format!("Model: {}", d.model.as_deref().or(client.subagent_model()).unwrap_or(client.spec())),
+            format!("Source: {}", d.path.as_ref().map_or("built-in".into(), |p| p.display().to_string())),
+            d.prompt.clone(),
+        ])
+    });
+    items.collect()
+}
+
+/// `/mcp`: each server, its tools or why it failed, and its log.
+fn mcp_items(env: &Env) -> Vec<Item> {
+    let items = env.mcp_statuses().map(|s| {
+        let took = crate::util::short_duration(s.took);
+        let (description, details) = match &s.outcome {
+            Ok(tools) => {
+                let count = format!("{} {}", tools.len(), text::plural(tools.len(), "tool"));
+                (format!("Connected in {took} · {count}"), tools.clone())
+            }
+            Err(e) => (format!("Connection failed after {took}"), vec![e.clone()]),
+        };
+        let log = format!("Log: {}", crate::mcp::log_path(&s.name).display());
+        Item::new(&s.name, description).details(details.into_iter().chain(std::iter::once(log)))
+    });
+    items.collect()
+}
+
+/// `/sandbox`: what it lets commands do, and what it costs each one.
+fn sandbox_items() -> Vec<Item> {
+    let Some(sandbox) = crate::sandbox::active() else {
+        return vec![Item::new("Sandbox is off", "Start with --sandbox to enable it; this view does not change permissions")];
+    };
+    let per_command = crate::util::short_duration(sandbox.startup());
+    let startup = ("startup", format!("{per_command} per command (measured at launch)"));
+    sandbox.describe().into_iter().chain([startup]).map(|(label, value)| Item::new(label, value)).collect()
 }
 
 /// `/usage` as a panel: the context's size, and the tokens used by model.
