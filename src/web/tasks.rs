@@ -13,14 +13,14 @@ use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
 use crate::agent::{Agent, Inbox, Observer};
-use crate::hooks::{Event, Hooks};
+use crate::extensions::hooks::{Event, Hooks};
+use crate::extensions::skills::Skill;
 use crate::llm::Client;
+use crate::security::permissions::{Answer, Asker, Request};
 use crate::session::{self, Recorder, Store};
-use crate::permissions::{Answer, Asker, Request};
-use crate::skills::Skill;
 use crate::subagent::{AgentDef, Forks, Subagents};
-use crate::tools::{FileTracker, ToolOutput};
 use crate::tools::shells::Shells;
+use crate::tools::{FileTracker, ToolOutput};
 
 /// Tool results are cut to this many bytes in events; the model still gets
 /// the full result.
@@ -95,7 +95,7 @@ pub struct Task {
     log: Mutex<Vec<Arc<str>>>,
     tx: broadcast::Sender<Sequenced>,
     /// The agent's permissions, which the UI's mode menu changes.
-    pub permissions: Arc<crate::permissions::Permissions>,
+    pub permissions: Arc<crate::security::permissions::Permissions>,
     /// Calls waiting for the user's approval, by question id.
     questions: Mutex<std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<Answer>>>,
     next_question: std::sync::atomic::AtomicU64,
@@ -221,7 +221,7 @@ impl Task {
     ) -> Arc<Self> {
         if let Some(rec) = &recorder {
             agent.hooks().set_session(&rec.meta().id, Some(rec.file()));
-            agent.file_history().set_dir(crate::checkpoint::session_dir(&rec.meta().id));
+            agent.file_history().set_dir(crate::session::checkpoint::session_dir(&rec.meta().id));
         }
         let created = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let meta = Meta { status: Status::Idle, model: agent.model().to_string(), turns: 0, handle: None };
@@ -310,7 +310,7 @@ impl Task {
         }
         if code {
             let changes = agent.file_history().changes(message)?;
-            crate::checkpoint::restore(&changes)?;
+            crate::session::checkpoint::restore(&changes)?;
             self.push(json!({"type": "hook", "message": format!("restored {} files as they were before that prompt", changes.len())}));
         }
         let prompt = if conversation { agent.rewind(message) } else { None };

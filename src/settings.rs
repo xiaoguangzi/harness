@@ -28,11 +28,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::extensions::{hooks, mcp, plugins};
 use crate::llm::Effort;
 use crate::llm::config::ProviderConfig;
+use crate::security::sandbox;
 use crate::tools::bash;
 use crate::util::env_refs;
-use crate::{hooks, mcp, plugins, sandbox};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,7 +56,7 @@ pub struct Settings {
     #[serde(default)]
     pub sandbox: sandbox::Config,
     #[serde(default)]
-    pub permissions: crate::permissions::Config,
+    pub permissions: crate::security::permissions::Config,
     #[serde(default)]
     pub shell: bash::Config,
     #[serde(default)]

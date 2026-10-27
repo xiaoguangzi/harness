@@ -8,7 +8,7 @@ use tokio::process::Command;
 
 use super::glob::expand_braces;
 use super::{Tool, ToolOutput, parse_input, spill};
-use crate::sandbox;
+use crate::security::sandbox;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_HEAD_LIMIT: usize = 250;

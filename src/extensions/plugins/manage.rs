@@ -549,7 +549,7 @@ fn write_secrets(home: &Path, id: &str, answers: Map<String, Value>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::fetch::tests::repo;
+    use crate::extensions::plugins::fetch::tests::repo;
 
     /// Answers questions from a list, and remembers them.
     struct Answers(Vec<&'static str>, Vec<String>);

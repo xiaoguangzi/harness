@@ -659,12 +659,12 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
 - `src/cli/` — 终端前端：启动与 REPL 主循环（`mod.rs`）、一次性模式（`one_shot.rs`）、内置命令及输入行的解析（`parse.rs`）、运行一轮并在其下保留输入框（`turn.rs`）、选择、恢复（并重新显示其结尾）和保存会话（`sessions.rs`）、命令逐行打印的内容（`print.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`!命令`、`/btw`、`/copy` 和 `/export`（`actions.rs`）、询问工具调用（`approve.rs`）、状态栏（`status_line.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）、各个无参数命令在面板中显示的内容及在一轮运行期间执行命令（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、共享的标准输出句柄，让旋转指示器和输入框始终画在输出下方（`output.rs`）、实时显示一轮的进度（`terminal.rs`）、工具调用及其结果的显示方式（`calls.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、在调用下方以带行号的 diff 显示文件改动（`diff.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、着色用的具名颜色与样式（`style.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
-- `src/agent.rs` — 代理循环：请求 → 运行工具 → 发送结果 → 循环直到 `end_turn`，以及一轮前后的 hook、失败或取消后对历史的修复
-- `src/agent/calls.rs` — 一次响应中的工具调用：PreToolUse hook、权限、并发运行、PostToolUse hook，按调用顺序汇总结果
-- `src/agent/inbox.rs` — 收件箱，把期间到达的内容（如后台子代理的报告）交给模型
-- `src/agent/deferred.rs` — 当 MCP 工具的定义会占满上下文的十分之一时，把它们延后到 `tool_search` 之后加载，并告诉模型它们的名字
-- `src/agent/usage.rs` — `/usage` 显示的按模型统计的 token 数，与子代理共享
-- `src/agent/compact.rs` — 上下文压缩：何时压缩、总结请求、替换会话的新历史
+- `src/agent/` — 代理循环：请求 → 运行工具 → 发送结果 → 循环直到 `end_turn`，以及一轮前后的 hook、失败或取消后对历史的修复 (`mod.rs`)
+  - `calls.rs` — 一次响应中的工具调用：PreToolUse hook、权限、并发运行、PostToolUse hook，按调用顺序汇总结果
+  - `inbox.rs` — 收件箱，把期间到达的内容（如后台子代理的报告）交给模型
+  - `deferred.rs` — 当 MCP 工具的定义会占满上下文的十分之一时，把它们延后到 `tool_search` 之后加载，并告诉模型它们的名字
+  - `usage.rs` — `/usage` 显示的按模型统计的 token 数，与子代理共享
+  - `compact.rs` — 上下文压缩：何时压缩、总结请求、替换会话的新历史
 - `src/llm/` — LLM 网关
   - `config.rs` — 由配置和环境变量得到 provider、模型 spec 解析、按 provider/模型的设置
   - `manage.rs` — `harness provider` 与 `/provider …`：通过修改配置添加和移除 provider 与列出的模型、设置默认模型
@@ -672,21 +672,23 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
   - `http.rs` — POST（开启时用 gzip 压缩）、SSE 读取器；标记哪些失败（连接断开、过载、可重试的状态码）之后 `llm::Client` 会重发请求，以及要等多久
 - `src/prompt/` — 系统提示词：主代理的模板（`system.md`）及其工具、环境和 `AGENTS.md`，子代理的提示词（`mod.rs`）；`/init` 的要求（`init.md`）
-- `src/session.rs` — 会话保存：会话文件、`--continue` / `--resume` 参数
-- `src/checkpoint.rs` — `/rewind` 的检查点：`edit` 和 `write` 修改的文件在每条提示之前的版本，随会话保存；恢复它们
+- `src/session/` — 会话保存：会话文件、`--continue` / `--resume` 参数 (`mod.rs`)
+  - `checkpoint.rs` — `/rewind` 的检查点：`edit` 和 `write` 修改的文件在每条提示之前的版本，随会话保存；恢复它们
 - `src/mentions.rs` — `@路径` 的解析与展开为附件块；粘贴图片的附件块
-- `src/permissions.rs` — 权限：配置中的规则、各个模式、哪些调用直接运行、询问或拒绝，以及通过前端询问
-- `src/sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read`、`edit` 和 `write` 检查的路径规则
-- `src/subagent.rs` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具
-- `src/subagent/worktree.rs` — `isolation: "worktree"` 子代理的 git worktree：创建、结算与删除
-- `src/subagent/runtime.rs` — 一个会话的子代理：前台与后台运行、后续追问、停止、向主代理收件箱报告
-- `src/mcp.rs` — MCP 客户端：服务器配置、连接、`mcp__*` 工具适配器
-- `src/lsp.rs` — 插件语言服务器的 LSP 客户端：配置、按需启动、基于 stdio 的 JSON-RPC、诊断；`lsp` 工具
-- `src/hooks.rs` — hooks：配置中的 `hooks` 部分、matcher、Claude Code 工具名、运行命令（经过 `sh` 或直接启动）和 prompt hook，并解析其输出
-- `src/skills.rs` — 技能发现、`SKILL.md` frontmatter 解析（含 `context: fork`）、命令、技能的渲染（`$ARGUMENTS`、`` !`command` ``）、`skill` 工具
-- `src/plugins.rs` — 插件：配置中的插件市场、`marketplace.json` 与 `plugin.json`、每个插件的技能、命令、代理、hook、MCP 与语言服务器、`userConfig` 的答案，以及未被使用的部分
-  - `fetch.rs` — 从 git 或 npm 拉取到 `~/.harness/plugins` 的市场和插件，按版本存放；更新它们，并删除没有运行中进程使用的旧版本
-  - `manage.rs` — `harness plugin` 与 `/plugins …`：通过修改配置（及敏感设置文件）安装、启用、配置和移除插件与市场
+- `src/security/` — 限制模型工具调用的机制
+  - `permissions.rs` — 权限：配置中的规则、各个模式、哪些调用直接运行、询问或拒绝，以及通过前端询问
+  - `sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read`、`edit` 和 `write` 检查的路径规则
+- `src/subagent/` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具 (`mod.rs`)
+  - `worktree.rs` — `isolation: "worktree"` 子代理的 git worktree：创建、结算与删除
+  - `runtime.rs` — 一个会话的子代理：前台与后台运行、后续追问、停止、向主代理收件箱报告
+- `src/extensions/` — 配置及其启用的插件加进来的东西
+  - `mcp.rs` — MCP 客户端：服务器配置、连接、`mcp__*` 工具适配器
+  - `lsp.rs` — 插件语言服务器的 LSP 客户端：配置、按需启动、基于 stdio 的 JSON-RPC、诊断；`lsp` 工具
+  - `hooks.rs` — hooks：配置中的 `hooks` 部分、matcher、Claude Code 工具名、运行命令（经过 `sh` 或直接启动）和 prompt hook，并解析其输出
+  - `skills.rs` — 技能发现、`SKILL.md` frontmatter 解析（含 `context: fork`）、命令、技能的渲染（`$ARGUMENTS`、`` !`command` ``）、`skill` 工具
+  - `plugins/` — 插件：配置中的插件市场、`marketplace.json` 与 `plugin.json`、每个插件的技能、命令、代理、hook、MCP 与语言服务器、`userConfig` 的答案，以及未被使用的部分 (`mod.rs`)
+    - `fetch.rs` — 从 git 或 npm 拉取到 `~/.harness/plugins` 的市场和插件，按版本存放；更新它们，并删除没有运行中进程使用的旧版本
+    - `manage.rs` — `harness plugin` 与 `/plugins …`：通过修改配置（及敏感设置文件）安装、启用、配置和移除插件与市场
 - `src/tools/` — `Tool` trait、注册表和 `FileTracker`（共享的读/改/写状态）
   - `bash.rs` — 通过 `bash -c` 运行命令（超时、大输出经 `spill.rs` 保存）；拒绝自行修改文件的命令（写文件的内联 Python/Node/Perl 脚本、`sed -i`、写入文件的 heredoc 或 `echo`），这些修改应走 `edit` / `write`
   - `read.rs` — 读取文本文件并带行号（`offset` / `limit` 分页），或读取图片、PDF 供模型查看

@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::hooks::{self, Condition};
+use crate::extensions::hooks::{self, Condition};
 use crate::tools::Tool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -293,7 +293,7 @@ impl Permissions {
                     .into(),
             ),
             Mode::AcceptEdits if matches!(name, "edit" | "write") && in_working_dir(input) => Decision::Allow,
-            _ if name == "bash" && crate::sandbox::active().is_some_and(|s| s.auto_allows_bash()) => Decision::Allow,
+            _ if name == "bash" && crate::security::sandbox::active().is_some_and(|s| s.auto_allows_bash()) => Decision::Allow,
             _ => Decision::Ask("it changes things".into()),
         }
     }

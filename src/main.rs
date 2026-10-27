@@ -1,19 +1,13 @@
 mod agent;
-mod checkpoint;
 mod cli;
-mod hooks;
+mod extensions;
 mod llm;
-mod lsp;
-mod mcp;
 mod mentions;
-mod plugins;
-mod permissions;
 mod prompt;
-mod sandbox;
+mod security;
 mod session;
 mod settings;
 mod setup;
-mod skills;
 mod subagent;
 mod tools;
 mod util;
@@ -26,7 +20,9 @@ use anyhow::Result;
 use serde_json::Value;
 
 use agent::Agent;
+use extensions::{mcp, plugins};
 use llm::{Client, Providers};
+use security::{permissions, sandbox};
 use settings::Settings;
 use setup::{Env, Extensions};
 

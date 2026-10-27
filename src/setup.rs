@@ -12,14 +12,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::hooks;
+use crate::extensions::hooks;
+use crate::extensions::lsp;
+use crate::extensions::mcp;
+use crate::extensions::plugins::{self, Checkout, Plugins};
+use crate::extensions::skills::{self, Skill, SkillTool};
 use crate::llm::Client;
-use crate::lsp;
-use crate::mcp;
-use crate::plugins::{self, Checkout, Plugins};
 use crate::prompt;
 use crate::settings::Settings;
-use crate::skills::{self, Skill, SkillTool};
 use crate::subagent::{self, AgentDef, AgentTool, Forks, MessageAgentTool, Reporter, StopAgentTool};
 use crate::tools::{self, FileTracker, ToolRegistry};
 

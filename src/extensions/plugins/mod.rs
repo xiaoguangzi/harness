@@ -36,11 +36,11 @@ use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::hooks;
-use crate::lsp;
-use crate::mcp::ServerConfig;
+use crate::extensions::hooks;
+use crate::extensions::lsp;
+use crate::extensions::mcp::ServerConfig;
+use crate::extensions::skills::{self, PluginDirs, PluginOption, Skill, markdown_files, scoped, stem};
 use crate::settings::Settings;
-use crate::skills::{self, PluginDirs, PluginOption, Skill, markdown_files, scoped, stem};
 use crate::subagent::{self, AgentDef};
 pub use fetch::Checkout;
 use fetch::Source;
@@ -1014,7 +1014,7 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::Event;
+    use crate::extensions::hooks::Event;
     use fetch::tests::repo;
 
     fn write(dir: &Path, files: &[(&str, &str)]) {

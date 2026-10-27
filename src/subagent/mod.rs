@@ -40,9 +40,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::Agent;
-use crate::hooks::{self, Hooks};
+use crate::extensions::hooks::{self, Hooks};
+use crate::extensions::skills::{Fork, PluginDirs, Skill, parse_frontmatter, split_frontmatter};
 use crate::llm::{Client, Effort, Message};
-use crate::skills::{Fork, PluginDirs, Skill, parse_frontmatter, split_frontmatter};
 use crate::tools::{FileTracker, Tool, ToolOutput, ToolRegistry, parse_input};
 pub use runtime::{Subagents, scope};
 

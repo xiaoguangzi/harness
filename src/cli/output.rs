@@ -75,7 +75,7 @@ struct State {
     /// Where those readers hand keys while a panel is open over a turn.
     panel_keys: Option<tokio::sync::mpsc::UnboundedSender<Key>>,
     /// The conversation's permissions, whose mode shows under the box.
-    permissions: Option<Arc<crate::permissions::Permissions>>,
+    permissions: Option<Arc<crate::security::permissions::Permissions>>,
 }
 
 /// Restores a usable shell cursor on normal exit and error unwinding.
@@ -338,7 +338,7 @@ impl Output {
 
     /// Shows `permissions`' mode under the input box, and has Shift+Tab
     /// change it.
-    pub fn set_permissions(&self, permissions: Arc<crate::permissions::Permissions>) {
+    pub fn set_permissions(&self, permissions: Arc<crate::security::permissions::Permissions>) {
         self.state.lock().unwrap().permissions = Some(permissions);
     }
 
@@ -770,8 +770,8 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
 
 /// The permission mode under the input box, unless it is the one asking
 /// for nothing that the settings start in.
-fn mode_line(permissions: &crate::permissions::Permissions) -> Option<String> {
-    use crate::permissions::Mode;
+fn mode_line(permissions: &crate::security::permissions::Permissions) -> Option<String> {
+    use crate::security::permissions::Mode;
     let mode = permissions.mode();
     let label = match mode {
         Mode::BypassPermissions if permissions.default_mode() == Mode::BypassPermissions => return None,

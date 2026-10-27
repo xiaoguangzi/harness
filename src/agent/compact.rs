@@ -792,7 +792,7 @@ pub(crate) mod tests {
         let (client, mut requests) = gateway(|_| (vec![text("answer")], "end_turn", 500)).await;
         let mut agent = Agent::new(client, crate::tools::ToolRegistry::new(), "sys");
         let command = |command: String| json!([{"type": "command", "command": command}]);
-        agent.set_hooks(crate::hooks::tests::hooks(json!({
+        agent.set_hooks(crate::extensions::hooks::tests::hooks(json!({
             "PreCompact": [
                 {"matcher": "manual", "hooks": command(format!("cat > {}", pre.display()))},
                 {"matcher": "auto", "hooks": command("echo 'not now' >&2; exit 2".into())}

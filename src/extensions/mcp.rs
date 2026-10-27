@@ -604,7 +604,7 @@ for line in sys.stdin:
 
     /// The test server as a config, or `None` without python3.
     fn test_server(dir: &std::path::Path, name: &str) -> Option<ServerConfig> {
-        if !crate::lsp::command_exists("python3") {
+        if !crate::extensions::lsp::command_exists("python3") {
             eprintln!("python3 not found; skipped");
             return None;
         }

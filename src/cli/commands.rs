@@ -10,11 +10,12 @@ use super::parse::{BUILTINS, Input, effort_help, help_keys};
 use super::{Output, output, print, text};
 use super::style::BOLD;
 use crate::agent::Agent;
+use crate::extensions::skills::Skill;
 use crate::llm::{self, Client};
-use crate::permissions::{Mode, Permissions};
+use crate::security::permissions::{Mode, Permissions};
 use crate::subagent::Subagents;
 use crate::tools::{ToolRegistry, shells::Shells};
-use crate::{settings::Settings, setup::Env, skills::Skill};
+use crate::{settings::Settings, setup::Env};
 
 /// What commands see of a conversation, and change in it, without holding
 /// its `Agent`: a turn may be running with it.
@@ -307,7 +308,7 @@ fn mcp_items(env: &Env) -> Vec<Item> {
             }
             Err(e) => (format!("Connection failed after {took}"), vec![e.clone()]),
         };
-        let log = format!("Log: {}", crate::mcp::log_path(&s.name).display());
+        let log = format!("Log: {}", crate::extensions::mcp::log_path(&s.name).display());
         Item::new(&s.name, description).details(details.into_iter().chain(std::iter::once(log)))
     });
     items.collect()
@@ -315,7 +316,7 @@ fn mcp_items(env: &Env) -> Vec<Item> {
 
 /// `/sandbox`: what it lets commands do, and what it costs each one.
 fn sandbox_items() -> Vec<Item> {
-    let Some(sandbox) = crate::sandbox::active() else {
+    let Some(sandbox) = crate::security::sandbox::active() else {
         return vec![Item::new("Sandbox is off", "Start with --sandbox to enable it; this view does not change permissions")];
     };
     let per_command = crate::util::short_duration(sandbox.startup());

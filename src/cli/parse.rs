@@ -1,8 +1,8 @@
 //! What a line typed at the prompt means: the built-in commands, and the
 //! [`Input`] a line parses into.
 
+use crate::extensions::skills::Skill;
 use crate::llm;
-use crate::skills::Skill;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
 pub(super) const BUILTINS: [(&str, &str); 25] = [
@@ -197,7 +197,7 @@ pub(super) fn parse_input(line: &str, skills: &[Skill]) -> Input {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills;
+    use crate::extensions::skills;
 
     #[tokio::test]
     async fn parses_commands() {

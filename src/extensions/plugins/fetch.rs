@@ -292,7 +292,7 @@ pub(super) mod tests {
     use super::*;
 
     /// A git repository in `dir` holding `files`, committed.
-    pub(in crate::plugins) fn repo(dir: &Path, files: &[(&str, &str)]) {
+    pub(in crate::extensions::plugins) fn repo(dir: &Path, files: &[(&str, &str)]) {
         for (path, text) in files {
             let path = dir.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -93,7 +93,7 @@ impl Tool for EditTool {
         if !path.exists() {
             return ToolOutput::error(format!("{} does not exist; to create it, use `write`", input.path));
         }
-        if let Some(sandbox) = crate::sandbox::active()
+        if let Some(sandbox) = crate::security::sandbox::active()
             && let Err(e) = sandbox.check_write(path)
         {
             return ToolOutput::error(e);
@@ -137,7 +137,7 @@ impl Tool for EditTool {
                 ));
             }
         };
-        crate::checkpoint::before_change(path).await;
+        crate::session::checkpoint::before_change(path).await;
         if let Err(e) = tokio::fs::write(path, &after).await {
             return ToolOutput::error(format!("Cannot write {}: {e}", input.path));
         }

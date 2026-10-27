@@ -732,7 +732,7 @@ impl Tool for LspTool {
             Err(e) => return e,
         };
         let path = PathBuf::from(&input.path);
-        if let Some(sandbox) = crate::sandbox::active()
+        if let Some(sandbox) = crate::security::sandbox::active()
             && let Err(e) = sandbox.check_read(&path)
         {
             return ToolOutput::error(e);

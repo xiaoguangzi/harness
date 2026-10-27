@@ -19,9 +19,9 @@ use tokio::task::AbortHandle;
 use super::worktree::Worktree;
 use super::{ForkBase, MAX_RESULT_BYTES, Reporter};
 use crate::agent::{Agent, Inbox, Observer, UsageLog};
-use crate::checkpoint::FileHistory;
-use crate::hooks::Hooks;
+use crate::extensions::hooks::Hooks;
 use crate::llm::Client;
+use crate::session::checkpoint::FileHistory;
 use crate::tools::{ToolOutput, spill, truncate};
 
 /// Subagents of one conversation that may run at once.

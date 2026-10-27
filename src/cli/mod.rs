@@ -40,13 +40,13 @@ use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
 use serde_json::Value;
 
 use crate::agent::Agent;
-use crate::hooks::{Event, Hooks};
+use crate::extensions::hooks::{Event, Hooks};
+use crate::extensions::plugins;
+use crate::extensions::skills::Skill;
 use crate::llm;
 use crate::mentions;
-use crate::plugins;
 use crate::session::{self, Recorder, Resume, Store};
 use crate::setup::Env;
-use crate::skills::Skill;
 use crate::tools::FileTracker;
 use clipboard::Image;
 use commands::View;

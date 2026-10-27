@@ -124,7 +124,7 @@ pub fn init(args: &str) -> String {
 /// `explore` only searches, and goes without the notes.
 pub fn subagent(def: &AgentDef) -> String {
     let names = if def.name.contains(':') {
-        let tools: Vec<&str> = crate::hooks::ALIASES.iter().map(|(name, _)| *name).collect();
+        let tools: Vec<&str> = crate::extensions::hooks::ALIASES.iter().map(|(name, _)| *name).collect();
         format!("\n\n{}", claude_code_names(tools))
     } else {
         String::new()
@@ -145,7 +145,7 @@ pub fn subagent(def: &AgentDef) -> String {
 /// How the tool names Claude Code uses, which skills, commands and agents
 /// written for it mention, map onto `tools`.
 fn claude_code_names(tools: Vec<&str>) -> String {
-    let pairs: Vec<String> = crate::hooks::ALIASES
+    let pairs: Vec<String> = crate::extensions::hooks::ALIASES
         .iter()
         .filter(|(name, _)| tools.contains(name))
         .map(|(name, aliases)| {
@@ -209,7 +209,7 @@ fn environment() -> String {
         let more = if commands.len() > 30 { format!(" and {} more", commands.len() - 30) } else { String::new() };
         lines.push(format!("- Commands the enabled plugins add, on the `bash` tool's PATH: {}{more}", shown.join(", ")));
     }
-    if let Some(sandbox) = crate::sandbox::active() {
+    if let Some(sandbox) = crate::security::sandbox::active() {
         lines.push(format!("- Sandbox: {}", sandbox.prompt_note()));
     }
     if let Some(date) = today() {
@@ -385,7 +385,7 @@ mod tests {
     fn maps_claude_code_tool_names() {
         let mut tools = ToolRegistry::with_defaults(FileTracker::default());
         assert!(!main(&tools).contains("written for Claude Code"), "nothing written for it to load");
-        tools.register(crate::skills::SkillTool::new(&[], crate::subagent::Forks::default()));
+        tools.register(crate::extensions::skills::SkillTool::new(&[], crate::subagent::Forks::default()));
         let prompt = main(&tools);
         assert!(prompt.contains("`Bash` is `bash`") && prompt.contains("`Glob` or `LS` is `glob`"), "{prompt}");
         assert!(prompt.contains("`Skill` is `skill`") && !prompt.contains("`Task` is"), "only registered tools");

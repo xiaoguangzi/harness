@@ -13,7 +13,7 @@ use tokio::process::{Child, Command};
 
 use super::spill::Capture;
 use super::{Tool, ToolOutput, parse_input};
-use crate::sandbox;
+use crate::security::sandbox;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;

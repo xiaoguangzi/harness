@@ -658,12 +658,12 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/settings.rs` — the settings file: its location, `--settings`, parsing into each section, editing it in place
 - `src/cli/` — terminal frontend: startup and the REPL loop (`mod.rs`), one-shot mode (`one_shot.rs`), the built-in commands and what a typed line means (`parse.rs`), running a turn with the input box under it (`turn.rs`), picking, resuming (showing their end again) and saving conversations (`sessions.rs`), what commands print line by line (`print.rs`), `--output-format json` / `stream-json` (`json.rs`), `!command`, `/btw`, `/copy` and `/export` (`actions.rs`), asking about tool calls (`approve.rs`), the status line (`status_line.rs`), `/rewind` (`rewind.rs`), the keyboard panels slash commands open (`dialog.rs`), what each bare command shows in one and running commands beside a turn (`commands.rs`), the `/model` panel for models and effort (`model.rs`), the shared stdout handle that keeps the spinner and input box drawn under the output (`output.rs`), showing a turn as it runs (`terminal.rs`), how tool calls and their results are shown (`calls.rs`), retained tool results (`tool_output.rs`), the searchable expanded conversation (`transcript.rs`), the input box while a turn runs: its text, rendering and queued messages (`input.rs`), the keys read during a turn: Esc and editing the input box (`keys.rs`), a file change as a numbered diff under its call (`diff.rs`), streaming Markdown rendering (`markdown.rs`), display-width helpers (`text.rs`), the named colors and styles it paints with (`style.rs`), the menu under the prompt: commands, project file search (`menu.rs`), shared viewport and native scrollback (`screen.rs`), prompt input, menu keys, completion, history, multi-line input, Ctrl+V and Esc Esc (`repl.rs`), reading an image or copied files from the clipboard (`clipboard.rs`)
 - `src/web/` — web frontend (`--web`): axum server and JSON/SSE API (`mod.rs`), background tasks and their event logs (`tasks.rs`), the single-page UI (`index.html`, embedded in the binary)
-- `src/agent.rs` — agent loop: request → run tools → send results → repeat until `end_turn`, with the hooks around a turn and the repairs after a failed or cancelled one
-- `src/agent/calls.rs` — one response's tool calls: PreToolUse hooks, permissions, running them concurrently, PostToolUse hooks, the results in call order
-- `src/agent/inbox.rs` — the inbox that hands the model what arrives meanwhile, such as background subagent reports
-- `src/agent/deferred.rs` — deferring MCP tools behind `tool_search` once their definitions would fill a tenth of the context, and telling the model their names
-- `src/agent/usage.rs` — the per-model token counts `/usage` shows, shared with the subagents
-- `src/agent/compact.rs` — compaction: when to compact, the summarization request, the history that replaces the conversation
+- `src/agent/` — agent loop: request → run tools → send results → repeat until `end_turn`, with the hooks around a turn and the repairs after a failed or cancelled one (`mod.rs`)
+  - `calls.rs` — one response's tool calls: PreToolUse hooks, permissions, running them concurrently, PostToolUse hooks, the results in call order
+  - `inbox.rs` — the inbox that hands the model what arrives meanwhile, such as background subagent reports
+  - `deferred.rs` — deferring MCP tools behind `tool_search` once their definitions would fill a tenth of the context, and telling the model their names
+  - `usage.rs` — the per-model token counts `/usage` shows, shared with the subagents
+  - `compact.rs` — compaction: when to compact, the summarization request, the history that replaces the conversation
 - `src/llm/` — LLM gateways
   - `config.rs` — providers from the settings and environment, model spec resolution, per-provider/model settings
   - `manage.rs` — `harness provider` and `/provider …`: adding and removing providers and listed models, the default model, by editing the settings
@@ -671,21 +671,23 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST (gzip-compressed where that is on), SSE reader; marks the failures (a dropped connection, an overload, a retryable status) after which `llm::Client` sends the request again, and how long to wait
 - `src/prompt/` — system prompts: the main agent's template (`system.md`) with its tools, environment and `AGENTS.md`, and subagents' (`mod.rs`); what `/init` asks for (`init.md`)
-- `src/session.rs` — saved conversations: the session files, `--continue` / `--resume` flags
-- `src/checkpoint.rs` — checkpoints for `/rewind`: the files `edit` and `write` change, kept as they were before each prompt, saved with the session; restoring them
+- `src/session/` — saved conversations: the session files, `--continue` / `--resume` flags (`mod.rs`)
+  - `checkpoint.rs` — checkpoints for `/rewind`: the files `edit` and `write` change, kept as they were before each prompt, saved with the session; restoring them
 - `src/mentions.rs` — `@path` parsing and expansion into attachment blocks; pasted images' blocks
-- `src/permissions.rs` — permissions: the settings' rules, the modes, which calls run, ask or are refused, and asking through the frontend
-- `src/sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read`, `edit` and `write` check
-- `src/subagent.rs` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools
-- `src/subagent/worktree.rs` — git worktrees for subagents with `isolation: "worktree"`: making, settling and removing them
-- `src/subagent/runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox
-- `src/mcp.rs` — MCP client: server configs, connections, `mcp__*` tool adapters
-- `src/lsp.rs` — LSP client for plugins' language servers: configs, starting them on demand, JSON-RPC over stdio, diagnostics; the `lsp` tool
-- `src/hooks.rs` — hooks: the settings' `hooks` section, matchers, Claude Code tool names, running the commands (through `sh` or directly) and prompt hooks, and reading their answers
-- `src/skills.rs` — skill discovery, `SKILL.md` frontmatter parsing (`context: fork` included), commands, rendering a skill (`$ARGUMENTS`, `` !`command` ``), the `skill` tool
-- `src/plugins.rs` — plugins: the settings' marketplaces, `marketplace.json` and `plugin.json`, each plugin's skills, commands, agents, hooks, MCP and language servers, its `userConfig` answers, and what of it is not used
-  - `fetch.rs` — marketplaces and plugins fetched from git or npm under `~/.harness/plugins`, kept by version; updating them, and deleting versions no running process uses
-  - `manage.rs` — `harness plugin` and `/plugins …`: installing, enabling, configuring and removing plugins and marketplaces by editing the settings (and the secrets file)
+- `src/security/` — what limits the model's tool calls
+  - `permissions.rs` — permissions: the settings' rules, the modes, which calls run, ask or are refused, and asking through the frontend
+  - `sandbox.rs` — the OS sandbox: config, the Seatbelt profile and bwrap arguments, the path rules `read`, `edit` and `write` check
+- `src/subagent/` — subagent definitions (`explore`, `general-purpose`, custom files), permissions, the `agent`, `message_agent` and `stop_agent` tools (`mod.rs`)
+  - `worktree.rs` — git worktrees for subagents with `isolation: "worktree"`: making, settling and removing them
+  - `runtime.rs` — a conversation's subagents: foreground and background runs, follow-ups, stopping, reports to the parent's inbox
+- `src/extensions/` — what the settings and the plugins they enable add
+  - `mcp.rs` — MCP client: server configs, connections, `mcp__*` tool adapters
+  - `lsp.rs` — LSP client for plugins' language servers: configs, starting them on demand, JSON-RPC over stdio, diagnostics; the `lsp` tool
+  - `hooks.rs` — hooks: the settings' `hooks` section, matchers, Claude Code tool names, running the commands (through `sh` or directly) and prompt hooks, and reading their answers
+  - `skills.rs` — skill discovery, `SKILL.md` frontmatter parsing (`context: fork` included), commands, rendering a skill (`$ARGUMENTS`, `` !`command` ``), the `skill` tool
+  - `plugins/` — plugins: the settings' marketplaces, `marketplace.json` and `plugin.json`, each plugin's skills, commands, agents, hooks, MCP and language servers, its `userConfig` answers, and what of it is not used (`mod.rs`)
+    - `fetch.rs` — marketplaces and plugins fetched from git or npm under `~/.harness/plugins`, kept by version; updating them, and deleting versions no running process uses
+    - `manage.rs` — `harness plugin` and `/plugins …`: installing, enabling, configuring and removing plugins and marketplaces by editing the settings (and the secrets file)
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/edit/write state)
   - `bash.rs` — run a command via `bash -c` (timeout, large output saved through `spill.rs`); refuses commands that change files themselves (inline Python/Node/Perl scripts that write files, `sed -i`, heredocs or `echo` into a file), which go through `edit` / `write`
   - `read.rs` — read a text file with line numbers (`offset` / `limit` paging), or an image or PDF for the model to view

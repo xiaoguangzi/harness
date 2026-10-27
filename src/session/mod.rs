@@ -9,6 +9,8 @@
 //! file contents and command output, so the files are readable by their
 //! owner only.
 
+pub mod checkpoint;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

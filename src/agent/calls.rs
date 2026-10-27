@@ -8,8 +8,8 @@ use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde_json::{Value, json};
 
 use super::{Agent, Observer, show_notices};
-use crate::hooks::{self, Event, Outcome};
-use crate::permissions::{Decision, Request};
+use crate::extensions::hooks::{self, Event, Outcome};
+use crate::security::permissions::{Decision, Request};
 use crate::tools::ToolOutput;
 
 /// What came of one call: its output, and what the hooks before and after
@@ -165,12 +165,12 @@ impl Agent {
             Decision::Deny(reason) => return Err(reason),
             Decision::Ask(reason) => reason,
         };
-        let suggestion = crate::permissions::suggestion(name, input);
+        let suggestion = crate::security::permissions::suggestion(name, input);
         let hooked = self.hooks.permission_request(name, input, &suggestion, self.client.spec()).await;
         if let Some(reason) = hooked.block {
             return Err(format!("A PermissionRequest hook denied this call: {reason}"));
         }
-        if hooked.permission == Some(crate::permissions::HookDecision::Allow) {
+        if hooked.permission == Some(crate::security::permissions::HookDecision::Allow) {
             return Ok(());
         }
         let agent = self.hooks.subagent_label();

@@ -10,7 +10,7 @@ use super::input::Typing;
 use super::{Output, diff, text};
 use super::style::{BOLD, DIM, GREEN, RED};
 use crate::agent::Agent;
-use crate::checkpoint::{self, Change};
+use crate::session::checkpoint::{self, Change};
 use crate::session;
 
 /// Prompts offered, the most recent first.

@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use super::config::{Effort, Protocol, Providers};
-use crate::plugins::manage::Ask;
+use crate::extensions::plugins::manage::Ask;
 use crate::settings::{self, Settings};
 
 pub const USAGE: &str = "\

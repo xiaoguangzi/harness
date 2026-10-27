@@ -70,7 +70,7 @@ impl Tool for WriteTool {
         if path.is_dir() {
             return ToolOutput::error(format!("{} is a directory", input.path));
         }
-        if let Some(sandbox) = crate::sandbox::active()
+        if let Some(sandbox) = crate::security::sandbox::active()
             && let Err(e) = sandbox.check_write(path)
         {
             return ToolOutput::error(e);
@@ -85,7 +85,7 @@ impl Tool for WriteTool {
             Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
             Err(_) => None,
         };
-        crate::checkpoint::before_change(path).await;
+        crate::session::checkpoint::before_change(path).await;
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {

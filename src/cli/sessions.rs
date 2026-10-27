@@ -10,8 +10,8 @@ use super::markdown::Markdown;
 use super::{Output, dialog, input, text};
 use super::style::{ACCENT, BOLD, DIM};
 use crate::agent::{Agent, INTERRUPTED};
-use crate::checkpoint;
 use crate::llm::Message;
+use crate::session::checkpoint;
 use crate::session::{self, Recorder};
 
 /// Saved conversations offered by `/resume`.

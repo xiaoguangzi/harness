@@ -13,10 +13,10 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use crate::checkpoint::FileHistory;
-use crate::hooks::{self, Event, Hooks, Outcome};
+use crate::extensions::hooks::{self, Event, Hooks, Outcome};
 use crate::llm::{Client, Message, Response, StreamEvent, ToolDef, Usage};
-use crate::permissions::{Mode, Permissions};
+use crate::security::permissions::{Mode, Permissions};
+use crate::session::checkpoint::FileHistory;
 use crate::subagent::Subagents;
 use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
@@ -476,7 +476,7 @@ impl Agent {
         let nested = self.hooks.is_subagent();
         let history = self.history.clone();
         let turn = crate::subagent::scope(subagents, client, nested, self.run_loop(observer));
-        let result = crate::checkpoint::scope(history, crate::tools::shells::scope(shells, turn)).await;
+        let result = crate::session::checkpoint::scope(history, crate::tools::shells::scope(shells, turn)).await;
         if result.is_err() {
             // A compaction moves the turn's start.
             let turn_start = self.turn_start.unwrap_or_default();
@@ -806,7 +806,7 @@ pub(crate) mod tests {
         })
         .await;
         let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
-        agent.set_hooks(crate::hooks::tests::hooks(json!({
+        agent.set_hooks(crate::extensions::hooks::tests::hooks(json!({
             "SessionStart": command("echo on branch main"),
             "UserPromptSubmit": command("echo '{\"hookSpecificOutput\": {\"additionalContext\": \"ticket 42\"}}'"),
             "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo 'no rm' >&2; exit 2"}]}],
@@ -846,7 +846,7 @@ pub(crate) mod tests {
         let _guard = crate::util::lock_cwd();
         let (client, mut requests) = compact::tests::gateway(|_| (vec![text("hi")], "end_turn", 100)).await;
         let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
-        agent.set_hooks(crate::hooks::tests::hooks(json!({"UserPromptSubmit": command("echo 'has a secret' >&2; exit 2")})));
+        agent.set_hooks(crate::extensions::hooks::tests::hooks(json!({"UserPromptSubmit": command("echo 'has a secret' >&2; exit 2")})));
         let error = agent.run_turn(vec![text("key=abc")], &mut Notices::default()).await.unwrap_err();
         assert!(error.to_string().contains("has a secret"), "{error}");
         assert!(agent.messages().is_empty());
@@ -857,7 +857,7 @@ pub(crate) mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn calls_that_need_approval_ask_or_are_refused() {
         let _guard = crate::util::lock_cwd();
-        use crate::permissions::{Answer, Asker, Mode, Permissions};
+        use crate::security::permissions::{Answer, Asker, Mode, Permissions};
         use compact::tests::texts;
         let bash = |id: &str, command: &str| json!({"type": "tool_use", "id": id, "name": "bash", "input": {"command": command}});
         let (client, mut requests) = compact::tests::gateway(move |n| match n {
@@ -878,7 +878,7 @@ pub(crate) mod tests {
         struct Yes;
         #[async_trait::async_trait]
         impl Asker for Yes {
-            async fn ask(&self, _: &crate::permissions::Request) -> Option<Answer> {
+            async fn ask(&self, _: &crate::security::permissions::Request) -> Option<Answer> {
                 Some(Answer::Allow)
             }
         }
@@ -915,7 +915,7 @@ pub(crate) mod tests {
         let (client, _requests) = compact::tests::gateway(|_| (vec![text("hi")], "end_turn", 100)).await;
         let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
         let hook = r#"grep -q '"prompt":"/review src"' && { echo 'typed' >&2; exit 2; }; exit 0"#;
-        agent.set_hooks(crate::hooks::tests::hooks(json!({"UserPromptSubmit": command(hook)})));
+        agent.set_hooks(crate::extensions::hooks::tests::hooks(json!({"UserPromptSubmit": command(hook)})));
         agent.set_prompt_label("/review src");
         let error = agent.run_turn(vec![text("Review the code in src ...")], &mut Notices::default()).await;
         assert!(error.unwrap_err().to_string().contains("typed"));
@@ -949,7 +949,7 @@ pub(crate) mod tests {
             agent.file_history().checkpoints().into_iter().map(|c| (c.message, c.prompt)).collect();
         assert_eq!(listed, [(0, "/first".to_string()), (4, "two".to_string())]);
 
-        crate::checkpoint::restore(&agent.file_history().changes(4).unwrap()).unwrap();
+        crate::session::checkpoint::restore(&agent.file_history().changes(4).unwrap()).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
         assert_eq!(agent.rewind(4).as_deref(), Some("two"));
         assert_eq!(agent.messages().len(), 4);
@@ -965,7 +965,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ended = dir.path().join("ended");
         let (client, mut requests) = compact::tests::gateway(|_| (vec![text("ok")], "end_turn", 100)).await;
-        let hooks = crate::hooks::tests::hooks(json!({
+        let hooks = crate::extensions::hooks::tests::hooks(json!({
             "SubagentStart": command("echo only read files"),
             "SessionEnd": command(&format!("cat >> {}", ended.display())),
         }));

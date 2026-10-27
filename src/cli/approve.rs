@@ -13,7 +13,7 @@ use super::Output;
 use super::calls::call_label;
 use super::text;
 use super::style::{BOLD, CYAN, DIM, GREEN, QUESTION, RED};
-use crate::permissions::{Answer, Asker, Request};
+use crate::security::permissions::{Answer, Asker, Request};
 
 /// Lines of an edit shown with the question, for each side.
 const EDIT_LINES: usize = 4;

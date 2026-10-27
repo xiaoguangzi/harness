@@ -15,10 +15,10 @@ use super::parse::parse_input;
 use super::{Output, repl, sessions};
 use super::style::{ACCENT, DIM, YELLOW};
 use crate::agent::{Agent, Inbox};
+use crate::extensions::skills::Skill;
 use crate::mentions;
 use crate::session::Recorder;
 use crate::setup::Env;
-use crate::skills::Skill;
 use crate::tools::FileTracker;
 
 /// The input box under a running turn, and what sending from it needs.

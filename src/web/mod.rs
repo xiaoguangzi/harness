@@ -30,10 +30,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::Agent;
+use crate::extensions::skills::Skill;
 use crate::llm::{Client, Providers};
 use crate::mentions;
 use crate::settings::{self, Settings};
-use crate::skills::Skill;
 use crate::subagent::{AgentDef, AgentTool, Forks, MessageAgentTool, Reporter, StopAgentTool};
 use crate::tools::{FileTracker, ToolRegistry};
 
@@ -510,7 +510,7 @@ async fn answer_permission(
     Path((id, question)): Path<(u64, u64)>,
     Json(req): Json<PermissionAnswer>,
 ) -> ApiResult<Json<Value>> {
-    use crate::permissions::Answer;
+    use crate::security::permissions::Answer;
     let task = find_task(&state, id)?;
     let answer = match req.answer.as_str() {
         "allow" => Answer::Allow,
@@ -560,7 +560,7 @@ async fn resume_session(State(state): State<Shared>, Path(session): Path<String>
     };
     agent.restore(messages);
     let mut notes = Vec::new();
-    if let Some(dir) = crate::checkpoint::session_dir(&meta.id)
+    if let Some(dir) = crate::session::checkpoint::session_dir(&meta.id)
         && let Err(e) = agent.file_history().load(dir, agent.messages())
     {
         notes.push(format!("its checkpoints were not loaded: {e:#}"));
@@ -611,7 +611,7 @@ struct SetMode {
 
 async fn set_mode(State(state): State<Shared>, Path(id): Path<u64>, Json(req): Json<SetMode>) -> ApiResult<Json<Value>> {
     let task = find_task(&state, id)?;
-    let mode = crate::permissions::Mode::parse(&req.mode).map_err(bad_request)?;
+    let mode = crate::security::permissions::Mode::parse(&req.mode).map_err(bad_request)?;
     task.permissions.set_mode(mode);
     task.push(json!({"type": "permission_mode", "mode": mode.as_str()}));
     Ok(Json(task.summary()))

@@ -33,9 +33,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::agent::Inbox;
-use crate::permissions::HookDecision;
+use crate::extensions::skills::PluginDirs;
 use crate::llm::{Client, Message};
-use crate::skills::PluginDirs;
+use crate::security::permissions::HookDecision;
 use crate::tools::{KillGroup, ToolOutput};
 
 /// How long a hook may run unless it sets `timeout`.
@@ -525,7 +525,7 @@ pub struct Hooks {
     /// The conversation's inbox, where background hooks' answers go.
     inbox: Option<Arc<Inbox>>,
     /// The conversation's permissions, whose mode hooks are told.
-    permissions: Option<Arc<crate::permissions::Permissions>>,
+    permissions: Option<Arc<crate::security::permissions::Permissions>>,
 }
 
 impl Default for Hooks {
@@ -554,7 +554,7 @@ pub struct Outcome {
     pub updated_output: Option<String>,
     /// A PreToolUse hook's `permissionDecision` of `allow` or `ask`, or a
     /// PermissionRequest hook's `allow` (its `deny` blocks).
-    pub permission: Option<crate::permissions::HookDecision>,
+    pub permission: Option<crate::security::permissions::HookDecision>,
 }
 
 /// How a hook process ended.
@@ -571,7 +571,7 @@ impl Hooks {
     }
 
     /// Tells hooks the permission mode of `permissions`, the conversation's.
-    pub fn set_permissions(&mut self, permissions: Arc<crate::permissions::Permissions>) {
+    pub fn set_permissions(&mut self, permissions: Arc<crate::security::permissions::Permissions>) {
         self.permissions = Some(permissions);
     }
 
@@ -604,7 +604,7 @@ impl Hooks {
         self.subagent.as_ref().map(|(id, agent_type)| format!("{agent_type} {id}"))
     }
 
-    pub fn permissions(&self) -> Option<&Arc<crate::permissions::Permissions>> {
+    pub fn permissions(&self) -> Option<&Arc<crate::security::permissions::Permissions>> {
         self.permissions.as_ref()
     }
 
@@ -1246,7 +1246,7 @@ pub(crate) mod tests {
     async fn plugin_hooks() {
         let _guard = crate::util::lock_cwd();
         let mut plugin = PluginDirs::new("/p/root".into(), "/p/data".into());
-        plugin.options.push(crate::skills::PluginOption { key: "token".into(), value: "t0k".into(), sensitive: true });
+        plugin.options.push(crate::extensions::skills::PluginOption { key: "token".into(), value: "t0k".into(), sensitive: true });
         let events = json!({
             "UserPromptSubmit": [{"hooks": [
                 {"type": "command", "command": "echo \"${CLAUDE_PLUGIN_ROOT}/x $CLAUDE_PLUGIN_ROOT ${user_config.token}\"", "timeout": 5},

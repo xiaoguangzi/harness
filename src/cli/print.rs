@@ -7,12 +7,12 @@ use super::parse::{BUILTINS, help_keys};
 use super::{Output, output, text};
 use super::style::{ACCENT, BOLD, CYAN, DIM, GRAY, GREEN, RED, YELLOW};
 use crate::agent::Agent;
+use crate::extensions::mcp;
+use crate::extensions::plugins::Plugins;
+use crate::extensions::skills::Skill;
 use crate::llm;
-use crate::mcp;
-use crate::permissions::Permissions;
-use crate::plugins::Plugins;
+use crate::security::permissions::Permissions;
 use crate::setup::Env;
-use crate::skills::Skill;
 use crate::subagent::AgentDef;
 use crate::tools::ToolRegistry;
 
@@ -35,7 +35,7 @@ pub(super) fn banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {
     };
     let effort = out.paint(DIM, &format!(" · {} effort", agent.client().effort().as_str()));
     out.line(format!("{} {}{effort}", out.paint(ACCENT, "✻ harness"), out.paint(BOLD, agent.model())));
-    let sandboxed = if crate::sandbox::active().is_some() { " · sandboxed" } else { "" };
+    let sandboxed = if crate::security::sandbox::active().is_some() { " · sandboxed" } else { "" };
     let tools = agent.tools().names().count();
     out.note(format!("  {cwd} · {tools} tools · {} skills · {servers}{plugins}{sandboxed}", skills.len()));
     out.note("  / for commands · @ for files · Ctrl+O for transcript · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt");
@@ -76,7 +76,7 @@ pub(super) fn tools(out: &Output, tools: &ToolRegistry) {
 }
 
 pub(super) fn sandbox(out: &Output) {
-    let Some(sandbox) = crate::sandbox::active() else {
+    let Some(sandbox) = crate::security::sandbox::active() else {
         out.line("the sandbox is off; start with --sandbox, HARNESS_SANDBOX=1 or \"sandbox\": {\"enabled\": true} in ~/.harness/settings.json");
         return;
     };

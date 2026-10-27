@@ -91,7 +91,7 @@ impl Tool for ReadTool {
         };
         input.path = super::workdir::resolve(&input.path);
 
-        if let Some(sandbox) = crate::sandbox::active()
+        if let Some(sandbox) = crate::security::sandbox::active()
             && let Err(e) = sandbox.check_read(input.path.as_ref())
         {
             return ToolOutput::error(e);
