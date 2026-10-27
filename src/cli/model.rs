@@ -166,7 +166,7 @@ impl Picker {
         }
         rows.push(row(format!("Effort: {effort}")));
         let help = match self.pending.effort_override() {
-            Some(effort) => format!("{} · {}", effort.as_str(), super::effort_help(effort)),
+            Some(effort) => format!("{} · {}", effort.as_str(), super::parse::effort_help(effort)),
             None => format!("auto → {} · uses each model's configured effort", preview.effort().as_str()),
         };
         rows.push(row(paint("2", &help)));

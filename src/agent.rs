@@ -927,7 +927,6 @@ impl Agent {
     }
 }
 
-/// The prompt in a user message's `content`: its last text block.
 /// Whether the call of `name` with `input` may run: what the permission
 /// rules and mode say, after PreToolUse hooks (`check`), and if they say to
 /// ask, PermissionRequest hooks or the user. `Err` is what the model is
@@ -963,6 +962,7 @@ pub fn is_timestamp(block: &Value) -> bool {
     block["type"] == "text" && block["text"].as_str().is_some_and(|t| t.starts_with(TIMESTAMP_START))
 }
 
+/// The prompt in a user message's `content`: its last text block.
 fn prompt_text(content: &[Value]) -> String {
     let text = content.iter().rev().find(|b| b["type"] == "text").and_then(|b| b["text"].as_str());
     text.unwrap_or_default().to_string()

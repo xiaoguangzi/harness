@@ -87,7 +87,7 @@ impl ReplHelper {
             };
             if out.question_key(&key) || out.tool_output_key(&key) { continue; }
             if key == Key::PasteImage {
-                super::paste_clipboard(out);
+                super::turn::paste_clipboard(out);
                 continue;
             }
             let action = out.edit_input(|t| {
