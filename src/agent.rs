@@ -1,27 +1,28 @@
 //! The agent loop: send the conversation, run any requested tools, send the
 //! results back, and repeat until the model ends its turn.
 
+mod calls;
 mod compact;
 mod deferred;
+mod inbox;
 mod usage;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde_json::{Value, json};
-use tokio::sync::Notify;
 
 use crate::checkpoint::FileHistory;
 use crate::hooks::{self, Event, Hooks, Outcome};
-use crate::llm::{Client, Message, StreamEvent, Usage};
-use crate::permissions::{Decision, Mode, Permissions, Request};
+use crate::llm::{Client, Message, Response, StreamEvent, ToolDef, Usage};
+use crate::permissions::{Mode, Permissions};
 use crate::subagent::Subagents;
 use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
 
 pub use compact::{is_compacted, set_idle as set_idle_compaction};
+pub use inbox::Inbox;
 #[cfg(test)]
 pub(crate) use compact::tests as mock;
 pub use usage::UsageLog;
@@ -83,135 +84,6 @@ pub trait Observer: Send {
     fn on_hook(&mut self, _message: &str) {}
     /// Empty when no tool is waiting; otherwise the task IDs being awaited.
     fn on_waiting(&mut self, _tasks: &[String]) {}
-}
-
-/// Messages for the model that arrive from elsewhere while it works or
-/// waits: a background subagent's report for the main agent, a follow-up
-/// for a subagent, a message the user typed while a turn ran. The loop
-/// hands over what has arrived with its next request; a frontend starts a
-/// turn for them when the agent is idle.
-#[derive(Default)]
-pub struct Inbox {
-    queue: Mutex<Queue>,
-    arrived: Notify,
-    /// Called after each push that wants a turn.
-    on_wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-}
-
-#[derive(Default)]
-struct Queue {
-    entries: Vec<Entry>,
-    next_id: u64,
-}
-
-struct Entry {
-    id: u64,
-    blocks: Vec<Value>,
-    /// Whether it should start a turn of its own, rather than wait for the
-    /// next one.
-    wake: bool,
-    completion: Option<String>,
-}
-
-impl Inbox {
-    /// Queues `text` for the model. With `wake`, an idle agent should run a
-    /// turn for it; otherwise it goes along with the next one.
-    pub fn push(&self, text: String, wake: bool) {
-        self.push_content(vec![json!({"type": "text", "text": text})], wake);
-    }
-
-    /// Queues content blocks for the model, like [`Inbox::push`]; returns
-    /// an id to follow them by.
-    pub fn push_content(&self, blocks: Vec<Value>, wake: bool) -> u64 {
-        self.enqueue(blocks, wake, None)
-    }
-
-    pub fn push_completion(&self, key: String, text: String) {
-        self.enqueue(vec![json!({"type": "text", "text": text})], true, Some(key));
-    }
-
-    /// Explicitly collected results must not also wake a later turn.
-    pub fn acknowledge(&self, key: &str) {
-        self.queue.lock().unwrap().entries.retain(|e| e.completion.as_deref() != Some(key));
-    }
-
-    pub async fn input_wanted(&self) {
-        loop {
-            let arrived = self.arrived.notified();
-            tokio::pin!(arrived);
-            arrived.as_mut().enable();
-            if self.queue.lock().unwrap().entries.iter().any(|e| e.wake && e.completion.is_none()) { return; }
-            arrived.await;
-        }
-    }
-
-    fn enqueue(&self, blocks: Vec<Value>, wake: bool, completion: Option<String>) -> u64 {
-        let deferred = completion.is_some();
-        let id = {
-            let mut queue = self.queue.lock().unwrap();
-            let id = queue.next_id;
-            queue.next_id += 1;
-            queue.entries.push(Entry { id, blocks, wake, completion });
-            id
-        };
-        if wake {
-            self.arrived.notify_waiters();
-            let hook = self.on_wake.lock().unwrap().clone();
-            if let Some(hook) = hook {
-                // Completion is published under the task state lock. Invoke
-                // frontend hooks outside that lock to avoid lock inversion.
-                if deferred { tokio::spawn(async move { hook(); }); } else { hook(); }
-            }
-        }
-        id
-    }
-
-    /// Whether something waiting wants a turn.
-    pub fn wants_turn(&self) -> bool {
-        self.queue.lock().unwrap().entries.iter().any(|e| e.wake)
-    }
-
-    /// Whether what was pushed as `id` still waits, not yet taken.
-    pub fn waiting(&self, id: u64) -> bool {
-        self.queue.lock().unwrap().entries.iter().any(|e| e.id == id)
-    }
-
-    /// Takes back what was pushed as `id`, if it still waits.
-    pub fn withdraw(&self, id: u64) -> bool {
-        let mut queue = self.queue.lock().unwrap();
-        let before = queue.entries.len();
-        queue.entries.retain(|e| e.id != id);
-        queue.entries.len() < before
-    }
-
-    pub fn clear(&self) {
-        self.take();
-    }
-
-    /// Takes everything waiting.
-    pub fn take(&self) -> Vec<Value> {
-        let entries = std::mem::take(&mut self.queue.lock().unwrap().entries);
-        entries.into_iter().flat_map(|e| e.blocks).collect()
-    }
-
-    /// Sets what to call when something arrives that wants a turn, such
-    /// as starting one in a frontend.
-    pub fn on_wake(&self, hook: impl Fn() + Send + Sync + 'static) {
-        *self.on_wake.lock().unwrap() = Some(Arc::new(hook));
-    }
-
-    /// Resolves once something waiting wants a turn.
-    pub async fn wanted(&self) {
-        loop {
-            let arrived = self.arrived.notified();
-            tokio::pin!(arrived);
-            arrived.as_mut().enable();
-            if self.wants_turn() {
-                return;
-            }
-            arrived.await;
-        }
-    }
 }
 
 pub struct Agent {
@@ -740,26 +612,7 @@ impl Agent {
             }
             self.compact_if_full(&definitions, observer).await?;
             self.session_hooks(observer).await;
-            observer.on_request_start();
-            let (log, model) = (&self.usage, self.client.spec());
-            let mut on_event = |event: StreamEvent| match event {
-                StreamEvent::TextDelta(text) => observer.on_text_delta(text),
-                StreamEvent::TextEnd => observer.on_text_end(),
-                StreamEvent::ThinkingDelta(text) => observer.on_thinking_delta(text),
-                StreamEvent::ToolInputStart(name) => observer.on_tool_input_start(name),
-                StreamEvent::ToolInputDelta(json) => observer.on_tool_input_delta(json),
-                StreamEvent::PartialUsage(usage) => {
-                    log.record(model, &usage);
-                    observer.on_usage(&usage);
-                }
-                StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
-            };
-            let response =
-                self.client.create(&self.system, &definitions, &self.messages, &mut on_event).await?;
-            if let Some(usage) = &response.usage {
-                self.usage.record(self.client.spec(), usage);
-                observer.on_usage(usage);
-            }
+            let response = self.request(&definitions, observer).await?;
             let stop_reason = response.stop_reason.as_deref().unwrap_or("");
 
             if stop_reason == "refusal" {
@@ -771,12 +624,6 @@ impl Agent {
             let tool_uses: Vec<Value> =
                 content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
             self.messages.push(Message { role: "assistant", content, source: Some(self.client.spec().to_string()) });
-            // A fork starts from the conversation as it is now.
-            let forks = tool_uses.iter().any(|t| t["name"] == "agent" && t["input"]["agent_type"] == crate::subagent::FORK);
-            if forks {
-                let (system, tools, messages) = (self.system.clone(), self.tools.clone(), self.messages.clone());
-                self.subagents.set_fork_base(Some(crate::subagent::ForkBase { system, tools, messages }));
-            }
             if let Some(usage) = &response.usage {
                 self.context = Some((self.messages.len(), usage.input_tokens + usage.output_tokens));
             }
@@ -798,163 +645,59 @@ impl Agent {
                 // Something arrived while the model was answering: it
                 // carries on with that rather than end the turn.
                 _ if self.inbox.wants_turn() => continue,
-                _ => {
-                    // A Stop hook may send the model back to work.
-                    let last = self.last_text(self.messages.len() - 1);
-                    let outcome = self.hooks.stop(stop_hook_active, &last, self.client.spec()).await;
-                    show_notices(&outcome, observer);
-                    let event = self.hooks.stop_event();
-                    match (outcome.halt, outcome.block) {
-                        (None, Some(reason)) => {
-                            observer.on_hook(&format!("{} hook: {reason}", event.as_str()));
-                            let feedback = json!({"type": "text", "text": hooks::feedback(event, &reason)});
-                            self.messages.push(Message::user(vec![feedback]));
-                            stop_hook_active = true;
-                            continue;
-                        }
-                        _ => return Ok(()),
-                    }
-                }
+                // A Stop hook may send the model back to work.
+                _ if self.stop_hooks(&mut stop_hook_active, observer).await => continue,
+                _ => return Ok(()),
             }
 
-            // PreToolUse hooks see every call first; they may refuse one or
-            // change its input.
-            let invalid = &response.invalid_tool_inputs;
-            let (tools, hooks, model, permissions) = (&self.tools, &self.hooks, self.client.spec(), &*self.permissions);
-            let checks = join_all(tool_uses.iter().map(|t| async {
-                let id = t["id"].as_str().unwrap_or("");
-                if invalid.contains_key(id) {
-                    return Outcome::default();
-                }
-                hooks.pre_tool_use(t["name"].as_str().unwrap_or(""), id, &t["input"], model).await
-            }))
-            .await;
-            for (t, check) in tool_uses.iter().zip(&checks) {
-                let input = check.updated_input.as_ref().unwrap_or(&t["input"]);
-                observer.on_tool_call_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), input);
-                show_notices(check, observer);
-            }
-            // Run all tool calls from this response concurrently, then send
-            // every result back in a single user message. A call whose
-            // streamed input was not valid JSON is not run; the model gets
-            // the raw text back so it can retry.
-            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut calls: FuturesUnordered<_> = tool_uses.iter().zip(checks).enumerate().map(|(i, (t, check))| {
-                let tx = progress_tx.clone();
-                async move {
-                    let output = crate::tools::progress::scope(t["id"].as_str().unwrap_or("").to_string(), tx, async move {
-                        let (id, name) = (t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""));
-                        if let Some(raw) = invalid.get(id) {
-                            return (ToolOutput::error(json!({"INVALID_JSON": raw}).to_string()), check, None);
-                        }
-                        if let Some(reason) = &check.block {
-                            let text = hooks::feedback(Event::PreToolUse, &format!("The call was blocked: {reason}"));
-                            return (ToolOutput::error(text), check, None);
-                        }
-                        if check.halt.is_some() {
-                            return (ToolOutput::error("The call was not run: a hook stopped the turn"), check, None);
-                        }
-                        let input = check.updated_input.clone().unwrap_or_else(|| t["input"].clone());
-                        if let Err(reason) = permitted(permissions, tools, hooks, name, &input, &check, model).await {
-                            return (ToolOutput::error(reason), check, None);
-                        }
-                        let mut out = tools.run(name, input.clone()).await;
-                        let post = hooks.post_tool_use(name, id, &input, &out, model).await;
-                        let event = if out.is_error { Event::PostToolUseFailure } else { Event::PostToolUse };
-                        if let Some(text) = &post.updated_output {
-                            out.content = text.clone();
-                        }
-                        let added = check.context.iter().map(|c| hooks::feedback(Event::PreToolUse, c));
-                        let added = added.chain(post.block.iter().chain(&post.context).map(|c| hooks::feedback(event, c)));
-                        for text in added {
-                            out.content.truncate(out.content.trim_end().len());
-                            out.content.push_str(&format!("\n\n{text}"));
-                        }
-                        (out, check, Some(post))
-                    }).await;
-                    (i, output)
-                }
-            }).collect();
-            drop(progress_tx);
-            let mut outputs: Vec<_> = (0..tool_uses.len()).map(|_| None).collect();
-            let mut waiting = std::collections::BTreeMap::new();
-            let mut progress_open = true;
-            while !calls.is_empty() {
-                tokio::select! {
-                    event = progress_rx.recv(), if progress_open => match event {
-                        Some((id, tasks)) => {
-                            if tasks.is_empty() { waiting.remove(&id); } else { waiting.insert(id, tasks); }
-                            let tasks: Vec<String> = waiting.values().flatten().cloned().collect();
-                            observer.on_waiting(&tasks);
-                        }
-                        None => progress_open = false,
-                    },
-                    Some((i, output)) = calls.next() => {
-                        let t = &tool_uses[i];
-                        observer.on_tool_result_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), &output.0);
-                        if let Some(post) = &output.2 { show_notices(post, observer); }
-                        outputs[i] = Some(output);
-                    }
-                }
-            }
-            observer.on_waiting(&[]);
-            if forks {
-                self.subagents.set_fork_base(None);
-            }
-
-            let mut results = Vec::with_capacity(outputs.len());
-            let mut halt = None;
-            for (t, output) in tool_uses.iter().zip(outputs) {
-                let (out, check, post) = output.unwrap();
-                halt = halt.or(check.halt).or(post.and_then(|p| p.halt));
-                results.push(json!({
-                    "type": "tool_result",
-                    "tool_use_id": t["id"],
-                    "content": out.to_result_content(),
-                    "is_error": out.is_error,
-                }));
-            }
-            // A hook said to stop (`continue: false`): the turn ends here.
-            if let Some(reason) = halt {
-                let reason = if reason.is_empty() { String::new() } else { format!(": {reason}") };
-                observer.on_hook(&format!("A hook stopped the turn{reason}"));
-                results.push(json!({"type": "text", "text": format!("[Stopped by a hook{reason}]")}));
-                self.messages.push(Message::user(results));
+            let (results, halted) = self.run_calls(&tool_uses, &response.invalid_tool_inputs, observer).await;
+            self.messages.push(Message::user(results));
+            if halted {
                 return Ok(());
             }
-            self.messages.push(Message::user(results));
         }
     }
-}
 
-/// Whether the call of `name` with `input` may run: what the permission
-/// rules and mode say, after PreToolUse hooks (`check`), and if they say to
-/// ask, PermissionRequest hooks or the user. `Err` is what the model is
-/// told when it does not run.
-async fn permitted(
-    permissions: &Permissions,
-    tools: &ToolRegistry,
-    hooks: &Hooks,
-    name: &str,
-    input: &Value,
-    check: &Outcome,
-    model: &str,
-) -> Result<(), String> {
-    let reason = match permissions.decide(name, tools.get(name).map(|t| t.as_ref()), input, check.permission.as_ref()) {
-        Decision::Allow => return Ok(()),
-        Decision::Deny(reason) => return Err(reason),
-        Decision::Ask(reason) => reason,
-    };
-    let suggestion = crate::permissions::suggestion(name, input);
-    let hooked = hooks.permission_request(name, input, &suggestion, model).await;
-    if let Some(reason) = hooked.block {
-        return Err(format!("A PermissionRequest hook denied this call: {reason}"));
+    /// Sends the conversation, streaming what comes back to `observer`, and
+    /// counts the tokens it took.
+    async fn request(&self, definitions: &[ToolDef], observer: &mut dyn Observer) -> Result<Response> {
+        observer.on_request_start();
+        let (log, model) = (&self.usage, self.client.spec());
+        let mut on_event = |event: StreamEvent| match event {
+            StreamEvent::TextDelta(text) => observer.on_text_delta(text),
+            StreamEvent::TextEnd => observer.on_text_end(),
+            StreamEvent::ThinkingDelta(text) => observer.on_thinking_delta(text),
+            StreamEvent::ToolInputStart(name) => observer.on_tool_input_start(name),
+            StreamEvent::ToolInputDelta(json) => observer.on_tool_input_delta(json),
+            StreamEvent::PartialUsage(usage) => {
+                log.record(model, &usage);
+                observer.on_usage(&usage);
+            }
+            StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
+        };
+        let response = self.client.create(&self.system, definitions, &self.messages, &mut on_event).await?;
+        if let Some(usage) = &response.usage {
+            self.usage.record(self.client.spec(), usage);
+            observer.on_usage(usage);
+        }
+        Ok(response)
     }
-    if hooked.permission == Some(crate::permissions::HookDecision::Allow) {
-        return Ok(());
+
+    /// Runs the Stop hooks as the model ends its turn; true if one sends it
+    /// back to work, with its reason added to the history. `active` says
+    /// whether one did already in this turn.
+    async fn stop_hooks(&mut self, active: &mut bool, observer: &mut dyn Observer) -> bool {
+        let last = self.last_text(self.messages.len() - 1);
+        let outcome = self.hooks.stop(*active, &last, self.client.spec()).await;
+        show_notices(&outcome, observer);
+        let event = self.hooks.stop_event();
+        let (None, Some(reason)) = (outcome.halt, outcome.block) else { return false };
+        observer.on_hook(&format!("{} hook: {reason}", event.as_str()));
+        let feedback = json!({"type": "text", "text": hooks::feedback(event, &reason)});
+        self.messages.push(Message::user(vec![feedback]));
+        *active = true;
+        true
     }
-    let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestion, agent: hooks.subagent_label() };
-    permissions.ask(request).await
 }
 
 /// Whether `block` is the time [`Agent`] noted for a user's message.
