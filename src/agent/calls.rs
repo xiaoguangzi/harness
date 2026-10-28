@@ -139,7 +139,9 @@ impl Agent {
             return Ran::refused(ToolOutput::error(reason), check);
         }
         let model = self.client.spec();
-        let mut output = self.tools.run(name, input.clone()).await;
+        let mut output = crate::tools::question::scope(
+            self.permissions.asker(), self.hooks.subagent_label(), self.tools.run(name, input.clone()),
+        ).await;
         let post = self.hooks.post_tool_use(name, id, &input, &output, model).await;
         let event = if output.is_error { Event::PostToolUseFailure } else { Event::PostToolUse };
         if let Some(text) = &post.updated_output {

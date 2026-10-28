@@ -23,6 +23,13 @@ const OTHER_NOTES_LIMIT: usize = 20_000;
 /// How to use each built-in tool, in the order they are listed.
 const GUIDANCE: &[(&str, &str)] = &[
     (
+        "ask_user_question",
+        "ask an important choice or missing requirement through an interactive panel, then continue with the user's answer. \
+         Prefer this to ending your reply with a list of choices. Give distinct options and their tradeoffs, recommended first; \
+         custom text is always available. Make routine implementation decisions yourself. Do not batch dependent actions with \
+         the question. If cancelled or unavailable, never assume consent or immediately repeat the call; explain what is still needed.",
+    ),
+    (
         "read",
         "view a file with line numbers. Read the code you are about to change or explain; page \
          through large files with `offset` and `limit`. It also shows you images and PDFs, such as \
@@ -96,7 +103,7 @@ const GUIDANCE: &[(&str, &str)] = &[
 ];
 
 /// Claude Code tools the harness has no counterpart of.
-const MISSING: &str = "`WebFetch`, `WebSearch`, `TodoWrite`, `NotebookEdit`, `AskUserQuestion`";
+const MISSING: &str = "`WebFetch`, `WebSearch`, `TodoWrite`, `NotebookEdit`";
 
 /// The main agent's system prompt, for the tools in `tools`.
 pub fn main(tools: &ToolRegistry) -> String {
@@ -155,7 +162,7 @@ fn claude_code_names(tools: Vec<&str>) -> String {
         .collect();
     format!(
         "Skills, commands and agents written for Claude Code name its tools; here {}. {MISSING} have no \
-         counterpart: do without them, and ask the user in your reply rather than through a tool.",
+         counterpart: do without them. For questions, use `ask_user_question` when available.",
         pairs.join(", ")
     )
 }

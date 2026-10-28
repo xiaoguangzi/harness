@@ -117,12 +117,26 @@ impl TerminalAsker {
 
 #[async_trait]
 impl Asker for TerminalAsker {
+    async fn question(&self, request: &crate::tools::question::Request, agent: Option<&str>) -> Option<crate::tools::question::Answer> {
+        if !self.out.keys_routed() { return None; }
+        let _turn = self.turn.lock().await;
+        if !self.out.keys_routed() { return None; }
+        struct Close<'a>(&'a Output);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) { self.0.set_user_question(None); }
+        }
+        let (tx, rx) = oneshot::channel();
+        self.out.set_user_question(Some(super::question::Question::new(request.clone(), agent.map(str::to_owned), tx)));
+        let _close = Close(&self.out);
+        rx.await.ok()
+    }
+
     async fn ask(&self, request: &Request) -> Option<Answer> {
         if !self.out.keys_routed() {
             return None;
         }
         self.waiting.fetch_add(1, Ordering::SeqCst);
-        let turn = self.turn.lock().await;
+        let _turn = self.turn.lock().await;
         let waiting = self.waiting.fetch_sub(1, Ordering::SeqCst) - 1;
         // Closed when answered, or when the call that asks is dropped.
         struct Close<'a>(&'a Output);
@@ -135,7 +149,6 @@ impl Asker for TerminalAsker {
         self.out.set_question(Some(Question::new(request, waiting, tx)));
         let _close = Close(&self.out);
         let chosen = rx.await.ok();
-        drop(turn);
         match chosen? {
             0 => Some(Answer::Allow),
             1 => Some(Answer::AllowAlways),

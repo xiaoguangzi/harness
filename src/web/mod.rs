@@ -152,6 +152,7 @@ pub async fn serve(addr: &str, setup: Setup) -> Result<()> {
         .route("/api/tasks/{id}/subagents", get(list_subagents))
         .route("/api/tasks/{id}/subagents/{agent_id}/stop", post(stop_subagent))
         .route("/api/tasks/{id}/permissions/{question}", post(answer_permission))
+        .route("/api/tasks/{id}/questions/{question}", post(answer_question))
         .route("/api/tasks/{id}/checkpoints", get(list_checkpoints))
         .route("/api/tasks/{id}/rewind", post(rewind_task))
         .route("/api/sessions", get(list_sessions))
@@ -519,6 +520,18 @@ async fn answer_permission(
         other => return Err(bad_request(format!("unknown answer `{other}` (allow, always or deny)"))),
     };
     if !task.answer(question, answer) {
+        return Err(api_error(StatusCode::NOT_FOUND, "nothing waits for that answer"));
+    }
+    Ok(Json(json!({"answered": question})))
+}
+
+async fn answer_question(
+    State(state): State<Shared>,
+    Path((id, question)): Path<(u64, u64)>,
+    Json(answer): Json<crate::tools::question::Answer>,
+) -> ApiResult<Json<Value>> {
+    let task = find_task(&state, id)?;
+    if !task.answer_question(question, answer).map_err(bad_request)? {
         return Err(api_error(StatusCode::NOT_FOUND, "nothing waits for that answer"));
     }
     Ok(Json(json!({"answered": question})))

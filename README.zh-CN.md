@@ -108,6 +108,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `POST /api/tasks/{id}/messages` `{prompt}`、`/model` `{model}`、`/cancel`；`DELETE /api/tasks/{id}` | 驱动任务 |
 | `GET /api/tasks/{id}/subagents`、`POST /api/tasks/{id}/subagents/{agent_id}/stop` | 列出 / 停止该任务的子代理 |
 | `POST /api/tasks/{id}/permissions/{question}` `{answer, message?}`、`/mode` `{mode}` | 回答 `permission` 事件（`allow`、`always`、`deny`），或设置该任务的[权限模式](#权限) |
+| `POST /api/tasks/{id}/questions/{question}` `{status, index?, text?}` | 回答 `user_question` 事件：`selected` 加从 0 开始的 index，`custom` 加 text，或 `cancelled`；结束后发出 `user_question_answered`，带 `status`（`selected`、`custom`、`cancelled`，调用已不在时为 `dropped`）和 `answer` |
 | `GET /api/tasks/{id}/events` | server-sent events：先回放该任务的日志，再实时推送（可通过 `Last-Event-ID` 恢复）；`reset` 事件表示之前的内容不再显示（回退之后） |
 | `GET /api/tasks/{id}/checkpoints`、`POST /api/tasks/{id}/rewind` `{message, code, conversation}` | 任务可以回到的提示，以及执行回退 |
 | `GET /api/sessions`、`POST /api/sessions/{id}/resume` | 这个目录下保存的会话，以及在任务中继续其中一个 |
@@ -205,6 +206,8 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 交互式终端启动后会占满当前屏幕，对话从顶部开始，shell 和对话输出保留在终端原生滚动历史中。输入框夹在两条横线之间，在等待输入和模型运行期间都固定在底部；命令和文件菜单在输入框下方展开，输入框会向上让出空间。文本换行、光标、菜单和窗口缩放由同一个渲染器处理，设置 `NO_COLOR` 也只关闭颜色，仍保留布局。终端 Reset 或 Clear Buffer 后，下一次编辑、缩放或运行状态刷新会恢复布局。模型工作时输入的内容会进入这个输入框：按 Enter 后，这条消息列在输入框上方，直到模型在下一次请求中拿到它（跟在当时正在运行的工具调用结果之后；如果模型正在写回答，它会继续而不是结束本轮），之后它显示在会话中。`@路径` 提及、Ctrl+V 以及命令和文件菜单在这里同样可用；历史只在提示符处可用。不改动对话的 `/命令` 会立即在本轮旁边执行，与 Claude Code 一样：`/model`、`/effort`、`/permissions`、`/help`、`/skills`、`/tools`、`/mcp`、`/agents`、`/tasks`、`/stop` 和 `/sandbox`（未知命令也会立即提示）。它们的面板显示在输入框的位置，本轮期间结束时面板仍保持打开；此时选定的模型或 effort 从下一条消息开始使用，一轮内的请求始终使用同一个模型。其他命令（`/clear`、`/compact`、`/rewind`、`/usage`、`!命令`、技能等）会等本轮结束再执行。想改主意时，在输入框第一行按 ↑（有排队消息时空输入框会给出提示）：模型尚未拿到的消息会回到输入框中、排在你已输入的内容之前，可以修改后重新发送，与 Claude Code 一样。如果中断本轮，模型尚未拿到的消息会回到输入框中；本轮结束后，输入框里剩下的内容仍会保留在提示符中。
 
 每个已完成的工具调用会与自己的结果相邻显示，同一批并发调用多次使用同名工具也能明确对应。正常对话默认只显示简短预览。按 Ctrl+O 或执行 `/output`，可连续浏览展开的整段会话：用户问题、思考、回复和所有保留的工具结果放在一起，命令下方直接显示输出。按 `i` 或 Tab 显示/隐藏完整 JSON 输入与 Call ID；↑/↓ 或 `j`/`k` 逐行滚动，PgUp/PgDn 或空格/`b` 翻页，Home/End 或 `g`/`G` 跳到开头/末尾，按 `/` 输入关键词并回车搜索，`n`/`N` 查找下一处/上一处。搜索输入中 Esc 取消搜索；其他时候 Esc、`q` 或 Ctrl+O 关闭视图。打开时定位到底部并跟随新输出，向上滚动后暂停跟随，按 `G` 恢复；操作提示固定在屏幕底部。模型运行期间同样可用，不会提交或丢弃输入草稿。`/resume` 恢复已保存的会话内容，`/clear` 清空视图。完整文本仍受工具自身的输出上限约束，例如 `bash` 最多返回 30,000 字节（见[大输出](#大输出)）；图片和文档附件在此文本视图中只显示说明。
+
+模型遇到重要选择或缺失的需求时，可以调用 `ask_user_question`，让你直接选择后继续当前任务。交互式 REPL 会用问题面板替换输入框：先是问题，然后是带编号的选项，说明显示在各自标签下方，最后一项（“Type something.”）用于自定义回答。↑/↓ 或 Tab 切换选项，Enter 提交，直接打字切到自定义回答；回答之后显示在会话中该调用的下方（`⎿ Answered: …`）；Esc 取消且不做选择，Ctrl+C 中断当前轮。长问题和说明用 PgUp/PgDn 滚动查看，原来未发送的草稿会保留。每次工具调用问一个问题，提供 2–6 个选项，或者只收自由文本；始终可以自定义回答。终端把同时到达的问题（包括子代理的问题）逐个显示。Web UI 在会话中把问题显示为一张卡片：带编号的选项及其说明，加一个用于自定义回答的“其他回答”输入框（按 1–N 选择，Enter 提交）；回答后卡片只保留问题和答案。刷新页面后仍可回答等待中的问题。此功能独立于工具审批，默认 `bypassPermissions` 和规划模式下均可用。一次性/JSON 运行或重定向输入时立即返回 `unavailable`，由模型在回复里说明问题；取消或无法交互都不代表同意。
 
 交互面板按终端可用宽度展开，使用标题和留白，不绘制边框或分隔线；宽度足够时每项的说明显示在名称旁边，放不下时在列表下方完整显示选中项的说明。无参数的选择类命令会打开键盘交互面板：`/effort`、`/resume`、`/rewind`、`/tasks`、`/stop`、`/provider` 和 `/plugins`。↑/↓ 选择，输入文字筛选，Enter 继续，Esc 取消或返回。`/help` 和 `/skills` 可将选中的命令填入输入框，便于补充参数后执行。`/tools`、`/agents`、`/mcp`、`/usage` 和 `/sandbox` 提供可搜索的只读详情面板；Tab 展开完整详情，↑/↓ 滚动，Tab/Esc 返回。没有可显示的任务时 `/stop` 和 `/tasks` 只给出提示；`/rewind` 仅在代码有改动且可以恢复时提供恢复代码的选项。带参数的命令和重定向输入保留原来的行为；`/clear`、`/compact`、`/init`、`/reload-plugins` 和 `/exit` 继续直接执行。
 
@@ -657,7 +660,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/setup.rs` — 会话由什么构成：插件及其技能、代理、hook、MCP 与语言服务器（由 `/reload-plugins` 重建）、用户的 MCP 服务器、工具集和系统提示词；`--check-plugins`；后台自动更新
 - `src/util.rs` — 共享的小工具：`~/.harness` 的位置、`${VAR}` 展开、JSON 合并、截短文本与时长、`--bare`、工作目录锁
 - `src/settings.rs` — 配置文件：位置、`--settings`、解析为各个部分、原地修改
-- `src/cli/` — 终端前端：启动与 REPL 主循环（`mod.rs`）、一次性模式（`one_shot.rs`）、内置命令及输入行的解析（`parse.rs`）、运行一轮并在其下保留输入框（`turn.rs`）、选择、恢复（并重新显示其结尾）和保存会话（`sessions.rs`）、命令逐行打印的内容（`print.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`!命令`、`/btw`、`/copy` 和 `/export`（`actions.rs`）、询问工具调用（`approve.rs`）、状态栏（`status_line.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）、各个无参数命令在面板中显示的内容及在一轮运行期间执行命令（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、共享的标准输出句柄，让旋转指示器和输入框始终画在输出下方（`output.rs`）、实时显示一轮的进度（`terminal.rs`）、工具调用及其结果的显示方式（`calls.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、在调用下方以带行号的 diff 显示文件改动（`diff.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、着色用的具名颜色与样式（`style.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
+- `src/cli/` — 终端前端：启动与 REPL 主循环（`mod.rs`）、一次性模式（`one_shot.rs`）、内置命令及输入行的解析（`parse.rs`）、运行一轮并在其下保留输入框（`turn.rs`）、选择、恢复（并重新显示其结尾）和保存会话（`sessions.rs`）、命令逐行打印的内容（`print.rs`）、`--output-format json` / `stream-json`（`json.rs`）、`!命令`、`/btw`、`/copy` 和 `/export`（`actions.rs`）、询问工具调用（`approve.rs`）、模型提问面板（`question.rs`）、状态栏（`status_line.rs`）、`/rewind`（`rewind.rs`）、斜杠命令打开的键盘面板（`dialog.rs`）、各个无参数命令在面板中显示的内容及在一轮运行期间执行命令（`commands.rs`）、设置模型和 effort 的 `/model` 面板（`model.rs`）、共享的标准输出句柄，让旋转指示器和输入框始终画在输出下方（`output.rs`）、实时显示一轮的进度（`terminal.rs`）、工具调用及其结果的显示方式（`calls.rs`）、保留工具返回结果（`tool_output.rs`）、可搜索的展开会话视图（`transcript.rs`）、一轮运行期间的输入框：其文本、渲染和排队的消息（`input.rs`）、一轮运行期间读取的按键：Esc 和编辑输入框（`keys.rs`）、在调用下方以带行号的 diff 显示文件改动（`diff.rs`）、流式 Markdown 渲染（`markdown.rs`）、显示宽度辅助（`text.rs`）、着色用的具名颜色与样式（`style.rs`）、提示符下方的菜单：命令、项目文件搜索（`menu.rs`）、共享屏幕布局与原生滚动历史（`screen.rs`）、提示符输入、菜单按键、补全、历史、多行输入、Ctrl+V 粘贴和 Esc Esc（`repl.rs`）、从剪贴板读取图片或复制的文件（`clipboard.rs`）
 - `src/web/` — web 前端（`--web`）：axum 服务器与 JSON/SSE API（`mod.rs`）、后台任务及其事件日志（`tasks.rs`）、单页 UI（`index.html`，内嵌于二进制）
 - `src/agent/` — 代理循环：请求 → 运行工具 → 发送结果 → 循环直到 `end_turn`，以及一轮前后的 hook、失败或取消后对历史的修复 (`mod.rs`)
   - `calls.rs` — 一次响应中的工具调用：PreToolUse hook、权限、并发运行、PostToolUse hook，按调用顺序汇总结果
@@ -695,6 +698,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
   - `edit.rs` — 把文件中一段精确且唯一的文本替换掉（`replace_all` 则替换全部出现），修改的开销只取决于改动本身；与 `write` 相同的先读规则，同一次回复中对同一文件的多个修改按顺序生效
   - `write.rs` — 创建或覆盖文件；已存在的文件必须先被读取且此后未被修改
   - `scheduling.rs` — 共享工作区、文件及显式资源的执行锁
+  - `question.rs` — `ask_user_question`：校验问题与回答，路由到会话前端
   - `progress.rs` — 交给 CLI 和 Web 的工具等待事件
   - `wait.rs` — 等待一个或多个后台命令、子代理
   - `snapshot.rs` — 登录 Shell 的环境，启动时为模型执行的命令采集一次

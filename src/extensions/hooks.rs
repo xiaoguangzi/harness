@@ -361,6 +361,7 @@ impl Matcher {
 /// Claude Code's names for the built-in tools; the first is the one hooks
 /// see in `tool_name`.
 pub(crate) const ALIASES: &[(&str, &[&str])] = &[
+    ("ask_user_question", &["AskUserQuestion"]),
     ("agent", &["Agent", "Task"]),
     ("bash", &["Bash"]),
     ("bash_output", &["BashOutput"]),

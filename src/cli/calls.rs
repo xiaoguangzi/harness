@@ -31,7 +31,8 @@ fn todo_lines(out: &Output, input: &Value) -> Vec<String> {
 /// A one-line view of a tool call: `bash(cargo test)`, `grep(foo · src)`.
 pub(super) fn call_label(name: &str, input: &Value, max: usize) -> String {
     // The fields that say the most about a call, most telling first.
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 13] = [
+        "question",
         "agent_type", "description", "agent_id", "message", "command", "pattern", "path", "file_path", "glob", "url",
         "query", "name",
     ];
@@ -92,11 +93,34 @@ fn result_lines(name: &str, content: &str, is_error: bool, width: usize) -> Vec<
     if name == "read" && !is_error && lines[0].split_whitespace().next().is_some_and(|n| n.parse::<u64>().is_ok()) {
         return vec![format!("Read {} lines", lines.len())];
     }
+    if name == "ask_user_question" && !is_error && let Some(answer) = answer_lines(content, width) {
+        return answer;
+    }
+    first_lines(&lines, width)
+}
+
+fn first_lines(lines: &[&str], width: usize) -> Vec<String> {
     let mut shown: Vec<String> = lines.iter().take(RESULT_LINES).map(|l| text::fit(l, width)).collect();
     if lines.len() > RESULT_LINES {
         shown.push(format!("… +{} lines", lines.len() - RESULT_LINES));
     }
     shown
+}
+
+/// What the user said to a model's question, rather than the JSON the
+/// model gets.
+fn answer_lines(content: &str, width: usize) -> Option<Vec<String>> {
+    let result: Value = serde_json::from_str(content).ok()?;
+    Some(match result["status"].as_str()? {
+        "answered" => {
+            let answer = format!("Answered: {}", result["answer"].as_str()?);
+            let clean: Vec<String> = answer.lines().map(text::printable).collect();
+            first_lines(&clean.iter().map(|l| l.trim_end()).filter(|l| !l.trim().is_empty()).collect::<Vec<_>>(), width)
+        }
+        "cancelled" => vec!["Dismissed without an answer".to_string()],
+        "unavailable" => vec!["Not asked: no interactive input here".to_string()],
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -127,5 +151,16 @@ mod tests {
         );
         assert_eq!(result_lines("read", "No such file", true, 80), vec!["No such file"]);
         assert_eq!(result_lines("read", "shot.png (image, 12 KB)", false, 80), vec!["shot.png (image, 12 KB)"]);
+    }
+
+    #[test]
+    fn shows_answers_to_questions_not_their_json() {
+        let answered = json!({"status": "answered", "index": 0, "answer": "简单测试即可"}).to_string();
+        assert_eq!(result_lines("ask_user_question", &answered, false, 80), vec!["Answered: 简单测试即可"]);
+        let custom = json!({"status": "answered", "answer": "a\n\nb\nc\nd"}).to_string();
+        assert_eq!(result_lines("ask_user_question", &custom, false, 80), vec!["Answered: a", "b", "c", "… +1 lines"]);
+        let cancelled = json!({"status": "cancelled", "message": "…"}).to_string();
+        assert_eq!(result_lines("ask_user_question", &cancelled, false, 80), vec!["Dismissed without an answer"]);
+        assert_eq!(result_lines("ask_user_question", "bad input", true, 80), vec!["bad input"]);
     }
 }

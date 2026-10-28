@@ -98,6 +98,7 @@ pub struct Task {
     pub permissions: Arc<crate::security::permissions::Permissions>,
     /// Calls waiting for the user's approval, by question id.
     questions: Mutex<std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<Answer>>>,
+    user_questions: Mutex<std::collections::BTreeMap<u64, PendingQuestion>>,
     next_question: std::sync::atomic::AtomicU64,
     /// Where the conversation is saved, as the REPL's are; `None` without
     /// a home directory.
@@ -156,8 +157,34 @@ pub fn history_events(messages: &[crate::llm::Message]) -> Vec<Value> {
 /// the task's log, answered through `answer`.
 struct WebAsker(Weak<Task>);
 
+struct PendingQuestion {
+    request: crate::tools::question::Request,
+    answer: tokio::sync::oneshot::Sender<crate::tools::question::Answer>,
+}
+
 #[async_trait::async_trait]
 impl Asker for WebAsker {
+    async fn question(&self, request: &crate::tools::question::Request, agent: Option<&str>) -> Option<crate::tools::question::Answer> {
+        let task = self.0.upgrade()?;
+        let id = task.next_question.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        task.user_questions.lock().unwrap().insert(id, PendingQuestion { request: request.clone(), answer: tx });
+        task.push(json!({"type": "user_question", "id": id, "request": request, "agent": agent}));
+        drop(task);
+        struct Forget(Weak<Task>, u64);
+        impl Drop for Forget {
+            fn drop(&mut self) {
+                if let Some(task) = self.0.upgrade()
+                    && task.user_questions.lock().unwrap().remove(&self.1).is_some()
+                {
+                    task.push(json!({"type": "user_question_answered", "id": self.1, "status": "dropped"}));
+                }
+            }
+        }
+        let _forget = Forget(self.0.clone(), id);
+        rx.await.ok()
+    }
+
     async fn ask(&self, request: &Request) -> Option<Answer> {
         let task = self.0.upgrade()?;
         let id = task.next_question.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -257,6 +284,7 @@ impl Task {
                 tx: broadcast::channel(1024).0,
                 permissions,
                 questions: Mutex::new(std::collections::BTreeMap::new()),
+                user_questions: Mutex::new(std::collections::BTreeMap::new()),
                 next_question: std::sync::atomic::AtomicU64::new(1),
                 recorder: Mutex::new(recorder),
             }
@@ -332,6 +360,21 @@ impl Task {
         };
         self.push(json!({"type": "permission_answered", "id": id, "answer": name}));
         tx.send(answer).is_ok()
+    }
+
+    pub fn answer_question(&self, id: u64, answer: crate::tools::question::Answer) -> Result<bool, &'static str> {
+        let mut pending = self.user_questions.lock().unwrap();
+        let Some(question) = pending.get(&id) else { return Ok(false) };
+        question.request.validate_answer(&answer)?;
+        let (status, shown) = match &answer {
+            crate::tools::question::Answer::Selected { index } => ("selected", Some(question.request.options[*index].label.clone())),
+            crate::tools::question::Answer::Custom { text } => ("custom", Some(text.clone())),
+            crate::tools::question::Answer::Cancelled {} => ("cancelled", None),
+        };
+        let question = pending.remove(&id).unwrap();
+        drop(pending);
+        self.push(json!({"type": "user_question_answered", "id": id, "status": status, "answer": shown}));
+        Ok(question.answer.send(answer).is_ok())
     }
 
     pub fn summary(&self) -> Value {
@@ -603,6 +646,33 @@ mod tests {
     use crate::llm::Providers;
     use crate::llm::config::tests::{file, no_env};
     use crate::tools::ToolRegistry;
+
+    #[tokio::test]
+    async fn user_questions_validate_answers_replay_and_disappear_on_cancellation() {
+        use crate::tools::question::{Request, Answer as UserAnswer};
+        let (client, _requests) = crate::agent::mock::gateway(|_| (vec![], "end_turn", 1)).await;
+        let agent = Agent::new(client, ToolRegistry::new(), "sys");
+        let task = Task::new(1, "test".into(), None, FileTracker::default(), agent, Forks::default());
+        let request: Request = serde_json::from_value(json!({"question": "choose", "options": [
+            {"label": "a", "description": "first"}, {"label": "b", "description": "second"}
+        ]})).unwrap();
+        let asker = WebAsker(Arc::downgrade(&task));
+        let mut pending = Box::pin(asker.question(&request, Some("child")));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        let (events, _) = task.subscribe(0);
+        assert!(events.iter().any(|(_, e)| e.contains("user_question") && e.contains("child")));
+        assert!(task.answer_question(1, UserAnswer::Selected { index: 8 }).is_err());
+        assert!(task.user_questions.lock().unwrap().contains_key(&1));
+        assert!(task.answer_question(1, UserAnswer::Selected { index: 1 }).unwrap());
+        assert!(matches!(pending.await, Some(UserAnswer::Selected { index: 1 })));
+        assert!(!task.answer_question(1, UserAnswer::Cancelled {}).unwrap());
+        let mut pending = Box::pin(asker.question(&request, None));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert!(task.user_questions.lock().unwrap().is_empty());
+        let (events, _) = task.subscribe(0);
+        assert_eq!(events.iter().filter(|(_, e)| e.contains("user_question_answered")).count(), 2);
+    }
 
     #[tokio::test]
     async fn a_report_for_an_idle_task_starts_a_turn() {

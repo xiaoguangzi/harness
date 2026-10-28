@@ -219,6 +219,22 @@ impl Draft {
         if self.text.is_empty() {
             return (vec![format!("{prompt}{}", paint(DIM, &text::fit(placeholder, room)))], (0, 2));
         }
+        let (rows, cursor) = self.wrapped(room);
+        // Show the rows around the cursor.
+        let first = (cursor.0 + 1).saturating_sub(DRAFT_ROWS).min(rows.len().saturating_sub(DRAFT_ROWS));
+        let shown = rows
+            .into_iter()
+            .enumerate()
+            .skip(first)
+            .take(DRAFT_ROWS)
+            .map(|(i, row)| if i == 0 { format!("{prompt}{row}") } else { format!("  {row}") })
+            .collect();
+        (shown, (cursor.0 - first, cursor.1 + 2))
+    }
+
+    /// The text wrapped at `room` columns, and where the cursor is in it:
+    /// (row, column).
+    pub fn wrapped(&self, room: usize) -> (Vec<String>, (usize, usize)) {
         let (mut rows, mut row, mut used) = (Vec::new(), String::new(), 0);
         let mut cursor = (0, 0);
         for (i, c) in self.text.char_indices() {
@@ -242,16 +258,7 @@ impl Draft {
             cursor = (rows.len(), used);
         }
         rows.push(row);
-        // Show the rows around the cursor.
-        let first = (cursor.0 + 1).saturating_sub(DRAFT_ROWS).min(rows.len().saturating_sub(DRAFT_ROWS));
-        let shown = rows
-            .into_iter()
-            .enumerate()
-            .skip(first)
-            .take(DRAFT_ROWS)
-            .map(|(i, row)| if i == 0 { format!("{prompt}{row}") } else { format!("  {row}") })
-            .collect();
-        (shown, (cursor.0 - first, cursor.1 + 2))
+        (rows, cursor)
     }
 }
 

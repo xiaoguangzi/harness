@@ -871,7 +871,7 @@ mod tests {
     fn read_only_is_the_default() {
         let mut def = explore();
         def.tools = None;
-        assert_eq!(names(&agent_tool(vec![]).registry_for(&def)), vec!["glob", "grep", "read"]);
+        assert_eq!(names(&agent_tool(vec![]).registry_for(&def)), vec!["ask_user_question", "glob", "grep", "read"]);
     }
 
     #[test]

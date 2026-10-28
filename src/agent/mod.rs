@@ -909,6 +909,52 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn model_questions_wait_then_send_the_answer_in_the_same_turn() {
+        use crate::security::permissions::{Asker, Mode};
+        use crate::tools::question::{Request, Answer};
+        struct Frontend(tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Answer>>);
+        #[async_trait::async_trait]
+        impl Asker for Frontend {
+            async fn ask(&self, _: &crate::security::permissions::Request) -> Option<crate::security::permissions::Answer> {
+                panic!("a question needs no permission approval");
+            }
+            async fn question(&self, request: &Request, _: Option<&str>) -> Option<Answer> {
+                assert_eq!(request.question, "Which approach?");
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.0.send(tx).unwrap();
+                rx.await.ok()
+            }
+        }
+        for mode in [Mode::BypassPermissions, Mode::Plan] {
+            let (client, mut requests) = compact::tests::gateway(|n| match n {
+                0 => (vec![json!({"type": "tool_use", "id": "q1", "name": "ask_user_question", "input": {
+                    "question": "Which approach?", "options": [{"label": "A", "description": "small"}, {"label": "B", "description": "large"}]
+                }})], "tool_use", 100),
+                _ => (vec![text("continued with B")], "end_turn", 100),
+            }).await;
+            let mut agent = Agent::new(client, ToolRegistry::with_defaults(crate::tools::FileTracker::default()), "sys");
+            agent.permissions().set_mode(mode);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            agent.permissions().set_asker(Some(Arc::new(Frontend(tx))));
+            let running = tokio::spawn(async move {
+                agent.run_turn(vec![text("choose")], &mut Notices::default()).await.unwrap();
+                agent
+            });
+            let answer = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            requests.recv().await.unwrap();
+            assert!(requests.try_recv().is_err(), "no next model request while waiting for the user");
+            answer.send(Answer::Selected { index: 1 }).unwrap();
+            let agent = running.await.unwrap();
+            let next = requests.recv().await.unwrap();
+            let result = next["messages"].as_array().unwrap().last().unwrap()["content"][0].clone();
+            assert_eq!(result["tool_use_id"], "q1");
+            let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+            assert_eq!(result["answer"], "B");
+            assert_eq!(agent.last_text(0), "continued with B");
+        }
+    }
+
+    #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn prompt_hooks_see_a_command_as_typed() {
         let _guard = crate::util::lock_cwd();

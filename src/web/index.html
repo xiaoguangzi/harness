@@ -211,6 +211,49 @@ details.tool.subagent { border-left: 3px solid var(--accent); }
 .card.rewind { display: flex; flex-direction: column; gap: 10px; margin: 0 0 12px; }
 .rewind-item { border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 4px; }
 .note.permission { color: var(--text); font-size: 13px; border: 1px solid var(--warn); background: var(--warn-soft); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.ask {
+  border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: var(--shadow-sm);
+  padding: 12px 14px; margin: 0 0 10px; display: grid; gap: 10px; animation: fadeUp .18s ease;
+}
+.ask.open { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); box-shadow: 0 0 0 3px var(--accent-ring), var(--shadow-sm); padding: 14px 16px; gap: 12px; }
+.ask-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.ask-head .icon { flex: none; width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); font: 700 12px var(--mono); }
+.ask-head .badge { margin-left: auto; }
+.ask-q { font-size: 15px; font-weight: 600; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ask:not(.open) .ask-q { font-size: 13.5px; font-weight: 500; color: var(--muted); }
+.ask-options { display: grid; gap: 6px; }
+.ask-form { display: grid; gap: 12px; }
+label.ask-option {
+  display: flex; gap: 12px; align-items: flex-start; margin: 0; padding: 9px 12px; position: relative;
+  border: 1px solid var(--line); border-radius: 10px; cursor: pointer; color: var(--text); font-size: 13.5px; font-weight: 400;
+  transition: border-color .12s, background .12s;
+}
+label.ask-option:hover { border-color: var(--line-strong); background: var(--panel2); }
+label.ask-option.selected { border-color: var(--accent); background: var(--accent-soft); }
+label.ask-option:has(input:focus-visible) { box-shadow: 0 0 0 3px var(--accent-ring); }
+label.ask-option input[type=radio] { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.ask-num {
+  flex: none; width: 22px; height: 22px; margin-top: 1px; border-radius: 7px; border: 1px solid var(--line-strong);
+  display: grid; place-items: center; font: 600 11.5px var(--mono); color: var(--muted); background: var(--panel);
+  transition: background .12s, border-color .12s, color .12s;
+}
+label.ask-option.selected .ask-num { background: var(--accent); border-color: var(--accent); color: #fff; }
+.ask-text { min-width: 0; flex: 1; display: grid; gap: 1px; overflow-wrap: anywhere; }
+.ask-text .label { font-weight: 600; white-space: pre-wrap; }
+.ask-text .desc { color: var(--muted); font-size: 12.5px; white-space: pre-wrap; }
+label.ask-option textarea {
+  border: 0; padding: 1px 0; border-radius: 0; background: transparent; box-shadow: none; resize: none;
+  font: inherit; line-height: 1.5; min-height: 22px; max-height: 200px; overflow-y: auto;
+}
+label.ask-option textarea:focus { box-shadow: none; }
+.ask-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ask-foot .hint { margin-right: auto; color: var(--muted); font-size: 11.5px; }
+.ask-answer { display: flex; gap: 8px; align-items: baseline; font-size: 13.5px; font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ask-answer .mark { flex: none; color: var(--ok); }
+.ask-answer.none { color: var(--muted); font-weight: 400; }
+.ask-answer.none .mark { color: var(--muted); }
+.ask-answer.err { color: var(--err); font-weight: 400; }
+.ask-answer.err .mark { color: var(--err); }
 .note.err { color: var(--err); white-space: pre-wrap; }
 .note.hook { color: var(--warn); white-space: pre-wrap; }
 
@@ -583,13 +626,13 @@ function showNewTask() {
   prompt.focus();
 }
 
-let transcript, pending, assistantEl, subagents;
+let transcript, pending, assistantEl, subagents, asks;
 function openTask(id) {
   if (source) { source.close(); source = null; }
   currentTask = id;
   const t = tasks.find(x => x.id === id) || { id, title: "任务 #" + id, status: "", model: "", agent: "" };
   transcript = h("div", { class: "scroll" });
-  pending = []; assistantEl = null; subagents = new Map();
+  pending = []; assistantEl = null; subagents = new Map(); asks = [];
 
   const input = h("textarea", { rows: 1, placeholder: "继续对话…" });
   const send = h("button", { class: "btn primary" }, "发送 ↑");
@@ -669,7 +712,9 @@ function stickToBottom(fn) {
 
 // Tool calls that will never get a result (the turn failed or was cancelled).
 function abandonPending(label) {
-  for (const p of pending) { const b = p.el.querySelector(".badge"); b.textContent = label; b.className = "badge cancelled"; }
+  for (const p of pending) {
+    if (p.card) { askFinish(p.card, "dropped"); continue; }
+    const b = p.el.querySelector(".badge"); b.textContent = label; b.className = "badge cancelled"; }
   pending = [];
 }
 
@@ -723,6 +768,115 @@ function permissionCard(ev) {
   return el;
 }
 
+// An `ask_user_question` call is one card: the question from the call,
+// a form while it waits for the user, then what they answered.
+function askCard(question, agent) {
+  const badge = h("span", { class: "badge waiting" }, "等待回答");
+  const body = h("div", {});
+  const el = h("div", { class: "ask" },
+    h("div", { class: "ask-head" }, h("span", { class: "icon" }, "?"),
+      h("span", {}, agent ? `子代理 ${agent} 的提问` : "模型的提问"), badge),
+    h("div", { class: "ask-q" }, question), body);
+  const card = { el, badge, body, question, agent, qid: null, done: false };
+  asks.push(card);
+  transcript.append(el);
+  return card;
+}
+
+const ASK_END = {
+  answered: ["已回答", "idle", "✓"], cancelled: ["已取消", "cancelled", "–"], dropped: ["已中止", "cancelled", "–"],
+  unavailable: ["无法交互", "cancelled", "–"], error: ["出错", "error", "✖"],
+};
+const ASK_TEXT = {
+  cancelled: "没有作出选择，问题已关闭", dropped: "调用已中止，问题没有得到回答",
+  unavailable: "这里无法交互，模型会在回复里提出这个问题",
+};
+
+function askFinish(card, status, text) {
+  if (card.done) return;
+  card.done = true;
+  card.el.classList.remove("open");
+  const [label, cls, mark] = ASK_END[status] || ASK_END.error;
+  card.badge.textContent = label; card.badge.className = "badge " + cls;
+  const kind = status === "answered" ? "" : status === "error" || !ASK_END[status] ? " err" : " none";
+  card.body.replaceChildren(h("div", { class: "ask-answer" + kind },
+    h("span", { class: "mark" }, mark), h("span", {}, ASK_TEXT[status] || text || "(空)")));
+}
+
+/** The call's result, which is all a saved conversation has of it. */
+function askResult(card, ev) {
+  let result = {};
+  try { result = JSON.parse(ev.content); } catch {}
+  if (ev.is_error) askFinish(card, "error", ev.content);
+  else if (result.status === "answered") askFinish(card, "answered", result.answer);
+  else askFinish(card, ASK_TEXT[result.status] ? result.status : "error", ev.content);
+}
+
+function askForm(card, ev) {
+  if (card.done) return;
+  const owner = currentTask;
+  const options = ev.request.options || [];
+  const custom = options.length;
+  card.qid = ev.id;
+  card.el.classList.add("open");
+  let selected = options.length ? null : custom, submitting = false;
+  const tiles = [];
+  const text = h("textarea", { rows: 1, maxlength: 16000, "aria-label": "自己的回答",
+    placeholder: options.length ? "其他回答…" : "输入你的回答…" });
+  const send = h("button", { class: "btn primary", type: "submit", disabled: true }, "提交");
+  const update = () => { send.disabled = submitting || selected === null || (selected === custom && !text.value.trim()); };
+  const select = i => {
+    selected = i;
+    tiles.forEach((t, j) => { t.classList.toggle("selected", j === i); t.querySelector("input").checked = j === i; });
+    if (i === custom && document.activeElement !== text) text.focus();
+    update();
+  };
+  const tile = (i, num, content) => {
+    const el = h("label", { class: "ask-option" }, h("input", { type: "radio", name: `ask-${owner}-${ev.id}`, onchange: () => select(i) }),
+      h("span", { class: "ask-num" }, num), content);
+    tiles.push(el);
+    return el;
+  };
+  const list = h("div", { class: "ask-options", role: "radiogroup", "aria-label": ev.request.question },
+    options.map((o, i) => tile(i, i + 1, h("span", { class: "ask-text" }, h("span", { class: "label" }, o.label),
+      o.description ? h("span", { class: "desc" }, o.description) : null))),
+    tile(custom, options.length ? custom + 1 : "✎", h("span", { class: "ask-text" }, text)));
+  text.addEventListener("focus", () => { if (selected !== custom) select(custom); });
+  text.addEventListener("input", () => {
+    text.style.height = "auto"; text.style.height = text.scrollHeight + "px";
+    if (selected !== custom) select(custom); else update();
+  });
+  const submit = async answer => {
+    if (submitting || card.done) return;
+    submitting = true; update();
+    const controls = [...form.querySelectorAll("input,textarea,button")];
+    controls.forEach(c => { c.disabled = true; });
+    try { await api("POST", `/api/tasks/${owner}/questions/${ev.id}`, answer); }
+    catch (err) { toast(err.message, true); controls.forEach(c => { c.disabled = false; }); }
+    finally { submitting = false; update(); }
+  };
+  const form = h("form", { class: "ask-form", onsubmit: e => {
+    e.preventDefault();
+    if (send.disabled) return;
+    submit(selected === custom ? { status: "custom", text: text.value.trim() } : { status: "selected", index: selected });
+  } }, list, h("div", { class: "ask-foot" },
+    h("span", { class: "hint" }, options.length ? `按 1–${custom + 1} 选择 · Enter 提交` : "Enter 提交 · Shift+Enter 换行"),
+    h("button", { class: "btn", type: "button", onclick: () => submit({ status: "cancelled" }) }, "取消"), send));
+  form.addEventListener("keydown", e => {
+    if (e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === "Enter" && !(e.target === text && e.shiftKey)) { e.preventDefault(); form.requestSubmit(); return; }
+    const n = e.target === text ? NaN : Number(e.key);
+    if (n >= 1 && n <= tiles.length) { e.preventDefault(); select(n - 1); if (n - 1 !== custom) tiles[n - 1].querySelector("input").focus(); }
+  });
+  card.body.replaceChildren(form);
+  if (selected === custom) tiles[custom].classList.add("selected");
+  // Take the keys, unless the user is in the middle of typing elsewhere.
+  const active = document.activeElement;
+  if (!active || active === document.body || (active.tagName === "TEXTAREA" && !active.value && !active.closest(".ask"))) {
+    setTimeout(() => (selected === custom ? text : tiles[0].querySelector("input")).focus({ preventScroll: true }));
+  }
+}
+
 /** Lists the task's prompts to go back to before, and does it. */
 async function showRewind(id, input) {
   let list;
@@ -765,6 +919,10 @@ function renderEvent(ev) {
       case "text_end": assistantEl = null; break;
       case "tool_call": {
         assistantEl = null;
+        if (ev.name === "ask_user_question" && typeof ev.input?.question === "string") {
+          pending.push({ id: ev.id, name: ev.name, input: ev.input, card: askCard(ev.input.question, null) });
+          break;
+        }
         const body = h("div", { class: "body" }, h("pre", {}, pretty(ev.input)));
         const d = h("details", { class: "tool" },
           h("summary", {}, h("span", { class: "name" }, ev.name), h("span", { class: "args" + (ev.name === "bash" ? " cmd" : "") }, toolSummary(ev.name, ev.input)), h("span", { class: "badge" }, "…")),
@@ -793,7 +951,19 @@ function renderEvent(ev) {
         transcript.append(h("div", { class: "note hook" }, "⚑ " + ev.message)); break;
       case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台任务有了结果，继续")); break;
       case "permission": assistantEl = null; transcript.append(permissionCard(ev)); break;
-      case "reset": transcript.replaceChildren(); pending = []; assistantEl = null; subagents = new Map(); break;
+      case "user_question": {
+        assistantEl = null;
+        // A subagent's calls are not in the transcript: its question gets a card of its own.
+        const card = !ev.agent && asks.find(c => !c.done && c.qid === null && c.question === ev.request.question);
+        askForm(card || askCard(ev.request.question, ev.agent), ev);
+        break;
+      }
+      case "user_question_answered": {
+        const card = asks.find(c => c.qid === ev.id);
+        if (card) askFinish(card, ev.status === "selected" || ev.status === "custom" ? "answered" : ev.status, ev.answer);
+        break;
+      }
+      case "reset": transcript.replaceChildren(); pending = []; assistantEl = null; subagents = new Map(); asks = []; break;
       case "note": assistantEl = null; transcript.append(h("div", { class: "note" }, ev.text)); break;
       case "permission_answered": {
         const q = questions.get(ev.id);
@@ -808,6 +978,7 @@ function renderEvent(ev) {
       case "tool_result": {
         const i = pending.findIndex(x => ev.id ? x.id === ev.id : x.name === ev.name);
         const p = i >= 0 ? pending.splice(i, 1)[0] : null;
+        if (p?.card) { askResult(p.card, ev); break; }
         const out = h("pre", {}, ev.content || "(空)");
         if (p) {
           p.body.append(out);

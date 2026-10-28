@@ -70,6 +70,7 @@ struct State {
     footer: Option<String>,
     /// A tool call waiting for the user's approval, in the input box's place.
     question: Option<super::approve::Question>,
+    user_question: Option<super::question::Question>,
     /// How many key readers hand keys to [`Output::question_key`] now.
     routed: usize,
     /// Where those readers hand keys while a panel is open over a turn.
@@ -147,6 +148,7 @@ impl Output {
             silent: false,
             footer: None,
             question: None,
+            user_question: None,
             routed: 0,
             panel_keys: None,
             permissions: None,
@@ -283,6 +285,11 @@ impl Output {
     /// taken.
     pub fn question_key(&self, key: &Key) -> bool {
         let mut state = self.state.lock().unwrap();
+        if let Some(question) = state.user_question.as_mut() {
+            if question.key(key) { state.user_question = None; }
+            self.show(&mut state, "");
+            return true;
+        }
         if *key == Key::BackTab && let Some(permissions) = &state.permissions {
             permissions.set_mode(permissions.mode().next());
             self.show(&mut state, "");
@@ -299,6 +306,12 @@ impl Output {
     pub(super) fn set_question(&self, question: Option<super::approve::Question>) {
         let mut state = self.state.lock().unwrap();
         state.question = question;
+        self.show(&mut state, "");
+    }
+
+    pub(super) fn set_user_question(&self, question: Option<super::question::Question>) {
+        let mut state = self.state.lock().unwrap();
+        state.user_question = question;
         self.show(&mut state, "");
     }
 
@@ -698,6 +711,9 @@ impl Output {
 /// input box also says where the cursor goes: (row, column).
 fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, Option<(usize, usize)>) {
     let width = text::terminal_width();
+    if let Some(question) = &state.user_question {
+        return question.render(width, text::terminal_height().unwrap_or(24), &paint);
+    }
     if let Some(panel) = &state.tool_panel {
         return panel.render(&state.transcript, &state.tool_records, width,
             text::terminal_height().unwrap_or(24), &paint);
@@ -842,6 +858,37 @@ impl Output {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn model_questions_preserve_drafts_and_close_when_the_call_is_dropped() {
+        use crate::security::permissions::Asker;
+        use crate::tools::question::{Request, Answer};
+        let out = Output::capture();
+        let inbox = Arc::new(Inbox::default());
+        out.open_input(Typing::default(), inbox.clone());
+        out.edit_input(|t| t.draft.set_text("unsent draft"));
+        let _routed = out.route_keys();
+        let asker = super::super::approve::TerminalAsker::new(out.clone());
+        let request = Request { question: "Your choice?".into(), options: Vec::new() };
+        let mut pending = Box::pin(asker.question(&request, None));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        assert!(out.state.lock().unwrap().user_question.is_some());
+        assert!(out.question_key(&Key::Text("自己的回答".into())));
+        assert!(out.question_key(&Key::Enter));
+        assert!(matches!(pending.await, Some(Answer::Custom { text }) if text == "自己的回答"));
+        let mut pending = Box::pin(asker.question(&request, None));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        let mut queued = Box::pin(asker.question(&request, Some("child")));
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+        drop(pending);
+        assert!(out.state.lock().unwrap().user_question.is_none());
+        assert!(futures::poll!(queued.as_mut()).is_pending());
+        assert!(out.state.lock().unwrap().user_question.is_some());
+        out.question_key(&Key::Esc);
+        assert!(matches!(queued.await, Some(Answer::Cancelled {})));
+        assert_eq!(out.close_input().draft.text(), "unsent draft");
+        assert!(!inbox.wants_turn());
+    }
 
     #[test]
     fn inspector_consumes_keys_without_editing_the_draft_and_clear_resets_it() {

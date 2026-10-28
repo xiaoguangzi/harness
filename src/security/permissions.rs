@@ -211,6 +211,11 @@ pub trait Asker: Send + Sync {
     /// The user's answer about `request`; `None` if no one can be asked
     /// now.
     async fn ask(&self, request: &Request) -> Option<Answer>;
+
+    /// A model's question, independent of permission rules or mode.
+    async fn question(&self, _request: &crate::tools::question::Request, _agent: Option<&str>) -> Option<crate::tools::question::Answer> {
+        None
+    }
 }
 
 /// One conversation's permissions: the settings' rules, the mode, what the
@@ -250,6 +255,10 @@ impl Permissions {
 
     pub fn set_asker(&self, asker: Option<Arc<dyn Asker>>) {
         *self.asker.write().unwrap() = asker;
+    }
+
+    pub fn asker(&self) -> Option<Arc<dyn Asker>> {
+        self.asker.read().unwrap().clone()
     }
 
     /// The rules, for `/permissions`: each kind with its rules, the session's

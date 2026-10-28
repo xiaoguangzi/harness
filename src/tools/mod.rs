@@ -16,6 +16,7 @@ pub(crate) mod spill;
 pub mod workdir;
 pub mod scheduling;
 pub(crate) mod progress;
+pub mod question;
 mod wait;
 #[allow(dead_code)] // `todo_write` isn't registered; see `with_defaults`
 pub mod todo;
@@ -165,6 +166,7 @@ impl ToolRegistry {
         registry.register(BashOutputTool);
         registry.register(KillShellTool);
         registry.register(WaitTasksTool);
+        registry.register(question::AskUserQuestionTool);
         registry.register(GrepTool);
         registry.register(GlobTool);
         // `todo_write` is off: current models plan well enough without it. The tool, its
