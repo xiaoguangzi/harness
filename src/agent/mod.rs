@@ -855,6 +855,30 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn calls_may_name_parameters_as_claude_code_does() {
+        let _guard = crate::util::lock_cwd();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let call = json!({"type": "tool_use", "id": "t1", "name": "read", "input": {"file_path": file, "limit": "1"}});
+        let (client, mut requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![call.clone()], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let mut agent = Agent::new(client, ToolRegistry::with_defaults(crate::tools::FileTracker::default()), "sys");
+        agent.run_turn(vec![text("read it")], &mut Notices::default()).await.unwrap();
+        let _ = requests.recv().await;
+        let second = requests.recv().await.unwrap();
+        let result = &second["messages"][2]["content"][0];
+        assert_eq!(result["is_error"], false, "{result}");
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("1\tone") && !content.contains("two"), "{content}");
+        assert!(second["messages"][1]["content"][0]["input"]["file_path"].is_string(), "the history keeps the call as made");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn calls_that_need_approval_ask_or_are_refused() {
         let _guard = crate::util::lock_cwd();
         use crate::security::permissions::{Answer, Asker, Mode, Permissions};

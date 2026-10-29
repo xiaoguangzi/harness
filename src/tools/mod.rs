@@ -44,7 +44,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use crate::llm::ToolDef;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// Result of running a tool, sent back to the model as a `tool_result` block.
 #[derive(Debug, Clone, PartialEq)]
@@ -141,6 +141,10 @@ pub trait Tool: Send + Sync {
     fn access(&self, _input: &Value) -> scheduling::Access {
         if self.read_only() { scheduling::Access::Concurrent } else { scheduling::Access::Workspace }
     }
+    /// Renames the parameters a model gave under the Claude Code tool's
+    /// names (`file_path`) to this tool's own, and drops those it has no use
+    /// for: models trained on Claude Code's transcripts reach for them.
+    fn normalize_input(&self, _input: &mut Map<String, Value>) {}
     async fn run(&self, input: Value) -> ToolOutput;
 }
 
@@ -240,6 +244,27 @@ impl ToolRegistry {
         self.tools.values().filter(|t| t.deferred()).map(|t| definition(t.as_ref(), true)).collect()
     }
 
+    /// Makes `input` what the tool `name` takes, before hooks, permissions
+    /// and the tool see the call: what [`Tool::normalize_input`] renames,
+    /// and booleans and integers its schema asks for given as strings
+    /// (`"true"`, `"80"`) as such.
+    pub fn normalize_input(&self, name: &str, input: &mut Value) {
+        let (Some(tool), Some(object)) = (self.tools.get(name), input.as_object_mut()) else { return };
+        tool.normalize_input(object);
+        let schema = tool.input_schema();
+        for (key, value) in object.iter_mut() {
+            let Some(text) = value.as_str() else { continue };
+            let typed = match schema["properties"][key]["type"].as_str() {
+                Some("boolean") => text.parse::<bool>().ok().map(Value::from),
+                Some("integer") => text.parse::<i64>().ok().map(Value::from),
+                _ => None,
+            };
+            if let Some(typed) = typed {
+                *value = typed;
+            }
+        }
+    }
+
     pub async fn run(&self, name: &str, input: Value) -> ToolOutput {
         match self.tools.get(name) {
             Some(tool) => {
@@ -273,6 +298,16 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
         return s.to_string();
     }
     format!("{}\n... [truncated {dropped} bytes]", &s[..end])
+}
+
+/// Moves `input[from]` to `input[to]`, unless both are given: the tool then
+/// refuses `from` as unknown.
+pub(crate) fn rename(input: &mut Map<String, Value>, from: &str, to: &str) {
+    if !input.contains_key(to)
+        && let Some(value) = input.remove(from)
+    {
+        input.insert(to.into(), value);
+    }
 }
 
 /// Parses tool input into its typed form; unknown fields are rejected by

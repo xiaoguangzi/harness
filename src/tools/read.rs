@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use tokio::io::AsyncBufReadExt;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::{FileTracker, Tool, ToolOutput, parse_input};
 
@@ -82,6 +82,10 @@ impl Tool for ReadTool {
 
     fn read_only(&self) -> bool {
         true
+    }
+
+    fn normalize_input(&self, input: &mut Map<String, Value>) {
+        super::rename(input, "file_path", "path");
     }
 
     async fn run(&self, input: Value) -> ToolOutput {

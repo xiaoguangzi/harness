@@ -711,6 +711,8 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 
 On the official Anthropic API, tools are declared with `eager_input_streaming`, so large inputs (such as file contents for `write`) stream as they are generated. The API then no longer validates tool input, so each built-in tool parses its input into a strict struct (unknown fields rejected), and a call whose streamed JSON does not parse is not run: the model gets an `INVALID_JSON` error result instead. MCP tools keep input buffering on, so the API validates their input against the server-provided schema.
 
+Models trained on Claude Code's transcripts (GLM, for one) often call the tools with its parameter names, which those strict structs would refuse. So before hooks, permission rules and the tool see a call, the names the tool knows are taken as its own: the file tools' `file_path` as `path`, `grep`'s `-i` as `case_insensitive` and `-A` / `-B` / `-C` as `context` (the most asked for), `bash`'s `timeout` as `timeout_ms`, `bash_output`'s `bash_id` as `shell_id`, `agent`'s `subagent_type` as `agent_type`. `grep`'s `-n` and `bash`'s `description` are dropped, and a boolean or integer given as a string (`"true"`, `"80"`) counts as one. The conversation keeps the call as the model made it.
+
 ## Adding a tool
 
-Implement `tools::Tool` (name, description, JSON schema, async `run`) and register it in `ToolRegistry::with_defaults`.
+Implement `tools::Tool` (name, description, JSON schema, async `run`; `normalize_input` when the Claude Code tool names its parameters differently) and register it in `ToolRegistry::with_defaults`.

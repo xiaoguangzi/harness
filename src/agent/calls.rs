@@ -39,6 +39,14 @@ impl Agent {
         invalid: &HashMap<String, String>,
         observer: &mut dyn Observer,
     ) -> (Vec<Value>, bool) {
+        // Hooks, permission rules and the tools see the parameters under the
+        // tool's own names, whatever names the model gave them.
+        let calls: Vec<Value> = calls.iter().cloned().map(|mut t| {
+            let name = t["name"].as_str().unwrap_or("").to_string();
+            self.tools.normalize_input(&name, &mut t["input"]);
+            t
+        }).collect();
+        let calls = calls.as_slice();
         // A fork starts from the conversation as it is now.
         let forks = calls.iter().any(|t| t["name"] == "agent" && t["input"]["agent_type"] == crate::subagent::FORK);
         if forks {
@@ -48,7 +56,7 @@ impl Agent {
         // PreToolUse hooks see every call first; they may refuse one or
         // change its input.
         let model = self.client.spec();
-        let checks = join_all(calls.iter().map(|t| async {
+        let mut checks = join_all(calls.iter().map(|t| async {
             let id = t["id"].as_str().unwrap_or("");
             if invalid.contains_key(id) {
                 return Outcome::default();
@@ -56,7 +64,11 @@ impl Agent {
             self.hooks.pre_tool_use(t["name"].as_str().unwrap_or(""), id, &t["input"], model).await
         }))
         .await;
-        for (t, check) in calls.iter().zip(&checks) {
+        for (t, check) in calls.iter().zip(&mut checks) {
+            // Hooks written for Claude Code may give its names too.
+            if let Some(input) = &mut check.updated_input {
+                self.tools.normalize_input(t["name"].as_str().unwrap_or(""), input);
+            }
             let input = check.updated_input.as_ref().unwrap_or(&t["input"]);
             observer.on_tool_call_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), input);
             show_notices(check, observer);

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::process::Command;
 
 use super::glob::expand_braces;
@@ -136,6 +136,22 @@ impl Tool for GrepTool {
 
     fn read_only(&self) -> bool {
         true
+    }
+
+    fn normalize_input(&self, input: &mut Map<String, Value>) {
+        super::rename(input, "-i", "case_insensitive");
+        super::rename(input, "-C", "context");
+        // `context` lines go before and after each match, so they also do
+        // for Claude Code's `-B` (before) and `-A` (after): the most asked.
+        let lines = |v: &Value| v.as_u64().or_else(|| v.as_str()?.parse().ok());
+        for key in ["-A", "-B"] {
+            let Some(n) = input.remove(key) else { continue };
+            if input.get("context").is_none_or(|c| lines(c) < lines(&n)) {
+                input.insert("context".into(), n);
+            }
+        }
+        // Content always comes with line numbers.
+        input.remove("-n");
     }
 
     async fn run(&self, input: Value) -> ToolOutput {
@@ -305,5 +321,28 @@ mod tests {
         let dir = fixture();
         let out = grep(json!({"pattern": "fn", "path": dir.path(), "output_mode": "content", "head_limit": 1})).await;
         assert!(out.content.contains("showing 1 of 2 lines"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn takes_claude_codes_parameters() {
+        let dir = fixture();
+        let mut registry = super::super::ToolRegistry::new();
+        registry.register(GrepTool);
+        // As glm-5.3-flash gave them, flags as strings.
+        let mut input = json!({
+            "pattern": "HELPER", "path": dir.path(), "output_mode": "content",
+            "-i": "true", "-n": "true", "-A": 1, "-B": "3", "-C": 2, "head_limit": "80"
+        });
+        registry.normalize_input("grep", &mut input);
+        assert_eq!(input, json!({
+            "pattern": "HELPER", "path": dir.path(), "output_mode": "content",
+            "case_insensitive": true, "context": 3, "head_limit": 80
+        }));
+        let out = grep(input).await;
+        assert!(out.content.contains("a.rs-1-fn main() {}\n") && out.content.ends_with("a.rs:2:fn helper() {}"), "{}", out.content);
+
+        let mut both = json!({"pattern": "x", "-i": true, "case_insensitive": false});
+        registry.normalize_input("grep", &mut both);
+        assert!(grep(both).await.content.contains("unknown field `-i`"), "given twice, it is refused");
     }
 }

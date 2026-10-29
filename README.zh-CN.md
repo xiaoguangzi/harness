@@ -712,6 +712,8 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 
 在官方 Anthropic API 上，工具以 `eager_input_streaming` 声明，因此较大的输入（例如 `write` 的文件内容）会在生成时流式传输。此后 API 不再校验工具输入，所以每个内置工具都把输入解析成严格的结构体（拒绝未知字段），流式 JSON 解析失败的调用不会执行：模型会得到 `INVALID_JSON` 错误结果。MCP 工具保持输入缓冲开启，因此 API 会按服务器提供的 schema 校验其输入。
 
+用 Claude Code 对话记录训练过的模型（例如 GLM）常用 Claude Code 的参数名调用工具，严格的结构体会拒绝这些名字。所以在 hook、权限规则和工具看到调用之前，工具认得的名字会换成它自己的：文件工具的 `file_path` 当作 `path`，`grep` 的 `-i` 当作 `case_insensitive`、`-A` / `-B` / `-C` 当作 `context`（取最大的），`bash` 的 `timeout` 当作 `timeout_ms`，`bash_output` 的 `bash_id` 当作 `shell_id`，`agent` 的 `subagent_type` 当作 `agent_type`。`grep` 的 `-n` 和 `bash` 的 `description` 会被丢掉，以字符串给出的布尔值或整数（`"true"`、`"80"`）按布尔值或整数算。对话历史里保留模型原样发出的调用。
+
 ## 添加工具
 
-实现 `tools::Tool`（name、description、JSON schema、异步 `run`），并在 `ToolRegistry::with_defaults` 中注册。
+实现 `tools::Tool`（name、description、JSON schema、异步 `run`；若 Claude Code 的对应工具参数名不同，再实现 `normalize_input`），并在 `ToolRegistry::with_defaults` 中注册。

@@ -481,6 +481,10 @@ impl Tool for AgentTool {
         crate::tools::scheduling::Access::Concurrent
     }
 
+    fn normalize_input(&self, input: &mut serde_json::Map<String, Value>) {
+        crate::tools::rename(input, "subagent_type", "agent_type");
+    }
+
     fn name(&self) -> &str {
         "agent"
     }

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::{FileChange, FileTracker, Tool, ToolOutput, parse_input};
 
@@ -28,6 +28,10 @@ struct Input {
 impl Tool for WriteTool {
     fn access(&self, input: &Value) -> super::scheduling::Access {
         super::scheduling::file_access(input)
+    }
+
+    fn normalize_input(&self, input: &mut Map<String, Value>) {
+        super::rename(input, "file_path", "path");
     }
 
     fn name(&self) -> &str {

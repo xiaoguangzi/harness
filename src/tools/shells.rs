@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::task::AbortHandle;
 use tokio::sync::Notify;
@@ -376,6 +376,10 @@ impl Tool for BashOutputTool {
 
     fn input_schema(&self) -> Value {
         shell_schema("The shell id bash returned, e.g. shell_1.")
+    }
+
+    fn normalize_input(&self, input: &mut Map<String, Value>) {
+        super::rename(input, "bash_id", "shell_id");
     }
 
     /// It only reads what a command printed.

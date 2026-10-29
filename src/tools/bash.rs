@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
@@ -42,6 +42,13 @@ impl Tool for BashTool {
     // The command owns its guard even after this call returns a shell ID.
     fn access(&self, _input: &Value) -> super::scheduling::Access {
         super::scheduling::Access::Concurrent
+    }
+
+    /// Claude Code's `timeout` is in milliseconds too; its `description`
+    /// only labels the call.
+    fn normalize_input(&self, input: &mut Map<String, Value>) {
+        super::rename(input, "timeout", "timeout_ms");
+        input.remove("description");
     }
 
     fn name(&self) -> &str {
