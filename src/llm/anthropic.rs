@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use super::config::{CacheTtl, Target};
 use super::{Message, Response, StreamEvent, ToolDef, http, parse_tool_input, references, references_as_text, same_source};
 
-const API_VERSION: &str = "2023-06-01";
+pub(super) const API_VERSION: &str = "2023-06-01";
 /// The server-side tool search tool, which earlier versions used: its
 /// calls in saved conversations are left out.
 const SERVER_TOOL_SEARCH: &str = "tool_search_tool_bm25";

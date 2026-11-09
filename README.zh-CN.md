@@ -157,6 +157,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `gzip` | 用 gzip 压缩 1 KiB 及以上的请求体；`api.anthropic.com` 默认开启，网关默认关闭，因为很多网关不接受 |
 | `tool_search` | 仅 Anthropic：MCP 工具定义会占上下文窗口十分之一以上时，把它们[延迟加载](#延迟加载的工具)到 `tool_search` 工具之后。`api.anthropic.com` 默认开启，网关默认关闭；provider 对这样的请求返回 HTTP 400 或 422 时，会把所有工具完整发送再试一次，成功的话本次运行剩下的时间里都这样发送 |
 | `models` | 按模型的覆盖项；列出的模型会显示在 `/model` 和 Tab 补全中 |
+| `sync` | `harness provider sync` 列出网关的哪些模型：`{"include": [...], "exclude": [...]}`，模式中 `*` 匹配任意一串字符（包括 `/`），`?` 匹配一个字符，不区分大小写；模型匹配某个 `include` 模式（没有 `include` 时匹配所有）且不匹配任何 `exclude` 模式时才会列出。命令的 `--include` / `--exclude` 会保存到这里 |
 | `price` | 按模型设置：每百万 token 的美元价格，`{"input": 1.25, "output": 10, "cache_read": 0.125}`（也可设 `cache_write`；默认缓存读取为输入价的十分之一、写入为 1.25 倍，1 小时缓存为 2 倍），用于 `/usage` 显示的费用估算。Claude 模型内置了官方价格 |
 
 临时性失败的请求（连接失败或断开、HTTP 408、409 或 5xx、回复中途断开）最多重发 3 次，分别等 1、2、4 秒；API 过载或限流（HTTP 429、529，或流中出现这类错误）最多重发 10 次，等待时间翻倍直到 1 分钟，总共约 5 分钟。响应带 `retry-after`（或 `retry-after-ms`）头时按它等待；超过 10 分钟的不等。每次重试都会显示一行 `↻` 和原因。
@@ -171,10 +172,22 @@ harness provider add relay-b --protocol openai-responses --base-url https://rela
   --api-key '${RELAY_B_KEY}' --model gpt-5 --model gpt-5-mini
 harness provider model add relay-b/gpt-5 --context-window 400000 --effort high --default   # 另有 --max-tokens
 harness provider default relay-a/claude-opus-5
+harness provider sync relay-b --include 'gpt-*' --exclude '*-mini'   # 列出它的 /v1/models 给出的模型
 harness provider list              # 另有：remove <name>、model remove <provider>/<model>
 ```
 
-对已有的 provider 执行 `add` 只修改选项给出的部分（不带选项时重新逐项询问，直接回车保留原值）。密钥按输入原样保存，所以写 `${VAR}`（在 shell 中用单引号）可以不把它写进文件。没有可用的默认模型时，`add` 把它的第一个模型设为默认模型。每次修改后，如果配置还不能使用（例如没有默认模型），会说明原因。
+对已有的 provider 执行 `add` 只修改选项给出的部分（不带选项时重新逐项询问，直接回车保留原值）。密钥按输入原样保存，所以写 `${VAR}`（在 shell 中用单引号）可以不把它写进文件；`--api-key ''` 表示不设密钥。没有可用的默认模型时，`add` 把它的第一个模型设为默认模型。每次修改后，如果配置还不能使用（例如没有默认模型），会说明原因。
+
+`sync` 向网关请求模型列表（`GET {base_url}/v1/models`，带上该 provider 的密钥和请求头；网关像 Anthropic API 那样分页时逐页读取），并把它们设为该 provider 列出的模型：已列出的模型保留原有设置；没有 `context_window` 的模型取列表给出的值（`context_window`、`context_length`、`max_input_tokens` 或 `top_provider.context_length`），除非该 provider 为所有模型统一设置了 `context_window`；网关不再提供的模型会从列表中移除，若 `model` 或 `subagent_model` 是其中之一会给出警告。`--include` 和 `--exclude`（可重复）筛选列表，并保存为该 provider 的 [`sync`](#llm-网关)，之后不带选项的 `sync` 沿用同样的筛选；筛选后一个模型都不剩时不做任何修改。在 REPL 中，`/provider sync <name>` 或面板中的 *Sync listed models* 作用相同。
+
+汇集多个订阅、同时提供两种协议的本地网关（例如 magpie），可以配成同一地址上的两个 provider，各自同步适合其协议的模型：
+
+```sh
+harness provider add magpie --protocol anthropic --base-url http://127.0.0.1:3425 --api-key ''
+harness provider sync magpie --exclude 'codex/*'
+harness provider add magpie-openai --protocol openai-responses --base-url http://127.0.0.1:3425/v1 --api-key ''
+harness provider sync magpie-openai --include 'codex/*'
+```
 
 会话中途可用 `/model <provider>/<model>` 直接切换模型，或输入无参数的 `/model` 并回车打开模型设置面板：Tab 切换主模型和子代理默认模型，↑/↓ 选择模型，输入文字筛选（Enter 采用高亮的模型，仅筛选不会改变设置），←/→ 调整共同的会话 effort（`auto`、`low`、`medium`、`high`、`xhigh`、`max`）。面板显示两个模型选择、协议、配置的上下文/输出上限和 effort；Enter 一次应用所有预览修改，Esc 放弃修改，仅影响本次会话。子代理默认模型可设置为跟随主模型，也可独立选择；代理自身指定的模型仍优先，已有子代理保留原模型。重定向输入时仍打印 provider、模型列表和实际生效的设置。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
 
@@ -215,7 +228,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 |---|---|
 | `/help` | 浏览命令，Enter 将选项填入输入框 |
 | `/model [spec]` | 设置主模型、子代理默认模型及 effort，或直接切换主模型到 `<provider>/<model>` |
-| `/provider [子命令]` | 打开 provider 管理；`/provider add`、`remove`、`model add`、`model remove`、`default` 与 `harness provider` 相同，并立即生效（见 [LLM 网关](#llm-网关)） |
+| `/provider [子命令]` | 打开 provider 管理；`/provider add`、`remove`、`model add`、`model remove`、`sync`、`default` 与 `harness provider` 相同，并立即生效（见 [LLM 网关](#llm-网关)） |
 | `/effort [level]` | 交互选择推理强度，或直接设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
 | `/clear` | 开始新会话 |
 | `/compact [重点]` | 总结会话以腾出上下文（见[上下文压缩](#上下文压缩)）；`重点` 指定摘要要特别保留的内容 |
@@ -670,7 +683,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
   - `compact.rs` — 上下文压缩：何时压缩、总结请求、替换会话的新历史
 - `src/llm/` — LLM 网关
   - `config.rs` — 由配置和环境变量得到 provider、模型 spec 解析、按 provider/模型的设置
-  - `manage.rs` — `harness provider` 与 `/provider …`：通过修改配置添加和移除 provider 与列出的模型、设置默认模型
+  - `manage.rs` — `harness provider` 与 `/provider …`：通过修改配置添加和移除 provider 与列出的模型、从网关的模型列表同步模型、设置默认模型
   - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退）
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
   - `http.rs` — POST（开启时用 gzip 压缩）、SSE 读取器；标记哪些失败（连接断开、过载、可重试的状态码）之后 `llm::Client` 会重发请求，以及要等多久

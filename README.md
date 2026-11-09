@@ -156,6 +156,7 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 | `gzip` | gzip-compress request bodies of 1 KiB or more; default on for `api.anthropic.com`, off for gateways, many of which reject it |
 | `tool_search` | Anthropic only: [defer MCP tools](#deferred-tools) behind the `tool_search` tool once their definitions would take a tenth of the context window. Default on for `api.anthropic.com`, off for gateways; a provider that answers such a request with HTTP 400 or 422 gets it again with every tool in full, and if that works, so for the rest of the run |
 | `models` | per-model overrides; listed models show in `/model` and Tab completion |
+| `sync` | which of the gateway's models `harness provider sync` lists: `{"include": [...], "exclude": [...]}`, patterns where `*` is any run of characters (`/` included) and `?` one, case ignored; a model is taken when it matches an `include` pattern (any, without one) and no `exclude` pattern. The command's `--include` / `--exclude` save it |
 | `price` | per model: what its tokens cost in dollars per million, `{"input": 1.25, "output": 10, "cache_read": 0.125}` (`cache_write` too; by default a tenth and 1.25 times the input price, twice it with the 1-hour cache), for the estimate `/usage` shows. Claude models have their list prices built in |
 
 A request that fails in passing (a connection that fails or drops, HTTP 408, 409 or 5xx, a response that breaks off) is sent again up to 3 times, after 1, 2 and 4 seconds; an overloaded or rate-limited API (HTTP 429 or 529, or such an error in the stream) up to 10 times, the wait doubling up to a minute, about five minutes in all. A `retry-after` (or `retry-after-ms`) header sets the wait instead; one over 10 minutes is not waited for. Each retry shows as `↻` with its reason.
@@ -170,10 +171,22 @@ harness provider add relay-b --protocol openai-responses --base-url https://rela
   --api-key '${RELAY_B_KEY}' --model gpt-5 --model gpt-5-mini
 harness provider model add relay-b/gpt-5 --context-window 400000 --effort high --default   # also --max-tokens
 harness provider default relay-a/claude-opus-5
+harness provider sync relay-b --include 'gpt-*' --exclude '*-mini'   # list the models its /v1/models gives
 harness provider list              # also: remove <name>, model remove <provider>/<model>
 ```
 
-`add` on an existing provider changes only what its options give (with no options, it asks again, Enter keeping each value). The key is stored as typed, so `${VAR}` (in single quotes on the shell) keeps it out of the file. When there is no working default model, `add` makes its first model the default. Each change says when the setup cannot be used yet, for example without a default model.
+`add` on an existing provider changes only what its options give (with no options, it asks again, Enter keeping each value). The key is stored as typed, so `${VAR}` (in single quotes on the shell) keeps it out of the file; `--api-key ''` stores none. When there is no working default model, `add` makes its first model the default. Each change says when the setup cannot be used yet, for example without a default model.
+
+`sync` asks the gateway for its models (`GET {base_url}/v1/models` with the provider's key and headers, page by page where it pages them as the Anthropic API does) and makes them the provider's listed models: a model already listed keeps its settings, one without a `context_window` gets the one the list gives (`context_window`, `context_length`, `max_input_tokens` or `top_provider.context_length`) unless the provider sets one for all its models, and listed models the gateway no longer gives are taken off, with a warning when `model` or `subagent_model` was one of them. `--include` and `--exclude` (repeatable) filter the list and are saved as the provider's [`sync`](#llm-gateways), so a later `sync` without them applies the same ones; a filter that leaves no model changes nothing. In the REPL, `/provider sync <name>` or the panel's *Sync listed models* does the same.
+
+A local gateway that pools several subscriptions and serves both protocols, such as magpie, is two providers on the same address, each syncing the models that suit its protocol:
+
+```sh
+harness provider add magpie --protocol anthropic --base-url http://127.0.0.1:3425 --api-key ''
+harness provider sync magpie --exclude 'codex/*'
+harness provider add magpie-openai --protocol openai-responses --base-url http://127.0.0.1:3425/v1 --api-key ''
+harness provider sync magpie-openai --include 'codex/*'
+```
 
 Switch models mid-conversation with `/model <provider>/<model>`, or run `/model` without arguments to open the model settings panel. Tab switches between the main model and subagent default, ↑/↓ selects a model, typing filters (Enter takes the highlighted model; filtering alone changes nothing), and ←/→ adjusts the shared session effort (`auto`, `low`, `medium`, `high`, `xhigh`, `max`). The panel shows both model choices, protocol, configured context/output limits and effort. Enter applies all previewed changes to this session; Esc cancels them. Subagents can follow the main model or use a separate default; agent-specific models still take priority and existing children keep their original model. Redirected input still prints providers, models and effective settings. `/effort <level>` changes the effort for the rest of the session (kept across `/model`), and `/effort auto` goes back to the configured one. The history is kept in Anthropic form and converted for OpenAI (`function_call` / `function_call_output`, `input_image`, `input_file`); requests are stateless (`store: false`), with reasoning items replayed from their encrypted content. Model-bound blocks (Anthropic thinking, OpenAI reasoning) are only sent back to the model that produced them. Subagents can use a different gateway through `subagent_model` or an agent's `model`.
 
@@ -214,7 +227,7 @@ Interactive command panels use the available terminal width, with headings and s
 |---|---|
 | `/help` | browse commands; Enter inserts one into the prompt |
 | `/model [spec]` | configure main/subagent models and effort, or switch the main model directly to `<provider>/<model>` |
-| `/provider [command]` | open provider management;  `/provider add`, `remove`, `model add`, `model remove` and `default` work as `harness provider` does and apply at once (see [LLM gateways](#llm-gateways)) |
+| `/provider [command]` | open provider management;  `/provider add`, `remove`, `model add`, `model remove`, `sync` and `default` work as `harness provider` does and apply at once (see [LLM gateways](#llm-gateways)) |
 | `/effort [level]` | choose reasoning effort, or set it directly: `low`, `medium`, `high`, `xhigh`, `max`, or `auto` for the configured one |
 | `/clear` | start a new conversation |
 | `/compact [focus]` | summarize the conversation to free context (see [Compaction](#compaction)); `focus` says what the summary should keep |
@@ -669,7 +682,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
   - `compact.rs` — compaction: when to compact, the summarization request, the history that replaces the conversation
 - `src/llm/` — LLM gateways
   - `config.rs` — providers from the settings and environment, model spec resolution, per-provider/model settings
-  - `manage.rs` — `harness provider` and `/provider …`: adding and removing providers and listed models, the default model, by editing the settings
+  - `manage.rs` — `harness provider` and `/provider …`: adding and removing providers and listed models, syncing those from a gateway's model list, the default model, by editing the settings
   - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST (gzip-compressed where that is on), SSE reader; marks the failures (a dropped connection, an overload, a retryable status) after which `llm::Client` sends the request again, and how long to wait

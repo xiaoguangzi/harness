@@ -144,9 +144,54 @@ pub struct ProviderConfig {
     /// rather than all sent in full. Default: on for the official API, off
     /// for gateways, whose models may not have it.
     pub tool_search: Option<bool>,
+    /// Which of the gateway's models `harness provider sync` lists.
+    pub sync: Option<ModelFilter>,
     /// Per-model overrides; listed models are offered by `/model`.
     #[serde(default)]
     pub models: BTreeMap<String, ModelConfig>,
+}
+
+/// Model names a gateway lists that `harness provider sync` takes: those
+/// matching one of `include` (all, when it is empty) and none of
+/// `exclude`. In a pattern, `*` stands for any run of characters (`/`
+/// included) and `?` for one; case doesn't matter.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelFilter {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl ModelFilter {
+    pub fn admits(&self, model: &str) -> bool {
+        let matches = |patterns: &[String]| patterns.iter().any(|p| glob_match(p, model));
+        (self.include.is_empty() || matches(&self.include)) && !matches(&self.exclude)
+    }
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    let text: Vec<char> = text.to_lowercase().chars().collect();
+    let (mut p, mut t) = (0, 0);
+    // The last `*` seen, and where in `text` it began matching.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            (p, t) = (p + 1, t + 1);
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((s, from)) = star {
+            // Let that `*` take one more character.
+            star = Some((s, from + 1));
+            (p, t) = (s + 1, from + 1);
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
 }
 
 /// How long the Anthropic API keeps a cached prompt prefix after it was
@@ -258,11 +303,7 @@ impl Providers {
             max_tokens = Some(n.trim().parse().context("HARNESS_MAX_TOKENS")?);
         }
         for p in providers.values_mut() {
-            p.base_url = expand_env(&p.base_url).trim_end_matches('/').to_string();
-            p.api_key = p.api_key.as_deref().map(expand_env).filter(|k| !k.is_empty());
-            for v in p.headers.values_mut() {
-                *v = expand_env(v);
-            }
+            p.expand();
         }
 
         let anthropic_key = env("ANTHROPIC_API_KEY").map(|k| (k, AuthStyle::XApiKey));
@@ -420,13 +461,47 @@ impl ProviderConfig {
             prompt_cache_ttl: None,
             gzip: None,
             tool_search: None,
+            sync: None,
             models: BTreeMap::new(),
+        }
+    }
+
+    /// Expands `${VAR}` in the base URL, key and headers, as the settings
+    /// file may hold them.
+    pub fn expand(&mut self) {
+        self.base_url = expand_env(&self.base_url).trim_end_matches('/').to_string();
+        self.api_key = self.api_key.as_deref().map(expand_env).filter(|k| !k.is_empty());
+        for v in self.headers.values_mut() {
+            *v = expand_env(v);
         }
     }
 
     fn is_official_anthropic(&self) -> bool {
         let host = self.base_url.split("://").nth(1).unwrap_or(&self.base_url);
         host.split(['/', ':']).next() == Some(OFFICIAL_ANTHROPIC_HOST)
+    }
+
+    /// `{base_url}/v1/{path}`, not doubling a `/v1` already in `base_url`.
+    pub fn url(&self, path: &str) -> String {
+        let base = &self.base_url;
+        if base.ends_with("/v1") { format!("{base}/{path}") } else { format!("{base}/v1/{path}") }
+    }
+
+    /// Authentication and custom headers.
+    pub fn headers(&self) -> Vec<(String, String)> {
+        let mut headers = Vec::new();
+        if let Some(key) = &self.api_key {
+            let default = match self.protocol {
+                Protocol::Anthropic => AuthStyle::XApiKey,
+                Protocol::OpenAiResponses => AuthStyle::Bearer,
+            };
+            match self.auth.unwrap_or(default) {
+                AuthStyle::XApiKey => headers.push(("x-api-key".into(), key.clone())),
+                AuthStyle::Bearer => headers.push(("authorization".into(), format!("Bearer {key}"))),
+            }
+        }
+        headers.extend(self.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+        headers
     }
 }
 
@@ -497,27 +572,12 @@ impl Target<'_> {
             && self.config.tool_search.unwrap_or_else(|| self.config.is_official_anthropic())
     }
 
-    /// `{base_url}/v1/{path}`, not doubling a `/v1` already in `base_url`.
     pub fn url(&self, path: &str) -> String {
-        let base = &self.config.base_url;
-        if base.ends_with("/v1") { format!("{base}/{path}") } else { format!("{base}/v1/{path}") }
+        self.config.url(path)
     }
 
-    /// Authentication and custom headers.
     pub fn headers(&self) -> Vec<(String, String)> {
-        let mut headers = Vec::new();
-        if let Some(key) = &self.config.api_key {
-            let default = match self.config.protocol {
-                Protocol::Anthropic => AuthStyle::XApiKey,
-                Protocol::OpenAiResponses => AuthStyle::Bearer,
-            };
-            match self.config.auth.unwrap_or(default) {
-                AuthStyle::XApiKey => headers.push(("x-api-key".into(), key.clone())),
-                AuthStyle::Bearer => headers.push(("authorization".into(), format!("Bearer {key}"))),
-            }
-        }
-        headers.extend(self.config.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
-        headers
+        self.config.headers()
     }
 }
 
@@ -740,5 +800,36 @@ pub(crate) mod tests {
         assert!(Providers::from_parts(&two_relays(), &bad).is_err());
         let p = Providers::from_parts(&two_relays(), &no_env).unwrap();
         assert_eq!(p.target("relay-a/m").unwrap().effort, Effort::High, "the default");
+    }
+
+    #[test]
+    fn model_filters() {
+        for (pattern, text, matches) in [
+            ("codex/*", "codex/gpt-6-luna", true),
+            ("codex/*", "claude/opus", false),
+            ("*", "anything/at/all", true),
+            ("zenmux/*flash", "zenmux/qwen/qwen3.8-flash", true),
+            ("*-2025????", "claude-opus-4-5-20251101", true),
+            ("*-2025????", "claude-opus-4-5", false),
+            ("glm-?.?", "GLM-5.3", true),
+            ("a*b*c", "abxbc", true),
+            ("a*b*c", "abxbcx", false),
+            ("", "", true),
+            ("", "x", false),
+        ] {
+            assert_eq!(glob_match(pattern, text), matches, "{pattern} ~ {text}");
+        }
+        let all = ModelFilter::default();
+        assert!(all.admits("x"));
+        let filter = ModelFilter { include: vec!["claude/*".into(), "auto/*".into()], exclude: vec!["*haiku*".into()] };
+        assert!(filter.admits("auto/glm") && filter.admits("claude/opus"));
+        assert!(!filter.admits("claude/haiku-5") && !filter.admits("codex/gpt"));
+
+        let settings = file(json!({"providers": {"gw": {
+            "protocol": "anthropic", "base_url": "https://gw.example.com", "sync": {"exclude": ["codex/*"]}
+        }}}));
+        assert_eq!(settings.providers["gw"].sync.as_ref().unwrap().exclude, ["codex/*"]);
+        let bad = json!({"providers": {"gw": {"protocol": "anthropic", "base_url": "u", "sync": {"only": ["x"]}}}});
+        assert!(Settings::parse(&bad.to_string()).is_err());
     }
 }

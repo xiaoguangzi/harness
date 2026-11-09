@@ -3,12 +3,14 @@
 //! the settings file's `providers` and `model`. The REPL switches to the
 //! changed setup at once; otherwise it applies at the next start.
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
-use super::config::{Effort, Protocol, Providers};
+use super::config::{Effort, ModelFilter, Protocol, ProviderConfig, Providers};
 use crate::extensions::plugins::manage::Ask;
 use crate::settings::{self, Settings};
 
@@ -20,12 +22,15 @@ Commands:
   add <name> [options]             Add a gateway, or change one; asks for what the options leave out
       --protocol P                 anthropic or openai-responses
       --base-url URL
-      --api-key KEY                The key, or '${VAR}' to read it from the environment
+      --api-key KEY                The key, or '${VAR}' to read it from the environment ('' for none)
       --model MODEL                List a model on it (repeatable)
   remove <name>                    Remove a gateway and its models
   model add <provider>/<model> [--context-window N] [--max-tokens N] [--effort LEVEL] [--default]
                                    List a model (/model offers it), with its own settings
   model remove <provider>/<model>  Take it off the list
+  sync <name> [--include PATTERN] [--exclude PATTERN]
+                                   List the models the gateway's /v1/models gives, each keeping its
+                                   settings; the patterns (* and ?, repeatable) are kept for later syncs
   default <provider>/<model>       Make it the default model
 
 Changes apply at the next start; /provider … in the REPL switches to them at once.
@@ -33,13 +38,13 @@ Changes apply at the next start; /provider … in the REPL switches to them at o
 
 /// Whether `args` change the settings (rather than list them).
 pub fn changes(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("add" | "remove" | "rm" | "model" | "default"))
+    matches!(args.first().map(String::as_str), Some("add" | "remove" | "rm" | "model" | "sync" | "default"))
 }
 
 /// Runs `harness provider <args>`; returns what to print.
 pub fn run(args: &[String], ask: &mut dyn Ask) -> Result<Vec<String>> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    Manager { settings_file: None, env: &env }.run(args, ask)
+    Manager { settings_file: None, env: &env, fetch: &list_models }.run(args, ask)
 }
 
 /// Where the commands act: the settings file (the configured one unless
@@ -47,6 +52,8 @@ pub fn run(args: &[String], ask: &mut dyn Ask) -> Result<Vec<String>> {
 struct Manager<'a> {
     settings_file: Option<&'a Path>,
     env: &'a dyn Fn(&str) -> Option<String>,
+    /// The entries of the model list a gateway gives.
+    fetch: &'a dyn Fn(&ProviderConfig) -> Result<Vec<Value>>,
 }
 
 impl Manager<'_> {
@@ -59,6 +66,7 @@ impl Manager<'_> {
             ["remove" | "rm", name] => self.remove(name),
             ["model", "add", spec, options @ ..] => self.add_model(spec, options),
             ["model", "remove" | "rm", spec] => self.remove_model(spec),
+            ["sync", name, options @ ..] => self.sync(name, options),
             ["default", spec] => self.set_default(spec),
             _ => bail!("unknown provider command `{}`; see `harness provider help`", args.join(" ")),
         }
@@ -163,9 +171,18 @@ impl Manager<'_> {
             let mut changed = Vec::new();
             let protocol = protocol.map(|p| p.as_str().to_string());
             for (key, value) in [("protocol", protocol), ("base_url", base_url), ("api_key", api_key)] {
-                if let Some(value) = value {
-                    p.insert(key.into(), value.into());
-                    changed.push(key);
+                match value {
+                    // `--api-key ''`: none.
+                    Some(value) if value.is_empty() => {
+                        if p.shift_remove(key).is_some() {
+                            changed.push(key);
+                        }
+                    }
+                    Some(value) => {
+                        p.insert(key.into(), value.into());
+                        changed.push(key);
+                    }
+                    None => {}
                 }
             }
             if !models.is_empty() {
@@ -258,6 +275,93 @@ impl Manager<'_> {
         })
     }
 
+    /// Lists on `name` the models its gateway gives that its filter admits
+    /// (the options' patterns, which replace the saved ones, or those): a
+    /// listed model keeps its settings, one without a context window gets
+    /// the gateway's (unless the provider sets one for all), and those it
+    /// no longer gives go.
+    fn sync(&self, name: &str, args: &[&str]) -> Result<Vec<String>> {
+        let options = options(args, &["include", "exclude"], &[])?;
+        let given = |key: &str| options.iter().filter(|(k, _)| *k == key).map(|(_, v)| v.to_string()).collect();
+        let settings = self.settings()?;
+        let mut config = settings.providers.get(name).cloned().ok_or_else(|| {
+            anyhow!("no provider `{name}` in the settings; add it with `harness provider add {name}`")
+        })?;
+        let filter = if options.is_empty() {
+            config.sync.clone().unwrap_or_default()
+        } else {
+            ModelFilter { include: given("include"), exclude: given("exclude") }
+        };
+        config.expand();
+        let offered = (self.fetch)(&config)?;
+        let offered: Vec<(&str, &Value)> = offered
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(|id| (id, m)))
+            .collect();
+        let found: BTreeMap<String, Option<u32>> = offered
+            .iter()
+            .filter(|(id, _)| filter.admits(id))
+            .map(|(id, model)| (id.to_string(), context_window(model)))
+            .collect();
+        let patterns = describe(&filter);
+        if found.is_empty() {
+            let matching = if patterns.is_empty() { String::new() } else { format!(" matching {patterns}") };
+            bail!("{} lists no models{matching} ({} in all); nothing changed", config.url("models"), offered.len());
+        }
+
+        self.edit(|s| {
+            let p = settings::object(settings::object(s, "providers"), name);
+            let mut changed = false;
+            if !options.is_empty() {
+                let mut saved = Map::new();
+                for (key, patterns) in [("include", &filter.include), ("exclude", &filter.exclude)] {
+                    if !patterns.is_empty() {
+                        saved.insert(key.into(), json!(patterns));
+                    }
+                }
+                let saved = (!saved.is_empty()).then_some(Value::Object(saved));
+                changed = p.get("sync") != saved.as_ref();
+                match saved {
+                    Some(saved) => p.insert("sync".into(), saved),
+                    None => p.shift_remove("sync"),
+                };
+            }
+            let old = p.get("models").and_then(Value::as_object).cloned().unwrap_or_default();
+            let mut models = Map::new();
+            for (id, window) in &found {
+                let mut entry = old.get(id).cloned().unwrap_or_else(|| json!({}));
+                if let (Some(n), Some(e)) = (window, entry.as_object_mut())
+                    && config.context_window.is_none()
+                    && !e.contains_key("context_window")
+                {
+                    e.insert("context_window".into(), (*n).into());
+                }
+                models.insert(id.clone(), entry);
+            }
+            changed |= old != models;
+            p.insert("models".into(), Value::Object(models));
+
+            let spec = |m: &String| format!("{name}/{m}");
+            let added: Vec<String> = found.keys().filter(|m| !old.contains_key(*m)).map(spec).collect();
+            let removed: Vec<String> = old.keys().filter(|m| !found.contains_key(*m)).map(spec).collect();
+            let of = format!("{} of the {} models it lists", found.len(), offered.len());
+            let by = if patterns.is_empty() { String::new() } else { format!(", by {patterns}") };
+            let state = if changed { "synced provider" } else { "unchanged provider" };
+            let mut lines = vec![format!("{state} {name}: {of}{by}")];
+            for (what, specs) in [("added", &added), ("removed", &removed)] {
+                if !specs.is_empty() {
+                    lines.push(format!("{what}: {}", specs.join(", ")));
+                }
+            }
+            for key in ["model", "subagent_model"] {
+                if let Some(set) = s.get(key).and_then(Value::as_str).filter(|m| removed.iter().any(|r| r == m)) {
+                    lines.push(format!("`{key}` is {set}, which the gateway no longer lists"));
+                }
+            }
+            Ok(lines)
+        })
+    }
+
     fn set_default(&self, spec: &str) -> Result<Vec<String>> {
         let mut settings = self.settings()?;
         settings.model = Some(spec.to_string());
@@ -293,6 +397,76 @@ fn default_url(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::Anthropic => "https://api.anthropic.com",
         Protocol::OpenAiResponses => "https://api.openai.com/v1",
+    }
+}
+
+/// The context window an entry of a gateway's model list gives, under one
+/// of the names gateways (magpie, OpenRouter, LiteLLM…) give it.
+fn context_window(model: &Value) -> Option<u32> {
+    let fields = ["/context_window", "/context_length", "/max_input_tokens", "/top_provider/context_length"];
+    let n = fields.iter().find_map(|f| model.pointer(f).and_then(Value::as_u64))?;
+    u32::try_from(n).ok().filter(|&n| n > 0)
+}
+
+/// `include a, b; exclude c`, or nothing for a filter that takes all.
+fn describe(filter: &ModelFilter) -> String {
+    let parts = [("include", &filter.include), ("exclude", &filter.exclude)];
+    let parts = parts.iter().filter(|(_, p)| !p.is_empty()).map(|(what, p)| format!("{what} {}", p.join(", ")));
+    parts.collect::<Vec<_>>().join("; ")
+}
+
+/// The entries of the model list the gateway gives at `/v1/models`, page
+/// after page where it pages them as the Anthropic API does.
+fn list_models(config: &ProviderConfig) -> Result<Vec<Value>> {
+    // A runtime of its own, as the callers block their thread.
+    std::thread::scope(|s| {
+        let listing = s.spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            runtime.block_on(fetch_model_pages(config))
+        });
+        listing.join().unwrap_or_else(|_| Err(anyhow!("listing the gateway's models failed")))
+    })
+}
+
+async fn fetch_model_pages(config: &ProviderConfig) -> Result<Vec<Value>> {
+    let http = super::http_client()?;
+    let mut headers = config.headers();
+    if config.protocol == Protocol::Anthropic {
+        headers.push(("anthropic-version".into(), super::anthropic::API_VERSION.into()));
+    }
+    let url = config.url("models");
+    let mut models = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut page_url = reqwest::Url::parse(&url).with_context(|| format!("`{url}` is not a URL"))?;
+        if config.protocol == Protocol::Anthropic {
+            // The official API gives 20 a page unless asked for more.
+            page_url.query_pairs_mut().append_pair("limit", "1000");
+            if let Some(id) = &after {
+                page_url.query_pairs_mut().append_pair("after_id", id);
+            }
+        }
+        let mut request = http.get(page_url).timeout(Duration::from_secs(30));
+        for (name, value) in &headers {
+            request = request.header(name, value);
+        }
+        let response = request.send().await.with_context(|| format!("asking {url} for its models"))?;
+        let status = response.status();
+        let body = response.text().await.with_context(|| format!("reading {url}'s model list"))?;
+        if !status.is_success() {
+            bail!("{url} answered {status}: {}", crate::util::one_line(&body, 300));
+        }
+        let page: Value = serde_json::from_str(&body).with_context(|| format!("{url} answered with no JSON"))?;
+        let Some(data) = page.get("data").and_then(Value::as_array) else {
+            bail!("{url} answered with no `data` list of models");
+        };
+        models.extend(data.iter().cloned());
+        let last = page.get("last_id").and_then(Value::as_str).map(String::from);
+        let more = page.get("has_more").and_then(Value::as_bool) == Some(true);
+        if config.protocol != Protocol::Anthropic || !more || data.is_empty() || last.is_none() || last == after {
+            return Ok(models);
+        }
+        after = last;
     }
 }
 
@@ -342,12 +516,16 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap()
     }
 
+    fn no_fetch(_: &ProviderConfig) -> Result<Vec<Value>> {
+        bail!("no network in tests")
+    }
+
     #[test]
     fn adds_providers_and_models() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("settings.json");
         let no_env = |_: &str| None;
-        let m = Manager { settings_file: Some(&file), env: &no_env };
+        let m = Manager { settings_file: Some(&file), env: &no_env, fetch: &no_fetch };
         let none = &mut Answers(Vec::new(), Vec::new());
 
         assert!(run(&m, "list", none).unwrap().last().unwrap().starts_with("not usable yet: no LLM provider"));
@@ -397,6 +575,10 @@ mod tests {
         run(&m, "add gw --base-url https://gw2.example.com", none).unwrap();
         assert_eq!(read(&file)["providers"]["gw"]["api_key"], "k");
         assert_eq!(read(&file)["providers"]["gw"]["base_url"], "https://gw2.example.com");
+        // An empty key is none.
+        assert_eq!(run(&m, "add gw --api-key=", none).unwrap(), ["changed provider gw"]);
+        assert!(read(&file)["providers"]["gw"].get("api_key").is_none());
+        run(&m, "add gw --api-key k", none).unwrap();
 
         assert!(run(&m, "model add nope/x", none).is_err());
         assert!(run(&m, "model add gw/x --context-window lots", none).is_err());
@@ -416,11 +598,90 @@ mod tests {
     }
 
     #[test]
+    fn syncs_the_models_a_gateway_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("settings.json");
+        let settings = json!({
+            "model": "gw/zcode/glm",
+            "providers": {
+                "gw": {
+                    "protocol": "anthropic", "base_url": "https://gw.example.com/",
+                    "models": {"claude/opus": {"effort": "max"}, "zcode/glm": {}}
+                },
+                "flat": {"protocol": "anthropic", "base_url": "https://flat.example.com", "context_window": 128000}
+            }
+        });
+        std::fs::write(&file, settings.to_string()).unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let fetch = |config: &ProviderConfig| -> Result<Vec<Value>> {
+            asked.borrow_mut().push(config.url("models"));
+            Ok(vec![
+                json!({"id": "claude/opus", "context_window": 1000000}),
+                json!({"id": "claude/haiku", "context_length": 200000}),
+                json!({"id": "codex/gpt", "top_provider": {"context_length": 272000}}),
+                json!({"id": "claude/opus-20250101"}),
+                json!({"object": "model"}),
+            ])
+        };
+        let no_env = |_: &str| None;
+        let m = Manager { settings_file: Some(&file), env: &no_env, fetch: &fetch };
+        let none = &mut Answers(Vec::new(), Vec::new());
+        let gw = || read(&file)["providers"]["gw"].clone();
+
+        // Listed models keep their settings and get the gateway's context
+        // window; those it doesn't list go; the patterns are kept.
+        let lines = run(&m, "sync gw --exclude codex/* --exclude *-2025????", none).unwrap();
+        assert_eq!(
+            lines,
+            [
+                "synced provider gw: 2 of the 4 models it lists, by exclude codex/*, *-2025????",
+                "added: gw/claude/haiku",
+                "removed: gw/zcode/glm",
+                "`model` is gw/zcode/glm, which the gateway no longer lists",
+            ]
+        );
+        assert_eq!(asked.borrow().as_slice(), ["https://gw.example.com/v1/models"]);
+        assert_eq!(
+            gw()["models"],
+            json!({
+                "claude/haiku": {"context_window": 200000},
+                "claude/opus": {"effort": "max", "context_window": 1000000}
+            })
+        );
+        assert_eq!(gw()["sync"], json!({"exclude": ["codex/*", "*-2025????"]}));
+
+        // Without options, the saved patterns.
+        let lines = run(&m, "sync gw", none).unwrap();
+        assert_eq!(lines, ["unchanged provider gw: 2 of the 4 models it lists, by exclude codex/*, *-2025????"]);
+        // New ones replace them; case doesn't matter.
+        let lines = run(&m, "sync gw --include CODEX/*", none).unwrap();
+        assert_eq!(lines[0], "synced provider gw: 1 of the 4 models it lists, by include CODEX/*");
+        assert_eq!(gw()["models"], json!({"codex/gpt": {"context_window": 272000}}));
+        assert_eq!(gw()["sync"], json!({"include": ["CODEX/*"]}));
+
+        // Nothing matching changes nothing.
+        let err = run(&m, "sync gw --include gemini-*", none).unwrap_err().to_string();
+        assert_eq!(err, "https://gw.example.com/v1/models lists no models matching include gemini-* (4 in all); nothing changed");
+        assert_eq!(gw()["sync"], json!({"include": ["CODEX/*"]}));
+
+        // A provider with a context window of its own gets none per model.
+        let lines = run(&m, "sync flat", none).unwrap();
+        assert_eq!(lines[0], "synced provider flat: 4 of the 4 models it lists");
+        let flat = &read(&file)["providers"]["flat"];
+        assert_eq!(flat["models"]["codex/gpt"], json!({}));
+        assert!(flat.get("sync").is_none());
+
+        assert!(run(&m, "sync nope", none).is_err());
+        assert!(run(&m, "sync gw --colour red", none).is_err());
+        assert!(changes(&["sync".to_string()]));
+    }
+
+    #[test]
     fn lists_providers_from_the_environment() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("settings.json");
         let env = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk".to_string());
-        let m = Manager { settings_file: Some(&file), env: &env };
+        let m = Manager { settings_file: Some(&file), env: &env, fetch: &no_fetch };
         let none = &mut Answers(Vec::new(), Vec::new());
         assert_eq!(run(&m, "", none).unwrap(), ["anthropic  (from the environment)", "default model: anthropic/claude-opus-5"]);
         // A default already works, so a new provider's model does not take

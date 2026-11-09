@@ -440,6 +440,7 @@ async fn providers(view: &View, out: &Output) -> Option<Input> {
         Item::new("Set default model", "Save the default for new conversations in the settings file"),
         Item::new("Add listed model", "Choose a provider and enter a model name"),
         Item::new("Remove listed model", "Remove a model from the configured list"),
+        Item::new("Sync listed models", "List the models a provider's gateway gives, by its saved patterns"),
         Item::new("Remove provider", "Remove the provider and its model list from settings"),
     ];
     loop {
@@ -463,17 +464,19 @@ async fn providers(view: &View, out: &Output) -> Option<Input> {
                 let Some(model) = dialog::input(out, "Add model", about).await else { continue };
                 return Some(Input::Providers(vec!["model".into(), "add".into(), format!("{}/{model}", names[i])]));
             }
-            2 | 6 => {
-                let edit = action == 2;
+            2 | 6 | 7 => {
+                let (command, title, what, enter) = match action {
+                    2 => ("add", "Edit provider", "Edit settings; the API key stays hidden", "edit"),
+                    6 => ("sync", "Sync listed models", "Lists the models its gateway gives at /v1/models", "sync"),
+                    _ => ("remove", "Remove provider", "Removes this provider from settings", "remove"),
+                };
                 let names: Vec<_> = load_settings(out)?.providers.into_keys().collect();
-                let what = if edit { "Edit settings; the API key stays hidden" } else { "Removes this provider from settings" };
                 let items = names.iter().map(|n| Item::new(n, what)).collect();
-                let keys = Keys { enter: if edit { "edit" } else { "remove" }, esc: "back" };
-                let title = if edit { "Edit provider" } else { "Remove provider" };
+                let keys = Keys { enter, esc: "back" };
                 let Some(i) = dialog::choose(out, title, "Providers in the settings file", keys, items, 0).await else {
                     continue;
                 };
-                return Some(Input::Providers(vec![if edit { "add" } else { "remove" }.into(), names[i].clone()]));
+                return Some(Input::Providers(vec![command.into(), names[i].clone()]));
             }
             3 | 5 => {
                 let default = action == 3;
