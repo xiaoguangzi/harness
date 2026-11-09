@@ -144,7 +144,7 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 |---|---|
 | `protocol` | `anthropic` (`POST {base_url}/v1/messages`) or `openai-responses` (`POST {base_url}/v1/responses`); a `/v1` already in `base_url` is not doubled |
 | `api_key` | sent as `x-api-key` (Anthropic) or `Authorization: Bearer` (OpenAI); override with `"auth": "bearer"` / `"x-api-key"` |
-| `headers` | extra request headers |
+| `headers` | extra request headers. Requests carry `User-Agent: harness/<version>`, by which gateways that serve several agents (magpie, say) tell the harness's usage apart; a `User-Agent` here replaces it |
 | `max_tokens` | output cap: top level, per provider or per model |
 | `context_window` | the model's context window in tokens: top level, per provider or per model; the conversation is [compacted](#compaction) before it fills up. Without one, well-known models get theirs (1M for Claude Opus 4.6 and later, Sonnet 4.6 and later, Haiku 5.5 and Fable; 200k for older Claude models; 400k for GPT-5, also behind a gateway's prefix such as `anthropic/claude-…`) and others `200000`; set it when a gateway allows less |
 | `effort` | top level or per model: `low`, `medium`, `high` (default), `xhigh` or `max`. Sent as Anthropic `output_config.effort` or OpenAI `reasoning.effort`; `extra_body` still overrides it, e.g. `{"output_config": null}` for a model that takes no effort |

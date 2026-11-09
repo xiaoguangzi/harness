@@ -145,7 +145,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 |---|---|
 | `protocol` | `anthropic`（`POST {base_url}/v1/messages`）或 `openai-responses`（`POST {base_url}/v1/responses`）；`base_url` 中已有的 `/v1` 不会重复拼接 |
 | `api_key` | 以 `x-api-key`（Anthropic）或 `Authorization: Bearer`（OpenAI）发送；可用 `"auth": "bearer"` / `"x-api-key"` 覆盖 |
-| `headers` | 额外的请求头 |
+| `headers` | 额外的请求头。请求带有 `User-Agent: harness/<version>`，同时服务多个 agent 的网关（比如 magpie）据此把 harness 的用量单独统计；在这里设置 `User-Agent` 会替换它 |
 | `max_tokens` | 输出上限：顶层、按 provider 或按模型设置 |
 | `context_window` | 模型的上下文窗口（token 数）：顶层、按 provider 或按模型设置；会话在窗口占满前会被[压缩](#上下文压缩)。不设置时，常见模型用它们自己的窗口（Claude Opus 4.6 及以后、Sonnet 4.6 及以后、Haiku 5.5 和 Fable 为 1M；更早的 Claude 模型为 200k；GPT-5 为 400k；网关加了前缀如 `anthropic/claude-…` 也能识别），其他模型为 `200000`；网关允许的更小时请手动设置 |
 | `effort` | 顶层或按模型设置：`low`、`medium`、`high`（默认）、`xhigh` 或 `max`。以 Anthropic 的 `output_config.effort` 或 OpenAI 的 `reasoning.effort` 发送；`extra_body` 仍可覆盖它，例如对不支持 effort 的模型用 `{"output_config": null}` |

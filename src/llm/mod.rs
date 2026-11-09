@@ -111,6 +111,19 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// The HTTP client requests to the providers go through.
+fn http_client() -> Result<reqwest::Client> {
+    // Gateways that pool subscriptions for several agents (magpie, for one)
+    // tell their usage apart by it; a provider's `headers` can still set
+    // another.
+    reqwest::Client::builder()
+        .user_agent(concat!("harness/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(300))
+        .build()
+        .context("building HTTP client")
+}
+
 /// A handle on one model at one provider. Cheap to clone.
 #[derive(Clone)]
 pub struct Client {
@@ -126,13 +139,8 @@ pub struct Client {
 impl Client {
     /// A client for the providers' default model.
     pub fn new(providers: Providers) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(300))
-            .build()
-            .context("building HTTP client")?;
         let spec = providers.default_model.clone();
-        Ok(Self { http, providers: Arc::new(providers), spec, effort: None, subagent_model: None })
+        Ok(Self { http: http_client()?, providers: Arc::new(providers), spec, effort: None, subagent_model: None })
     }
 
     /// The `provider/model` this client talks to.
