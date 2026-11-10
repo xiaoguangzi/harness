@@ -312,7 +312,7 @@ Tool results appear as soon as they finish, paired by call ID, while the model r
 
 ## Large outputs
 
-Output too large to return whole (over 30,000 bytes from `bash`, `grep`, `glob` or `lsp`, 100,000 from an MCP tool, a subagent's report over its limit) is not just cut off: the model gets its first two thirds and its last third, so the end of a build or a test run is still there, with a note between them naming a file that holds all of it (`$TMPDIR/harness-<uid>/tool-output/`, readable by you only, up to 64 MB each). The model can then `read` or `grep` that file for the part it needs. `bash` writes the file while the command runs, keeping only the start and end in memory; stdout and stderr each get their own.
+One `read` returns at most 2000 lines and about 256 kB, and says at which line to read on. Output too large to return whole (over 30,000 bytes from `bash`, `grep`, `glob` or `lsp`, 100,000 from an MCP tool, a subagent's report over its limit) is not just cut off: the model gets its first two thirds and its last third, so the end of a build or a test run is still there, with a note between them naming a file that holds all of it (`$TMPDIR/harness-<uid>/tool-output/`, readable by you only, up to 64 MB each). The model can then `read` or `grep` that file for the part it needs. `bash` writes the file while the command runs, keeping only the start and end in memory; stdout and stderr each get their own.
 
 ## Compaction
 

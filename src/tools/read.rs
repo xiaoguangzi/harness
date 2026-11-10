@@ -7,6 +7,10 @@ use super::{FileTracker, Tool, ToolOutput, parse_input};
 
 const DEFAULT_LIMIT: usize = 2000;
 const MAX_LINE_CHARS: usize = 2000;
+/// One read returns about this much (some 64k tokens) at most, whatever
+/// `limit` says: 2000 lines of 2000 characters would be 4 MB, more than
+/// most context windows hold.
+const MAX_OUTPUT_BYTES: usize = 256_000;
 
 /// Reads a text file and returns it with line numbers (`cat -n` style).
 pub struct ReadTool {
@@ -51,8 +55,9 @@ impl Tool for ReadTool {
 
     fn description(&self) -> &str {
         "Read a text file and return its contents with 1-based line numbers. \
-         Reads up to 2000 lines by default; use `offset` and `limit` to page through \
-         larger files. Lines longer than 2000 characters are truncated. \
+         Reads up to 2000 lines by default, and at most about 256 kB at once; use `offset` \
+         and `limit` to page through larger files (the result says where to continue). \
+         Lines longer than 2000 characters are truncated. \
          Images (png, jpg, gif, webp, up to 3.75 MB) and PDFs (up to 20 MB) are returned \
          for you to view; `offset` and `limit` do not apply to them. \
          Relative paths resolve against the working directory."
@@ -200,7 +205,8 @@ pub(crate) fn number_lines(text: &str, offset: usize, limit: usize) -> Result<St
 }
 
 /// Renders `lines`, which start at 1-based `offset` (at least 1) and are at
-/// most `limit` (at least 1) of the `total`.
+/// most `limit` (at least 1) of the `total`, as far as [`MAX_OUTPUT_BYTES`]
+/// allows.
 fn render<'a>(
     lines: impl Iterator<Item = &'a str>,
     offset: usize,
@@ -212,14 +218,19 @@ fn render<'a>(
     }
 
     let mut out = String::new();
-    for (i, line) in (offset - 1..).zip(lines) {
+    let mut last = offset - 1;
+    for line in lines.take(limit) {
+        // At least one line, so paging on always gets further.
+        if out.len() >= MAX_OUTPUT_BYTES {
+            break;
+        }
         let line = match line.char_indices().nth(MAX_LINE_CHARS) {
             Some((cut, _)) => format!("{}... [line truncated]", &line[..cut]),
             None => line.to_string(),
         };
-        out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+        last += 1;
+        out.push_str(&format!("{last:>6}\t{line}\n"));
     }
-    let last = (offset - 1).saturating_add(limit).min(total);
     if last < total {
         out.push_str(&format!(
             "... [showing lines {offset}-{last} of {total}; use offset={} to continue]\n",
@@ -310,6 +321,22 @@ mod tests {
         assert!(!out.is_error);
         assert!(out.content.starts_with("     2\tb\n     3\tc\n"));
         assert!(out.content.contains("use offset=4 to continue"));
+    }
+
+    #[tokio::test]
+    async fn stops_at_the_output_limit_and_says_where_to_continue() {
+        // 2000 lines of 1000 characters: 2 MB, of which one read returns about 256 kB.
+        let line = "y".repeat(1000);
+        let f = file_with(format!("{line}\n").repeat(2000).as_bytes());
+        let out = read_tool().run(json!({"path": path(&f)})).await;
+        assert!(!out.is_error);
+        assert!(out.content.len() < MAX_OUTPUT_BYTES + 2 * 1024, "{}", out.content.len());
+        let shown = out.content.lines().count() - 1;
+        assert!(shown > 200 && shown < 2000, "{shown}");
+        let note = format!("... [showing lines 1-{shown} of 2000; use offset={} to continue]\n", shown + 1);
+        assert!(out.content.ends_with(&note), "{}", &out.content[out.content.len() - 100..]);
+        let out = read_tool().run(json!({"path": path(&f), "offset": shown + 1, "limit": 1})).await;
+        assert!(out.content.starts_with(&format!("{:>6}\ty", shown + 1)), "paging goes on from there");
     }
 
     #[tokio::test]
