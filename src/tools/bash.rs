@@ -59,8 +59,9 @@ impl Tool for BashTool {
         "Run a shell command with `bash -c` and return its stdout, stderr and exit code. \
          Each call runs in a fresh process started in the working directory, so `cd` and \
          environment changes do not persist between calls. Output longer than 30000 bytes \
-         is shortened to its start and end, and saved whole to a file the result names. Use this for builds, tests, git, listing files (ls, find) and other \
-         shell work. Do not use it to read, write or search file contents: no `cat`, `head`, \
+         is shortened to its start and end, and saved whole to a file the result names. Use this for \
+         builds, tests, git, listing a directory (`ls`) and other shell work; find files by name \
+         with the `glob` tool. Do not use it to read, write or search file contents: no `cat`, `head`, \
          `tail`, `sed`, `awk`, `echo >`, heredocs, `grep` or `rg` for that, and no Python, \
          Node or Perl scripts that change files. Use the `read` tool to view files, `edit` to \
          change them, `write` to create them, and the `grep` tool to search. Commands that \
