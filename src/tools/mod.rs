@@ -268,7 +268,10 @@ impl ToolRegistry {
     pub async fn run(&self, name: &str, input: Value) -> ToolOutput {
         match self.tools.get(name) {
             Some(tool) => {
-                let _guard = scheduling::acquire(tool.access(&input)).await;
+                let _guard = match scheduling::acquire(tool.access(&input)).await {
+                    Ok(guard) => guard,
+                    Err(held) => return ToolOutput::error(held),
+                };
                 tool.run(input).await
             }
             None => ToolOutput::error(format!("Unknown tool: {name}")),

@@ -70,8 +70,11 @@ const GUIDANCE: &[(&str, &str)] = &[
          Node or Perl scripts, `sed -i`, heredocs or `>` redirection into files. Those changes go \
          through `edit` and `write`, which check that you read the file and show the user the \
          change; commands that edit files themselves are refused. Running the project's own build \
-         steps, formatters and code generators is fine. Start dev servers, watchers and other \
-         commands that keep running with `run_in_background`.",
+         steps, formatters and code generators is fine. Start a long build or test run you will \
+         collect later with `run_in_background`; start dev servers, watchers and other commands \
+         that keep running with `background_kind: service` and a `resource` of their own (such as \
+         `service:web`) as well, or they hold the workspace, and your other commands and edits \
+         wait for them.",
     ),
     (
         "bash_output",

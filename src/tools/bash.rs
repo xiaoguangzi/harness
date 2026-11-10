@@ -69,7 +69,9 @@ impl Tool for BashTool {
          keeps running (dev servers, watchers, long builds) and the call returns a shell id \
          at once: read its output with `bash_output`, wait for required results with `wait_tasks`, \
          stop it with `kill_shell`. Finite tasks must be collected before reporting success. \
-         Services need background_kind service and an explicit independent resource."
+         Services need background_kind service and an explicit independent resource: a \
+         background command holds the workspace (or its resource) until it exits, and other \
+         commands and file changes that wait for it longer than a minute are refused."
     }
 
     fn input_schema(&self) -> Value {
@@ -139,7 +141,10 @@ async fn execute(input: Value) -> ToolOutput {
         let Some(shells) = super::shells::current() else {
             return ToolOutput::error("Background commands only run within a conversation");
         };
-        let guard = super::scheduling::acquire(access).await;
+        let guard = match super::scheduling::acquire(access).await {
+            Ok(guard) => guard,
+            Err(held) => return ToolOutput::error(held),
+        };
         return match shells.start(&input.command, input.background_kind, guard) {
             Ok(id) => ToolOutput::ok(format!(
                 "Started in the background as {id}. Read its output with bash_output, and stop it with \
@@ -149,7 +154,10 @@ async fn execute(input: Value) -> ToolOutput {
             Err(e) => ToolOutput::error(e),
         };
     }
-    let _execution = super::scheduling::acquire(access).await;
+    let _execution = match super::scheduling::acquire(access).await {
+        Ok(guard) => guard,
+        Err(held) => return ToolOutput::error(held),
+    };
     let timeout_ms = input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     run_command(&input.command, timeout_ms).await
 }
@@ -159,7 +167,10 @@ async fn execute(input: Value) -> ToolOutput {
 /// changing files, which is for the model.
 pub async fn run_for_user(command: &str) -> ToolOutput {
     super::snapshot::wait().await;
-    let _execution = super::scheduling::acquire(super::scheduling::Access::Workspace).await;
+    let _execution = match super::scheduling::acquire(super::scheduling::Access::Workspace).await {
+        Ok(guard) => guard,
+        Err(held) => return ToolOutput::error(held),
+    };
     run_command(command, DEFAULT_TIMEOUT_MS).await
 }
 

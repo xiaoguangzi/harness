@@ -97,7 +97,7 @@ impl Shells {
     }
 
     /// Starts `command` in the background; returns its id.
-    pub fn start(&self, command: &str, kind: Kind, execution: super::scheduling::Guard) -> Result<String, String> {
+    pub fn start(&self, command: &str, kind: Kind, mut execution: super::scheduling::Guard) -> Result<String, String> {
         let mut list = self.state.lock().unwrap();
         if list.shells.iter().filter(|s| s.status() == Status::Running).count() >= MAX_RUNNING {
             return Err(format!(
@@ -115,6 +115,8 @@ impl Shells {
             kind,
             changed: Notify::new(),
         });
+        // Calls that wait for what it holds are told so, rather than hang.
+        execution.held_in_background(format!("{} (`{}`)", shell.id, crate::util::ellipsize(command, 80)));
         let watched = shell.clone();
         let inbox = self.inbox.clone();
         let task = tokio::spawn(async move {
