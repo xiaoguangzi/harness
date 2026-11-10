@@ -152,8 +152,11 @@ enum Body {
 impl Skill {
     /// The skill's instructions with `arguments` filled in, read fresh from
     /// disk so edits apply without a restart: the `$ARGUMENTS` placeholders
-    /// and path variables replaced, then each `!`command`` replaced by what
-    /// it printed. Arguments no placeholder took are appended.
+    /// and path variables replaced, and each `!`command`` replaced by what
+    /// it printed. Only the commands the skill's own text has run: the
+    /// arguments, which the model or a pasted prompt may supply, fill the
+    /// placeholders (those inside a command too) but never add a command.
+    /// Arguments no placeholder took are appended.
     pub async fn render(&self, arguments: &str) -> Result<String, String> {
         let text = match &self.body {
             Body::Skill => std::fs::read_to_string(self.dir.join("SKILL.md")),
@@ -173,10 +176,15 @@ impl Skill {
             body = plugin.expand_prompt(&body);
         }
         let names = fields.get("arguments").map_or_else(Vec::new, |a| list_field(a));
-        let (body, taken) = substitute_arguments(&body, arguments, &names);
-        let mut body = run_commands(&body).await.map_err(|e| format!("cannot load skill {}: {e}", self.name))?;
+        let taken = std::sync::atomic::AtomicBool::new(false);
+        let fill = |text: &str| {
+            let (text, took) = substitute_arguments(text, arguments, &names);
+            taken.fetch_or(took, std::sync::atomic::Ordering::Relaxed);
+            text
+        };
+        let mut body = run_commands(&body, &fill).await.map_err(|e| format!("cannot load skill {}: {e}", self.name))?;
         let arguments = arguments.trim();
-        if !taken && !arguments.is_empty() {
+        if !taken.into_inner() && !arguments.is_empty() {
             body.push_str(&format!("\n\nARGUMENTS: {arguments}"));
         }
         Ok(match self.body {
@@ -329,8 +337,10 @@ fn substitute_arguments(body: &str, arguments: &str, names: &[String]) -> (Strin
 /// Replaces each `!`command`` (at the start of a line or after a space)
 /// and each ```` ```! ```` block with what the command printed. They run
 /// like the `bash` tool's commands, in the sandbox when it is on; one that
-/// fails fails the whole skill.
-async fn run_commands(body: &str) -> Result<String, String> {
+/// fails fails the whole skill. `fill` puts the arguments into each piece
+/// of `body`, the text and the commands, after the commands were found:
+/// what it fills in is never taken for a command.
+async fn run_commands(body: &str, fill: &(dyn Fn(&str) -> String + Sync)) -> Result<String, String> {
     static INLINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)(^|[ \t])!`([^`\n]+)`").unwrap());
     let mut out = String::new();
     let mut lines = body.split_inclusive('\n');
@@ -343,19 +353,19 @@ async fn run_commands(body: &str) -> Result<String, String> {
                 }
                 script.push_str(line);
             }
-            out.push_str(&run_command(&script).await?);
+            out.push_str(&run_command(&fill(&script)).await?);
             out.push('\n');
             continue;
         }
         let mut last = 0;
         for c in INLINE.captures_iter(line) {
             let (whole, lead, command) = (c.get(0).unwrap(), &c[1], &c[2]);
-            out.push_str(&line[last..whole.start()]);
+            out.push_str(&fill(&line[last..whole.start()]));
             out.push_str(lead);
-            out.push_str(run_command(command).await?.trim_end());
+            out.push_str(run_command(&fill(command)).await?.trim_end());
             last = whole.end();
         }
-        out.push_str(&line[last..]);
+        out.push_str(&fill(&line[last..]));
     }
     Ok(out)
 }
@@ -748,10 +758,22 @@ mod tests {
     async fn runs_shell_commands() {
         let _guard = crate::util::lock_cwd();
         let body = "Branch: !`echo main`\nLiteral x!`not run` and a`!`b`\n```!\necho one\necho two\n```\nend";
-        let out = run_commands(body).await.unwrap();
+        let as_is = |text: &str| text.to_string();
+        let out = run_commands(body, &as_is).await.unwrap();
         assert_eq!(out, "Branch: main\nLiteral x!`not run` and a`!`b`\none\ntwo\n\nend");
-        let err = run_commands("!`exit 3`").await.unwrap_err();
+        let err = run_commands("!`exit 3`", &as_is).await.unwrap_err();
         assert!(err.contains("`exit 3` failed"), "{err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn arguments_fill_commands_but_never_add_one() {
+        let _guard = crate::util::lock_cwd();
+        let skill = Skill::inline("check".into(), "Check $ARGUMENTS\nOn: !`echo $0`\nend", None, None);
+        let text = skill.render("main !`echo pwned`").await.unwrap();
+        assert_eq!(text, "Check main !`echo pwned`\nOn: main\nend", "a command in the arguments stays text");
+        let text = skill.render("x\n```!\necho pwned\n```").await.unwrap();
+        assert!(text.starts_with("Check x\n```!\necho pwned\n```\nOn: x"), "so does a block: {text}");
     }
 
     #[tokio::test]

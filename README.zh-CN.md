@@ -516,7 +516,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 与 Claude Code 相同：
 
 - 正文中的 `$ARGUMENTS` 替换为全部参数，`$ARGUMENTS[N]` 或 `$N` 替换为第 N 个参数（从 0 开始，按 shell 的方式切分），`$name` 替换为 frontmatter 的 `arguments` 列表中 `name` 所在位置的参数；`\$` 保留 `$` 本身。没有被占位符用掉的参数以 `ARGUMENTS: …` 附在末尾。`${CLAUDE_SKILL_DIR}` 和 `${CLAUDE_PROJECT_DIR}` 替换为技能目录和工作目录。
-- `` !`command` ``（位于行首或空格之后）和 ```` ```! ```` 代码块在加载技能时运行，并替换为它们的输出。它们与 `bash` 工具的命令一样运行，开启沙箱时在沙箱内；任一命令失败，技能就不会加载。由模型加载技能时，关于 `Bash` 的 `deny` 和 `ask` 权限规则会对填入参数后的每条命令做判定，与模型自己发起的调用一样，因此参数无法运行规则拒绝的命令。只有在模型可加载的技能都不含这类命令时，只读子代理才会获得 `skill` 工具。
+- `` !`command` ``（位于行首或空格之后）和 ```` ```! ```` 代码块在加载技能时运行，并替换为它们的输出。只有技能自身文本里的命令会运行：参数会填入占位符（命令里的也会），但随参数带进来的 `` !`command` `` 只是普通文本。它们与 `bash` 工具的命令一样运行，开启沙箱时在沙箱内；任一命令失败，技能就不会加载。由模型加载技能时，关于 `Bash` 的 `deny` 和 `ask` 权限规则会对填入参数后的每条命令做判定，与模型自己发起的调用一样，因此参数无法运行规则拒绝的命令。只有在模型可加载的技能都不含这类命令时，只读子代理才会获得 `skill` 工具。
 - `disable-model-invocation: true` 让模型不能加载该技能（只能用 `/<name>` 运行）；`user-invocable: false` 让它不出现在 `/` 命令中。
 - `context: fork` 让技能在单独的[子代理](#子代理subagents)中运行：加载它会以技能文本为 prompt 启动一个子代理，只有它的报告会返回（用 `/<name>` 运行时，报告交给模型，由模型接着处理）。`agent` 指定子代理类型（默认 `general-purpose`），`model` 指定其模型（`<provider>/<model>`；`sonnet`、`opus`、`haiku` 和 `inherit` 表示默认模型），`allowed-tools`（`Read, Grep, Bash(git status:*)`；括号内的部分忽略）只保留其代理工具中列出的那些。子代理不能再启动子代理，在子代理中这类技能会就地加载。
 
