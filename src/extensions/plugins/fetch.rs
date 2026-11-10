@@ -213,12 +213,20 @@ fn alive(pid: u32) -> bool {
 
 /// Clones `url` into `dir`; returns the files' directory and the commit.
 fn clone(dir: &Path, url: &str, git_ref: Option<&str>, sha: Option<&str>) -> Result<(PathBuf, String), String> {
+    // The source is what a marketplace's catalog says: none of it may reach
+    // git as an option (`--upload-pack=…` runs a command).
+    if [Some(url), git_ref].into_iter().flatten().any(|value| value.starts_with('-')) {
+        return Err("its source's `url` or `ref` starts with `-`".into());
+    }
+    if sha.is_some_and(|sha| sha.len() < 7 || !sha.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err("its source's `sha` is not a commit hash".into());
+    }
     let dir_arg = dir.to_string_lossy();
     let mut args = vec!["clone", "--quiet", "--depth", "1"];
     if let Some(git_ref) = git_ref {
         args.extend(["--branch", git_ref]);
     }
-    args.extend([url, &dir_arg]);
+    args.extend(["--", url, &dir_arg]);
     git(None, &args)?;
     if let Some(sha) = sha {
         git(Some(dir), &["fetch", "--quiet", "--depth", "1", "origin", sha])?;
@@ -233,6 +241,9 @@ fn clone(dir: &Path, url: &str, git_ref: Option<&str>, sha: Option<&str>) -> Res
 /// Fetches npm package `package` with `npm pack` and unpacks it in `dir`;
 /// returns the package's directory and its version. Its scripts never run.
 fn pack(dir: &Path, package: &str, version: Option<&str>, registry: Option<&str>) -> Result<(PathBuf, String), String> {
+    if package.starts_with('-') {
+        return Err(format!("invalid package name `{package}`"));
+    }
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let spec = match version {
         Some(version) => format!("{package}@{version}"),
@@ -372,6 +383,26 @@ pub(super) mod tests {
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let path = git_checkout(dir.clone(), &origin).ensure().unwrap();
         assert!(path.join("a.txt").is_file() && !dir.join(".git").exists());
+    }
+
+    #[test]
+    fn a_source_never_reaches_git_as_an_option() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        repo(&origin, &[("a.txt", "one")]);
+        let marker = tmp.path().join("ran");
+        let option = format!("--upload-pack=touch {}", marker.display());
+        let url = format!("file://{}", origin.display());
+        let with = |url: &str, git_ref: Option<&str>, sha: Option<&str>| {
+            let source = Source::Git { url: url.into(), git_ref: git_ref.map(String::from), sha: sha.map(String::from) };
+            Checkout { label: "plugin p@m".into(), dir: tmp.path().join("cache/m/p"), source }.ensure()
+        };
+        assert!(with(&option, None, None).unwrap_err().contains("starts with `-`"));
+        assert!(with(&url, Some("-x"), None).unwrap_err().contains("starts with `-`"));
+        assert!(with(&url, None, Some(&option)).unwrap_err().contains("not a commit hash"));
+        assert!(!marker.exists());
+        let head = git(Some(&origin), &["rev-parse", "HEAD"]).unwrap();
+        assert!(with(&url, None, Some(&head)).unwrap().join("a.txt").is_file(), "a commit is still fetched");
     }
 
     #[test]
