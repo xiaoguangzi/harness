@@ -629,6 +629,21 @@ impl Observer for WebObserver<'_> {
         self.task.push(json!({"type": "compact", "before": before, "after": after}));
     }
 
+    fn on_advisor_start(&mut self, model: &str) {
+        self.task.push(json!({"type": "advisor", "model": model}));
+    }
+
+    fn on_advisor_result(&mut self, outcome: &crate::llm::advisor::Outcome) {
+        use crate::llm::advisor::Outcome;
+        let advice = match outcome { Outcome::Advice(text) => Some(text.as_str()), _ => None };
+        let ok = !matches!(outcome, Outcome::Unavailable(_));
+        self.task.push(json!({"type": "advisor_result", "summary": outcome.summary(), "advice": advice, "ok": ok}));
+    }
+
+    fn on_advisor_refused(&mut self, reason: &str) {
+        self.task.push(json!({"type": "advisor_refused", "message": reason}));
+    }
+
     fn on_retry(&mut self, error: &anyhow::Error, attempt: u32, max: u32, wait: Duration) {
         self.task.push(json!({
             "type": "retry",

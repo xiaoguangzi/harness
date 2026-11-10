@@ -32,6 +32,7 @@ harness plugin install fmt@team         # 安装插件（见下文；harness plu
 harness --check-plugins                 # 报告每个已启用插件加载了什么、没加载什么
 harness --output-format json "..."      # 一次性模式，输出供脚本使用的 JSON 结果（见下文）
 harness --bare "..."                    # 不加载插件、hooks、MCP 服务器、技能和 AGENTS.md 启动
+harness --advisor opus                  # 让模型在关键节点咨询更强的模型（见下文）
 harness --help                          # 查看全部选项
 ```
 
@@ -44,6 +45,7 @@ harness --help                          # 查看全部选项
 | `HARNESS_SUBAGENT_MODEL` | 配置中的 `subagent_model`，否则与主模型相同 |
 | `HARNESS_MAX_TOKENS` | 配置中的 `max_tokens`，否则 `64000`（可被 provider 或单个模型覆盖） |
 | `HARNESS_EFFORT` | 配置中的 `effort`，否则 `high` |
+| `HARNESS_ADVISOR_MODEL` | 配置中的 `advisor_model`，否则不使用顾问；`off` 表示关闭（`--advisor` 优先） |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_BASE_URL` | 隐式的 `anthropic` provider |
 | `OPENAI_API_KEY`、`OPENAI_BASE_URL` | 隐式的 `openai` provider（Responses API） |
 | `HARNESS_SANDBOX` | `1` 或 `0`：开启或关闭[沙箱](#沙箱)（`--sandbox` / `--no-sandbox` 参数优先） |
@@ -76,6 +78,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | 键 | 说明 |
 |---|---|
 | `model`、`subagent_model`、`effort`、`max_tokens`、`context_window`、`providers` | 模型和 [LLM 网关](#llm-网关) |
+| `advisor_model` | 主模型咨询的[顾问](#顾问advisor) |
 | `idle_compaction`、`idle_compaction_min_tokens` | [空闲压缩](#上下文压缩) |
 | `mcpServers` | [MCP 服务器](#mcp-服务器) |
 | `sandbox` | [沙箱](#沙箱) |
@@ -151,6 +154,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `effort` | 顶层或按模型设置：`low`、`medium`、`high`（默认）、`xhigh` 或 `max`。以 Anthropic 的 `output_config.effort` 或 OpenAI 的 `reasoning.effort` 发送；`extra_body` 仍可覆盖它，例如对不支持 effort 的模型用 `{"output_config": null}` |
 | `extra_body` | 合并进每个请求体，也可按模型设置；`null` 会移除默认键，例如对不支持自适应思考的模型用 `{"thinking": null}`，或对拒绝加密推理的网关用 `{"include": null}` |
 | `fallbacks`、`eager_input_streaming` | 仅 Anthropic 的 API 特性；`api.anthropic.com` 默认开启，网关默认关闭 |
+| `advisor` | 仅 Anthropic：设置了顾问时请求带上 [advisor](#顾问advisor) 工具。`api.anthropic.com` 默认开启，网关默认关闭（网关可能不转发它） |
 | `tool_result_media` | 仅 Anthropic：工具返回的图片和 PDF（`read`、MCP 工具）放在 `tool_result` 里。`api.anthropic.com` 默认开启；网关默认关闭，此时它们放在同一条消息里、紧跟工具结果之后，因为很多网关会丢掉工具结果里的图片 |
 | `prompt_cache` | Anthropic 提示词缓存，默认开启：会话末尾的自动断点，加上系统提示词上的一个断点，这样它之前的消息发生变化时（[压缩](#上下文压缩)、`/rewind`、`/clear`、同一项目里的新会话），以及同类型的每个子代理，仍然从缓存读取工具和系统提示词 |
 | `prompt_cache_ttl` | 仅 Anthropic：缓存在最后一次使用后保留多久，`5m`（默认）或 `1h`。写入 1 小时缓存的价格是输入价的 2 倍而不是 1.25 倍，常在 5 分钟到 1 小时之间停顿时更划算 |
@@ -191,6 +195,24 @@ harness provider sync magpie-openai --include 'codex/*'
 
 会话中途可用 `/model <provider>/<model>` 直接切换模型，或输入无参数的 `/model` 并回车打开模型设置面板：Tab 切换主模型和子代理默认模型，↑/↓ 选择模型，输入文字筛选（Enter 采用高亮的模型，仅筛选不会改变设置），←/→ 调整共同的会话 effort（`auto`、`low`、`medium`、`high`、`xhigh`、`max`）。面板显示两个模型选择、协议、配置的上下文/输出上限和 effort；Enter 一次应用所有预览修改，Esc 放弃修改，仅影响本次会话。子代理默认模型可设置为跟随主模型，也可独立选择；代理自身指定的模型仍优先，已有子代理保留原模型。重定向输入时仍打印 provider、模型列表和实际生效的设置。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
 
+## 顾问（Advisor）
+
+顾问对应 Claude Code 的 `/advisor`：主模型在关键节点（确定方案前、错误反复出现时、宣布任务完成前）咨询的第二个模型，通常更强。它基于 Anthropic API 的服务端 advisor 工具（beta `advisor-tool-2026-03-01`）：请求中带上 `{"type": "advisor_20260301", "name": "advisor", "model": …}`，由模型决定何时调用，API 让顾问读完整个会话（包括所有工具调用和结果），再把建议交回主模型继续。例如用 sonnet 当主模型、opus 当顾问，日常工作按 Sonnet 的价格完成，关键判断交给 Opus。
+
+```sh
+harness --advisor opus                  # 仅本次运行
+```
+
+```json
+{ "advisor_model": "opus" }
+```
+
+- **设置**：配置中的 `advisor_model`、`$HARNESS_ADVISOR_MODEL`，或只对本次运行生效的 `--advisor MODEL`（优先级最高）；`off` 表示关闭。`/advisor` 打开选择面板；`/advisor <model>` 和 `/advisor off` 设置本会话的顾问，并保存为配置中的 `advisor_model`。别名有 `fable`（`claude-fable-5-2`）、`opus`（`claude-opus-5-5`）、`sonnet`（`claude-sonnet-5-5`）和 `haiku`（`claude-haiku-5-5`）；也可以写任意模型 ID，按原样发送。单独输入 `/advisor` 会显示当前顾问以及是否生效；`/model` 和启动横幅也会显示。
+- **搭配**：与 API 的检查一致，顾问必须不弱于被咨询的模型：Opus 5 / 5.5 接受 Fable 或 Opus 5 / 5.5 作顾问，Sonnet 5.5 接受 Fable、Opus 5 / 5.5 或 Sonnet 5.5，Fable 5.2 只接受 Fable 5.2，Haiku 4.5 可以被咨询但不能当顾问。不符合的搭配或 harness 不认识的模型不会带上顾问，`/advisor` 会说明原因。子代理继承顾问，并按自己的模型检查搭配。
+- **适用范围**：仅 Anthropic provider，`api.anthropic.com` 默认开启。能把请求原样转发给 Anthropic API 的网关需要在 provider 上设置 `"advisor": true`。如果 API 拒绝顾问（HTTP 400 且错误提到 advisor），请求会去掉顾问重发，本次运行中该模型之后的请求也不再带它，并给出警告。
+- **会话中的显示**：顾问阅读期间状态栏显示 `Advising (model)…`（响应在此期间暂停），之后显示 `● advisor(model)` 和 `⎿ Advisor reviewed the conversation`；咨询失败时显示 `Advisor unavailable (<error_code>)`，模型不带建议继续。较新的顾问模型返回加密的建议，只有主模型能读；明文建议（较早的顾问模型）显示在调用下方和 Ctrl+O 中。`stream-json` 会输出 `advisor`、`advisor_result` 和 `advisor_refused` 事件，Web UI 也会在任务中显示。
+- **费用**：每次咨询都会按顾问模型的价格读取整个会话。顾问的 token 单独统计（`usage.iterations`），`/usage` 将其列在顾问模型名下；上下文大小取主模型最后一次请求的值，所以咨询不会让压缩提前。顾问的内容块保留在历史中，只发回调用它的模型；换成其他模型时，明文建议转为文本，加密建议则不发送。Prompt hook 提问时不带顾问。
+
 ## 用 `@` 附加文件
 
 用 `@` 提及一个路径，其内容会附加到你的消息中，模型无需工具调用即可看到：
@@ -216,7 +238,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 
 助手的 Markdown 在流式输出时即时渲染（逐行；表格在完整后对齐）。工具调用显示为 `● bash(cargo test)` 并带有结果的前几行，前台子代理的调用列在其 `agent` 调用之下，后台子代理结束时显示一行，并有旋转指示器显示正在运行的内容。每轮结束时显示耗时、输出 token 数和上下文大小。当 stdout 不是终端时，文本按原样输出，没有样式和摘要；一次性模式下错误输出到 stderr，退出码非零。
 
-交互式终端启动后会占满当前屏幕，对话从顶部开始，shell 和对话输出保留在终端原生滚动历史中。输入框夹在两条横线之间，在等待输入和模型运行期间都固定在底部；命令和文件菜单在输入框下方展开，输入框会向上让出空间。文本换行、光标、菜单和窗口缩放由同一个渲染器处理，设置 `NO_COLOR` 也只关闭颜色，仍保留布局。终端 Reset 或 Clear Buffer 后，下一次编辑、缩放或运行状态刷新会恢复布局。模型工作时输入的内容会进入这个输入框：按 Enter 后，这条消息列在输入框上方，直到模型在下一次请求中拿到它（跟在当时正在运行的工具调用结果之后；如果模型正在写回答，它会继续而不是结束本轮），之后它显示在会话中。`@路径` 提及、Ctrl+V 以及命令和文件菜单在这里同样可用；历史只在提示符处可用。不改动对话的 `/命令` 会立即在本轮旁边执行，与 Claude Code 一样：`/model`、`/effort`、`/permissions`、`/help`、`/skills`、`/tools`、`/mcp`、`/agents`、`/tasks`、`/stop` 和 `/sandbox`（未知命令也会立即提示）。它们的面板显示在输入框的位置，本轮期间结束时面板仍保持打开；此时选定的模型或 effort 从下一条消息开始使用，一轮内的请求始终使用同一个模型。其他命令（`/clear`、`/compact`、`/rewind`、`/usage`、`!命令`、技能等）会等本轮结束再执行。想改主意时，在输入框第一行按 ↑（有排队消息时空输入框会给出提示）：模型尚未拿到的消息会回到输入框中、排在你已输入的内容之前，可以修改后重新发送，与 Claude Code 一样。如果中断本轮，模型尚未拿到的消息会回到输入框中；本轮结束后，输入框里剩下的内容仍会保留在提示符中。
+交互式终端启动后会占满当前屏幕，对话从顶部开始，shell 和对话输出保留在终端原生滚动历史中。输入框夹在两条横线之间，在等待输入和模型运行期间都固定在底部；命令和文件菜单在输入框下方展开，输入框会向上让出空间。文本换行、光标、菜单和窗口缩放由同一个渲染器处理，设置 `NO_COLOR` 也只关闭颜色，仍保留布局。终端 Reset 或 Clear Buffer 后，下一次编辑、缩放或运行状态刷新会恢复布局。模型工作时输入的内容会进入这个输入框：按 Enter 后，这条消息列在输入框上方，直到模型在下一次请求中拿到它（跟在当时正在运行的工具调用结果之后；如果模型正在写回答，它会继续而不是结束本轮），之后它显示在会话中。`@路径` 提及、Ctrl+V 以及命令和文件菜单在这里同样可用；历史只在提示符处可用。不改动对话的 `/命令` 会立即在本轮旁边执行，与 Claude Code 一样：`/model`、`/effort`、`/advisor`、`/permissions`、`/help`、`/skills`、`/tools`、`/mcp`、`/agents`、`/tasks`、`/stop` 和 `/sandbox`（未知命令也会立即提示）。它们的面板显示在输入框的位置，本轮期间结束时面板仍保持打开；此时选定的模型或 effort 从下一条消息开始使用，一轮内的请求始终使用同一个模型。其他命令（`/clear`、`/compact`、`/rewind`、`/usage`、`!命令`、技能等）会等本轮结束再执行。想改主意时，在输入框第一行按 ↑（有排队消息时空输入框会给出提示）：模型尚未拿到的消息会回到输入框中、排在你已输入的内容之前，可以修改后重新发送，与 Claude Code 一样。如果中断本轮，模型尚未拿到的消息会回到输入框中；本轮结束后，输入框里剩下的内容仍会保留在提示符中。
 
 每个已完成的工具调用会与自己的结果相邻显示，同一批并发调用多次使用同名工具也能明确对应。正常对话默认只显示简短预览。按 Ctrl+O 或执行 `/output`，可连续浏览展开的整段会话：用户问题、思考、回复和所有保留的工具结果放在一起，命令下方直接显示输出。按 `i` 或 Tab 显示/隐藏完整 JSON 输入与 Call ID；↑/↓ 或 `j`/`k` 逐行滚动，PgUp/PgDn 或空格/`b` 翻页，Home/End 或 `g`/`G` 跳到开头/末尾，按 `/` 输入关键词并回车搜索，`n`/`N` 查找下一处/上一处。搜索输入中 Esc 取消搜索；其他时候 Esc、`q` 或 Ctrl+O 关闭视图。打开时定位到底部并跟随新输出，向上滚动后暂停跟随，按 `G` 恢复；操作提示固定在屏幕底部。模型运行期间同样可用，不会提交或丢弃输入草稿。`/resume` 恢复已保存的会话内容，`/clear` 清空视图。完整文本仍受工具自身的输出上限约束，例如 `bash` 最多返回 30,000 字节（见[大输出](#大输出)）；图片和文档附件在此文本视图中只显示说明。
 
@@ -230,6 +252,7 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/model [spec]` | 设置主模型、子代理默认模型及 effort，或直接切换主模型到 `<provider>/<model>` |
 | `/provider [子命令]` | 打开 provider 管理；`/provider add`、`remove`、`model add`、`model remove`、`sync`、`default` 与 `harness provider` 相同，并立即生效（见 [LLM 网关](#llm-网关)） |
 | `/effort [level]` | 交互选择推理强度，或直接设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
+| `/advisor [model\|off]` | 选择[顾问](#顾问advisor)，或直接设置（`opus` 等别名或模型 ID）或关闭；保存到配置中 |
 | `/clear` | 开始新会话 |
 | `/compact [重点]` | 总结会话以腾出上下文（见[上下文压缩](#上下文压缩)）；`重点` 指定摘要要特别保留的内容 |
 | `/resume [id]` | 继续当前目录下之前的会话（见[恢复会话](#恢复会话)） |
@@ -685,7 +708,8 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/llm/` — LLM 网关
   - `config.rs` — 由配置和环境变量得到 provider、模型 spec 解析、按 provider/模型的设置
   - `manage.rs` — `harness provider` 与 `/provider …`：通过修改配置添加和移除 provider 与列出的模型、从网关的模型列表同步模型、设置默认模型
-  - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退）
+  - `anthropic.rs` — Messages API 后端（SSE 转内容块、thinking、提示词缓存、拒答回退、advisor 工具）
+  - `advisor.rs` — 顾问：别名、哪些模型可以给哪些模型当顾问、`--advisor`、解析顾问结果块
   - `openai.rs` — Responses API 后端（历史 ⇄ 输入/输出项转换、加密推理）
   - `http.rs` — POST（开启时用 gzip 压缩）、SSE 读取器；标记哪些失败（连接断开、过载、可重试的状态码）之后 `llm::Client` 会重发请求，以及要等多久
 - `src/prompt/` — 系统提示词：主代理的模板（`system.md`）及其工具、环境和 `AGENTS.md`，子代理的提示词（`mod.rs`）；`/init` 的要求（`init.md`）

@@ -942,7 +942,7 @@ impl Outcome {
 /// with the hook's `input` in place of `$ARGUMENTS` in `prompt`; its answer
 /// as a command hook's: `ok: false` as exit code 2, other JSON as output.
 async fn ask_model(client: &Client, prompt: &str, model: Option<&str>, input: &str) -> Result<Reply, String> {
-    let client = model.and_then(|m| client.switch(m).ok()).unwrap_or_else(|| client.clone());
+    let client = model.and_then(|m| client.switch(m).ok()).unwrap_or_else(|| client.clone()).without_advisor();
     let text = match prompt.contains("$ARGUMENTS") {
         true => prompt.replace("$ARGUMENTS", input),
         false => format!("{prompt}\n\nThe input of the event:\n{input}"),

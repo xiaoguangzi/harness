@@ -5,10 +5,11 @@ use crate::extensions::skills::Skill;
 use crate::llm;
 
 /// Built-in commands and what they do, as the menu and `/help` show them.
-pub(super) const BUILTINS: [(&str, &str); 25] = [
+pub(super) const BUILTINS: [(&str, &str); 26] = [
     ("/help", "browse commands; Enter inserts one into the prompt"),
     ("/model", "choose main/subagent models and effort; /model <provider>/<model> switches directly"),
     ("/effort", "choose reasoning effort, or set it with /effort <level>"),
+    ("/advisor", "choose the model the main model consults at decision points; /advisor <model>|off sets it"),
     ("/provider", "manage providers and models; /provider add|remove|model|default … changes them"),
     ("/clear", "start a new conversation"),
     ("/compact", "summarize the conversation to free context; /compact <focus> says what to keep"),
@@ -88,6 +89,9 @@ pub(super) enum Input {
     Rewind,
     /// `/provider …`, as `harness provider` takes it.
     Providers(Vec<String>),
+    /// `/advisor` shows or picks the advisor; `/advisor <model>` sets it and
+    /// `/advisor off` turns it off, both saved to the settings.
+    Advisor(Option<String>),
     /// `/effort` shows the effort; `/effort <level>` sets it for this
     /// session, and `/effort auto` restores the configured one.
     Effort(Option<Option<llm::Effort>>),
@@ -178,6 +182,7 @@ pub(super) fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "sandbox" => Input::Sandbox,
         "usage" => Input::Usage,
         "model" => Input::Model(arg),
+        "advisor" => Input::Advisor(arg),
         "provider" | "providers" => Input::Providers(words()),
         "effort" => match args.trim() {
             "" => Input::Effort(None),

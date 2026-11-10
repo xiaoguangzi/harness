@@ -156,6 +156,23 @@ impl Observer for Events {
     fn on_hook(&mut self, message: &str) {
         self.emit(json!({"type": "hook", "message": message}));
     }
+
+    fn on_advisor_start(&mut self, model: &str) {
+        self.emit(json!({"type": "advisor", "model": model}));
+    }
+
+    fn on_advisor_result(&mut self, outcome: &crate::llm::advisor::Outcome) {
+        use crate::llm::advisor::Outcome;
+        self.emit(match outcome {
+            Outcome::Advice(advice) => json!({"type": "advisor_result", "status": "reviewed", "advice": advice}),
+            Outcome::Redacted => json!({"type": "advisor_result", "status": "reviewed"}),
+            Outcome::Unavailable(code) => json!({"type": "advisor_result", "status": "unavailable", "error_code": code}),
+        });
+    }
+
+    fn on_advisor_refused(&mut self, reason: &str) {
+        self.emit(json!({"type": "advisor_refused", "message": reason}));
+    }
 }
 
 #[cfg(test)]

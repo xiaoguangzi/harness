@@ -31,6 +31,7 @@ harness plugin install fmt@team         # install a plugin (see below; harness p
 harness --check-plugins                 # report what each enabled plugin loads, and what not
 harness --output-format json "..."      # one-shot, printing a JSON result for scripts (see below)
 harness --bare "..."                    # start without plugins, hooks, MCP servers, skills or AGENTS.md
+harness --advisor opus                  # have the model consult a stronger one at decision points (see below)
 harness --help                          # all options
 ```
 
@@ -43,6 +44,7 @@ Rerun `cargo install --path .` after pulling changes. While developing, `cargo r
 | `HARNESS_SUBAGENT_MODEL` | `subagent_model` from the settings, else the main model |
 | `HARNESS_MAX_TOKENS` | `max_tokens` from the settings, else `64000` (overridden per provider or model) |
 | `HARNESS_EFFORT` | `effort` from the settings, else `high` |
+| `HARNESS_ADVISOR_MODEL` | `advisor_model` from the settings, else none; `off` turns it off (`--advisor` wins) |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | implicit `anthropic` provider |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | implicit `openai` provider (Responses API) |
 | `HARNESS_SANDBOX` | `1` or `0`: turn the [sandbox](#sandbox) on or off (the `--sandbox` / `--no-sandbox` flags win) |
@@ -75,6 +77,7 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 | Key | |
 |---|---|
 | `model`, `subagent_model`, `effort`, `max_tokens`, `context_window`, `providers` | models and [LLM gateways](#llm-gateways) |
+| `advisor_model` | the [advisor](#advisor) the main model consults |
 | `idle_compaction`, `idle_compaction_min_tokens` | [idle compaction](#compaction) |
 | `mcpServers` | [MCP servers](#mcp-servers) |
 | `sandbox` | the [sandbox](#sandbox) |
@@ -150,6 +153,7 @@ Declare gateways under `providers` in the [settings](#settings). Each one speaks
 | `effort` | top level or per model: `low`, `medium`, `high` (default), `xhigh` or `max`. Sent as Anthropic `output_config.effort` or OpenAI `reasoning.effort`; `extra_body` still overrides it, e.g. `{"output_config": null}` for a model that takes no effort |
 | `extra_body` | merged into every request body, also per model; a `null` removes a default key, e.g. `{"thinking": null}` for a model without adaptive thinking, or `{"include": null}` for a gateway that rejects encrypted reasoning |
 | `fallbacks`, `eager_input_streaming` | Anthropic-only API features; default on for `api.anthropic.com`, off for gateways |
+| `advisor` | Anthropic only: requests carry the [advisor](#advisor) tool when one is chosen. Default on for `api.anthropic.com`, off for gateways, which may not pass it on |
 | `tool_result_media` | Anthropic only: images and PDFs a tool returns (`read`, MCP tools) stay inside its `tool_result`. Default on for `api.anthropic.com`; off for gateways, where they follow the tool results in the same message instead, because many gateways drop them from tool results |
 | `prompt_cache` | Anthropic prompt caching, default on: the automatic breakpoint at the end of the conversation, and one on the system prompt, so the tools and system prompt are still read from the cache when the messages before it change (a [compaction](#compaction), `/rewind`, `/clear`, a new session in the same project) and by every subagent of a kind |
 | `prompt_cache_ttl` | Anthropic only: how long the cache keeps the conversation after its last use, `5m` (default) or `1h`. Writing to the 1-hour cache costs twice the input price rather than 1.25 times, which pays off when you often pause between 5 minutes and an hour |
@@ -190,6 +194,24 @@ harness provider sync magpie-openai --include 'codex/*'
 
 Switch models mid-conversation with `/model <provider>/<model>`, or run `/model` without arguments to open the model settings panel. Tab switches between the main model and subagent default, ↑/↓ selects a model, typing filters (Enter takes the highlighted model; filtering alone changes nothing), and ←/→ adjusts the shared session effort (`auto`, `low`, `medium`, `high`, `xhigh`, `max`). The panel shows both model choices, protocol, configured context/output limits and effort. Enter applies all previewed changes to this session; Esc cancels them. Subagents can follow the main model or use a separate default; agent-specific models still take priority and existing children keep their original model. Redirected input still prints providers, models and effective settings. `/effort <level>` changes the effort for the rest of the session (kept across `/model`), and `/effort auto` goes back to the configured one. The history is kept in Anthropic form and converted for OpenAI (`function_call` / `function_call_output`, `input_image`, `input_file`); requests are stateless (`store: false`), with reasoning items replayed from their encrypted content. Model-bound blocks (Anthropic thinking, OpenAI reasoning) are only sent back to the model that produced them. Subagents can use a different gateway through `subagent_model` or an agent's `model`.
 
+## Advisor
+
+The advisor is Claude Code's `/advisor`: a second, usually stronger model the main model consults at decision points, such as before committing to an approach, when an error keeps coming back, or before it calls a task done. It is the Anthropic API's server-side advisor tool (beta `advisor-tool-2026-03-01`): the request carries `{"type": "advisor_20260301", "name": "advisor", "model": …}`, the model decides when to call it, and the API runs the advisor on the whole conversation (every tool call and result included) and hands its guidance back to the model before it goes on. A sonnet main model with an opus advisor, for one, does the routine work at Sonnet's price and gets Opus's judgment where it counts.
+
+```sh
+harness --advisor opus                  # for this run
+```
+
+```json
+{ "advisor_model": "opus" }
+```
+
+- **Choosing it**: `advisor_model` in the settings, `$HARNESS_ADVISOR_MODEL`, or `--advisor MODEL` for one run, which wins; `off` turns it off. `/advisor` opens a picker; `/advisor <model>` and `/advisor off` set it for the session and save it as `advisor_model`. The aliases are `fable` (`claude-fable-5-2`), `opus` (`claude-opus-5-5`), `sonnet` (`claude-sonnet-5-5`) and `haiku` (`claude-haiku-5-5`); any model id works, sent as written. `/advisor` alone shows it and whether it is used; so do `/model` and the startup banner.
+- **Pairing**: the advisor must be at least as capable as the model it advises, as the API checks: Opus 5 / 5.5 take a Fable or Opus 5 / 5.5 advisor, Sonnet 5.5 takes Fable, Opus 5 / 5.5 or Sonnet 5.5, Fable 5.2 only Fable 5.2, Haiku 4.5 can be advised but never advises. A pair that doesn't fit, or a model the harness does not recognize, goes without it, and `/advisor` says why. Subagents inherit the advisor and are checked against their own model.
+- **Where**: Anthropic providers only, on by default for `api.anthropic.com`. A gateway that forwards requests intact to the Anthropic API needs `"advisor": true` on the provider. If the API refuses the advisor (HTTP 400 naming it), the request is sent again without it, and so are later ones on that model for the rest of the run, with a warning.
+- **In the transcript**: the status line says `Advising (model)…` while it reads (the response pauses meanwhile), then `● advisor(model)` with `⎿ Advisor reviewed the conversation`, or `Advisor unavailable (<error_code>)` when the consultation failed; the model then goes on without advice. The newest advisors' advice comes back encrypted, read by the model only; plain-text advice (older advisors) is shown under the call and in Ctrl+O. `stream-json` emits `advisor`, `advisor_result` and `advisor_refused` events, and the web UI shows them in the task.
+- **Cost**: each consultation reads the whole conversation at the advisor's prices. Its tokens are reported apart (`usage.iterations`) and `/usage` lists them under the advisor's own model; the context size is the main model's last request, so a consultation does not bring a compaction forward. The advisor's blocks stay in the history and go back to the model that called it; another model gets plain advice as text and nothing of encrypted advice. Prompt hooks ask their question without the advisor.
+
 ## Attaching files with `@`
 
 Mention a path with `@` and its contents are attached to your message, so the model sees them without a tool call:
@@ -215,7 +237,7 @@ On macOS the clipboard is read through `osascript` (any image type an app puts t
 
 The assistant's Markdown is rendered as it streams (a line at a time; tables are aligned once complete). Tool calls show as `● bash(cargo test)` with the first lines of their result, a foreground subagent's calls are listed under its `agent` call, a background subagent gets a line when it ends, and a spinner shows what is running. Each turn ends with its time, output tokens and context size. When stdout is not a terminal, text is printed as is, without styling or the summary; in one-shot mode errors go to stderr and the exit code is non-zero.
 
-On an interactive terminal, startup claims the current screen and places the conversation at the top, preserving the shell and conversation in native terminal scrollback. The input box stays between two rules at the bottom, while waiting and while a turn runs. Commands and files open a menu below it; the box moves up to make room. One renderer handles text wrapping, cursor placement, menus and resizing, including when `NO_COLOR` disables colors. After a terminal reset or clear, the next edit, resize or running status redraw restores the viewport. What you type while the model works goes into it: press Enter and the message is listed above the box until the model gets it with its next request (after the tool calls running then; if the model was writing its answer, it carries on instead of ending the turn), and then it shows in the conversation. `@path` mentions, Ctrl+V and the command and file menus work there too; history only at the prompt. A `/command` that leaves the conversation as it is runs at once, beside the turn, as in Claude Code: `/model`, `/effort`, `/permissions`, `/help`, `/skills`, `/tools`, `/mcp`, `/agents`, `/tasks`, `/stop` and `/sandbox` (and an unknown command says so). Their panels open in the box's place and stay open if the turn ends meanwhile; a model or effort chosen then is used from the next message, so a turn's requests stay on one model. Other commands (`/clear`, `/compact`, `/rewind`, `/usage`, `!command`, skills and the like) wait for the turn to end. To change your mind, press ↑ on the box's first line (the empty box says so while messages are queued): the messages the model has not got yet come back into the box, ahead of what you typed, to edit and send again, as in Claude Code. If you interrupt the turn, messages the model has not got yet go back into the box, and anything left in the box is still there at the prompt after the turn.
+On an interactive terminal, startup claims the current screen and places the conversation at the top, preserving the shell and conversation in native terminal scrollback. The input box stays between two rules at the bottom, while waiting and while a turn runs. Commands and files open a menu below it; the box moves up to make room. One renderer handles text wrapping, cursor placement, menus and resizing, including when `NO_COLOR` disables colors. After a terminal reset or clear, the next edit, resize or running status redraw restores the viewport. What you type while the model works goes into it: press Enter and the message is listed above the box until the model gets it with its next request (after the tool calls running then; if the model was writing its answer, it carries on instead of ending the turn), and then it shows in the conversation. `@path` mentions, Ctrl+V and the command and file menus work there too; history only at the prompt. A `/command` that leaves the conversation as it is runs at once, beside the turn, as in Claude Code: `/model`, `/effort`, `/advisor`, `/permissions`, `/help`, `/skills`, `/tools`, `/mcp`, `/agents`, `/tasks`, `/stop` and `/sandbox` (and an unknown command says so). Their panels open in the box's place and stay open if the turn ends meanwhile; a model or effort chosen then is used from the next message, so a turn's requests stay on one model. Other commands (`/clear`, `/compact`, `/rewind`, `/usage`, `!command`, skills and the like) wait for the turn to end. To change your mind, press ↑ on the box's first line (the empty box says so while messages are queued): the messages the model has not got yet come back into the box, ahead of what you typed, to edit and send again, as in Claude Code. If you interrupt the turn, messages the model has not got yet go back into the box, and anything left in the box is still there at the prompt after the turn.
 
 Each completed tool call is printed together with its own result, including repeated calls to the same tool in a concurrent batch. The normal transcript shows a compact preview. Press Ctrl+O or run `/output` to browse the expanded conversation: prompts, reasoning, replies and all retained tool results appear together, with commands above their output. Press `i` or Tab to show/hide full JSON inputs and call IDs. Use ↑/↓ or `j`/`k` to scroll, PgUp/PgDn or Space/`b` to page, Home/End or `g`/`G` to jump to the beginning/end, `/` then Enter to search, and `n`/`N` for the next/previous match. Esc cancels an active search; otherwise Esc, `q` or Ctrl+O closes the viewer. It opens at the bottom and follows new output until you scroll up; `G` resumes following. The footer stays at the bottom. This also works while the model runs without submitting or discarding your input draft. `/resume` restores saved conversation content, and `/clear` clears the viewer. Full returned text means the text retained by the tool; a tool's own output limits still apply (for example, `bash` returns up to 30,000 bytes, see [Large outputs](#large-outputs)). Image/document attachments are labeled rather than decoded in this text viewer.
 
@@ -229,6 +251,7 @@ Interactive command panels use the available terminal width, with headings and s
 | `/model [spec]` | configure main/subagent models and effort, or switch the main model directly to `<provider>/<model>` |
 | `/provider [command]` | open provider management;  `/provider add`, `remove`, `model add`, `model remove`, `sync` and `default` work as `harness provider` does and apply at once (see [LLM gateways](#llm-gateways)) |
 | `/effort [level]` | choose reasoning effort, or set it directly: `low`, `medium`, `high`, `xhigh`, `max`, or `auto` for the configured one |
+| `/advisor [model\|off]` | choose the [advisor](#advisor), or set it directly (an alias such as `opus`, or a model id) or turn it off; saved to the settings |
 | `/clear` | start a new conversation |
 | `/compact [focus]` | summarize the conversation to free context (see [Compaction](#compaction)); `focus` says what the summary should keep |
 | `/resume [id]` | pick up an earlier conversation from this directory (see [Resuming](#resuming-conversations)) |
@@ -684,7 +707,8 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
 - `src/llm/` — LLM gateways
   - `config.rs` — providers from the settings and environment, model spec resolution, per-provider/model settings
   - `manage.rs` — `harness provider` and `/provider …`: adding and removing providers and listed models, syncing those from a gateway's model list, the default model, by editing the settings
-  - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks)
+  - `anthropic.rs` — Messages API backend (SSE into content blocks, thinking, prompt caching, refusal fallbacks, the advisor tool)
+  - `advisor.rs` — the advisor: aliases, which models may advise which, `--advisor`, reading its result blocks
   - `openai.rs` — Responses API backend (history ⇄ input/output item conversion, encrypted reasoning)
   - `http.rs` — POST (gzip-compressed where that is on), SSE reader; marks the failures (a dropped connection, an overload, a retryable status) after which `llm::Client` sends the request again, and how long to wait
 - `src/prompt/` — system prompts: the main agent's template (`system.md`) with its tools, environment and `AGENTS.md`, and subagents' (`mod.rs`); what `/init` asks for (`init.md`)

@@ -28,6 +28,10 @@
 //! implicit `anthropic` and `openai` providers when no provider of that name
 //! is configured.
 //!
+//! `advisor_model` (or `$HARNESS_ADVISOR_MODEL`, `off` to turn it off) is
+//! the model the main model consults at decision points, through the
+//! Anthropic API's advisor tool: see [`super::advisor`].
+//!
 //! `effort` (also per model, or `$HARNESS_EFFORT`; default `high`) sets how
 //! hard the model thinks: Anthropic `output_config.effort`, OpenAI
 //! `reasoning.effort`.
@@ -144,6 +148,10 @@ pub struct ProviderConfig {
     /// rather than all sent in full. Default: on for the official API, off
     /// for gateways, whose models may not have it.
     pub tool_search: Option<bool>,
+    /// Anthropic only: requests carry the advisor tool when an
+    /// `advisor_model` is set. Default: on for the official API, off for
+    /// gateways, which may not pass it on.
+    pub advisor: Option<bool>,
     /// Which of the gateway's models `harness provider sync` lists.
     pub sync: Option<ModelFilter>,
     /// Per-model overrides; listed models are offered by `/model`.
@@ -262,6 +270,8 @@ pub struct Providers {
     /// Spec for subagents without their own model; `None` means the
     /// caller's model.
     pub subagent_model: Option<String>,
+    /// The advisor's model name, as the API takes it; `None` without one.
+    pub advisor_model: Option<String>,
     /// Effort for models without their own `effort`.
     pub effort: Effort,
     /// `max_tokens` for providers and models without their own.
@@ -282,6 +292,9 @@ pub struct Target<'a> {
     pub(super) default_max_tokens: Option<u32>,
     /// The top-level `context_window`, likewise.
     pub(super) default_context_window: Option<u32>,
+    /// The advisor this request carries, if any: set by the client once it
+    /// checked the pairing.
+    pub advisor: Option<&'a str>,
 }
 
 impl Providers {
@@ -345,6 +358,8 @@ impl Providers {
             providers,
             default_model: String::new(),
             subagent_model: None,
+            advisor_model: env("HARNESS_ADVISOR_MODEL")
+                .map_or_else(|| settings.advisor_model.as_deref().and_then(super::advisor::parse), |m| super::advisor::parse(&m)),
             effort: effort.unwrap_or(DEFAULT_EFFORT),
             max_tokens,
             context_window: settings.context_window,
@@ -414,6 +429,7 @@ impl Providers {
             effort,
             default_max_tokens: self.max_tokens,
             default_context_window: self.context_window,
+            advisor: None,
         })
     }
 
@@ -461,6 +477,7 @@ impl ProviderConfig {
             prompt_cache_ttl: None,
             gzip: None,
             tool_search: None,
+            advisor: None,
             sync: None,
             models: BTreeMap::new(),
         }
@@ -570,6 +587,12 @@ impl Target<'_> {
     pub fn tool_search(&self) -> bool {
         self.config.protocol == Protocol::Anthropic
             && self.config.tool_search.unwrap_or_else(|| self.config.is_official_anthropic())
+    }
+
+    /// Whether this provider's requests may carry the advisor tool.
+    pub fn advisor_allowed(&self) -> bool {
+        self.config.protocol == Protocol::Anthropic
+            && self.config.advisor.unwrap_or_else(|| self.config.is_official_anthropic())
     }
 
     pub fn url(&self, path: &str) -> String {

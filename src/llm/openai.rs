@@ -89,7 +89,9 @@ fn assistant_items(message: &Message, own: bool, input: &mut Vec<Value>) {
             input.push(json!({"type": "message", "role": "assistant", "content": std::mem::take(text)}));
         }
     };
-    for block in &message.content {
+    // The advisor's plain advice, from a Claude model's turn, as text.
+    let blocks = super::advisor::for_other_model(message.content.clone());
+    for block in &blocks {
         match block["type"].as_str().unwrap_or("") {
             "text" => text.push(json!({"type": "output_text", "text": block["text"]})),
             "tool_use" => {
