@@ -360,8 +360,15 @@ async fn run_commands(body: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// Runs one of a skill's commands, with the arguments filled in. When the
+/// model loads the skill, the permission rules about `bash` decide on it as
+/// they would on a call of its own: the arguments are the model's, and
+/// `` !`echo $ARGUMENTS` `` would otherwise run what a deny rule refuses.
 async fn run_command(command: &str) -> Result<String, String> {
     let input = json!({"command": command, "timeout_ms": SHELL_TIMEOUT_MS});
+    if let Err(reason) = crate::security::permissions::nested("bash", &input).await {
+        return Err(format!("shell command `{}` was not run: {reason}", command.trim()));
+    }
     let output = crate::tools::bash::BashTool.run(input).await;
     if output.is_error {
         return Err(format!("shell command `{}` failed: {}", command.trim(), output.content.trim()));
@@ -745,6 +752,25 @@ mod tests {
         assert_eq!(out, "Branch: main\nLiteral x!`not run` and a`!`b`\none\ntwo\n\nend");
         let err = run_commands("!`exit 3`").await.unwrap_err();
         assert!(err.contains("`exit 3` failed"), "{err}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_rules_about_bash_hold_for_a_skills_commands() {
+        use std::sync::Arc;
+
+        use crate::security::permissions::{Permissions, scope};
+        let _guard = crate::util::lock_cwd();
+        let config = serde_json::from_value(json!({"deny": ["Bash(touch:*)"]})).unwrap();
+        let permissions = Arc::new(Permissions::with_config(Arc::new(config)));
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let skill = Skill::inline("log".into(), "Line: !`echo $ARGUMENTS`", None, None);
+        let arguments = format!("hi; touch {}", marker.display());
+        let err = scope(permissions.clone(), None, skill.render(&arguments)).await.unwrap_err();
+        assert!(err.contains("was not run") && err.contains("Bash(touch:*)"), "{err}");
+        assert!(!marker.exists());
+        assert_eq!(scope(permissions, None, skill.render("hi")).await.unwrap(), "Line: hi");
     }
 
     #[tokio::test]

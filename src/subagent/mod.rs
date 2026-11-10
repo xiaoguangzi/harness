@@ -18,6 +18,7 @@
 //! name: reviewer
 //! description: Reviews the current diff for bugs. Use after making changes.
 //! tools: read, grep, bash        # optional; default: every tool allowed
+//! disallowedTools: write         # optional; tools it never gets
 //! permission: read-only          # default; `write` allows modifying tools
 //! model: relay-b/gpt-5-mini       # optional; default: `subagent_model` or the main model
 //! ---
@@ -78,6 +79,9 @@ pub struct AgentDef {
     /// Tool names (a trailing `*` matches a prefix); `None` allows all tools
     /// the permission grants.
     pub tools: Option<Vec<String>>,
+    /// `disallowedTools`: tool names (or prefixes, as in `tools`) it never
+    /// gets, whatever `tools` and the permission allow.
+    pub disallowed: Vec<String>,
     pub model: Option<String>,
     /// The reasoning effort it works with; `None` keeps the caller's.
     pub effort: Option<Effort>,
@@ -90,13 +94,13 @@ pub struct AgentDef {
 
 impl AgentDef {
     fn allows(&self, tool: &str) -> bool {
-        match &self.tools {
-            None => true,
-            Some(names) => names.iter().any(|n| match n.strip_suffix('*') {
+        let named = |names: &[String]| {
+            names.iter().any(|n| match n.strip_suffix('*') {
                 Some(prefix) => tool.starts_with(prefix),
                 None => n == tool,
-            }),
-        }
+            })
+        };
+        !named(&self.disallowed) && self.tools.as_deref().is_none_or(named)
     }
 }
 
@@ -124,6 +128,7 @@ pub fn explore() -> AgentDef {
             .into(),
         permission: Permission::ReadOnly,
         tools: Some(vec!["grep".into(), "glob".into()]),
+        disallowed: Vec::new(),
         model: None,
         effort: None,
         compact_window: None,
@@ -150,6 +155,7 @@ pub fn general_purpose() -> AgentDef {
             .into(),
         permission: Permission::Write,
         tools: None,
+        disallowed: Vec::new(),
         model: None,
         effort: None,
         compact_window: None,
@@ -256,9 +262,12 @@ fn parse_def(text: &str, file: &Path, default: Permission) -> Result<AgentDef, S
     let (front, body) = split_frontmatter(text).ok_or("missing `---` frontmatter")?;
     let fields = parse_frontmatter(front);
     let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let name = fields.get("name").cloned().unwrap_or(stem);
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Err(format!("invalid agent name `{name}`"));
+    let valid = |name: &str| !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    // Claude Code takes any `name` (`Company Researcher`); the harness calls
+    // such an agent by its file's name.
+    let name = fields.get("name").filter(|name| valid(name)).cloned().unwrap_or(stem);
+    if !valid(&name) {
+        return Err(format!("invalid agent name `{}`", fields.get("name").unwrap_or(&name)));
     }
     let description = fields.get("description").cloned().filter(|d| !d.is_empty()).ok_or("missing `description`")?;
     let permission = match fields.get("permission").map(|p| p.to_ascii_lowercase()).as_deref() {
@@ -268,6 +277,7 @@ fn parse_def(text: &str, file: &Path, default: Permission) -> Result<AgentDef, S
         Some(other) => return Err(format!("unknown permission `{other}` (use `read-only` or `write`)")),
     };
     let tools = fields.get("tools").map(|t| tool_list(t));
+    let disallowed = fields.get("disallowedTools").map_or_else(Vec::new, |t| tool_list(t));
     let model = model_field(fields.get("model"));
     let effort = fields.get("effort").map(|e| Effort::parse(e).map_err(|e| e.to_string())).transpose()?;
     let compact_window = match fields.get("autoCompactWindow") {
@@ -279,7 +289,7 @@ fn parse_def(text: &str, file: &Path, default: Permission) -> Result<AgentDef, S
         return Err("empty system prompt".into());
     }
     let path = std::path::absolute(file).ok();
-    Ok(AgentDef { name, description, prompt, permission, tools, model, effort, compact_window, path })
+    Ok(AgentDef { name, description, prompt, permission, tools, disallowed, model, effort, compact_window, path })
 }
 
 /// Runs `context: fork` skills for the `skill` tool and the frontends,
@@ -400,9 +410,10 @@ impl AgentTool {
     pub fn unknown_tools(&self) -> Vec<(String, String)> {
         let mut unknown = Vec::new();
         for def in self.defs.iter().filter(|d| !d.name.contains(':')) {
-            let registry = self.registry_for(&AgentDef { tools: None, permission: Permission::Write, ..def.clone() });
-            for name in def.tools.iter().flatten() {
-                let probe = AgentDef { tools: Some(vec![name.clone()]), ..def.clone() };
+            let all = AgentDef { tools: None, disallowed: Vec::new(), permission: Permission::Write, ..def.clone() };
+            let registry = self.registry_for(&all);
+            for name in def.tools.iter().chain(Some(&def.disallowed)).flatten() {
+                let probe = AgentDef { tools: Some(vec![name.clone()]), ..all.clone() };
                 if !registry.names().any(|t| probe.allows(t)) {
                     unknown.push((def.name.clone(), name.clone()));
                 }
@@ -955,12 +966,21 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("explore.md"), "---\ndescription: custom explore\n---\nMine.\n").unwrap();
+        std::fs::write(
+            dir.path().join("company-researcher.md"),
+            "---\nname: Company Researcher\ndescription: d\npermission: write\ndisallowedTools: Write, Edit, mcp__gh__*\n---\nbody\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("bad.md"), "---\ndescription: x\npermission: root\n---\nbody\n").unwrap();
         std::fs::write(dir.path().join("window.md"), "---\ndescription: x\nautoCompactWindow: lots\n---\nbody\n").unwrap();
 
         let (defs, warnings) = discover(&[dir.path().into()]);
         let by_name: BTreeMap<&str, &AgentDef> = defs.iter().map(|d| (d.name.as_str(), d)).collect();
-        assert_eq!(by_name.keys().copied().collect::<Vec<_>>(), vec!["explore", "fixer", "general-purpose", "reviewer"]);
+        let names = vec!["company-researcher", "explore", "fixer", "general-purpose", "reviewer"];
+        assert_eq!(by_name.keys().copied().collect::<Vec<_>>(), names, "a name with a space gives way to the file's");
+        let researcher = by_name["company-researcher"];
+        assert_eq!(researcher.disallowed, ["write", "edit", "mcp__gh__*"]);
+        assert!(researcher.allows("bash") && !researcher.allows("write") && !researcher.allows("mcp__gh__list_issues"));
         assert_eq!(by_name["explore"].description, "custom explore", "files override built-ins");
         let reviewer = by_name["reviewer"];
         assert_eq!(reviewer.permission, Permission::ReadOnly);

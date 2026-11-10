@@ -307,6 +307,21 @@ impl Permissions {
         }
     }
 
+    /// What the rules say about a call a tool makes on its own while its
+    /// call runs (a skill's `` !`command` ``): the approval of the tool's
+    /// call covers it, except where a deny rule refuses it or an ask rule
+    /// has the user decide.
+    fn decide_nested(&self, name: &str, input: &Value) -> Decision {
+        let matching = |rules: &[Rule]| rules.iter().find(|r| r.matches(name, input)).map(|r| r.text.clone());
+        if let Some(rule) = matching(&self.config.deny) {
+            return Decision::Deny(format!("The permission rule `{rule}` denies this call."));
+        }
+        match matching(&self.config.ask) {
+            Some(rule) => Decision::Ask(format!("the rule `{rule}` asks for it")),
+            None => Decision::Allow,
+        }
+    }
+
     /// Settles a call [`Permissions::decide`] said to ask about: the user
     /// decides, if they can be asked. `Err` is what the model is told
     /// when it does not run.
@@ -335,6 +350,35 @@ impl Permissions {
             )),
         }
     }
+}
+
+tokio::task_local! {
+    /// The permissions of the conversation whose tool call is running, and
+    /// the subagent making it, if it is one.
+    static CALLER: (Arc<Permissions>, Option<String>);
+}
+
+/// Runs a tool's call (`future`) for the conversation with `permissions`,
+/// so that what the tool runs on its own is checked by them ([`nested`]).
+pub async fn scope<F: std::future::Future>(permissions: Arc<Permissions>, agent: Option<String>, future: F) -> F::Output {
+    CALLER.scope((permissions, agent), future).await
+}
+
+/// Whether the tool whose call is running may make a call of `name` with
+/// `input` on its own, as a skill does for each `` !`command` `` in its
+/// text: what fills such a command comes from the model, so the rules that
+/// deny or ask about the call it could not make itself hold here too.
+/// `Err` is why it does not run. Outside a tool's call (a skill the user
+/// typed) there is nothing to check.
+pub async fn nested(name: &str, input: &Value) -> Result<(), String> {
+    let Ok((permissions, agent)) = CALLER.try_with(Clone::clone) else { return Ok(()) };
+    let reason = match permissions.decide_nested(name, input) {
+        Decision::Allow => return Ok(()),
+        Decision::Deny(reason) => return Err(reason),
+        Decision::Ask(reason) => reason,
+    };
+    let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestion: suggestion(name, input), agent };
+    permissions.ask(request).await
 }
 
 /// What PreToolUse hooks decided about a call's permission.
@@ -448,6 +492,21 @@ mod tests {
         assert!(matches!(p.decide("bash", None, &json!({"command": "cargo run"}), None), Decision::Ask(_)));
         assert!(p.ask(request("make")).await.unwrap_err().contains("use ninja"));
         assert_eq!(p.rules()[3].1, ["Bash(cargo build:*)"]);
+    }
+
+    #[tokio::test]
+    async fn what_a_tool_runs_on_its_own_keeps_to_the_rules() {
+        let p = Arc::new(permissions(json!({"defaultMode": "default", "ask": ["Bash(git push:*)"], "deny": ["Bash(rm -rf:*)"]})));
+        let check = |command: &str| {
+            let (p, input) = (p.clone(), json!({"command": command}));
+            async move { scope(p, None, nested("bash", &input)).await }
+        };
+        assert_eq!(check("touch a").await, Ok(()), "the tool's own call was approved");
+        assert!(check("echo hi; rm -rf /").await.unwrap_err().contains("denies this call"));
+        assert!(check("git push origin").await.unwrap_err().contains("cannot be asked for here"));
+        p.set_asker(Some(Arc::new(Answers(Mutex::new(vec![Answer::Allow])))));
+        assert_eq!(check("git push origin").await, Ok(()));
+        assert_eq!(nested("bash", &json!({"command": "rm -rf /"})).await, Ok(()), "the user's own command");
     }
 
     #[test]

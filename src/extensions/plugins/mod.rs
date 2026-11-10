@@ -653,15 +653,16 @@ impl Loaded {
         self.agents.len() - before
     }
 
-    /// `hooks/hooks.json` and what the manifest's `hooks` adds: files
-    /// (`{"hooks": {...}}`) or the events inline. Returns the events.
+    /// `hooks/hooks.json` and what the manifest's `hooks` adds: files or the
+    /// events inline, either under a `hooks` key or not ([`hook_events`]).
+    /// Returns the events.
     fn add_hooks(&mut self, manifest: &Value, dirs: &PluginDirs, warnings: &mut Vec<String>) -> Vec<String> {
         let default = dirs.root.join("hooks/hooks.json");
         let mut files = vec![default.clone()];
         let mut sets = Vec::new();
         if default.is_file() {
             match read_json(&default) {
-                Ok(file) => sets.push(file["hooks"].clone()),
+                Ok(file) => sets.push(hook_events(&file).clone()),
                 Err(e) => warnings.push(e),
             }
         }
@@ -671,14 +672,14 @@ impl Loaded {
                     Ok(file) if files.contains(&file) => {}
                     Ok(file) => {
                         match read_json(&file) {
-                            Ok(file) => sets.push(file["hooks"].clone()),
+                            Ok(file) => sets.push(hook_events(&file).clone()),
                             Err(e) => warnings.push(e),
                         }
                         files.push(file);
                     }
                     Err(e) => warnings.push(e),
                 },
-                events => sets.push(events.clone()),
+                inline => sets.push(hook_events(inline).clone()),
             }
         }
         let mut events = Vec::new();
@@ -728,12 +729,47 @@ impl Loaded {
                 warnings.push(format!("MCP server `{server}` signs in with OAuth, which the harness does not do; left out"));
                 continue;
             }
-            // Codex's: comments, the variables it may see (it sees them all),
-            // its timeouts (the harness has its own), and a directory in the
-            // plugin that a `./` command starts from too.
-            for key in ["note", "description", "env_vars", "startup_timeout_sec", "tool_timeout_sec"] {
+            // Codex's keys: a server it turned off stays off, and its token
+            // and headers become `headers`, whose `${VAR}` is read on connecting.
+            if fields.get("enabled") == Some(&Value::Bool(false)) {
+                warnings.push(format!("MCP server `{server}` is turned off (`enabled: false`); left out"));
+                continue;
+            }
+            let mut headers = Map::new();
+            if let Some(var) = fields.get("bearer_token_env_var").and_then(Value::as_str) {
+                headers.insert("Authorization".into(), format!("Bearer ${{{var}}}").into());
+            }
+            for (header, var) in fields.get("env_http_headers").and_then(Value::as_object).into_iter().flatten() {
+                headers.insert(header.clone(), format!("${{{}}}", var.as_str().unwrap_or_default()).into());
+            }
+            for (header, value) in fields.get("http_headers").and_then(Value::as_object).into_iter().flatten() {
+                headers.insert(header.clone(), value.clone());
+            }
+            if !headers.is_empty() {
+                let own = fields.entry("headers").or_insert_with(|| Value::Object(Map::new()));
+                if let Some(own) = own.as_object_mut() {
+                    for (header, value) in headers {
+                        own.entry(header).or_insert(value);
+                    }
+                }
+            }
+            // The rest of what the harness has no field for: what describes
+            // the server, the variables it may see (it sees them all) and
+            // timeouts (the harness has its own) go without a word; any
+            // other key is reported, and the server runs without it.
+            const QUIET: [&str; 13] = [
+                "note", "description", "title", "icons", "_meta", "env_vars", "startup_timeout_sec", "tool_timeout_sec",
+                "timeout", "enabled", "bearer_token_env_var", "env_http_headers", "http_headers",
+            ];
+            let unknown: Vec<String> = fields.keys().filter(|key| !ServerConfig::FIELDS.contains(&key.as_str())).cloned().collect();
+            for key in &unknown {
                 fields.remove(key);
             }
+            let unused: Vec<String> = unknown.iter().filter(|key| !QUIET.contains(&key.as_str())).map(|key| format!("`{key}`")).collect();
+            if !unused.is_empty() {
+                warnings.push(format!("MCP server `{server}`: {} not used", unused.join(", ")));
+            }
+            // A directory in the plugin, which a `./` command starts from too.
             // Joined without their `.` parts.
             let join = |dir: &Path, path: &str| dir.join(path).components().collect::<PathBuf>();
             if let Some(cwd) = fields.get("cwd").and_then(Value::as_str).map(|cwd| join(&dirs.root, cwd)) {
@@ -893,6 +929,16 @@ fn items(value: &Value) -> Vec<&Value> {
 /// A manifest value that is one path or an array of them.
 fn paths(value: &Value) -> Vec<String> {
     items(value).into_iter().filter_map(Value::as_str).map(String::from).collect()
+}
+
+/// The events of a hooks file or of a manifest's inline `hooks`: under a
+/// `hooks` key (Claude Code's files, Codex's inline hooks too) or the
+/// object itself (Claude Code's inline hooks). No event is called `hooks`.
+fn hook_events(config: &Value) -> &Value {
+    match &config["hooks"] {
+        events @ Value::Object(_) => events,
+        _ => config,
+    }
 }
 
 /// The servers in an MCP config: its `mcpServers`, or the file itself
@@ -1198,13 +1244,18 @@ mod tests {
             (
                 "plugins/legacy/.codex-plugin/plugin.json",
                 r#"{"name": "legacy", "skills": "./skills/", "mcpServers": "./.mcp.json", "apps": "./.app.json",
-                    "hooks": "./hooks.json", "interface": {"displayName": "Legacy"}}"#,
+                    "hooks": ["./hooks.json", {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "true"}]}]}}],
+                    "interface": {"displayName": "Legacy"}}"#,
             ),
             ("plugins/legacy/skills/go/SKILL.md", "---\ndescription: Go\n---\nGo.\n"),
             (
                 "plugins/legacy/.mcp.json",
                 r#"{"mcpServers": {"api": {"type": "http", "url": "https://e.com/mcp", "note": "a comment", "description": "d"},
-                    "tool": {"command": "./bin/srv", "cwd": ".", "env_vars": ["HOME"]},
+                    "tool": {"command": "./bin/srv", "cwd": ".", "env_vars": ["HOME"], "title": "Tool", "enabled": true,
+                             "enabled_tools": ["a"], "tools": {"a": {"approval_mode": "prompt"}}},
+                    "remote": {"url": "https://e.com/r", "bearer_token_env_var": "R_TOKEN", "http_headers": {"X-A": "b"},
+                               "env_http_headers": {"X-Org": "R_ORG"}, "_meta": {}},
+                    "off": {"command": "srv", "enabled": false},
                     "signed": {"type": "http", "url": "https://e.com/oauth", "oauth_resource": "https://e.com"}}}"#,
             ),
             ("plugins/legacy/.app.json", r#"{"apps": {"x": {"id": "connector_1"}}}"#),
@@ -1229,21 +1280,26 @@ mod tests {
         let outcomes: Vec<(&str, &Vec<String>)> =
             loaded.plugins.list.iter().map(|p| (p.id.as_str(), p.outcome.as_ref().unwrap())).collect();
         assert_eq!(outcomes, [
-            ("legacy@codex-team", &vec!["1 skill".to_string(), "2 MCP servers".into(), "hooks (Stop)".into()]),
+            ("legacy@codex-team", &vec!["1 skill".to_string(), "3 MCP servers".into(), "hooks (Stop, SessionEnd)".into()]),
             ("portable@codex-team", &vec!["1 skill".to_string(), "1 MCP server".into(), "hooks (SessionStart)".into()]),
         ]);
         assert_eq!(loaded.plugins.list[1].version.as_deref(), Some("2.0.0"));
         let servers = loaded.mcp_servers.keys().collect::<Vec<_>>();
-        assert_eq!(servers, ["plugin:legacy:api", "plugin:legacy:tool", "plugin:portable:local"]);
+        assert_eq!(servers, ["plugin:legacy:api", "plugin:legacy:remote", "plugin:legacy:tool", "plugin:portable:local"]);
+        let headers: Vec<(&str, &str)> =
+            loaded.mcp_servers["plugin:legacy:remote"].headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(headers, [("Authorization", "Bearer ${R_TOKEN}"), ("X-A", "b"), ("X-Org", "${R_ORG}")]);
         let tool = format!("{:?}", loaded.mcp_servers["plugin:legacy:tool"]);
         let legacy = market.join("plugins/legacy");
         assert!(tool.contains(&format!("command: Some({:?})", legacy.join("bin/srv"))), "{tool}");
         assert!(tool.contains(&format!("cwd: Some({:?})", legacy)), "{tool}");
         let root = market.join("plugins/portable");
         assert_eq!(loaded.skills[1].plugin.as_ref().unwrap().expand("${PLUGIN_ROOT}"), root.display().to_string());
-        assert_eq!(loaded.warnings.len(), 2, "{:?}", loaded.warnings);
-        assert!(loaded.warnings[0].contains("`signed` signs in with OAuth"), "{:?}", loaded.warnings);
-        assert!(loaded.warnings[1].contains("apps"), "{:?}", loaded.warnings);
+        assert_eq!(loaded.warnings.len(), 4, "{:?}", loaded.warnings);
+        assert!(loaded.warnings[0].contains("`tool`: `enabled_tools`, `tools` not used"), "{:?}", loaded.warnings);
+        assert!(loaded.warnings[1].contains("`off` is turned off"), "{:?}", loaded.warnings);
+        assert!(loaded.warnings[2].contains("`signed` signs in with OAuth"), "{:?}", loaded.warnings);
+        assert!(loaded.warnings[3].contains("apps"), "{:?}", loaded.warnings);
 
         // Codex's personal marketplace is known by its own name; its paths
         // start from the directory holding `.agents/`.

@@ -73,6 +73,10 @@ enum Transport {
 }
 
 impl ServerConfig {
+    /// The keys a server's configuration has; a plugin's server is read
+    /// without the others it comes with.
+    pub(crate) const FIELDS: [&str; 8] = ["type", "command", "args", "env", "cwd", "url", "headers", "alwaysLoad"];
+
     fn transport(&self) -> Result<Transport> {
         let kind = self.kind.as_deref().unwrap_or(if self.url.is_some() { "http" } else { "stdio" });
         match kind {
@@ -303,10 +307,24 @@ fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
+/// The name the model calls a server's tool by: `mcp__<server>__<tool>`.
+/// One too long for the API is shortened from the server's end first (a
+/// plugin's server is `plugin:<plugin>:<server>`, long before the tool
+/// starts) and ends in a hash of the whole, so two tools of one server never
+/// come out as the same name.
 fn exposed_name(server: &str, tool: &str) -> String {
-    let mut name = format!("mcp__{}__{}", sanitize(server), sanitize(tool));
-    name.truncate(MAX_TOOL_NAME);
-    name
+    let (server, tool) = (sanitize(server), sanitize(tool));
+    let name = format!("mcp__{server}__{tool}");
+    if name.len() <= MAX_TOOL_NAME {
+        return name;
+    }
+    // FNV-1a: the name has to be the same in every run, for the prompt cache
+    // and saved conversations.
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193));
+    let room = MAX_TOOL_NAME - "mcp____".len() - "_ffffff".len();
+    let tool = &tool[..tool.len().min(room - server.len().min(16))];
+    let server = &server[..server.len().min(room - tool.len())];
+    format!("mcp__{server}__{tool}_{:06x}", hash & 0xff_ffff)
 }
 
 /// One MCP server tool, as seen by the model.
@@ -575,6 +593,14 @@ mod tests {
     fn tool_names_are_sanitized_and_capped() {
         assert_eq!(exposed_name("my server", "get.thing"), "mcp__my_server__get_thing");
         assert_eq!(exposed_name("s", &"x".repeat(100)).len(), MAX_TOOL_NAME);
+        // A long server name leaves the tools their names, and apart.
+        let server = "plugin:customer-relationship-suite:customer-relationship-api";
+        let (accounts, activity) = (exposed_name(server, "list_accounts"), exposed_name(server, "list_activity"));
+        assert!(accounts.starts_with("mcp__plugin_customer-relationship-suite_cu__list_accounts_"), "{accounts}");
+        assert!(accounts.len() <= MAX_TOOL_NAME && activity.len() <= MAX_TOOL_NAME && accounts != activity);
+        assert_eq!(accounts, exposed_name(server, "list_accounts"), "the same in every run");
+        let long = |end: &str| exposed_name(server, &format!("{}{end}", "x".repeat(80)));
+        assert!(long("a").len() == MAX_TOOL_NAME && long("a") != long("b"));
     }
 
     /// A stdio MCP server: `pid` answers with its process id; `die` (not

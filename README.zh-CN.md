@@ -427,7 +427,7 @@ REPL 和一次性模式的每个会话都会在每轮结束后保存到 `~/.harn
 - 服务器在启动时于后台并发连接：REPL 立即可用（启动信息会显示还有几个服务器在连接），第一次请求前才等待它们连完，这样一个对话从一开始就有相同的工具，prompt cache 的前缀也保持不变。one-shot 模式和 Web UI 会先等连接完成再开始。连接失败的服务器会被报告并跳过；`/mcp` 会显示每个服务器连接用了多久。
 - 连接断开时（服务器退出，或 HTTP 会话过期），下一次调用会重新建立连接，工具列表沿用最初获取的那份。被断线打断的调用只有在工具标记为只读（`readOnlyHint`）时才会自动重试；否则会告诉模型这次调用可能已经生效。重连失败后的 10 秒内，调用会直接失败，之后才会再次尝试重连。
 - `/reload-plugins` 会保留配置没有变化的插件 MCP 服务器继续运行，不会重新启动它们。
-- 工具以 `mcp__<server>__<tool>` 形式暴露。文本、内嵌文本资源和 PNG/JPEG/GIF/WebP 图片会传回给模型。
+- 工具以 `mcp__<server>__<tool>` 形式暴露。超过 API 64 个字符上限的名字会从服务器名的末尾截短，并以整个名字的哈希结尾，同一服务器的工具因此不会重名。文本、内嵌文本资源和 PNG/JPEG/GIF/WebP 图片会传回给模型。
 - stdio 服务器的 stderr 写入 `$TMPDIR/harness-mcp-<server>.log`。
 - `"alwaysLoad": true` 让一个服务器的工具始终完整加载，即使其他工具被[延迟加载](#延迟加载的工具)。
 
@@ -516,7 +516,7 @@ description: Draft release notes from the git log. Use when asked for a changelo
 与 Claude Code 相同：
 
 - 正文中的 `$ARGUMENTS` 替换为全部参数，`$ARGUMENTS[N]` 或 `$N` 替换为第 N 个参数（从 0 开始，按 shell 的方式切分），`$name` 替换为 frontmatter 的 `arguments` 列表中 `name` 所在位置的参数；`\$` 保留 `$` 本身。没有被占位符用掉的参数以 `ARGUMENTS: …` 附在末尾。`${CLAUDE_SKILL_DIR}` 和 `${CLAUDE_PROJECT_DIR}` 替换为技能目录和工作目录。
-- `` !`command` ``（位于行首或空格之后）和 ```` ```! ```` 代码块在加载技能时运行，并替换为它们的输出。它们与 `bash` 工具的命令一样运行，开启沙箱时在沙箱内；任一命令失败，技能就不会加载。只有在模型可加载的技能都不含这类命令时，只读子代理才会获得 `skill` 工具。
+- `` !`command` ``（位于行首或空格之后）和 ```` ```! ```` 代码块在加载技能时运行，并替换为它们的输出。它们与 `bash` 工具的命令一样运行，开启沙箱时在沙箱内；任一命令失败，技能就不会加载。由模型加载技能时，关于 `Bash` 的 `deny` 和 `ask` 权限规则会对填入参数后的每条命令做判定，与模型自己发起的调用一样，因此参数无法运行规则拒绝的命令。只有在模型可加载的技能都不含这类命令时，只读子代理才会获得 `skill` 工具。
 - `disable-model-invocation: true` 让模型不能加载该技能（只能用 `/<name>` 运行）；`user-invocable: false` 让它不出现在 `/` 命令中。
 - `context: fork` 让技能在单独的[子代理](#子代理subagents)中运行：加载它会以技能文本为 prompt 启动一个子代理，只有它的报告会返回（用 `/<name>` 运行时，报告交给模型，由模型接着处理）。`agent` 指定子代理类型（默认 `general-purpose`），`model` 指定其模型（`<provider>/<model>`；`sonnet`、`opus`、`haiku` 和 `inherit` 表示默认模型），`allowed-tools`（`Read, Grep, Bash(git status:*)`；括号内的部分忽略）只保留其代理工具中列出的那些。子代理不能再启动子代理，在子代理中这类技能会就地加载。
 
@@ -536,6 +536,7 @@ Claude Code 的命令（技能的旧形式）同样可用：`.harness/commands/`
   name: reviewer
   description: Reviews the current diff for bugs. Use after making changes.
   tools: read, grep          # 可选；`mcp__server__*` 匹配前缀
+  disallowedTools: write     # 可选；它永远拿不到的工具，写法与 `tools` 相同
   permission: read-only      # 默认；`write` 允许 bash/edit/write 和非只读的 MCP 工具
   model: claude-sonnet-5     # 可选
   effort: low                # 可选；思考力度（low … max）
@@ -547,7 +548,7 @@ Claude Code 的命令（技能的旧形式）同样可用：`.harness/commands/`
 - **自定义代理默认只读**：只读代理只会获得标记为只读的工具（`read`、`grep`、`glob`、`lsp`、`skill`，以及服务器设置了 `readOnlyHint` 的 MCP 工具），即使它的 `tools` 列表写了其他工具也不行。`tools` 用于进一步收窄。没有 `bash` 的代理也不会获得 `bash_output` 和 `kill_shell`，因为它没有后台命令。`agent` 工具按每种代理实际拿到的工具标注它是只读还是能修改文件，描述截断到 400 个字符。
 - 子代理不能再启动子代理。它们的文件读取使用自己的追踪器，因此不会计入主代理 `edit` 和 `write` 所需的已读记录。
 - 模型：代理的 `model`，否则 `subagent_model` / `HARNESS_SUBAGENT_MODEL`，否则会话当前使用的模型（包括 `/model`、`/effort` 切换之后）；任意 `<provider>/<model>`。Claude Code 的 `sonnet`、`opus`、`haiku` 别名视同未设置，与 `inherit` 相同。思考力度：`agent` 调用的 `effort`，否则代理自己的，否则会话的。
-- 工具可以用 Claude Code 的名称（`Read`、`Bash`、`KillShell`），会映射为 harness 自己的工具（`LS` 映射为 `glob`）。
+- 工具可以用 Claude Code 的名称（`Read`、`Bash`、`KillShell`），会映射为 harness 自己的工具（`LS` 映射为 `glob`）。harness 用不了的 `name`（例如带空格的，Claude Code 允许）会改用文件名。
 - `/agents` 列出可用类型。
 
 ### 后台子代理与后续追问
@@ -614,7 +615,7 @@ harness --check-plugins                           # 全部加载一遍，说明�
 - `${CLAUDE_PLUGIN_ROOT}` 和 `${CLAUDE_PLUGIN_DATA}`（或 `${PLUGIN_ROOT}` 和 `${PLUGIN_DATA}`）会在 hook 命令、MCP 与语言服务器配置以及技能、命令和代理的文本中被替换；hook 和 stdio MCP 服务器、语言服务器还会以环境变量的形式拿到它们。
 - 插件的 `userConfig` 声明它需要的设置（`type`：`string`、`number`、`boolean`、`directory` 或 `file`；`title`、`description`、`default`、`sensitive`）。`install` 和 `configure` 会逐项询问；答案存入配置的 `pluginConfigs`，但 `sensitive` 的存到 `~/.harness/plugins/secrets.json`（仅你可读）。它们替换 hook 命令、MCP 与语言服务器配置中的 `${user_config.<key>}`，非敏感的也替换技能、命令和代理文本（模型会读到）中的；hook、MCP 与语言服务器还会以 `CLAUDE_PLUGIN_OPTION_<KEY>` 环境变量拿到它们。缺少答案且没有默认值的插件照常加载，但会给出警告，提示运行 `harness plugin configure`。
 - 插件代理按 Claude Code 的方式获得 `tools`，即这份列表就是代理能用的全部工具：除非声明 `permission: read-only`，否则可以写（`bash`、`edit`、`write`），不写 `tools` 则获得除子代理工具外的全部工具。这和你的[自定义代理](#子代理subagents)默认只读不同：插件是你启用的，它的代理也是按这套规则写的。harness 没有的工具（`WebFetch`、`WebSearch`、`TodoWrite`）会被跳过。由于插件的技能、命令和代理用的是 Claude Code 的工具名（`Task`、`Bash`、`Read` 等），系统提示词（插件代理的也一样）会说明每个名字在这里对应哪个工具，以及哪些没有对应工具。
-- harness 用不了的部分会在启动时给出警告并略过，插件的其余部分照常加载：它不运行的 hook 事件或类型、MCP 包（`.mcpb`）、需要 OAuth 登录或配置不被接受的 MCP 服务器、命令没有安装的语言服务器。输出风格、monitors、channels、默认的 `settings.json` 以及 `dependencies`（不会随之安装）不会被使用；`/plugins` 和 `--check-plugins` 会列出它们。
+- harness 用不了的部分会在启动时给出警告并略过，插件的其余部分照常加载：它不运行的 hook 事件或类型、MCP 包（`.mcpb`）、需要 OAuth 登录或被插件关闭（`enabled: false`）的 MCP 服务器、命令没有安装的语言服务器。MCP 服务器配置里 harness 用不上的键会被去掉（其中会改变行为的，如 Codex 的 `enabled_tools`，会给出警告），服务器照常运行；Codex 的 `bearer_token_env_var`、`http_headers` 和 `env_http_headers` 会变成它的 `headers`。manifest 里内联的 `hooks` 可以直接是事件（Claude Code 的写法），也可以放在 `hooks` 键下（Codex 的写法），hook 文件同样如此。输出风格、monitors、channels、默认的 `settings.json` 以及 `dependencies`（不会随之安装）不会被使用；`/plugins` 和 `--check-plugins` 会列出它们。
 - `/plugins`（以及 Web UI 的环境页）列出每个插件提供的内容、被略过的部分，或它未能加载的原因。`harness --check-plugins`（也可加 `--plugin-dir`，用来试正在编写的插件）不启动会话，加载所有已启用插件、启动它们的 MCP 服务器、检查语言服务器的命令是否存在，说明哪些加载了、哪些被略过及原因；有插件或服务器失败时以非零退出码退出。
 - `/reload-plugins` 重新读取配置，重新加载插件、技能、命令、代理和 hook，以及插件的 MCP 服务器。一个会话的工具和系统提示词保持不变（这是提示词缓存的前缀），所以新内容对下一个会话生效：当前会话还是空的则立即生效，否则从 `/clear` 或 `/resume` 起生效。provider、沙箱和你自己的 MCP 服务器需要重启才生效，Web UI 也需要重启。
 - 插件会运行命令（hook、MCP 与语言服务器、命令中的 `!` 行），因此只有你的配置和命令行可以启用插件，项目不行。
