@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::*;
-use crate::agent::mock::texts as sent;
+use crate::agent::mock::{system, texts as sent};
 use crate::agent::{INTERRUPTED, Inbox, Observer, is_timestamp};
 use crate::llm::Providers;
 use crate::llm::config::tests::{file, no_env};
@@ -199,7 +199,7 @@ async fn foreground_reports_come_back_as_text_and_can_be_continued() {
 #[tokio::test]
 async fn background_reports_arrive_after_the_turn_and_wake_the_parent() {
     let mut mock = Mock::new(|body| {
-        if body["system"] != "parent" {
+        if system(body) != "parent" {
             return slow("child evidence", Duration::from_millis(200));
         }
         match messages(body) {
@@ -233,7 +233,7 @@ async fn background_reports_arrive_after_the_turn_and_wake_the_parent() {
     for _ in 0..4 {
         bodies.push(mock.next().await);
     }
-    let last = bodies.iter().find(|b| b["system"] == "parent" && messages(b) == 5).unwrap();
+    let last = bodies.iter().find(|b| system(b) == "parent" && messages(b) == 5).unwrap();
     let note = &sent(&last["messages"][4])[0];
     assert!(note.contains("<status>completed</status>") && note.contains("child evidence"), "{note}");
     // With nothing waiting, a turn without a prompt does nothing.
@@ -313,14 +313,14 @@ async fn stopped_subagents_keep_their_conversation() {
 #[tokio::test]
 async fn running_subagents_are_limited_and_stop_with_the_conversation() {
     let mock = Mock::new(|body| {
-        if body["system"] == "parent" && messages(body) == 1 {
+        if system(body) == "parent" && messages(body) == 1 {
             let spawn = |i: usize| {
                 call(&format!("t{i}"), "agent", json!({
                     "agent_type": "explore", "description": "slow", "prompt": "go", "run_in_background": true
                 }))
             };
             calls((0..=runtime::MAX_RUNNING).map(spawn).collect())
-        } else if body["system"] == "parent" {
+        } else if system(body) == "parent" {
             answer("waiting")
         } else {
             slow("slow", Duration::from_secs(60))

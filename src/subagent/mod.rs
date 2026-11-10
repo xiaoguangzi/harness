@@ -519,7 +519,7 @@ impl Tool for AgentTool {
                 "effort": {
                     "type": "string",
                     "enum": Effort::ALL.map(Effort::as_str),
-                    "description": "How hard the subagent thinks; default: the agent's own, else yours."
+                    "description": "How hard the subagent thinks; default: the agent's own, else yours. Leave it out for a fork: with another effort it cannot read this conversation from the prompt cache."
                 },
                 "isolation": {
                     "type": "string",
@@ -1068,7 +1068,7 @@ mod tests {
         crate::tools::workdir::scope(Some(repo.path().to_path_buf()), turn).await.unwrap();
         let _ = requests.recv().await;
         let child = requests.recv().await.unwrap();
-        assert!(child["system"].as_str().unwrap().contains("/worktrees/"), "its environment names the worktree");
+        assert!(crate::agent::mock::system(&child).contains("/worktrees/"), "its environment names the worktree");
         let _ = requests.recv().await;
         let back = requests.recv().await.unwrap();
         let report = back["messages"][2]["content"][0]["content"].as_str().unwrap_or_default().to_string();

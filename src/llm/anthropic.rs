@@ -106,23 +106,24 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
         })
         .collect();
 
+    let cache = target.cache_ttl().map(|ttl| match ttl {
+        CacheTtl::FiveMinutes => json!({"type": "ephemeral"}),
+        CacheTtl::OneHour => json!({"type": "ephemeral", "ttl": "1h"}),
+    });
     let mut body = json!({
         "model": target.model,
         "max_tokens": target.max_tokens(),
-        "system": system,
+        "system": system_prompt(system, cache.as_ref()),
         "tools": tools,
         "messages": messages,
         "thinking": {"type": "adaptive"},
         "output_config": {"effort": target.effort.as_str()},
         "stream": true,
     });
-    if let Some(ttl) = target.cache_ttl() {
+    if let Some(cache) = cache {
         // Automatic prompt caching: the growing conversation prefix is
         // re-read from cache on every loop iteration.
-        body["cache_control"] = match ttl {
-            CacheTtl::FiveMinutes => json!({"type": "ephemeral"}),
-            CacheTtl::OneHour => json!({"type": "ephemeral", "ttl": "1h"}),
-        };
+        body["cache_control"] = cache;
     }
     if target.fallbacks() {
         // On a safety decline, the API re-runs the request on a fallback
@@ -131,6 +132,21 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
     }
     target.apply_extra_body(&mut body);
     body
+}
+
+/// The system prompt as the request takes it. With caching (`cache`, the
+/// `cache_control` of the request) it is a block with a breakpoint of its
+/// own, of the same lifetime: the automatic breakpoint only ever sits at
+/// the end of the conversation, so without this one the tools and the
+/// system prompt are written again whenever the messages before it change
+/// (a compaction, `/rewind`, `/clear`, a new session in the same project)
+/// and for every subagent of a kind, whose first messages differ.
+fn system_prompt(system: &str, cache: Option<&Value>) -> Value {
+    match cache {
+        // The API refuses an empty text block.
+        Some(cache) if !system.is_empty() => json!([{"type": "text", "text": system, "cache_control": cache}]),
+        _ => json!(system),
+    }
 }
 
 /// A message's blocks as sent to `spec`: OpenAI reasoning items never go to
@@ -534,6 +550,9 @@ mod tests {
         assert!(body.get("fallbacks").is_none(), "gateways don't get fallbacks by default");
         assert!(body.get("thinking").is_none(), "model extra_body removed thinking");
         assert_eq!(body["cache_control"], json!({"type": "ephemeral"}));
+        let cached_system = |ttl: Value| json!([{"type": "text", "text": "sys", "cache_control": ttl}]);
+        assert_eq!(body["system"], cached_system(json!({"type": "ephemeral"})), "a breakpoint of its own");
+        assert_eq!(build_body(&target, "", &tools, &messages, false)["system"], "", "no empty text block");
         assert_eq!(body["tools"][0].get("eager_input_streaming"), None);
         assert_eq!(body["messages"][1]["content"], json!([{"type": "text", "text": "from gpt"}]));
         assert_eq!(body["messages"][3]["content"], json!([thinking, {"type": "text", "text": "mine"}]));
@@ -551,6 +570,16 @@ mod tests {
         .unwrap();
         let body = build_body(&p.target("gw/m").unwrap(), "sys", &tools, &messages, false);
         assert_eq!(body["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
+        assert_eq!(body["system"][0]["cache_control"], body["cache_control"], "longer lifetimes must come first");
+
+        let p = Providers::from_parts(
+            &file(json!({"model": "gw/m", "providers": {"gw": {"protocol": "anthropic",
+                "base_url": "https://gw.example.com", "prompt_cache": false}}})),
+            &no_env,
+        )
+        .unwrap();
+        let body = build_body(&p.target("gw/m").unwrap(), "sys", &tools, &messages, false);
+        assert_eq!((&body["system"], body.get("cache_control")), (&json!("sys"), None), "no caching, no blocks");
     }
 
     #[test]

@@ -639,6 +639,12 @@ pub(crate) mod tests {
         }
     }
 
+    /// The system prompt of a request sent, which is a block of its own
+    /// when the prompt is cached.
+    pub(crate) fn system(body: &Value) -> &str {
+        body["system"].as_str().or(body["system"][0]["text"].as_str()).unwrap_or_default()
+    }
+
     /// The texts of a message sent, without the time a prompt is stamped with.
     pub(crate) fn texts(message: &Value) -> Vec<String> {
         let blocks = message["content"].as_array().unwrap().iter().filter(|b| !crate::agent::is_timestamp(b));
@@ -655,7 +661,7 @@ pub(crate) mod tests {
         agent.run_turn(vec![text("next task")], &mut seen).await.unwrap();
 
         let summarize = requests.recv().await.unwrap();
-        assert_eq!(summarize["system"], "sys", "the same system prompt");
+        assert_eq!(system(&summarize), "sys", "the same system prompt");
         let sent = summarize["messages"].as_array().unwrap();
         assert_eq!(sent.len(), 3, "the history and the prompt, not the new message: {sent:?}");
         assert_eq!(texts(&sent[0]), vec!["first task"]);
