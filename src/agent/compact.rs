@@ -132,10 +132,14 @@ impl Agent {
 
     /// How long this conversation may wait for the user before it is
     /// compacted, or `None` if it is not to be: it must take at least the
-    /// configured tokens of the context. The wait ends a little before the
-    /// prompt cache would expire, so the summary request still reads it,
-    /// and the user's next message no longer resends the long history
-    /// uncached.
+    /// configured tokens of the context, and its prompt cache must still
+    /// be warm. The wait ends a little before the cache would expire, so
+    /// the summary request still reads it, and the user's next message no
+    /// longer resends the long history uncached. The cache is kept from
+    /// the start of the last request, so a long answer leaves less time;
+    /// once it has expired (or after `/resume`, when none is known), a
+    /// summary would cost the whole history uncached for a user who may
+    /// not come back, and the conversation is left as it is.
     pub fn idle_compaction_after(&self) -> Option<Duration> {
         self.idle_after(idle_config())
     }
@@ -145,7 +149,8 @@ impl Agent {
             return None;
         }
         let ttl = self.client.cache_ttl().unwrap_or(crate::llm::config::CacheTtl::FiveMinutes).duration();
-        Some(ttl.saturating_sub(IDLE_BEFORE_EXPIRY))
+        let since = (*self.last_request.lock().unwrap())?.elapsed();
+        idle_wait(ttl, since)
     }
 
     /// Compacts the conversation while it waits for the user (see
@@ -267,6 +272,7 @@ impl Agent {
             Some(last) if last.role == "user" => last.content.push(prompt),
             _ => request.push(Message::user(vec![prompt])),
         }
+        self.note_request();
         let (log, model) = (&self.usage, self.client.spec());
         let mut on_event = |event: StreamEvent| match event {
             StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
@@ -338,6 +344,13 @@ impl Agent {
         let intro = json!({"type": "text", "text": "The files read most recently, as they are now:"});
         std::iter::once(intro).chain(blocks).collect()
     }
+}
+
+/// How long a conversation whose last request started `since` ago may
+/// still wait before it is compacted while its cache, kept for `ttl`, is
+/// warm; `None` once that is too late.
+fn idle_wait(ttl: Duration, since: Duration) -> Option<Duration> {
+    ttl.checked_sub(IDLE_BEFORE_EXPIRY + since)
 }
 
 /// What starts a compaction.
@@ -694,7 +707,11 @@ pub(crate) mod tests {
         assert_eq!(agent.idle_after(config(1)), None, "nothing to compact");
         agent.run_turn(vec![text("go")], &mut Seen::default()).await.unwrap();
         let _ = requests.recv().await;
-        assert_eq!(agent.idle_after(config(1)), Some(Duration::from_secs(255)), "before the 5-minute cache expires");
+        let after = agent.idle_after(config(1)).unwrap();
+        assert!(after <= Duration::from_secs(255) && after > Duration::from_secs(250), "before the 5-minute cache expires: {after:?}");
+        let (ttl, secs) = (Duration::from_secs(300), Duration::from_secs);
+        assert_eq!(idle_wait(ttl, secs(200)), Some(secs(55)), "counted from the request's start, not the answer's end");
+        assert_eq!(idle_wait(ttl, secs(290)), None, "the cache is as good as gone: not worth a summary");
         assert_eq!(agent.idle_after(config(100_000)), None, "too short to bother");
         assert_eq!(agent.idle_after(IdleConfig { enabled: false, min_tokens: 1 }), None);
         agent.compact_when_idle(&mut Seen::default()).await.unwrap();

@@ -321,7 +321,7 @@ Host *
 
 压缩发生在一轮开始前（新消息原样保留在摘要之后），也发生在同一轮的工具调用之间，所以长任务会自己继续下去；REPL 会显示 `✻ Compacted the conversation: context 172.4k → about 9.8k`。`/compact [重点]` 可以手动压缩。如果总结请求本身也超长，会去掉最早的几轮对话再试；如果压缩后上下文仍然太满，或同一轮里第三次又被填满，这一轮会报错停止，而不是无限循环。压缩可以像普通一轮一样打断，打断后历史保持原样。保存的会话存的是压缩后的历史，恢复时会在压缩处显示 `✻ Conversation compacted`。新的历史还会写明摘要取代了每个工具各多少次调用（`bash ×12, read ×30`），展开的对话记录（Ctrl+O）也会在每次压缩处标出这些数字。
 
-**空闲压缩。** 上下文至少 20 万 token 的会话停在 REPL 提示符、或 web 任务空闲时，会在提示词缓存过期前 45 秒压缩（4¼ 分钟后；`"prompt_cache_ttl": "1h"` 时为 59¼ 分钟后），这样总结请求仍然命中缓存，你的下一条消息也不会把整段长历史以未缓存的价格重新发送。REPL 会在输入框上方显示 `✻ Compacted the idle conversation: …`，输入框保持打开；在压缩完成前发送消息会取消它，会话保持原样（web UI 中则是消息等压缩完成再发送）。PreCompact 和 PostCompact hook 看到的触发方式是 `auto`。在配置中设置 `"idle_compaction": false` 可以关闭，`"idle_compaction_min_tokens"` 设置阈值。
+**空闲压缩。** 上下文至少 20 万 token 的会话停在 REPL 提示符、或 web 任务空闲时，会在提示词缓存过期前 45 秒压缩，这样总结请求仍然命中缓存，你的下一条消息也不会把整段长历史以未缓存的价格重新发送。缓存从最后一次请求开始时起保留 5 分钟（`"prompt_cache_ttl": "1h"` 时为一小时），而不是从回答结束时算起：回答写了一分钟，提示符处就只剩 3¼ 分钟。缓存已经过期时（回答更久，或会话刚恢复）会话保持原样，因为此时总结要以未缓存的价格发送整段历史。REPL 会在输入框上方显示 `✻ Compacted the idle conversation: …`，输入框保持打开；在压缩完成前发送消息会取消它，会话保持原样（web UI 中则是消息等压缩完成再发送）。PreCompact 和 PostCompact hook 看到的触发方式是 `auto`。在配置中设置 `"idle_compaction": false` 可以关闭，`"idle_compaction_min_tokens"` 设置阈值。
 
 ## 恢复会话
 
