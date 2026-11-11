@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::markdown::Markdown;
 use super::Output;
 use super::calls::call_label;
-use super::text;
+use super::{print, text};
 use super::style::{DIM, RED};
 use crate::agent::Agent;
 use crate::llm::Message;
@@ -54,7 +54,7 @@ pub async fn shell(agent: &Agent, command: &str, out: &Output) {
 /// adding it or the answer to the conversation.
 pub async fn side_question(agent: &mut Agent, question: &str, out: &Output) {
     if question.trim().is_empty() {
-        out.warn("usage: /btw <question>");
+        print::failed(out, "/btw takes a question: /btw <question>");
         return;
     }
     out.set_status(Some("Answering on the side…"));
@@ -97,12 +97,12 @@ pub fn copy(agent: &Agent, n: usize, out: &Output) {
         .filter(|text| !text.trim().is_empty())
         .collect();
     let Some(reply) = replies.len().checked_sub(n).and_then(|i| replies.get(i)) else {
-        out.warn(if replies.is_empty() { "no reply to copy yet" } else { "there is no such reply" });
+        print::failed(out, if replies.is_empty() { "No reply to copy yet" } else { "There is no such reply" });
         return;
     };
     match super::clipboard::copy_text(reply.trim()) {
-        Ok(how) => out.note(format!("copied the reply ({} characters) through {how}", reply.trim().chars().count())),
-        Err(e) => out.error(format!("could not copy: {e}")),
+        Ok(how) => print::done(out, format!("Copied the reply ({} characters) through {how}", reply.trim().chars().count())),
+        Err(e) => print::failed(out, format!("Could not copy: {e}")),
     }
 }
 
@@ -110,7 +110,7 @@ pub fn copy(agent: &Agent, n: usize, out: &Output) {
 /// `harness-<session>.md` in the working directory.
 pub fn export(agent: &Agent, path: Option<&str>, session: Option<&str>, out: &Output) {
     if agent.messages().is_empty() {
-        out.warn("nothing to export yet");
+        print::failed(out, "Nothing to export yet");
         return;
     }
     let path = match path {
@@ -118,8 +118,8 @@ pub fn export(agent: &Agent, path: Option<&str>, session: Option<&str>, out: &Ou
         None => PathBuf::from(format!("harness-{}.md", session.unwrap_or("conversation"))),
     };
     match std::fs::write(&path, markdown(agent.messages())) {
-        Ok(()) => out.note(format!("exported the conversation to {}", path.display())),
-        Err(e) => out.error(format!("could not write {}: {e}", path.display())),
+        Ok(()) => print::done(out, format!("Exported the conversation to {}", path.display())),
+        Err(e) => print::failed(out, format!("Could not write {}: {e}", path.display())),
     }
 }
 

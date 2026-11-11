@@ -4,58 +4,77 @@
 use crate::extensions::skills::Skill;
 use crate::llm;
 
-/// Built-in commands and what they do, as the menu and `/help` show them.
-pub(super) const BUILTINS: [(&str, &str); 25] = [
-    ("/help", "browse commands; Enter inserts one into the prompt"),
-    ("/model", "choose main/subagent models and effort; /model <provider>/<model> switches directly"),
-    ("/effort", "choose reasoning effort, or set it with /effort <level>"),
-    ("/provider", "manage providers and models; /provider add|remove|model|default … changes them"),
-    ("/clear", "start a new conversation"),
-    ("/compact", "summarize the conversation to free context; /compact <focus> says what to keep"),
-    ("/resume", "pick up an earlier conversation from this directory"),
-    ("/rewind", "go back to before an earlier prompt, with the code, the conversation or both (or Esc Esc)"),
-    ("/init", "have the model write AGENTS.md, or improve it; /init <notes> says what else to cover"),
-    ("/usage", "show the tokens used so far and how full the context is"),
-    ("/btw", "ask a side question about the conversation; neither it nor the answer is kept"),
-    ("/copy", "copy the model's last reply to the clipboard; /copy <n> the nth latest"),
-    ("/export", "write the conversation to a Markdown file; /export <file> names it"),
-    ("/tools", "browse tool descriptions and input schemas"),
-    ("/output", "browse the expanded conversation (or Ctrl+O, including while running)"),
-    ("/skills", "browse skills; Enter inserts an invocation into the prompt"),
-    ("/agents", "browse subagent types, models, permissions and tools"),
-    ("/tasks", "browse this conversation's tasks and task actions"),
-    ("/stop", "choose a running task to stop, or stop one with /stop <id>"),
-    ("/mcp", "browse MCP servers, tools and connection errors"),
-    ("/plugins", "manage plugins; /plugins install|uninstall|enable|disable|update|marketplace … also works"),
-    ("/reload-plugins", "load plugins, skills, agents and hooks again, for the next conversation"),
-    ("/sandbox", "show what the sandbox allows commands to do"),
-    ("/permissions", "choose the permission mode (or Shift+Tab); /permissions <mode> sets it, /permissions rules lists the rules"),
-    ("/exit", "quit (or exit, Ctrl-D)"),
+/// A built-in command, as the menu and `/help` show it.
+pub(super) struct Builtin {
+    pub name: &'static str,
+    /// The arguments it takes, if any; without them it opens its panel.
+    pub args: &'static str,
+    pub about: &'static str,
+}
+
+const fn builtin(name: &'static str, args: &'static str, about: &'static str) -> Builtin {
+    Builtin { name, args, about }
+}
+
+pub(super) const BUILTINS: [Builtin; 25] = [
+    builtin("/help", "", "Commands and keyboard shortcuts"),
+    builtin("/model", "[provider/model]", "Choose the model, the subagents' model and the effort"),
+    builtin("/effort", "[level|auto]", "Set the reasoning effort for this session"),
+    builtin("/provider", "[add|remove|model|…]", "Manage providers and their models"),
+    builtin("/clear", "", "Start a new conversation"),
+    builtin("/compact", "[focus]", "Summarize the conversation to free context"),
+    builtin("/resume", "[id]", "Continue an earlier conversation from this directory"),
+    builtin("/rewind", "", "Go back to before an earlier prompt (Esc Esc)"),
+    builtin("/init", "[notes]", "Have the model write AGENTS.md, or improve it"),
+    builtin("/usage", "", "Tokens used and how full the context is"),
+    builtin("/btw", "<question>", "Ask a side question; nothing of it is kept"),
+    builtin("/copy", "[n]", "Copy the last reply, or the nth latest"),
+    builtin("/export", "[file]", "Save the conversation as Markdown"),
+    builtin("/tools", "", "Tools the model can call"),
+    builtin("/output", "", "The expanded conversation (Ctrl+O)"),
+    builtin("/skills", "", "Skills and custom commands"),
+    builtin("/agents", "", "Subagent types"),
+    builtin("/tasks", "", "Subagents and background commands"),
+    builtin("/stop", "[id]", "Stop running tasks"),
+    builtin("/mcp", "", "MCP servers and their tools"),
+    builtin("/plugins", "[install|update|…]", "Manage plugins"),
+    builtin("/reload-plugins", "", "Load plugins, skills, agents and hooks again"),
+    builtin("/sandbox", "", "What the sandbox lets commands do"),
+    builtin("/permissions", "[mode|rules]", "Permission mode and rules (Shift+Tab)"),
+    builtin("/exit", "", "Quit (Ctrl-D)"),
 ];
 
-/// Keys and input forms, as `/help` lists them after the commands.
-pub(super) fn help_keys() -> [(&'static str, &'static str); 10] {
-    [
-        ("/<skill> [args]", "run a skill"),
-        ("@path", "attach a file, directory, image or PDF; @ opens a file menu (@file#L10-20 for lines)"),
-        ("Ctrl+O", "expanded transcript; / searches, i shows inputs, Esc closes"),
-        ("Ctrl+V", "paste an image from the clipboard (files copied in Finder or a file manager become @ mentions)"),
-        ("\\ or Alt+Enter", "continue on a new line"),
-        ("↑ ↓ Tab Enter", "pick from the menu shown while typing / or @"),
-        ("↑", "while the model works: edit the messages queued for it"),
-        ("Esc", "interrupt the running turn"),
-        ("Esc Esc", "at an empty prompt: go back to before an earlier prompt (/rewind)"),
-        ("Ctrl-C", "interrupt the running turn; twice at the prompt to quit"),
-    ]
-}
+/// Keys and input forms, as `/help` lists them beside the commands, under
+/// what they are for.
+pub(super) const KEYS: [(&str, &[(&str, &str)]); 3] = [
+    ("Writing a message", &[
+        ("/command", "Run a command or a skill; a menu opens as you type"),
+        ("@path", "Attach a file, directory, image or PDF (@file#L10-20 for lines)"),
+        ("!command", "Run a shell command yourself"),
+        ("\\ or Alt+Enter", "Continue on a new line"),
+        ("Ctrl+V", "Paste an image; copied files become @ mentions"),
+        ("↑ ↓ Tab Enter", "Pick from the menu under the prompt"),
+    ]),
+    ("While the model works", &[
+        ("Enter", "Send a message for its next step"),
+        ("↑", "Edit the messages queued for it"),
+        ("Esc or Ctrl-C", "Interrupt the turn"),
+        ("Shift+Tab", "Go to the next permission mode"),
+        ("Ctrl+O", "Expanded conversation: / searches, i shows inputs"),
+    ]),
+    ("At an empty prompt", &[
+        ("Esc Esc", "Go back to before an earlier prompt (/rewind)"),
+        ("Ctrl-C Ctrl-C", "Quit"),
+    ]),
+];
 
 pub(super) fn effort_help(effort: llm::Effort) -> &'static str {
     match effort {
-        llm::Effort::Low => "fastest and cheapest; simple tasks",
-        llm::Effort::Medium => "balanced speed and depth",
-        llm::Effort::High => "deeper thinking",
-        llm::Effort::XHigh => "deeper still; suits most coding work",
-        llm::Effort::Max => "deepest; when correctness matters most",
+        llm::Effort::Low => "Fastest and cheapest; simple tasks",
+        llm::Effort::Medium => "Balanced speed and depth",
+        llm::Effort::High => "Deeper thinking",
+        llm::Effort::XHigh => "Deeper still; suits most coding work",
+        llm::Effort::Max => "Deepest; when correctness matters most",
     }
 }
 

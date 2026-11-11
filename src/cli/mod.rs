@@ -330,7 +330,7 @@ impl<'a> Repl<'a> {
             // A skill that runs in a subagent: its report goes to the model.
             Input::Skill(skill, args) => match turn::run_fork(self.agent, self.env, &skill, &args, &self.out).await {
                 Ok(prompt) => self.prompt(line, &prompt, images).await,
-                Err(e) => self.out.error(&e),
+                Err(e) => print::failed(&self.out, &e),
             },
             Input::Prompt(prompt) => self.prompt(line, &prompt, images).await,
             input => {
@@ -372,7 +372,7 @@ impl<'a> Repl<'a> {
         self.agent.clear();
         self.out.restore_tool_output(self.agent.messages());
         if apply_reload(self.agent, self.env, &mut self.skills, self.editor.helper()).await {
-            self.out.note("the reloaded plugins apply from here");
+            print::done(&self.out, "The reloaded plugins apply from here");
         } else {
             refresh_system(self.agent);
         }
@@ -380,12 +380,12 @@ impl<'a> Repl<'a> {
             rec.restart();
             sessions::attach(self.agent, rec);
         }
-        self.out.note("conversation cleared");
+        print::done(&self.out, "Started a new conversation");
     }
 
     async fn compact(&mut self, focus: Option<&str>) {
         if self.agent.messages().is_empty() {
-            self.out.note("nothing to compact yet");
+            print::done(&self.out, "Nothing to compact yet");
             return;
         }
         let _ = turn::compact_shown(self.agent, focus, &self.out, &mut self.term, self.recorder.as_mut()).await;
@@ -442,7 +442,7 @@ impl<'a> Repl<'a> {
         let lists = matches!(args.first().map(String::as_str), Some("list" | "help") | None)
             || matches!(args.get(..2), Some([a, b]) if a == "marketplace" && b == "list");
         if !lists {
-            self.out.note("run /reload-plugins to use the change");
+            print::done(&self.out, "Run /reload-plugins to use the change");
         }
     }
 
@@ -464,9 +464,9 @@ impl<'a> Repl<'a> {
             if let Some(rec) = self.recorder.as_ref() {
                 sessions::attach(self.agent, rec);
             }
-            self.out.note("they apply from the next message");
+            print::done(&self.out, "They apply from the next message");
         } else {
-            self.out.note("they apply to the next conversation: /clear starts one");
+            print::done(&self.out, "They apply to the next conversation: /clear starts one");
         }
     }
 
@@ -496,17 +496,17 @@ fn on_terminal(out: &Output, manage: impl FnOnce() -> Result<Vec<String>>) -> Re
 
 /// What the menu under the prompt offers.
 fn menu_commands(agent: &Agent, skills: &[Skill]) -> Vec<Command> {
-    let builtins = parse::BUILTINS.iter().map(|(name, description)| Command::new(*name, *description));
+    let builtins = parse::BUILTINS.iter().map(|b| Command::new(b.name, b.about));
     let mut commands: Vec<Command> = builtins.collect();
     commands.extend(
         skills.iter().filter(|s| s.user_invocable).map(|s| Command::new(format!("/{}", s.name), &s.description)),
     );
     commands.extend(
-        agent.client().providers().listed_models().iter().map(|m| Command::new(format!("/model {m}"), "switch to this model")),
+        agent.client().providers().listed_models().iter().map(|m| Command::new(format!("/model {m}"), "Switch to this model")),
     );
     let efforts = llm::Effort::ALL.iter();
     commands.extend(efforts.map(|e| Command::new(format!("/effort {}", e.as_str()), parse::effort_help(*e))));
-    commands.push(Command::new("/effort auto", "back to the configured effort"));
+    commands.push(Command::new("/effort auto", "Back to the configured effort"));
     commands
 }
 

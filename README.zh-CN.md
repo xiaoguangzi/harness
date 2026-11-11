@@ -178,7 +178,7 @@ harness provider list              # 另有：remove <name>、model remove <prov
 
 对已有的 provider 执行 `add` 只修改选项给出的部分（不带选项时重新逐项询问，直接回车保留原值）。密钥按输入原样保存，所以写 `${VAR}`（在 shell 中用单引号）可以不把它写进文件；`--api-key ''` 表示不设密钥。没有可用的默认模型时，`add` 把它的第一个模型设为默认模型。每次修改后，如果配置还不能使用（例如没有默认模型），会说明原因。
 
-`sync` 向网关请求模型列表（`GET {base_url}/v1/models`，带上该 provider 的密钥和请求头；网关像 Anthropic API 那样分页时逐页读取），并把它们设为该 provider 列出的模型：已列出的模型保留原有设置；没有 `context_window` 的模型取列表给出的值（`context_window`、`context_length`、`max_input_tokens` 或 `top_provider.context_length`），除非该 provider 为所有模型统一设置了 `context_window`；网关不再提供的模型会从列表中移除，若 `model` 或 `subagent_model` 是其中之一会给出警告。`--include` 和 `--exclude`（可重复）筛选列表，并保存为该 provider 的 [`sync`](#llm-网关)，之后不带选项的 `sync` 沿用同样的筛选；筛选后一个模型都不剩时不做任何修改。在 REPL 中，`/provider sync <name>` 或面板中的 *Sync listed models* 作用相同。
+`sync` 向网关请求模型列表（`GET {base_url}/v1/models`，带上该 provider 的密钥和请求头；网关像 Anthropic API 那样分页时逐页读取），并把它们设为该 provider 列出的模型：已列出的模型保留原有设置；没有 `context_window` 的模型取列表给出的值（`context_window`、`context_length`、`max_input_tokens` 或 `top_provider.context_length`），除非该 provider 为所有模型统一设置了 `context_window`；网关不再提供的模型会从列表中移除，若 `model` 或 `subagent_model` 是其中之一会给出警告。`--include` 和 `--exclude`（可重复）筛选列表，并保存为该 provider 的 [`sync`](#llm-网关)，之后不带选项的 `sync` 沿用同样的筛选；筛选后一个模型都不剩时不做任何修改。在 REPL 中，`/provider sync <name>` 或面板中的 *Sync models* 作用相同。
 
 汇集多个订阅、同时提供两种协议的本地网关（例如 magpie），可以配成同一地址上的两个 provider，各自同步适合其协议的模型：
 
@@ -189,7 +189,7 @@ harness provider add magpie-openai --protocol openai-responses --base-url http:/
 harness provider sync magpie-openai --include 'codex/*'
 ```
 
-会话中途可用 `/model <provider>/<model>` 直接切换模型，或输入无参数的 `/model` 并回车打开模型设置面板：Tab 切换主模型和子代理默认模型，↑/↓ 选择模型，输入文字筛选（Enter 采用高亮的模型，仅筛选不会改变设置），←/→ 调整共同的会话 effort（`auto`、`low`、`medium`、`high`、`xhigh`、`max`）。面板显示两个模型选择、协议、配置的上下文/输出上限和 effort；Enter 一次应用所有预览修改，Esc 放弃修改，仅影响本次会话。子代理默认模型可设置为跟随主模型，也可独立选择；代理自身指定的模型仍优先，已有子代理保留原模型。重定向输入时仍打印 provider、模型列表和实际生效的设置。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
+会话中途可用 `/model <provider>/<model>` 直接切换模型，或输入无参数的 `/model` 并回车打开模型面板：第一行显示主模型和子代理默认模型，Tab 切换列表设置的是哪一个，↑/↓ 选择模型（模型多到一屏放不下时可输入文字筛选；Enter 采用高亮的模型，仅筛选不会改变设置），←/→ 调整共同的会话 effort（`auto`、`low`、`medium`、`high`、`xhigh`、`max`）。列表下方显示 effort、协议以及配置的上下文/输出上限；Enter 一次应用所有预览修改，Esc 放弃修改，仅影响本次会话。子代理默认模型可设置为跟随主模型，也可独立选择；代理自身指定的模型仍优先，已有子代理保留原模型。重定向输入时仍打印 provider、模型列表和实际生效的设置。`/effort <level>` 修改本次会话剩余部分的推理强度（`/model` 切换后保留），`/effort auto` 恢复为配置值。历史始终以 Anthropic 形式保存，请求 OpenAI 时再转换（`function_call` / `function_call_output`、`input_image`、`input_file`）；请求是无状态的（`store: false`），推理项会以其加密内容重放。绑定模型的块（Anthropic thinking、OpenAI reasoning）只会发回产生它们的那个模型。子代理可以通过 `subagent_model` 或代理自身的 `model` 使用不同的网关。
 
 ## 用 `@` 附加文件
 
@@ -222,11 +222,11 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 
 模型遇到重要选择或缺失的需求时，可以调用 `ask_user_question`，让你直接选择后继续当前任务。交互式 REPL 会用问题面板替换输入框：先是问题，然后是带编号的选项，说明显示在各自标签下方，最后一项（“Type something.”）用于自定义回答。↑/↓ 或 Tab 切换选项，Enter 提交，直接打字切到自定义回答；回答之后显示在会话中该调用的下方（`⎿ Answered: …`）；Esc 取消且不做选择，Ctrl+C 中断当前轮。长问题和说明用 PgUp/PgDn 滚动查看，原来未发送的草稿会保留。每次工具调用问一个问题，提供 2–6 个选项，或者只收自由文本；始终可以自定义回答。终端把同时到达的问题（包括子代理的问题）逐个显示。Web UI 在会话中把问题显示为一张卡片：带编号的选项及其说明，加一个用于自定义回答的“其他回答”输入框（按 1–N 选择，Enter 提交）；回答后卡片只保留问题和答案。刷新页面后仍可回答等待中的问题。此功能独立于工具审批，默认 `bypassPermissions` 和规划模式下均可用。一次性/JSON 运行或重定向输入时立即返回 `unavailable`，由模型在回复里说明问题；取消或无法交互都不代表同意。
 
-交互面板按终端可用宽度展开，使用标题和留白，不绘制边框或分隔线；宽度足够时每项的说明显示在名称旁边，放不下时在列表下方完整显示选中项的说明。无参数的选择类命令会打开键盘交互面板：`/effort`、`/resume`、`/rewind`、`/tasks`、`/stop`、`/provider` 和 `/plugins`。↑/↓ 选择，输入文字筛选，Enter 继续，Esc 取消或返回。`/help` 和 `/skills` 可将选中的命令填入输入框，便于补充参数后执行。`/tools`、`/agents`、`/mcp`、`/usage` 和 `/sandbox` 提供可搜索的只读详情面板；Tab 展开完整详情，↑/↓ 滚动，Tab/Esc 返回。没有可显示的任务时 `/stop` 和 `/tasks` 只给出提示；`/rewind` 仅在代码有改动且可以恢复时提供恢复代码的选项。带参数的命令和重定向输入保留原来的行为；`/clear`、`/compact`、`/init`、`/reload-plugins` 和 `/exit` 继续直接执行。
+交互面板显示在输入框的位置，外形也与输入框一致：一条带面板标题的横线（长列表或长文本还会在右侧标出当前滚动位置）、内容、一条横线，最后一行只列出此刻有用的按键。宽度足够时每项的说明显示在名称旁边，放不下时在列表下方完整显示选中项的说明；名称前的标记表示当前生效的选项（`✓`）或状态（`●` 开启/运行中，`✗` 失败，`○` 关闭）。↑/↓（或 PgUp/PgDn）选择，Enter 确认，→ 或 Tab 在该项还有更多内容时展开详情（↑/↓ 滚动，Esc 或 ← 返回），Esc 取消或返回。一屏放不下的列表可以滚动，并按输入的文字筛选；较短的列表不提供筛选。无参数的选择类命令会打开这样的面板：`/effort`、`/permissions`、`/resume`、`/rewind`、`/stop`、`/provider` 和 `/plugins`。`/help` 显示命令，按 Tab 切换到快捷键；它和 `/skills` 可将选中的命令填入输入框，便于补充参数后执行。`/tools`、`/agents`、`/mcp` 和 `/tasks` 打开可浏览的列表，Enter 展开选中项的详情；`/usage`（用进度条显示上下文占用，并按模型列出 token）和 `/sandbox` 是只读页面。没有可显示的内容时 `/stop`、`/tasks` 和 `/skills` 只给出提示；`/rewind` 仅在代码有改动且可以恢复时提供恢复代码的选项。带参数的命令和重定向输入改为逐行打印；命令做了什么、或为什么没做，显示在命令行下方的 `⎿` 之后。`/clear`、`/compact`、`/init`、`/reload-plugins` 和 `/exit` 继续直接执行。
 
 | 命令 / 按键 | 说明 |
 |---|---|
-| `/help` | 浏览命令，Enter 将选项填入输入框 |
+| `/help` | 浏览命令（Enter 将选中的命令填入输入框），按 Tab 查看快捷键 |
 | `/model [spec]` | 设置主模型、子代理默认模型及 effort，或直接切换主模型到 `<provider>/<model>` |
 | `/provider [子命令]` | 打开 provider 管理；`/provider add`、`remove`、`model add`、`model remove`、`sync`、`default` 与 `harness provider` 相同，并立即生效（见 [LLM 网关](#llm-网关)） |
 | `/effort [level]` | 交互选择推理强度，或直接设置为 `low`、`medium`、`high`、`xhigh`、`max`；`auto` 恢复为配置值 |
@@ -236,13 +236,13 @@ macOS 通过 `osascript` 读取剪贴板（应用放入的任意图片格式均�
 | `/rewind` | 回到之前某条提示之前，恢复代码、对话或两者（见[回退](#回退)） |
 | `/init [说明]` | 让模型编写项目的 `AGENTS.md`，已有时改进它（见[项目说明](#项目说明)） |
 | `/usage` | 按模型显示 REPL 启动以来用掉的 token（请求数、输入、缓存读取与写入、输出；包括子代理和上下文压缩，`/clear` 和 `/resume` 后不清零）、已知[价格](#llm-网关)的模型大约花了多少钱，以及当前会话大约占用了多少上下文窗口 |
-| `/tools` | 浏览工具说明和输入参数 schema |
+| `/tools` | 浏览工具；Enter 显示完整说明和输入参数 schema |
 | `/output` | 浏览展开的整段会话；运行中也可按 Ctrl+O |
 | `/skills` | 浏览技能，Enter 将调用命令填入输入框 |
 | `/agents` | 浏览子代理类型、模型、权限和工具 |
 | `/tasks` | 列出本会话启动的子代理（ID、状态、模型、工具调用次数、耗时、运行中子代理最近的一次调用）和[后台命令](#后台命令) |
 | `/stop [id]` | 选择一个或全部运行中的任务停止；指定 ID 时直接停止对应子代理或后台命令（`shell_1`）（见[子代理](#子代理subagents)） |
-| `/mcp` | 列出 MCP 服务器、其工具和日志文件 |
+| `/mcp` | 浏览 MCP 服务器：是否连接成功、其工具和日志文件 |
 | `/plugins [子命令]` | 打开插件管理；`/plugins update` 拉取它们的最新版本，`/plugins install`、`uninstall`、`enable`、`disable`、`configure`、`marketplace …` 与 `harness plugin` 相同（见[插件](#插件plugins)） |
 | `/reload-plugins` | 从配置重新加载插件、技能、命令、代理和 hook，供下一个会话使用：当前会话还是空的则立即生效，否则从 `/clear` 或 `/resume` 起生效 |
 | `/sandbox` | 显示沙箱允许的操作（见[沙箱](#沙箱)） |

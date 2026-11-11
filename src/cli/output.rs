@@ -29,6 +29,7 @@ const SHIMMER_SGR: &str = "1;38;5;216";
 /// Wrap a redraw, so terminals that support it show it all at once.
 const SYNC_START: &str = "\x1b[?2026h\x1b[?25l";
 const SYNC_END: &str = "\x1b[?25h\x1b[?2026l";
+const HIDE_CURSOR: &str = "\x1b[?25l";
 
 /// Shared handle on stdout. Output printed while an agent runs goes through
 /// it, so the status lines and input box are cleared first and redrawn
@@ -598,6 +599,8 @@ impl Output {
                 else { viewport.draw(printed, rows, cursor, size.0, height) };
             screen.push_str(&frame);
             screen.push_str(SYNC_END);
+            // A panel with nothing to type into shows no cursor.
+            if state.panel.is_some() && cursor.is_none() { screen.push_str(HIDE_CURSOR); }
             let mut stdout = io::stdout().lock();
             let _ = stdout.write_all(screen.as_bytes());
             let _ = stdout.flush();
@@ -829,9 +832,13 @@ pub(super) fn elapsed(secs: u64) -> String {
     if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) }
 }
 
-/// `12345` -> `12.3k`.
+/// `12345` -> `12.3k`, `1000000` -> `1M`.
 pub(super) fn tokens(n: u64) -> String {
-    if n < 1000 { n.to_string() } else { format!("{:.1}k", n as f64 / 1000.0) }
+    match n {
+        0..1000 => n.to_string(),
+        1000..1_000_000 => format!("{:.1}k", n as f64 / 1000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0).replace(".0M", "M"),
+    }
 }
 
 #[cfg(test)]

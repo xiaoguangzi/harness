@@ -4,11 +4,12 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use super::dialog::{self, Item, Keys};
+use super::dialog::{self, Item, Keys, List, Mark, Sheet};
 use super::input::Typing;
-use super::parse::{BUILTINS, Input, effort_help, help_keys};
+use super::keys::Key;
+use super::parse::{BUILTINS, Input, effort_help};
 use super::{Output, output, print, text};
-use super::style::BOLD;
+use super::style::{BOLD, DIM};
 use crate::agent::Agent;
 use crate::extensions::skills::Skill;
 use crate::llm::{self, Client};
@@ -51,11 +52,14 @@ impl View {
 
     /// Has the conversation go on with `client`; while a turn runs, from
     /// the next one.
-    pub fn set_client(&self, client: Client, out: &Output) {
-        if self.running {
-            out.note("used from the next message; this one goes on as it began");
-        }
+    pub fn set_client(&self, client: Client) {
         *self.switch_to.lock().unwrap() = Some(client);
+    }
+
+    /// When a model or effort set now is used, to say after it: a turn
+    /// that runs goes on as it began.
+    fn later(&self) -> &'static str {
+        if self.running { ", from the next message" } else { "" }
     }
 }
 
@@ -83,6 +87,7 @@ pub(super) fn runs_during_turn(input: &Input) -> bool {
 /// Runs a command that [`runs_during_turn`], once its panel, if any, is
 /// done. A model chosen goes to `view`, for the agent to switch to.
 pub(super) async fn run(input: Input, view: &View, env: &Env, skills: &[Skill], out: &Output) {
+    let bold = |text: &str| out.paint(BOLD, text);
     match input {
         Input::Help => print::help(out, skills),
         Input::ListSkills => print::skills(out, skills),
@@ -90,55 +95,54 @@ pub(super) async fn run(input: Input, view: &View, env: &Env, skills: &[Skill], 
         Input::ListMcp => print::mcp(out, env.mcp_statuses()),
         Input::ListAgents => print::agents(out, &env.ext.agent_defs),
         Input::Tasks => print::tasks(out, &view.subagents.list(), &view.shells.list()),
-        Input::Stop(None) => {
-            let stopped = view.subagents.stop_all();
-            let killed = view.shells.stop_all();
-            let note = format!(
-                "stopped {stopped} {} and {killed} {}",
-                text::plural(stopped, "subagent"),
-                text::plural(killed, "background command")
-            );
-            out.note(&note);
-        }
+        Input::Stop(None) => match (view.subagents.stop_all(), view.shells.stop_all()) {
+            (0, 0) => print::done(out, "No running tasks"),
+            (stopped, killed) => {
+                let stopped = format!("{stopped} {}", text::plural(stopped, "subagent"));
+                print::done(out, format!("Stopped {stopped} and {killed} {}", text::plural(killed, "background command")));
+            }
+        },
         Input::Stop(Some(id)) if id.starts_with("shell_") => match view.shells.stop(&id) {
-            Ok(true) => out.note(format!("stopped {id}")),
-            Ok(false) => out.note(format!("{id} is not running")),
-            Err(e) => out.error(&e),
+            Ok(true) => print::done(out, format!("Stopped {}", bold(&id))),
+            Ok(false) => print::done(out, format!("{id} is not running")),
+            Err(e) => print::failed(out, &e),
         },
         Input::Stop(Some(id)) => match view.subagents.stop(&id, true) {
-            Ok(true) => out.note(format!("stopped {id}")),
-            Ok(false) => out.note(format!("{id} is not running")),
-            Err(e) => out.error(format!("{e:#}")),
+            Ok(true) => print::done(out, format!("Stopped {}", bold(&id))),
+            Ok(false) => print::done(out, format!("{id} is not running")),
+            Err(e) => print::failed(out, format!("{e:#}")),
         },
         Input::Sandbox => print::sandbox(out),
         Input::Model(None) => print::models(out, &view.client()),
         Input::Model(Some(spec)) => match view.client().switch(&spec) {
             Ok(client) => {
-                out.line(format!("model: {}", out.paint(BOLD, client.spec())));
-                view.set_client(client, out);
+                print::done(out, format!("Model set to {}{}", bold(client.spec()), view.later()));
+                view.set_client(client);
             }
-            Err(e) => out.error(format!("{e:#}")),
+            Err(e) => print::failed(out, format!("{e:#}")),
         },
         Input::Permissions(None) => print::permissions(&view.permissions, out),
         Input::Permissions(Some(arg)) if arg == "rules" => print::permissions(&view.permissions, out),
         Input::Permissions(Some(arg)) => match Mode::parse(&arg) {
             Ok(mode) => {
                 view.permissions.set_mode(mode);
-                out.line(format!("permission mode: {} — {}", out.paint(BOLD, mode.as_str()), mode.describe()));
+                let about = out.paint(DIM, &format!("· {}", mode.describe()));
+                print::done(out, format!("Permission mode set to {} {about}", bold(mode.as_str())));
             }
-            Err(e) => out.error(&e),
+            Err(e) => print::failed(out, &e),
         },
         Input::Effort(None) => {
-            out.line(format!("effort: {}", out.paint(BOLD, view.client().effort().as_str())));
-            out.note("set with /effort low|medium|high|xhigh|max, or /effort auto");
+            let how = out.paint(DIM, "· /effort low|medium|high|xhigh|max sets it, /effort auto restores the configured one");
+            print::done(out, format!("Effort is {} {how}", bold(view.client().effort().as_str())));
         }
         Input::Effort(Some(level)) => {
             let mut client = view.client();
             client.set_effort(level);
-            out.line(format!("effort: {}", out.paint(BOLD, client.effort().as_str())));
-            view.set_client(client, out);
+            let configured = if level.is_none() { ", as configured" } else { "" };
+            print::done(out, format!("Effort set to {}{configured}{}", bold(client.effort().as_str()), view.later()));
+            view.set_client(client);
         }
-        Input::Error(e) => out.error(&e),
+        Input::Error(e) => print::failed(out, &e),
         _ => unreachable!("only commands that leave the conversation as it is run here"),
     }
 }
@@ -157,7 +161,7 @@ pub(super) async fn during_turn(input: Input, panel: bool, view: View, env: &Env
     }
 }
 
-const SELECT: Keys = Keys { enter: "select", esc: "cancel" };
+const SELECT: Keys = Keys { enter: "open", esc: "close" };
 const BACK: Keys = Keys { enter: "select", esc: "back" };
 
 /// Opens the panel of a command typed alone. Returns what to run once it
@@ -176,11 +180,15 @@ pub(super) async fn interactive(
         Input::Permissions(None) => choose_mode(view, out).await,
         Input::Model(None) => choose_model(view, out).await,
         Input::Effort(None) => choose_effort(view, out).await,
+        Input::ListSkills if skills.is_empty() => Some(input),
         Input::ListSkills => pick_skill(skills, out, typing).await,
-        Input::ListTools => browse(out, "Tools", "What the model can call, with input schemas", tool_items(view)).await,
-        Input::ListAgents => browse(out, "Agent types", "Subagent types the model can start", agent_items(view, env)).await,
-        Input::ListMcp => browse(out, "MCP servers", "Servers, their tools and connection errors", mcp_items(env)).await,
-        Input::Sandbox => browse(out, "Sandbox", "What commands may do; read-only", sandbox_items()).await,
+        Input::ListTools => browse(out, "Tools", "No tools", tool_items(view)).await,
+        Input::ListAgents => browse(out, "Subagent types", "No subagent types", agent_items(view, env)).await,
+        Input::ListMcp => browse(out, "MCP servers", print::NO_MCP, mcp_items(env)).await,
+        Input::Sandbox => {
+            dialog::sheet(out, "Sandbox", print::sandbox_lines(out, dialog::room())).await;
+            None
+        }
         Input::Stop(None) => stop(view, out).await,
         Input::Tasks => tasks(view, out).await,
         Input::Providers(args) if args.is_empty() => providers(view, out).await,
@@ -190,83 +198,116 @@ pub(super) async fn interactive(
 }
 
 /// Shows `items` in a panel to look through; nothing runs after it.
-async fn browse(out: &Output, title: &str, about: &str, items: Vec<Item>) -> Option<Input> {
-    dialog::inspect(out, title, about, items).await;
+async fn browse(out: &Output, title: &str, empty: &str, items: Vec<Item>) -> Option<Input> {
+    dialog::inspect(out, title, "", empty, items).await;
     None
 }
 
-/// `/help`: the commands, skills and keys; Enter puts a command in the
-/// prompt.
-async fn help(skills: &[Skill], out: &Output, typing: &mut Typing) -> Option<Input> {
-    let mut items: Vec<_> = BUILTINS.iter().map(|(name, description)| Item::new(*name, *description)).collect();
-    let skills = skills.iter().filter(|s| s.user_invocable);
-    items.extend(skills.map(|s| Item::new(format!("/{}", s.name), &s.description)));
-    let keyboard = items.len();
-    let keys: Vec<_> = help_keys().iter().map(|(key, description)| format!("{key}: {description}")).collect();
-    items.push(Item::new("Keyboard shortcuts", "Browse composer, interrupt and rewind shortcuts").details(keys.clone()));
-    let about = "Built-in commands, skills and keyboard shortcuts";
-    let insert = Keys { enter: "insert", esc: "cancel" };
-    while let Some(i) = dialog::choose(out, "Commands", about, insert, items.clone(), 0).await {
-        if i == keyboard {
-            dialog::document(out, "Keyboard shortcuts", keys.clone()).await;
-        } else {
-            typing.draft.set_text(&items[i].label);
-            break;
+/// `/help`: the commands, to put one in the prompt, and beside them the
+/// keys.
+struct Help {
+    commands: List,
+    keys: Sheet,
+    /// Whether the keys show.
+    shortcuts: bool,
+}
+
+impl dialog::Panel for Help {
+    fn render(&self, width: usize, height: usize, paint: dialog::Paint) -> dialog::Frame {
+        if self.shortcuts { self.keys.render(width, height, paint) } else { self.commands.render(width, height, paint) }
+    }
+}
+
+impl Help {
+    /// Tab goes from the commands to the keys and back; other keys are
+    /// for the one that shows.
+    fn handle(&mut self, key: Key) -> Option<Option<usize>> {
+        match key {
+            Key::Tab => {
+                self.shortcuts = !self.shortcuts;
+                None
+            }
+            key if self.shortcuts => self.keys.handle(key).map(|_| None),
+            key => self.commands.handle(key),
         }
     }
+}
+
+async fn help(skills: &[Skill], out: &Output, typing: &mut Typing) -> Option<Input> {
+    let mut items: Vec<_> = BUILTINS.iter().map(|b| Item::new(b.name, b.about).hint(b.args)).collect();
+    let skills = skills.iter().filter(|s| s.user_invocable);
+    items.extend(skills.map(|s| Item::new(format!("/{}", s.name), &s.description)));
+    let tabs = ["Commands", "Shortcuts"];
+    let keys = Keys { enter: "insert", esc: "close" };
+    let panel = Help {
+        commands: List::new("Help", "", keys, items.clone(), 0).tabs(&tabs, 0),
+        keys: Sheet::new("Help", print::key_lines(out)).tabs(&tabs, 1),
+        shortcuts: false,
+    };
+    let picked = dialog::run(out, panel, Help::handle);
+    let item = &items[picked.await?];
+    // One that takes arguments is left ready for them.
+    typing.draft.set_text(&format!("{}{}", item.label, if item.hint.is_empty() { "" } else { " " }));
     None
 }
 
-/// `/permissions`: the mode to set, with the rules beside each.
+/// `/permissions`: the mode to set.
 async fn choose_mode(view: &View, out: &Output) -> Option<Input> {
+    let current = view.permissions.mode();
+    let mark = |mode: &Mode| if *mode == current { Mark::Check } else { Mark::None };
+    let items = Mode::ALL.iter().map(|m| Item::new(m.as_str(), print::capitalized(m.describe())).mark(mark(m))).collect();
     let rules = view.permissions.rules().into_iter().filter(|(_, r)| !r.is_empty());
-    let rules: Vec<String> = rules.map(|(kind, r)| format!("{kind}: {}", r.join(", "))).collect();
-    let items = Mode::ALL.iter().map(|m| Item::new(m.as_str(), m.describe()).details(rules.clone())).collect();
-    let current = Mode::ALL.iter().position(|m| *m == view.permissions.mode()).unwrap_or(0);
-    let about = "Which tool calls ask first; Shift+Tab cycles them too";
+    let rules: Vec<String> = rules.map(|(kind, r)| format!("{} {kind}", r.len())).collect();
+    let about = if rules.is_empty() { String::new() } else { format!("Rules apply in every mode: {} (/permissions rules)", rules.join(" · ")) };
+    let selected = Mode::ALL.iter().position(|m| *m == current).unwrap_or(0);
     let keys = Keys { enter: "apply", esc: "cancel" };
-    let i = dialog::choose(out, "Permission mode", about, keys, items, current).await?;
+    let i = dialog::choose(out, "Permission mode", &about, keys, items, selected).await?;
     Some(Input::Permissions(Some(Mode::ALL[i].as_str().to_string())))
 }
 
 /// `/model`: the main and subagent models and the effort, all at once.
 async fn choose_model(view: &View, out: &Output) -> Option<Input> {
     let client = super::model::pick(out, &view.client()).await?;
-    out.line(format!("model: {}", out.paint(BOLD, client.spec())));
-    out.line(format!("subagents: {}", client.subagent_model().unwrap_or("follow main model")));
-    out.line(format!("effort: {}", out.paint(BOLD, client.effort().as_str())));
-    view.set_client(client, out);
+    let subagents = client.subagent_model().map_or("follow it".to_string(), |model| format!("use {model}"));
+    let rest = out.paint(DIM, &format!("· {} effort · subagents {subagents}", client.effort().as_str()));
+    print::done(out, format!("Model set to {} {rest}{}", out.paint(BOLD, client.spec()), view.later()));
+    view.set_client(client);
     None
 }
 
 /// `/effort`: a level, or the configured one.
 async fn choose_effort(view: &View, out: &Output) -> Option<Input> {
     let client = view.client();
-    let configured = format!("Use configured effort (currently {})", client.effort().as_str());
+    let chosen = client.effort_override().and_then(|e| llm::Effort::ALL.iter().position(|level| *level == e)).map_or(0, |i| i + 1);
+    let configured = if chosen == 0 { format!("The configured effort ({})", client.effort().as_str()) } else { "The configured effort".into() };
     let mut items = vec![Item::new("auto", configured)];
     items.extend(llm::Effort::ALL.iter().map(|e| Item::new(e.as_str(), effort_help(*e))));
-    let chosen = client.effort_override().and_then(|e| llm::Effort::ALL.iter().position(|level| *level == e));
-    let about = "Applies to this session; /model changes the same setting";
+    items[chosen].mark = Mark::Check;
     let keys = Keys { enter: "apply", esc: "cancel" };
-    let i = dialog::choose(out, "Reasoning effort", about, keys, items, chosen.map_or(0, |i| i + 1)).await?;
+    let i = dialog::choose(out, "Reasoning effort", "", keys, items, chosen).await?;
     Some(Input::Effort(Some(i.checked_sub(1).map(|i| llm::Effort::ALL[i]))))
 }
 
 /// `/skills`: Enter puts a user-invocable one in the prompt.
 async fn pick_skill(skills: &[Skill], out: &Output, typing: &mut Typing) -> Option<Input> {
     let items = skills.iter().map(|s| {
-        Item::new(format!("/{}", s.name), &s.description).details(vec![
-            format!("Source: {}", s.dir.display()),
-            format!("User invocable: {} · model invocable: {}", s.user_invocable, s.model_invocable),
-            format!("Runs in a subagent: {}", s.fork.is_some()),
-        ])
+        let invoked = match (s.user_invocable, s.model_invocable) {
+            (true, true) => "you and the model",
+            (true, false) => "only you",
+            (false, _) => "only the model",
+        };
+        Item::new(format!("/{}", s.name), &s.description)
+            .field("Invoked by", invoked)
+            .field("Runs in", if s.fork.is_some() { "a subagent" } else { "this conversation" })
+            .field("Source", s.dir.display().to_string())
     });
-    let about = "Discovered skills; only user-invocable ones go into the prompt";
-    let keys = Keys { enter: "insert", esc: "cancel" };
-    if let Some(i) = dialog::choose(out, "Skills", about, keys, items.collect(), 0).await
-        && skills[i].user_invocable
-    {
-        typing.draft.set_text(&format!("/{} ", skills[i].name));
+    let keys = Keys { enter: "insert", esc: "close" };
+    if let Some(i) = dialog::choose(out, "Skills", "", keys, items.collect(), 0).await {
+        if skills[i].user_invocable {
+            typing.draft.set_text(&format!("/{} ", skills[i].name));
+        } else {
+            print::done(out, format!("/{} is for the model to invoke, not for the prompt", skills[i].name));
+        }
     }
     None
 }
@@ -275,8 +316,8 @@ async fn pick_skill(skills: &[Skill], out: &Output, typing: &mut Typing) -> Opti
 fn tool_items(view: &View) -> Vec<Item> {
     let items = view.tools.definitions().into_iter().map(|t| {
         let schema = serde_json::to_string_pretty(&t.input_schema).unwrap_or_default();
-        let details = std::iter::once("Input schema:".into()).chain(schema.lines().map(String::from));
-        Item::new(t.name, t.description).details(details)
+        let item = Item::new(t.name, print::summary(&t.description)).about(t.description.as_str());
+        item.section("Input schema").details(schema.lines().map(String::from))
     });
     items.collect()
 }
@@ -286,13 +327,14 @@ fn tool_items(view: &View) -> Vec<Item> {
 fn agent_items(view: &View, env: &Env) -> Vec<Item> {
     let client = view.client();
     let items = env.ext.agent_defs.iter().map(|d| {
-        Item::new(&d.name, &d.description).details(vec![
-            format!("Access: {}", d.permission.as_str()),
-            format!("Tools: {}", d.tools.as_ref().map_or("all permitted".into(), |t| t.join(", "))),
-            format!("Model: {}", d.model.as_deref().or(client.subagent_model()).unwrap_or(client.spec())),
-            format!("Source: {}", d.path.as_ref().map_or("built-in".into(), |p| p.display().to_string())),
-            d.prompt.clone(),
-        ])
+        Item::new(&d.name, print::summary(&d.description))
+            .about(&d.description)
+            .field("Access", d.permission.as_str())
+            .field("Tools", d.tools.as_ref().map_or("all permitted".into(), |t| t.join(", ")))
+            .field("Model", d.model.as_deref().or(client.subagent_model()).unwrap_or(client.spec()))
+            .field("Source", d.path.as_ref().map_or("built-in".into(), |p| p.display().to_string()))
+            .section("Prompt")
+            .details(vec![d.prompt.clone()])
     });
     items.collect()
 }
@@ -301,122 +343,100 @@ fn agent_items(view: &View, env: &Env) -> Vec<Item> {
 fn mcp_items(env: &Env) -> Vec<Item> {
     let items = env.mcp_statuses().map(|s| {
         let took = crate::util::short_duration(s.took);
-        let (description, details) = match &s.outcome {
+        let log = crate::extensions::mcp::log_path(&s.name).display().to_string();
+        match &s.outcome {
             Ok(tools) => {
                 let count = format!("{} {}", tools.len(), text::plural(tools.len(), "tool"));
-                (format!("Connected in {took} · {count}"), tools.clone())
+                let item = Item::new(&s.name, format!("{count} · connected in {took}")).mark(Mark::Dot);
+                item.field("Log", log).section("Tools").details(tools.clone())
             }
-            Err(e) => (format!("Connection failed after {took}"), vec![e.clone()]),
-        };
-        let log = format!("Log: {}", crate::extensions::mcp::log_path(&s.name).display());
-        Item::new(&s.name, description).details(details.into_iter().chain(std::iter::once(log)))
+            Err(e) => {
+                let item = Item::new(&s.name, format!("Failed after {took}")).mark(Mark::Cross);
+                item.field("Log", log).section("Error").details(vec![e.clone()])
+            }
+        }
     });
     items.collect()
 }
 
-/// `/sandbox`: what it lets commands do, and what it costs each one.
-fn sandbox_items() -> Vec<Item> {
-    let Some(sandbox) = crate::security::sandbox::active() else {
-        return vec![Item::new("Sandbox is off", "Start with --sandbox to enable it; this view does not change permissions")];
-    };
-    let per_command = crate::util::short_duration(sandbox.startup());
-    let startup = ("startup", format!("{per_command} per command (measured at launch)"));
-    sandbox.describe().into_iter().chain([startup]).map(|(label, value)| Item::new(label, value)).collect()
-}
-
-/// `/usage` as a panel: the context's size, and the tokens used by model.
+/// `/usage` as a panel: how full the context is, and the tokens used by
+/// model.
 pub(super) async fn usage(agent: &Agent, out: &Output) {
-    let (used, window) = (agent.context_tokens(), agent.client().context_window());
-    let context = format!(
-        "{} / {} tokens (about {}%)",
-        output::tokens(used),
-        output::tokens(window),
-        used.saturating_mul(100) / window.max(1)
-    );
-    let mut items = vec![Item::new("Current context", context)];
-    items.extend(agent.usage().models().into_iter().map(|(model, t)| {
-        let requests = format!("{} {}", t.requests, text::plural(t.requests as usize, "request"));
-        Item::new(model, format!("{requests} · {} output tokens", output::tokens(t.usage.output_tokens))).details(vec![
-            format!("Input: {}", t.usage.input_tokens),
-            format!("Cache reads: {}", t.usage.cache_read_tokens),
-            format!("Cache writes: {}", t.usage.cache_write_tokens),
-            format!("Output: {}", t.usage.output_tokens),
-        ])
-    }));
-    if let Some(cost) = print::usage_cost(agent) {
-        items.push(Item::new("Cost", cost));
-    }
-    dialog::inspect(out, "Usage", "This conversation, by model", items).await;
+    dialog::sheet(out, "Usage", print::usage_lines(out, agent, dialog::room())).await;
 }
 
 /// The conversation's subagents and background commands (only the running
-/// ones if `running_only`), as their ids, items and whether they run.
-fn task_items(view: &View, running_only: bool) -> Vec<(String, Item, bool)> {
+/// ones if `running_only`), as their ids and items.
+fn task_items(view: &View, running_only: bool) -> Vec<(String, Item)> {
+    let mark = |running: bool, status: &str| match status {
+        _ if running => Mark::Dot,
+        "completed" | "ended" => Mark::Check,
+        "failed" => Mark::Cross,
+        _ => Mark::Ring,
+    };
     let mut items = Vec::new();
     for s in view.subagents.list() {
-        let running = s["status"] == "running";
+        let status = s["status"].as_str().unwrap_or("");
+        let running = status == "running";
         if running_only && !running {
             continue;
         }
         let id = s["id"].as_str().unwrap_or("").to_string();
-        let label = format!("{id} · {}", s["label"].as_str().unwrap_or(""));
-        let status = format!("{} · {}", s["status"].as_str().unwrap_or(""), s["model"].as_str().unwrap_or(""));
-        let item = Item::new(label, status).details(vec![
-            format!("Tool calls: {} · time: {}", s["tool_calls"], output::elapsed(s["seconds"].as_u64().unwrap_or(0))),
-            format!("Latest call: {}", s["last_call"].as_str().unwrap_or("—")),
-            format!("Background: {}", s["background"]),
-        ]);
-        items.push((id, item, running));
+        let (model, time) = (s["model"].as_str().unwrap_or(""), output::elapsed(s["seconds"].as_u64().unwrap_or(0)));
+        let label = s["label"].as_str().unwrap_or("");
+        let item = Item::new(&id, format!("{status} · {label} · {time}"))
+            .mark(mark(running, status))
+            .field("Task", label)
+            .field("Status", status)
+            .field("Model", model)
+            .field("Tool calls", s["tool_calls"].to_string())
+            .field("Time", time)
+            .field("Latest call", s["last_call"].as_str().unwrap_or("—"))
+            .field("Runs in", if s["background"] == true { "the background" } else { "the foreground" });
+        items.push((id, item));
     }
     for (id, command, running) in view.shells.list() {
         if running_only && !running {
             continue;
         }
-        let item = Item::new(format!("{id} · background command"), if running { "running" } else { "ended" })
+        let status = if running { "running" } else { "ended" };
+        let item = Item::new(&id, format!("{status} · $ {}", command.lines().next().unwrap_or("")))
+            .mark(mark(running, status))
+            .field("Task", "background command")
+            .field("Status", status)
+            .section("Command")
             .details(command.lines().map(String::from));
-        items.push((id, item, running));
+        items.push((id, item));
     }
     items
 }
 
+/// `/stop`: a running task to stop, or all of them.
 async fn stop(view: &View, out: &Output) -> Option<Input> {
     let tasks = task_items(view, true);
     if tasks.is_empty() {
-        out.note("no running tasks");
+        print::done(out, "No running tasks");
         return None;
     }
-    let mut items: Vec<_> = tasks.iter().map(|(_, item, _)| item.clone()).collect();
-    items.push(Item::new(
-        "Stop all running tasks",
-        "Stop every running subagent and background command in this conversation",
-    ));
-    let about = "Running subagents and background commands";
-    let i = dialog::choose(out, "Stop tasks", about, Keys { enter: "stop", esc: "cancel" }, items, 0).await?;
-    Some(Input::Stop(tasks.get(i).map(|(id, _, _)| id.clone())))
+    let mut items: Vec<_> = tasks.iter().map(|(_, item)| item.clone()).collect();
+    if tasks.len() > 1 {
+        items.push(Item::new("All of them", format!("{} running tasks", tasks.len())));
+    }
+    let i = dialog::choose(out, "Stop a task", "", Keys { enter: "stop", esc: "cancel" }, items, 0).await?;
+    Some(Input::Stop(tasks.get(i).map(|(id, _)| id.clone())))
 }
 
+/// `/tasks`: the subagents and background commands, to look through.
 async fn tasks(view: &View, out: &Output) -> Option<Input> {
-    loop {
-        let tasks = task_items(view, false);
-        if tasks.is_empty() {
-            out.note("no subagents or background commands in this conversation");
-            return None;
-        }
-        let items = tasks.iter().map(|(_, item, _)| item.clone()).collect();
-        let about = "Subagents and background commands in this conversation";
-        let i = dialog::choose(out, "Tasks", about, Keys { enter: "open", esc: "cancel" }, items, 0).await?;
-        let (id, item, running) = &tasks[i];
-        let mut actions = vec![Item::new("View details", &item.description)];
-        if *running {
-            actions.push(Item::new("Stop this task", format!("Stop {id}")));
-        }
-        let Some(action) = dialog::choose(out, &format!("Task {id}"), "", BACK, actions, 0).await else { continue };
-        if action == 1 {
-            return Some(Input::Stop(Some(id.clone())));
-        }
-        let lines = std::iter::once(item.description.clone()).chain(item.details.clone()).collect();
-        dialog::document(out, &item.label, lines).await;
+    let tasks = task_items(view, false);
+    if tasks.is_empty() {
+        print::done(out, "No subagents or background commands in this conversation");
+        return None;
     }
+    let running = tasks.iter().filter(|(_, item)| item.mark == Mark::Dot).count();
+    let about = if running > 0 { format!("{running} running · /stop stops them") } else { String::new() };
+    dialog::inspect(out, "Tasks", &about, "", tasks.into_iter().map(|(_, item)| item).collect()).await;
+    None
 }
 
 fn provider_items(view: &View) -> Vec<Item> {
@@ -424,62 +444,60 @@ fn provider_items(view: &View) -> Vec<Item> {
     let providers = client.providers();
     let items = providers.names().into_iter().map(|name| {
         let config = providers.provider(name).unwrap();
-        let models = format!("{} listed {}", config.models.len(), text::plural(config.models.len(), "model"));
-        let key = format!("API key: {}", if config.api_key.is_some() { "configured" } else { "not set" });
+        let models = format!("{} {}", config.models.len(), text::plural(config.models.len(), "model"));
         Item::new(name, format!("{} · {models}", config.protocol.as_str()))
-            .details(std::iter::once(key).chain(config.models.keys().map(|m| format!("{name}/{m}"))))
+            .field("Protocol", config.protocol.as_str())
+            .field("Base URL", &config.base_url)
+            .field("API key", if config.api_key.is_some() { "configured" } else { "not set" })
+            .section("Models")
+            .details(config.models.keys().map(|m| format!("{name}/{m}")))
     });
     items.collect()
 }
 
 async fn providers(view: &View, out: &Output) -> Option<Input> {
     let actions = vec![
-        Item::new("Inspect providers", "Browse configured providers, protocols and models"),
-        Item::new("Add provider", "Enter a name, then configure its protocol, URL, key and models"),
-        Item::new("Edit provider", "Choose a provider and start its configuration wizard"),
-        Item::new("Set default model", "Save the default for new conversations in the settings file"),
-        Item::new("Add listed model", "Choose a provider and enter a model name"),
-        Item::new("Remove listed model", "Remove a model from the configured list"),
-        Item::new("Sync listed models", "List the models a provider's gateway gives, by its saved patterns"),
-        Item::new("Remove provider", "Remove the provider and its model list from settings"),
+        Item::new("Providers", "Look through the providers, their protocols and models"),
+        Item::new("Add a provider", "Name it, then set its protocol, URL, key and models"),
+        Item::new("Edit a provider", "Go through a provider's settings again"),
+        Item::new("Remove a provider", "Take a provider and its models out of the settings"),
+        Item::new("Default model", "Choose the model new conversations start with"),
+        Item::new("Add a model", "List one more model under a provider"),
+        Item::new("Remove a model", "Take a model off a provider's list"),
+        Item::new("Sync models", "List what a provider's gateway offers, by its saved patterns"),
     ];
     loop {
         let about = "Changes are saved to the settings file";
         let action = dialog::choose(out, "Providers", about, SELECT, actions.clone(), 0).await?;
         match action {
-            0 => dialog::inspect(out, "Provider details", "", provider_items(view)).await,
+            0 => dialog::inspect(out, "Providers", "", "No providers configured", provider_items(view)).await,
             1 => {
-                let about = "Provider name (letters, digits, dots, underscores or hyphens)";
-                let Some(name) = dialog::input(out, "Add provider", about).await else { continue };
+                let about = "Its name: letters, digits, dots, underscores or hyphens";
+                let Some(name) = dialog::input(out, "Add a provider", about).await else { continue };
                 return Some(Input::Providers(vec!["add".into(), name]));
             }
-            4 => {
+            5 => {
                 let names: Vec<_> = load_settings(out)?.providers.into_keys().collect();
-                let items = names.iter().map(|name| Item::new(name, "Choose the provider for this model")).collect();
-                let title = "Add model: provider";
-                let Some(i) = dialog::choose(out, title, "Providers in the settings file", BACK, items, 0).await else {
-                    continue;
-                };
-                let about = "Model name accepted by the selected gateway";
-                let Some(model) = dialog::input(out, "Add model", about).await else { continue };
+                let items = names.iter().map(|name| Item::new(name, "")).collect();
+                let Some(i) = dialog::choose(out, "Add a model › provider", "", BACK, items, 0).await else { continue };
+                let about = format!("A model name the {} gateway accepts", names[i]);
+                let Some(model) = dialog::input(out, "Add a model", &about).await else { continue };
                 return Some(Input::Providers(vec!["model".into(), "add".into(), format!("{}/{model}", names[i])]));
             }
-            2 | 6 | 7 => {
-                let (command, title, what, enter) = match action {
-                    2 => ("add", "Edit provider", "Edit settings; the API key stays hidden", "edit"),
-                    6 => ("sync", "Sync listed models", "Lists the models its gateway gives at /v1/models", "sync"),
-                    _ => ("remove", "Remove provider", "Removes this provider from settings", "remove"),
+            2 | 3 | 7 => {
+                let (command, title, about, enter) = match action {
+                    2 => ("add", "Edit a provider", "Its API key stays hidden", "edit"),
+                    7 => ("sync", "Sync models", "Lists the models the gateway gives at /v1/models", "sync"),
+                    _ => ("remove", "Remove a provider", "", "remove"),
                 };
                 let names: Vec<_> = load_settings(out)?.providers.into_keys().collect();
-                let items = names.iter().map(|n| Item::new(n, what)).collect();
+                let items = names.iter().map(|n| Item::new(n, "")).collect();
                 let keys = Keys { enter, esc: "back" };
-                let Some(i) = dialog::choose(out, title, "Providers in the settings file", keys, items, 0).await else {
-                    continue;
-                };
+                let Some(i) = dialog::choose(out, title, about, keys, items, 0).await else { continue };
                 return Some(Input::Providers(vec![command.into(), names[i].clone()]));
             }
-            3 | 5 => {
-                let default = action == 3;
+            4 | 6 => {
+                let default = action == 4;
                 // A model can be removed only from the providers in the
                 // settings file, not from those set up by environment variables.
                 let models = if default {
@@ -488,10 +506,9 @@ async fn providers(view: &View, out: &Output) -> Option<Input> {
                     let providers = load_settings(out)?.providers.into_iter();
                     providers.flat_map(|(name, p)| p.models.into_keys().map(move |m| format!("{name}/{m}"))).collect()
                 };
-                let what = if default { "Saves this default model" } else { "Removes this model from the list" };
-                let items = models.iter().map(|m| Item::new(m, what)).collect();
+                let items = models.iter().map(|m| Item::new(m, "")).collect();
                 let keys = Keys { enter: if default { "save" } else { "remove" }, esc: "back" };
-                let title = if default { "Default model" } else { "Remove listed model" };
+                let title = if default { "Default model" } else { "Remove a model" };
                 let Some(i) = dialog::choose(out, title, "", keys, items, 0).await else { continue };
                 let model = models[i].clone();
                 let args = if default { vec!["default".into(), model] } else { vec!["model".into(), "remove".into(), model] };
@@ -504,11 +521,11 @@ async fn providers(view: &View, out: &Output) -> Option<Input> {
 
 async fn plugins(env: &Env, out: &Output) -> Option<Input> {
     let actions = vec![
-        Item::new("Inspect loaded plugins", "Browse versions, extensions and loading errors"),
-        Item::new("Manage installed plugin", "Enable, disable, configure or uninstall a selected plugin"),
-        Item::new("Install plugin", "Enter plugin@marketplace to install and configure it"),
-        Item::new("Update plugins", "Fetch the latest versions of configured plugins and marketplaces"),
-        Item::new("Marketplaces", "Browse the marketplaces configured in settings"),
+        Item::new("Loaded plugins", "Look through their versions, what they add and what failed"),
+        Item::new("Manage a plugin", "Enable, disable, configure or uninstall one"),
+        Item::new("Install a plugin", "By its name: plugin@marketplace"),
+        Item::new("Update plugins", "Fetch the latest of every plugin and marketplace"),
+        Item::new("Marketplaces", "Look through the marketplaces in the settings"),
     ];
     loop {
         let about = "Changes apply after /reload-plugins";
@@ -516,28 +533,46 @@ async fn plugins(env: &Env, out: &Output) -> Option<Input> {
         match action {
             0 => {
                 let items = env.ext.plugins.list.iter().map(|p| {
-                    let outcome = p.outcome.as_ref().map_or_else(|e| e.clone(), |parts| parts.join(", "));
-                    let version = format!("Version: {}", p.version.as_deref().unwrap_or("—"));
-                    let ignored = p.ignored.iter().map(|i| format!("Not used: {i}"));
-                    let details = [version, outcome].into_iter().chain(p.warnings.clone()).chain(ignored);
-                    Item::new(&p.id, p.description.as_deref().unwrap_or("")).details(details)
+                    let mut item = Item::new(&p.id, p.description.as_deref().unwrap_or("")).field("Version", p.version.as_deref().unwrap_or("—"));
+                    item = match &p.outcome {
+                        Ok(parts) if parts.is_empty() => item.mark(Mark::Dot).field("Adds", "nothing the harness can use"),
+                        Ok(parts) => item.mark(Mark::Dot).field("Adds", parts.join(", ")),
+                        Err(e) => item.mark(Mark::Cross).field("Failed", e),
+                    };
+                    if let Some(root) = &p.root {
+                        item = item.field("Root", root.display().to_string());
+                    }
+                    if !p.ignored.is_empty() {
+                        item = item.field("Not used", p.ignored.join("; "));
+                    }
+                    item.section("Warnings").details(p.warnings.clone())
                 });
-                dialog::inspect(out, "Loaded plugins", "", items.collect()).await;
+                let empty = "No plugins enabled · they go under `enabledPlugins` in ~/.harness/settings.json, or --plugin-dir";
+                dialog::inspect(out, "Loaded plugins", "", empty, items.collect()).await;
             }
             1 => {
                 let settings = load_settings(out)?;
                 let loaded = env.ext.plugins.list.iter().map(|p| p.id.clone());
                 let ids: BTreeSet<_> = settings.enabled_plugins.keys().cloned().chain(loaded).collect();
                 let ids: Vec<_> = ids.into_iter().collect();
-                let state =
-                    |id: &String| if settings.enabled_plugins.get(id) == Some(&false) { "disabled" } else { "enabled" };
-                let items = ids.iter().map(|id| Item::new(id, state(id))).collect();
-                let Some(i) = dialog::choose(out, "Installed plugins", "", BACK, items, 0).await else { continue };
+                if ids.is_empty() {
+                    print::done(out, "No plugins installed");
+                    return None;
+                }
+                let disabled = |id: &String| settings.enabled_plugins.get(id) == Some(&false);
+                let state = |id: &String| if disabled(id) { ("disabled", Mark::Ring) } else { ("enabled", Mark::Dot) };
+                let items = ids.iter().map(|id| Item::new(id, state(id).0).mark(state(id).1)).collect();
+                let Some(i) = dialog::choose(out, "Manage a plugin", "", BACK, items, 0).await else { continue };
                 let id = &ids[i];
-                let actions = ["Enable", "Disable", "Configure", "Uninstall (keep data)"];
-                let items = actions.iter().map(|label| Item::new(*label, format!("Applies to {id}"))).collect();
+                let actions = [
+                    ("Enable", "Load it from the next /reload-plugins"),
+                    ("Disable", "Keep it installed, but don't load it"),
+                    ("Configure", "Answer its settings again"),
+                    ("Uninstall", "Remove it, keeping its data"),
+                ];
+                let items = actions.iter().map(|(label, about)| Item::new(*label, *about)).collect();
                 let keys = Keys { enter: "run", esc: "back" };
-                let Some(action) = dialog::choose(out, id, "", keys, items, 0).await else { continue };
+                let Some(action) = dialog::choose(out, &format!("Manage a plugin › {id}"), "", keys, items, 0).await else { continue };
                 let command = ["enable", "disable", "configure", "uninstall"][action];
                 let mut args = vec![command.into(), id.clone()];
                 if action == 3 {
@@ -546,16 +581,16 @@ async fn plugins(env: &Env, out: &Output) -> Option<Input> {
                 return Some(Input::ManagePlugins(args));
             }
             2 => {
-                let about = "Plugin identity: plugin@marketplace";
-                let Some(spec) = dialog::input(out, "Install plugin", about).await else { continue };
+                let about = "Its name: plugin@marketplace";
+                let Some(spec) = dialog::input(out, "Install a plugin", about).await else { continue };
                 return Some(Input::ManagePlugins(vec!["install".into(), spec]));
             }
             3 => return Some(Input::Plugins { update: true }),
             4 => {
                 let settings = load_settings(out)?;
-                let names = settings.extra_known_marketplaces.keys();
-                let items = names.map(|name| Item::new(name, "Configured marketplace")).collect();
-                dialog::inspect(out, "Marketplaces", "Manage with /plugins marketplace add|remove", items).await;
+                let items = settings.extra_known_marketplaces.keys().map(|name| Item::new(name, "")).collect();
+                let about = "/plugins marketplace add|remove changes them";
+                dialog::inspect(out, "Marketplaces", about, "None but the built-in claude-plugins-official", items).await;
             }
             _ => unreachable!(),
         }
@@ -571,6 +606,45 @@ fn load_settings(out: &Output) -> Option<Settings> {
 mod tests {
     use super::*;
     use crate::cli::parse::parse_input;
+
+    #[test]
+    fn help_shows_the_commands_or_the_keys() {
+        use dialog::Panel;
+        let tabs = ["Commands", "Shortcuts"];
+        let items = BUILTINS.iter().map(|b| Item::new(b.name, b.about).hint(b.args)).collect();
+        let out = Output::capture();
+        let mut help = Help {
+            commands: List::new("Help", "", Keys { enter: "insert", esc: "close" }, items, 0).tabs(&tabs, 0),
+            keys: Sheet::new("Help", print::key_lines(&out)).tabs(&tabs, 1),
+            shortcuts: false,
+        };
+        let rows = |help: &Help| help.render(100, 40, &|_, s| s.into()).0.iter().map(|r| text::strip_ansi(r)).collect::<Vec<_>>();
+        let shown = rows(&help);
+        assert_eq!(shown[1], "  ● Commands  ○ Shortcuts");
+        assert!(shown.contains(&"    /model [provider/model]         Choose the model, the subagents' model and the effort".to_string()), "{shown:?}");
+        assert_eq!(shown.last().unwrap(), "  ↑↓ select · enter insert · tab shortcuts · esc close");
+        assert_eq!(help.handle(Key::Tab), None);
+        let shown = rows(&help);
+        assert_eq!(shown[1], "  ○ Commands  ● Shortcuts");
+        assert!(shown.contains(&"    Esc Esc         Go back to before an earlier prompt (/rewind)".to_string()), "{shown:?}");
+        assert_eq!(shown.last().unwrap(), "  tab commands · esc close");
+        assert_eq!(help.handle(Key::Enter), Some(None), "the keys have nothing to take");
+        help.handle(Key::Tab);
+        help.handle(Key::Down);
+        assert_eq!(help.handle(Key::Enter), Some(Some(1)));
+    }
+
+    #[test]
+    fn commands_say_how_they_went_under_their_line() {
+        let out = Output::capture();
+        print::done(&out, "Effort set to max");
+        print::failed(&out, "unknown command /nope (try /help)");
+        print::help(&out, &[]);
+        let lines = out.captured();
+        assert_eq!(lines[..3], ["  ⎿ Effort set to max", "  ⎿ unknown command /nope (try /help)", "  Commands"]);
+        assert!(lines.contains(&"    /stop [id]                      Stop running tasks".to_string()), "{lines:?}");
+        assert!(lines.contains(&"  At an empty prompt".to_string()) && lines.contains(&"    Ctrl-C Ctrl-C   Quit".to_string()), "{lines:?}");
+    }
 
     #[test]
     fn commands_that_leave_the_conversation_run_during_a_turn() {

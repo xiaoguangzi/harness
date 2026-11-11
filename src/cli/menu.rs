@@ -145,14 +145,14 @@ impl Menu {
             let room = width.saturating_sub(name_width + 6);
             let description = text::fit(item.description.lines().next().unwrap_or(""), room);
             let name = if has_descriptions { text::pad(&name, name_width) } else { name };
-            let row = format!("  {name}  {description}");
+            let mark = if i == selected { "❯" } else { " " };
             plain.push('\n');
-            plain.push_str(row.trim_end());
+            plain.push_str(format!("{mark} {name}  {description}").trim_end());
             styled.push('\n');
             styled.push_str(&if i == selected {
-                format!("  \x1b[1;35m{name}\x1b[0m  {description}")
+                format!("\x1b[1;35m{mark} {name}\x1b[0m  {description}")
             } else {
-                format!("  {name}  \x1b[2m{description}\x1b[0m")
+                format!("{mark} {name}  \x1b[2m{description}\x1b[0m")
             });
         }
         let more = items.len().saturating_sub(start + MENU_ROWS);
@@ -409,8 +409,8 @@ mod tests {
     fn renders_rows_and_overflow() {
         let m = menu();
         let plain = m.render("/", 40).unwrap();
-        assert_eq!(plain, "\n  /help   about /help\n  /model  about /model\n  /mcp    about /mcp\n  /clear  about /clear");
-        assert!(m.styled(&plain).unwrap().contains("\x1b[1;35m/help"));
+        assert_eq!(plain, "\n❯ /help   about /help\n  /model  about /model\n  /mcp    about /mcp\n  /clear  about /clear");
+        assert!(m.styled(&plain).unwrap().contains("\x1b[1;35m❯ /help"));
         assert!(m.render("/zzz", 40).is_none());
     }
 

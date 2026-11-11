@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::calls::{call_lines, result_block};
 use super::markdown::Markdown;
-use super::{Output, dialog, input, text};
+use super::{Output, dialog, input, print, text};
 use super::style::{ACCENT, BOLD, DIM};
 use crate::agent::{Agent, INTERRUPTED};
 use crate::llm::Message;
@@ -27,17 +27,20 @@ pub(super) async fn pick(rec: &Recorder, out: &Output, boxed: bool) -> Result<Op
     let sessions: Vec<session::Meta> =
         rec.store().list(&rec.meta().cwd).into_iter().filter(|m| m.id != rec.meta().id).take(LISTED).collect();
     if sessions.is_empty() {
-        out.note("no saved conversations in this directory");
+        print::done(out, "No saved conversations in this directory");
         return Ok(None);
     }
     let now = session::now();
     if boxed {
-        let items = sessions.iter().map(|m| dialog::Item::new(
-            if m.title.is_empty() { "(untitled)" } else { &m.title },
-            format!("{} · {} {} · {}", session::ago(m.updated, now), m.messages, text::plural(m.messages, "message"), m.model),
-        ).details(vec![format!("Session: {}", m.id), format!("Directory: {}", m.cwd)])).collect();
+        let items = sessions.iter().map(|m| {
+            let messages = format!("{} {}", m.messages, text::plural(m.messages, "message"));
+            dialog::Item::new(
+                if m.title.is_empty() { "(untitled)" } else { &m.title },
+                format!("{} · {messages} · {}", session::ago(m.updated, now), m.model),
+            ).field("Session", &m.id).field("Directory", &m.cwd).field("Model", &m.model).field("Messages", m.messages.to_string())
+        }).collect();
         let keys = dialog::Keys { enter: "resume", esc: "cancel" };
-        let selected = dialog::choose(out, "Resume conversation", "Earlier conversations in this directory", keys, items, 0).await;
+        let selected = dialog::choose(out, "Resume a conversation", "", keys, items, 0).await;
         return Ok(selected.map(|i| sessions[i].id.clone()));
     }
     let width = text::terminal_width();

@@ -7,7 +7,7 @@ use rustyline::error::ReadlineError;
 
 use super::dialog::{Item, Keys, choose};
 use super::input::Typing;
-use super::{Output, diff, text};
+use super::{Output, diff, print, text};
 use super::style::{BOLD, DIM, GREEN, RED};
 use crate::agent::Agent;
 use crate::session::checkpoint::{self, Change};
@@ -27,9 +27,9 @@ enum Restore {
 }
 
 const CHOICES: [(Restore, &str); 3] = [
-    (Restore::Both, "restore code and conversation"),
-    (Restore::Conversation, "restore conversation"),
-    (Restore::Code, "restore code"),
+    (Restore::Both, "Code and conversation"),
+    (Restore::Conversation, "Conversation"),
+    (Restore::Code, "Code"),
 ];
 
 /// Lists the conversation's prompts, asks which to go back to before and
@@ -38,7 +38,7 @@ const CHOICES: [(Restore, &str); 3] = [
 pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, boxed: bool) -> Result<bool> {
     let checkpoints = agent.file_history().checkpoints();
     if checkpoints.is_empty() {
-        out.note("no earlier prompts to rewind to");
+        print::done(out, "No earlier prompts to rewind to");
         return Ok(false);
     }
     let listed: Vec<_> = checkpoints.iter().rev().take(LISTED).collect();
@@ -67,7 +67,7 @@ pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, bo
             },
         ).details(vec![c.prompt.clone()])).collect();
         let keys = Keys { enter: "continue", esc: "cancel" };
-        choose(out, "Rewind conversation", "Go back to before which prompt? What to restore comes next", keys, items, 0).await.map(|i| i + 1)
+        choose(out, "Rewind", "Go back to before which prompt? What to restore comes next", keys, items, 0).await.map(|i| i + 1)
     } else { ask(out, "rewind to before which prompt? (number, Enter to cancel) ", listed.len())? };
     let Some(n) = picked else {
         return Ok(false);
@@ -94,15 +94,15 @@ pub(super) async fn run(agent: &mut Agent, out: &Output, typing: &mut Typing, bo
     if restore != Restore::Conversation {
         let changes = changes?;
         checkpoint::restore(&changes)?;
-        done.push(format!("restored {} {}", changes.len(), text::plural(changes.len(), "file")));
+        done.push(format!("Restored {} {}", changes.len(), text::plural(changes.len(), "file")));
     }
     if restore != Restore::Code
         && let Some(prompt) = agent.rewind(checkpoint.message)
     {
         typing.draft.set_text(&prompt);
-        done.push("rewound the conversation; the prompt is back in the input box".to_string());
+        done.push(format!("{} the conversation; the prompt is back in the input box", if done.is_empty() { "Rewound" } else { "rewound" }));
     }
-    out.note(done.join(" · "));
+    print::done(out, done.join(" · "));
     Ok(true)
 }
 
@@ -147,7 +147,7 @@ async fn restore_choice(out: &Output, changes: &Result<Vec<Change>>) -> Option<R
         Ok(changes) if changes.is_empty() => ("The code is as it was then, so only the conversation goes back".to_string(), None),
         Ok(changes) => {
             let files = format!("{} {} go back", changes.len(), text::plural(changes.len(), "file"));
-            ("Tab lists the files that go back".to_string(), Some((files, change_lines(out, changes))))
+            ("→ lists the files that go back".to_string(), Some((files, change_lines(out, changes))))
         }
         Err(e) => (format!("The code cannot be restored: {e:#}"), None),
     };
@@ -162,7 +162,7 @@ async fn restore_choice(out: &Output, changes: &Result<Vec<Change>>) -> Option<R
         offered.push((restore, item));
     }
     let items = offered.iter().map(|(_, item)| item.clone()).collect();
-    let i = choose(out, "Restore what?", &subtitle, Keys { enter: "restore", esc: "cancel" }, items, 0).await?;
+    let i = choose(out, "Rewind › restore what?", &subtitle, Keys { enter: "restore", esc: "cancel" }, items, 0).await?;
     Some(offered[i].0)
 }
 
