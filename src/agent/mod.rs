@@ -14,7 +14,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::extensions::hooks::{self, Event, Hooks, Outcome};
-use crate::llm::{Client, Message, Response, StreamEvent, ToolDef, Usage};
+use crate::llm::{Client, Message, Response, StreamEvent, ToolDef, Usage, advisor};
 use crate::security::permissions::{Mode, Permissions};
 use crate::session::checkpoint::FileHistory;
 use crate::subagent::Subagents;
@@ -84,6 +84,14 @@ pub trait Observer: Send {
     fn on_hook(&mut self, _message: &str) {}
     /// Empty when no tool is waiting; otherwise the task IDs being awaited.
     fn on_waiting(&mut self, _tasks: &[String]) {}
+    /// The model consults the advisor, `model`: the response pauses while
+    /// it reads the conversation.
+    fn on_advisor_start(&mut self, _model: &str) {}
+    /// The advisor answered.
+    fn on_advisor_result(&mut self, _outcome: &advisor::Outcome) {}
+    /// The API refused the advisor for this model, as `reason` says; the
+    /// conversation goes on without it.
+    fn on_advisor_refused(&mut self, _reason: &str) {}
 }
 
 pub struct Agent {
@@ -253,6 +261,7 @@ impl Agent {
         if let Some(usage) = &response.usage {
             self.usage.record(self.client.spec(), usage);
         }
+        self.usage.record_advisor(&response);
         let answer: String = response.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
         if answer.trim().is_empty() {
             bail!("the model gave no answer{}", if response.stop_reason.as_deref() == Some("tool_use") { " (it tried to use a tool)" } else { "" });
@@ -636,12 +645,13 @@ impl Agent {
                 bail!("the model declined this request {detail}");
             }
 
+            let context = response.context();
             let content = response.content;
             let tool_uses: Vec<Value> =
                 content.iter().filter(|b| b["type"] == "tool_use").cloned().collect();
             self.messages.push(Message { role: "assistant", content, source: Some(self.client.spec().to_string()) });
-            if let Some(usage) = &response.usage {
-                self.context = Some((self.messages.len(), usage.input_tokens + usage.output_tokens));
+            if let Some(tokens) = context {
+                self.context = Some((self.messages.len(), tokens));
             }
 
             match stop_reason {
@@ -691,12 +701,16 @@ impl Agent {
                 observer.on_usage(&usage);
             }
             StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
+            StreamEvent::AdvisorStart(model) => observer.on_advisor_start(model),
+            StreamEvent::AdvisorResult(outcome) => observer.on_advisor_result(&outcome),
+            StreamEvent::AdvisorRefused(reason) => observer.on_advisor_refused(reason),
         };
         let response = self.client.create(&self.system, definitions, &self.messages, &mut on_event).await?;
         if let Some(usage) = &response.usage {
             self.usage.record(self.client.spec(), usage);
             observer.on_usage(usage);
         }
+        self.usage.record_advisor(&response);
         Ok(response)
     }
 

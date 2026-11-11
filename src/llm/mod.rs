@@ -11,6 +11,7 @@
 //! model-bound blocks (Anthropic `thinking`, OpenAI reasoning items) are
 //! only ever sent back to that same model.
 
+pub mod advisor;
 mod anthropic;
 pub mod config;
 mod http;
@@ -59,6 +60,14 @@ pub enum StreamEvent<'a> {
     /// and it is sent again after `wait`: what streamed so far is void, and
     /// the response starts over. `attempt` counts from 1 to `max`.
     Retry { error: &'a anyhow::Error, attempt: u32, max: u32, wait: Duration },
+    /// The model called the advisor, the model named: the response pauses
+    /// while it reads the conversation.
+    AdvisorStart(&'a str),
+    /// The advisor answered.
+    AdvisorResult(advisor::Outcome),
+    /// The API refused the advisor (`reason` says why); the request was
+    /// sent again without it, and so are later ones on this model.
+    AdvisorRefused(&'a str),
 }
 
 /// Why a response broke off, in one line: how far its stream got and the
@@ -95,8 +104,24 @@ pub struct Response {
     /// `tool_use` id -> raw input text, for tool calls whose streamed input
     /// was not a valid JSON object. Their `input` in `content` is `{}`.
     pub invalid_tool_inputs: HashMap<String, String>,
-    /// Token counts, when the gateway reports them.
+    /// Token counts, when the gateway reports them. They leave out the
+    /// advisor's, which [`Response::advisor_usage`] has.
     pub usage: Option<Usage>,
+    /// What the advisor's consultations in this response used, by the
+    /// advisor's `provider/model`.
+    pub advisor_usage: Vec<(String, Usage)>,
+    /// The size of the context after this response, in tokens, when it
+    /// differs from [`Usage::input_tokens`] plus output: a response that
+    /// consulted the advisor was several requests, whose inputs `usage`
+    /// adds up.
+    pub context_tokens: Option<u64>,
+}
+
+impl Response {
+    /// The size of the context after this response, in tokens.
+    pub fn context(&self) -> Option<u64> {
+        self.context_tokens.or_else(|| self.usage.map(|u| u.input_tokens + u.output_tokens))
+    }
 }
 
 /// Token counts of one request.
@@ -134,13 +159,32 @@ pub struct Client {
     effort: Option<Effort>,
     /// Session override: unset uses config; `Some(None)` follows the main model.
     subagent_model: Option<Option<String>>,
+    /// Session override of the advisor: unset uses config; `Some(None)`
+    /// is off.
+    advisor: Option<Option<String>>,
+}
+
+/// Whether requests carry the advisor, and if not, why.
+#[derive(Debug, PartialEq)]
+pub enum AdvisorState<'a> {
+    Off,
+    On(&'a str),
+    /// One is chosen, `model`, but this model's requests go without it.
+    Unused { model: &'a str, reason: String },
 }
 
 impl Client {
     /// A client for the providers' default model.
     pub fn new(providers: Providers) -> Result<Self> {
         let spec = providers.default_model.clone();
-        Ok(Self { http: http_client()?, providers: Arc::new(providers), spec, effort: None, subagent_model: None })
+        Ok(Self {
+            http: http_client()?,
+            providers: Arc::new(providers),
+            spec,
+            effort: None,
+            subagent_model: None,
+            advisor: None,
+        })
     }
 
     /// The `provider/model` this client talks to.
@@ -183,6 +227,50 @@ impl Client {
         let model = model.map(|spec| self.switch(spec).map(|client| client.spec)).transpose()?;
         self.subagent_model = Some(model);
         Ok(())
+    }
+
+    /// The advisor chosen for this session, or configured.
+    pub fn advisor_model(&self) -> Option<&str> {
+        match &self.advisor {
+            Some(model) => model.as_deref(),
+            None => self.providers.advisor_model.as_deref(),
+        }
+    }
+
+    /// Chooses the advisor for this session (an alias or model name), or
+    /// turns it off with `None`. Kept across [`Client::switch`], and for the
+    /// subagents, which check the pairing against their own model.
+    pub fn set_advisor(&mut self, model: Option<&str>) {
+        self.advisor = Some(model.and_then(advisor::parse));
+    }
+
+    /// The same client without the advisor, for requests that need no
+    /// guidance (a prompt hook's question).
+    pub fn without_advisor(&self) -> Self {
+        Self { advisor: Some(None), ..self.clone() }
+    }
+
+    /// Whether this model's requests carry the advisor.
+    pub fn advisor_state(&self) -> AdvisorState<'_> {
+        let Some(model) = self.advisor_model() else { return AdvisorState::Off };
+        let Ok(target) = self.providers.target(&self.spec) else { return AdvisorState::Off };
+        let unused = |reason: String| AdvisorState::Unused { model, reason };
+        if target.config.protocol != Protocol::Anthropic {
+            return unused(format!("{} speaks the OpenAI Responses API; the advisor needs the Anthropic API", target.provider));
+        }
+        if !target.advisor_allowed() {
+            return unused(format!(
+                "{} is a gateway: set \"advisor\": true on it if it passes the advisor tool on to the Anthropic API",
+                target.provider
+            ));
+        }
+        if !advisor::accepts(target.model, model) {
+            return unused(format!("{model} cannot advise {}: the advisor must be a Claude model at least as capable", target.model));
+        }
+        if anthropic::advisor_refused(&target, model) {
+            return unused(format!("the API refused it as the advisor of {}", target.model));
+        }
+        AdvisorState::On(model)
     }
 
     pub fn effort_override(&self) -> Option<Effort> {
@@ -239,6 +327,9 @@ impl Client {
     ) -> Result<Response> {
         let mut target = self.providers.target(&self.spec)?;
         target.effort = self.effort.unwrap_or(target.effort);
+        if let AdvisorState::On(model) = self.advisor_state() {
+            target.advisor = Some(model);
+        }
         let mut attempt = 0;
         loop {
             let result = match target.config.protocol {

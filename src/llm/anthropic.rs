@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use super::config::{CacheTtl, Target};
-use super::{Message, Response, StreamEvent, ToolDef, http, parse_tool_input, references, references_as_text, same_source};
+use super::{Message, Response, StreamEvent, ToolDef, Usage, advisor, http, parse_tool_input, references, references_as_text, same_source};
 
 pub(super) const API_VERSION: &str = "2023-06-01";
 /// The server-side tool search tool, which earlier versions used: its
@@ -21,6 +21,21 @@ const SERVER_TOOL_SEARCH: &str = "tool_search_tool_bm25";
 static NO_TOOL_SEARCH: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// Server-side refusal fallback, `fallbacks: "default"` form.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// Advisors the API refused for a model, as (base URL, model, advisor):
+/// requests to it go on without them.
+static NO_ADVISOR: Mutex<BTreeSet<(String, String, String)>> = Mutex::new(BTreeSet::new());
+
+/// Whether the API refused `advisor` as the advisor of `target`'s model.
+pub(super) fn advisor_refused(target: &Target<'_>, advisor: &str) -> bool {
+    let key = (target.config.base_url.clone(), target.model.to_string(), advisor.to_string());
+    NO_ADVISOR.lock().unwrap().contains(&key)
+}
+
+/// Whether `error` is the API refusing the advisor tool: the pairing, or a
+/// gateway that does not know the tool.
+fn refuses_advisor(error: &anyhow::Error) -> bool {
+    matches!(http::status(error), Some(400 | 422)) && error.to_string().to_ascii_lowercase().contains("advisor")
+}
 
 pub(super) async fn create(
     http_client: &reqwest::Client,
@@ -30,27 +45,36 @@ pub(super) async fn create(
     messages: &[Message],
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<Response> {
-    let defer = defers(target) && tools.iter().any(|t| t.defer_loading);
-    let body = build_body(target, system, tools, messages, defer);
-    let mut headers = target.headers();
-    headers.push(("anthropic-version".into(), API_VERSION.into()));
-    if target.fallbacks() {
-        headers.push(("anthropic-beta".into(), FALLBACK_BETA.into()));
-    }
+    let mut target = *target;
+    let mut defer = defers(&target) && tools.iter().any(|t| t.defer_loading);
+    let mut deferring_refused = false;
     let url = target.url("messages");
-    let resp = match http::post(http_client, &url, &headers, &body, target.gzip()).await {
-        // Perhaps the model cannot defer tools: every tool in full then, and
-        // so from now on with this provider if that works.
-        Err(e) if defer && matches!(http::status(&e), Some(400 | 422)) => {
-            let body = build_body(target, system, tools, messages, false);
-            let resp = http::post(http_client, &url, &headers, &body, target.gzip()).await?;
-            NO_TOOL_SEARCH.lock().unwrap().insert(target.config.base_url.clone());
-            resp
+    let resp = loop {
+        let body = build_body(&target, system, tools, messages, defer);
+        let headers = request_headers(&target, &body);
+        match http::post(http_client, &url, &headers, &body, target.gzip()).await {
+            // The API refused the advisor: without it, now and from now on
+            // for this model.
+            Err(e) if target.advisor.is_some() && refuses_advisor(&e) => {
+                let advisor = target.advisor.take().unwrap_or_default();
+                let key = (target.config.base_url.clone(), target.model.to_string(), advisor.to_string());
+                NO_ADVISOR.lock().unwrap().insert(key);
+                on_event(StreamEvent::AdvisorRefused(&super::retry_reason(&e)));
+            }
+            // Perhaps the model cannot defer tools: every tool in full then,
+            // and so from now on with this provider if that works.
+            Err(e) if defer && matches!(http::status(&e), Some(400 | 422)) => {
+                (defer, deferring_refused) = (false, true);
+            }
+            Err(e) => return Err(e),
+            Ok(resp) => break resp,
         }
-        resp => resp?,
     };
+    if deferring_refused {
+        NO_TOOL_SEARCH.lock().unwrap().insert(target.config.base_url.clone());
+    }
 
-    let mut acc = Accumulator::default();
+    let mut acc = Accumulator { provider: target.provider.to_string(), advisor: target.advisor.map(String::from), ..Default::default() };
     let result = http::read_sse(resp, "message_stop", |event| acc.apply(&event, on_event)).await;
     if result.is_err() {
         // The request still used tokens: report what message_start told us.
@@ -62,6 +86,26 @@ pub(super) async fn create(
     let mut response = acc.finish();
     response.content = content_for_history(&response.content);
     Ok(response)
+}
+
+/// The headers of a request with `body`: the betas it needs among them.
+fn request_headers(target: &Target<'_>, body: &Value) -> Vec<(String, String)> {
+    let mut headers = target.headers();
+    headers.push(("anthropic-version".into(), API_VERSION.into()));
+    let mut betas = Vec::new();
+    if target.fallbacks() {
+        betas.push(FALLBACK_BETA);
+    }
+    // Also for a history with the advisor's blocks in it, when the tool is
+    // not sent.
+    let advised = body["messages"].as_array().into_iter().flatten().flat_map(|m| m["content"].as_array().into_iter().flatten());
+    if target.advisor.is_some() || advised.clone().any(|b| advisor::is_call(b) || advisor::is_result(b)) {
+        betas.push(advisor::BETA);
+    }
+    if !betas.is_empty() {
+        headers.push(("anthropic-beta".into(), betas.join(",")));
+    }
+    headers
 }
 
 /// Whether requests to `target` may defer tools, for the model to load
@@ -78,7 +122,7 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
     let spec = target.spec();
     let eager = target.eager_input_streaming();
     let names: HashSet<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    let tools: Vec<Value> = tools
+    let mut tools: Vec<Value> = tools
         .iter()
         .map(|t| {
             let mut def = json!({"name": t.name, "description": t.description, "input_schema": t.input_schema});
@@ -91,6 +135,9 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
             def
         })
         .collect();
+    if let Some(model) = target.advisor {
+        tools.push(advisor::tool(model));
+    }
     let media_inside = target.tool_result_media();
     let messages: Vec<Value> = messages
         .iter()
@@ -150,11 +197,12 @@ fn system_prompt(system: &str, cache: Option<&Value>) -> Value {
 }
 
 /// A message's blocks as sent to `spec`: OpenAI reasoning items never go to
-/// Anthropic, thinking blocks only go back to the model that wrote them,
-/// and server-side tool searches, from earlier versions, not at all.
+/// Anthropic, thinking blocks and the advisor's only go back to the model
+/// that wrote them (plain advice as text to others), and server-side tool
+/// searches, from earlier versions, not at all.
 fn history_blocks(message: &Message, spec: &str) -> Vec<Value> {
     let own = same_source(message, spec);
-    message
+    let blocks: Vec<Value> = message
         .content
         .iter()
         .filter(|b| match b["type"].as_str().unwrap_or("") {
@@ -165,7 +213,8 @@ fn history_blocks(message: &Message, spec: &str) -> Vec<Value> {
             _ => true,
         })
         .cloned()
-        .collect()
+        .collect();
+    if own || message.role != "assistant" { blocks } else { advisor::for_other_model(blocks) }
 }
 
 /// A tool result's `content` with its `tool_reference` blocks as the
@@ -231,6 +280,10 @@ struct Accumulator {
     /// blocks (split by citations, or by gateways that open a block per
     /// chunk) are one run of text, ended by a tool call or the message end.
     text_open: bool,
+    /// The provider, for the advisor's usage, and the advisor the request
+    /// carries.
+    provider: String,
+    advisor: Option<String>,
 }
 
 impl Accumulator {
@@ -251,6 +304,13 @@ impl Accumulator {
                 match kind {
                     "thinking" | "redacted_thinking" => on_event(StreamEvent::ThinkingDelta("")),
                     "tool_use" => on_event(StreamEvent::ToolInputStart(content[index]["name"].as_str().unwrap_or(""))),
+                    _ if advisor::is_call(&content[index]) => {
+                        on_event(StreamEvent::AdvisorStart(self.advisor.as_deref().unwrap_or(advisor::TOOL_NAME)));
+                    }
+                    // It comes whole, with no deltas.
+                    _ if advisor::is_result(&content[index]) => {
+                        on_event(StreamEvent::AdvisorResult(advisor::Outcome::of(&content[index])));
+                    }
                     _ => {}
                 }
             }
@@ -352,6 +412,27 @@ impl Accumulator {
         }
         if let Some(output) = usage["output_tokens"].as_u64() {
             total.output_tokens = output;
+        }
+        // With the advisor, a response is several requests: the model's
+        // (`message`), which the totals add up, and the advisor's, which
+        // they leave out.
+        if let Some(iterations) = usage["iterations"].as_array() {
+            let tokens = |i: &Value| Usage {
+                input_tokens: ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+                    .iter()
+                    .filter_map(|k| i[k].as_u64())
+                    .sum(),
+                cache_read_tokens: i["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                cache_write_tokens: i["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                output_tokens: i["output_tokens"].as_u64().unwrap_or(0),
+            };
+            let last = iterations.iter().rfind(|i| i["type"] == "message").map(tokens);
+            self.response.context_tokens = last.map(|u| u.input_tokens + u.output_tokens);
+            self.response.advisor_usage = iterations
+                .iter()
+                .filter(|i| i["type"] == "advisor_message")
+                .map(|i| (format!("{}/{}", self.provider, i["model"].as_str().unwrap_or(advisor::TOOL_NAME)), tokens(i)))
+                .collect();
         }
     }
 
@@ -580,6 +661,155 @@ mod tests {
         .unwrap();
         let body = build_body(&p.target("gw/m").unwrap(), "sys", &tools, &messages, false);
         assert_eq!((&body["system"], body.get("cache_control")), (&json!("sys"), None), "no caching, no blocks");
+    }
+
+    /// A mock Messages API: records each request's body and beta header,
+    /// and answers with what `answer` makes of the body.
+    async fn mock(
+        answer: impl Fn(&Value) -> Result<Vec<Value>, String> + Clone + Send + Sync + 'static,
+    ) -> (String, std::sync::Arc<Mutex<Vec<(Value, String)>>>) {
+        use std::sync::Arc;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                record.lock().unwrap().push((body.clone(), beta));
+                let answer = answer.clone();
+                async move {
+                    match answer(&body) {
+                        Err(message) => axum::http::Response::builder().status(400).body(axum::body::Body::from(message)).unwrap(),
+                        Ok(events) => {
+                            let sse: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+                            axum::http::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from(sse)).unwrap()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, seen)
+    }
+
+    fn advisor_client(url: &str, model: &str) -> crate::llm::Client {
+        let config = file(json!({"model": format!("gw/{model}"), "advisor_model": "opus",
+            "providers": {"gw": {"protocol": "anthropic", "base_url": url, "advisor": true}}}));
+        crate::llm::Client::new(Providers::from_parts(&config, &no_env).unwrap()).unwrap()
+    }
+
+    fn ended(content: Vec<Value>) -> Vec<Value> {
+        let mut events = vec![json!({"type": "message_start", "message": {"content": []}})];
+        for (i, block) in content.into_iter().enumerate() {
+            events.push(json!({"type": "content_block_start", "index": i, "content_block": block}));
+            events.push(json!({"type": "content_block_stop", "index": i}));
+        }
+        events.push(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}));
+        events.push(json!({"type": "message_stop"}));
+        events
+    }
+
+    #[tokio::test]
+    async fn consults_the_advisor_and_counts_its_tokens_apart() {
+        let call = json!({"type": "server_tool_use", "id": "s1", "name": "advisor", "input": {}});
+        let result = json!({"type": "advisor_tool_result", "tool_use_id": "s1",
+            "content": {"type": "advisor_result", "text": "drain the channel first"}});
+        let mut events = ended(vec![call.clone(), result.clone(), json!({"type": "text", "text": "done"})]);
+        let n = events.len();
+        events[n - 2] = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {
+            "input_tokens": 1760, "cache_read_input_tokens": 412, "cache_creation_input_tokens": 0, "output_tokens": 531,
+            "iterations": [
+                {"type": "message", "input_tokens": 412, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 89},
+                {"type": "advisor_message", "model": "claude-opus-5-5", "input_tokens": 823, "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0, "output_tokens": 1612},
+                {"type": "message", "input_tokens": 1348, "cache_read_input_tokens": 412, "cache_creation_input_tokens": 0, "output_tokens": 442}
+            ]}});
+        let (url, seen) = mock(move |_| Ok(events.clone())).await;
+        let client = advisor_client(&url, "claude-sonnet-5-5");
+        assert_eq!(client.advisor_state(), crate::llm::AdvisorState::On("claude-opus-5-5"));
+        let mut shown = Vec::new();
+        let messages = [Message::user(vec![json!({"type": "text", "text": "build it"})])];
+        let response = client.create("sys", &[tool("bash", false)], &messages, &mut |e| match e {
+            StreamEvent::AdvisorStart(model) => shown.push(format!("start {model}")),
+            StreamEvent::AdvisorResult(outcome) => shown.push(outcome.summary()),
+            _ => {}
+        }).await.unwrap();
+        assert_eq!(shown, ["start claude-opus-5-5", "Advisor reviewed the conversation"]);
+        let (body, beta) = seen.lock().unwrap()[0].clone();
+        assert_eq!(body["tools"][1], json!({"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-5-5"}));
+        assert_eq!(beta, advisor::BETA);
+        assert_eq!(response.content[..2], [call.clone(), result.clone()], "kept to send back");
+        assert_eq!(response.usage.unwrap().input_tokens, 2172, "the model's own requests");
+        assert_eq!(response.advisor_usage, vec![("gw/claude-opus-5-5".to_string(), Usage { input_tokens: 823, output_tokens: 1612, ..Usage::default() })]);
+        assert_eq!(response.context(), Some(1348 + 412 + 442), "the last request's context, not the sum");
+
+        // The advice stays with this model; another gets it as text.
+        let history = |source: &str| vec![
+            messages[0].clone(),
+            Message { role: "assistant", content: response.content.clone(), source: Some(source.into()) },
+            Message::user(vec![json!({"type": "text", "text": "more"})]),
+        ];
+        // Without the tool, as after `/advisor off`.
+        let target = client.providers().target(client.spec()).unwrap();
+        let own = build_body(&target, "sys", &[], &history("gw/claude-sonnet-5-5"), false);
+        assert_eq!(own["messages"][1]["content"][1], result);
+        assert_eq!(request_headers(&target, &own).last().unwrap().1, advisor::BETA, "its blocks need the beta");
+        let other = build_body(&target, "sys", &[], &history("other/gpt-5"), false);
+        assert_eq!(other["messages"][1]["content"][0]["text"], "(The advisor's guidance: drain the channel first)");
+        assert!(!request_headers(&target, &other).iter().any(|(k, _)| k == "anthropic-beta"));
+    }
+
+    #[tokio::test]
+    async fn goes_on_without_an_advisor_the_api_refuses() {
+        let (url, seen) = mock(|body| match body["tools"].as_array().unwrap().iter().any(|t| t["type"] == advisor::TOOL_TYPE) {
+            true => Err("claude-opus-5-5 cannot be used as an advisor when the request model is claude-sonnet-5-5".into()),
+            false => Ok(ended(vec![json!({"type": "text", "text": "ok"})])),
+        })
+        .await;
+        let client = advisor_client(&url, "claude-sonnet-5-5");
+        let mut refused = Vec::new();
+        let messages = [Message::user(vec![json!({"type": "text", "text": "hi"})])];
+        for _ in 0..2 {
+            client.create("sys", &[], &messages, &mut |e| {
+                if let StreamEvent::AdvisorRefused(reason) = e { refused.push(reason.to_string()) }
+            }).await.unwrap();
+        }
+        let tools: Vec<usize> = seen.lock().unwrap().iter().map(|(b, _)| b["tools"].as_array().unwrap().len()).collect();
+        assert_eq!(tools, [1, 0, 0], "tried once, then without it");
+        assert_eq!(refused.len(), 1);
+        assert!(matches!(client.advisor_state(), crate::llm::AdvisorState::Unused { .. }));
+    }
+
+    #[test]
+    fn attaches_the_advisor_only_where_it_can_work() {
+        use crate::llm::AdvisorState;
+        let state = |settings: Value, env: &dyn Fn(&str) -> Option<String>| {
+            let client = crate::llm::Client::new(Providers::from_parts(&file(settings), env).unwrap()).unwrap();
+            match client.advisor_state() {
+                AdvisorState::Off => "off".to_string(),
+                AdvisorState::On(model) => model.to_string(),
+                AdvisorState::Unused { reason, .. } => reason,
+            }
+        };
+        let gw = |advisor: Option<bool>, model: &str| json!({"model": format!("gw/{model}"), "advisor_model": "opus",
+            "providers": {"gw": {"protocol": "anthropic", "base_url": "https://gw.example.com", "advisor": advisor}}});
+        assert_eq!(state(gw(Some(true), "claude-sonnet-5-5"), &no_env), "claude-opus-5-5");
+        assert!(state(gw(None, "claude-sonnet-5-5"), &no_env).contains("is a gateway"), "off for gateways by default");
+        assert!(state(gw(Some(true), "claude-fable-5-2"), &no_env).contains("cannot advise"));
+        let off = |k: &str| (k == "HARNESS_ADVISOR_MODEL").then(|| "off".to_string());
+        assert_eq!(state(gw(Some(true), "claude-sonnet-5-5"), &off), "off");
+        let official = |k: &str| (k == "ANTHROPIC_API_KEY").then(|| "sk".to_string());
+        let settings = json!({"model": "anthropic/claude-haiku-5-5", "advisor_model": "claude-opus-5"});
+        assert_eq!(state(settings, &official), "claude-opus-5", "on for the official API");
+
+        let mut client = crate::llm::Client::new(Providers::from_parts(&file(gw(Some(true), "claude-sonnet-5-5")), &no_env).unwrap()).unwrap();
+        client.set_advisor(Some("fable"));
+        assert_eq!(client.switch("gw/claude-haiku-5-5").unwrap().advisor_model(), Some("claude-fable-5-2"), "kept across switches");
+        assert_eq!(client.without_advisor().advisor_state(), AdvisorState::Off);
+        client.set_advisor(Some("off"));
+        assert_eq!(client.advisor_state(), AdvisorState::Off);
     }
 
     #[test]

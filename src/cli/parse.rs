@@ -16,10 +16,11 @@ const fn builtin(name: &'static str, args: &'static str, about: &'static str) ->
     Builtin { name, args, about }
 }
 
-pub(super) const BUILTINS: [Builtin; 25] = [
+pub(super) const BUILTINS: [Builtin; 26] = [
     builtin("/help", "", "Commands and keyboard shortcuts"),
     builtin("/model", "[provider/model]", "Choose the model, the subagents' model and the effort"),
     builtin("/effort", "[level|auto]", "Set the reasoning effort for this session"),
+    builtin("/advisor", "[model|off]", "Choose the model the main model consults at decision points"),
     builtin("/provider", "[add|remove|model|…]", "Manage providers and their models"),
     builtin("/clear", "", "Start a new conversation"),
     builtin("/compact", "[focus]", "Summarize the conversation to free context"),
@@ -107,6 +108,9 @@ pub(super) enum Input {
     Rewind,
     /// `/provider …`, as `harness provider` takes it.
     Providers(Vec<String>),
+    /// `/advisor` shows or picks the advisor; `/advisor <model>` sets it and
+    /// `/advisor off` turns it off, both saved to the settings.
+    Advisor(Option<String>),
     /// `/effort` shows the effort; `/effort <level>` sets it for this
     /// session, and `/effort auto` restores the configured one.
     Effort(Option<Option<llm::Effort>>),
@@ -197,6 +201,7 @@ pub(super) fn parse_input(line: &str, skills: &[Skill]) -> Input {
         "sandbox" => Input::Sandbox,
         "usage" => Input::Usage,
         "model" => Input::Model(arg),
+        "advisor" => Input::Advisor(arg),
         "provider" | "providers" => Input::Providers(words()),
         "effort" => match args.trim() {
             "" => Input::Effort(None),

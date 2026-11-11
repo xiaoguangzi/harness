@@ -947,6 +947,14 @@ function renderEvent(ev) {
       }
       case "retry": assistantEl = null;
         transcript.append(h("div", { class: "note" }, `↻ 请求出错（${ev.message}），${ev.wait}s 后重新请求（${ev.attempt}/${ev.max}）`)); break;
+      case "advisor": assistantEl = null;
+        transcript.append(h("div", { class: "note" }, `◆ 正在咨询顾问模型 ${ev.model}…`)); break;
+      case "advisor_result": assistantEl = null;
+        transcript.append(ev.advice
+          ? h("details", { class: "tool" }, h("summary", {}, h("span", { class: "name" }, "advisor"), h("span", { class: "args" }, ev.summary)), h("div", { class: "body" }, h("pre", {}, ev.advice)))
+          : h("div", { class: "note" + (ev.ok ? "" : " hook") }, "◆ " + ev.summary)); break;
+      case "advisor_refused": assistantEl = null;
+        transcript.append(h("div", { class: "note hook" }, `⚑ API 拒绝了这个顾问模型，之后不带顾问继续（${ev.message}）`)); break;
       case "hook": assistantEl = null;
         transcript.append(h("div", { class: "note hook" }, "⚑ " + ev.message)); break;
       case "wake": assistantEl = null; transcript.append(h("div", { class: "note" }, "↻ 后台任务有了结果，继续")); break;

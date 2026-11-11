@@ -311,6 +311,7 @@ fn providers_json(providers: &Providers) -> Value {
     json!({
         "default_model": providers.default_model,
         "subagent_model": providers.subagent_model,
+        "advisor_model": providers.advisor_model,
         "effort": providers.effort.as_str(),
         "providers": list,
         "models": providers.listed_models(),

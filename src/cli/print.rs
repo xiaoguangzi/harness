@@ -38,6 +38,11 @@ pub(super) fn banner(agent: &Agent, skills: &[Skill], env: &Env, out: &Output) {
     let sandboxed = if crate::security::sandbox::active().is_some() { " · sandboxed" } else { "" };
     let tools = agent.tools().names().count();
     out.note(format!("  {cwd} · {tools} tools · {} skills · {servers}{plugins}{sandboxed}", skills.len()));
+    match agent.client().advisor_state() {
+        llm::AdvisorState::On(model) => out.note(format!("  advisor {model} is on and may use more tokens · /advisor")),
+        llm::AdvisorState::Unused { model, reason } => out.note(format!("  advisor {model} is not used: {reason} · /advisor")),
+        llm::AdvisorState::Off => {}
+    }
     out.note("  / for commands · @ for files · Ctrl+O for transcript · Ctrl+V to paste an image · Esc or Ctrl-C to interrupt");
     out.line("");
 }
@@ -241,6 +246,7 @@ pub(super) fn models(out: &Output, client: &llm::Client) {
         ("Model".to_string(), client.spec().to_string()),
         ("Subagents".to_string(), client.subagent_model().unwrap_or("follow the main model").to_string()),
         ("Effort".to_string(), client.effort().as_str().to_string()),
+        ("Advisor".to_string(), client.advisor_model().unwrap_or("off").to_string()),
     ];
     let mut lines = rows(out, &pairs, text::terminal_width().saturating_sub(3));
     let listed = providers.listed_models();
@@ -260,6 +266,21 @@ pub(super) fn models(out: &Output, client: &llm::Client) {
         out.paint(DIM, "/provider add <name> adds a provider, /provider model add <provider>/<model> a model"),
     ]);
     listing(out, &lines);
+}
+
+/// `/advisor` without a panel: the advisor, whether it is used, and the
+/// names it takes.
+pub(super) fn advisor(out: &Output, client: &llm::Client) {
+    match client.advisor_state() {
+        llm::AdvisorState::Off => done(out, "Advisor is off"),
+        llm::AdvisorState::On(model) => done(out, format!("Advisor is {}", out.paint(BOLD, model))),
+        llm::AdvisorState::Unused { model, reason } => {
+            let unused = out.paint(DIM, &format!("· not used with {}: {reason}", client.spec()));
+            done(out, format!("Advisor is {} {unused}", out.paint(BOLD, model)));
+        }
+    }
+    let aliases: Vec<String> = llm::advisor::aliases().iter().map(|(a, m)| format!("{a} = {m}")).collect();
+    out.line(out.paint(DIM, &format!("    /advisor <model>|off sets it; aliases: {}", aliases.join(", "))));
 }
 
 pub(super) fn agents(out: &Output, defs: &[AgentDef]) {

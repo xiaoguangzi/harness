@@ -41,6 +41,9 @@ pub struct Settings {
     /// `<provider>/<model>`, or a bare model name.
     pub model: Option<String>,
     pub subagent_model: Option<String>,
+    /// The model the main model consults at decision points (Claude Code's
+    /// `advisorModel`): a model name or `fable`, `opus`, `sonnet`, `haiku`.
+    pub advisor_model: Option<String>,
     pub effort: Option<Effort>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,

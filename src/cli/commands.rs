@@ -78,6 +78,7 @@ pub(super) fn runs_during_turn(input: &Input) -> bool {
             | Input::Stop(_)
             | Input::Sandbox
             | Input::Model(_)
+            | Input::Advisor(_)
             | Input::Effort(_)
             | Input::Permissions(_)
             | Input::Error(_)
@@ -121,6 +122,22 @@ pub(super) async fn run(input: Input, view: &View, env: &Env, skills: &[Skill], 
             }
             Err(e) => print::failed(out, format!("{e:#}")),
         },
+        Input::Advisor(None) => print::advisor(out, &view.client()),
+        Input::Advisor(Some(name)) => {
+            let mut client = view.client();
+            client.set_advisor(Some(&name));
+            let model = client.advisor_model().map(String::from);
+            let mut said = model.as_ref().map_or("Advisor turned off".to_string(), |model| format!("Advisor set to {}", bold(model)));
+            said.push_str(view.later());
+            if let llm::AdvisorState::Unused { reason, .. } = client.advisor_state() {
+                said.push_str(&out.paint(DIM, &format!(" · not used with {}: {reason}", client.spec())));
+            }
+            print::done(out, said);
+            if let Err(e) = save_advisor(model.as_deref()) {
+                print::failed(out, format!("Set for this session only: {e:#}"));
+            }
+            view.set_client(client);
+        }
         Input::Permissions(None) => print::permissions(&view.permissions, out),
         Input::Permissions(Some(arg)) if arg == "rules" => print::permissions(&view.permissions, out),
         Input::Permissions(Some(arg)) => match Mode::parse(&arg) {
@@ -181,6 +198,7 @@ pub(super) async fn interactive(
         Input::Model(None) => choose_model(view, out).await,
         Input::Effort(None) => choose_effort(view, out).await,
         Input::ListSkills if skills.is_empty() => Some(input),
+        Input::Advisor(None) => choose_advisor(view, out).await,
         Input::ListSkills => pick_skill(skills, out, typing).await,
         Input::ListTools => browse(out, "Tools", "No tools", tool_items(view)).await,
         Input::ListAgents => browse(out, "Subagent types", "No subagent types", agent_items(view, env)).await,
@@ -273,6 +291,41 @@ async fn choose_model(view: &View, out: &Output) -> Option<Input> {
     print::done(out, format!("Model set to {} {rest}{}", out.paint(BOLD, client.spec()), view.later()));
     view.set_client(client);
     None
+}
+
+/// Saves the advisor as `advisor_model` in the settings, or removes it.
+fn save_advisor(model: Option<&str>) -> anyhow::Result<()> {
+    crate::settings::edit(|settings| {
+        match model {
+            Some(model) => settings.insert("advisor_model".into(), model.into()),
+            None => settings.remove("advisor_model"),
+        };
+        Ok(())
+    })
+}
+
+/// `/advisor`: no advisor, one of the aliases, or the model set now.
+async fn choose_advisor(view: &View, out: &Output) -> Option<Input> {
+    let client = view.client();
+    let current = client.advisor_model();
+    let mut items = vec![Item::new("off", "No advisor")];
+    let mut names = vec!["off".to_string()];
+    for (alias, model) in llm::advisor::aliases() {
+        let pairs = llm::advisor::accepts(client.spec(), model);
+        let about = if pairs { model.to_string() } else { format!("{model} · cannot advise {}", client.spec()) };
+        items.push(Item::new(*alias, about));
+        names.push(model.to_string());
+    }
+    if let Some(model) = current.filter(|m| !names.iter().any(|n| n == m)) {
+        items.push(Item::new(model, "Set now"));
+        names.push(model.to_string());
+    }
+    let chosen = names.iter().position(|n| Some(n.as_str()) == current.or(Some("off"))).unwrap_or(0);
+    items[chosen].mark = Mark::Check;
+    let about = "Consulted at decision points, on the Anthropic API; saved to the settings";
+    let keys = Keys { enter: "apply", esc: "cancel" };
+    let i = dialog::choose(out, "Advisor", about, keys, items, chosen).await?;
+    Some(Input::Advisor(Some(names[i].clone())))
 }
 
 /// `/effort`: a level, or the configured one.
@@ -648,7 +701,7 @@ mod tests {
 
     #[test]
     fn commands_that_leave_the_conversation_run_during_a_turn() {
-        let now = ["/model", "/model gw/m", "/effort high", "/permissions plan", "/tasks", "/stop", "/help", "/models"];
+        let now = ["/model", "/model gw/m", "/effort high", "/advisor opus", "/advisor", "/permissions plan", "/tasks", "/stop", "/help", "/models"];
         for line in now {
             assert!(runs_during_turn(&parse_input(line, &[])), "{line}");
         }

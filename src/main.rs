@@ -44,6 +44,7 @@ Options:
       --check-plugins Load the plugins, report what loaded and what not, and exit
       --bare          Start without plugins, hooks, MCP servers, skills, custom agents and AGENTS.md
       --permission-mode MODE  default, acceptEdits, plan or bypassPermissions (see the permissions settings)
+      --advisor MODEL The model to consult at decision points for this run (opus, fable, sonnet, a model id, or off)
       --output-format FORMAT  One-shot output: text (default), json or stream-json
   -h, --help          Print this help
   -V, --version       Print the version
@@ -103,6 +104,7 @@ async fn main() -> Result<ExitCode> {
     tools::snapshot::start(settings.shell.snapshot.unwrap_or(true));
     agent::set_idle_compaction(settings.idle_compaction, settings.idle_compaction_min_tokens);
     cli::status_line::set(settings.status_line.take());
+    let (advisor_flag, args) = llm::advisor::parse_flag(args)?;
     let (sandbox_flag, args) = sandbox::parse_flag(args);
     sandbox::init(sandbox_flag, &settings.sandbox).await?;
     // MCP servers connect in the background: the REPL waits for them only
@@ -121,6 +123,12 @@ async fn main() -> Result<ExitCode> {
         Err(e) if web_addr.is_none() => return Err(e),
         loaded => loaded,
     };
+    let providers = providers.map(|mut p| {
+        if let Some(flag) = &advisor_flag {
+            p.advisor_model = llm::advisor::parse(flag);
+        }
+        p
+    });
     let out = cli::Output::stdout();
     // Web tasks show their subagents' progress themselves; this is for the
     // terminal, and for subagents started from the web UI's tool page.
@@ -134,6 +142,10 @@ async fn main() -> Result<ExitCode> {
     }
 
     let client = Client::new(providers?)?;
+    // An advisor asked for by name that this model cannot use is an error.
+    if let (Some(_), llm::AdvisorState::Unused { model, reason }) = (&advisor_flag, client.advisor_state()) {
+        anyhow::bail!("--advisor {model}: not used with {}: {reason}", client.spec());
+    }
     // With MCP servers still connecting, the REPL checks once they are in.
     if env.mcp_connecting().is_none() {
         env.unknown_agent_tools(&client).iter().for_each(warn);

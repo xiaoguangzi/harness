@@ -38,6 +38,14 @@ impl UsageLog {
         totals.usage.output_tokens += usage.output_tokens;
     }
 
+    /// Adds what the advisor's consultations in `response` used, each to
+    /// its advisor model's totals.
+    pub fn record_advisor(&self, response: &crate::llm::Response) {
+        for (model, usage) in &response.advisor_usage {
+            self.record(model, usage);
+        }
+    }
+
     /// Each model's totals, in the order they were first used.
     pub fn models(&self) -> Vec<(String, Totals)> {
         self.models.lock().unwrap().clone()

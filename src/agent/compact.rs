@@ -289,6 +289,7 @@ impl Agent {
         if let Some(usage) = &response.usage {
             self.usage.record(self.client.spec(), usage);
         }
+        self.usage.record_advisor(&response);
         let summary: String =
             response.content.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
         match response.stop_reason.as_deref() {

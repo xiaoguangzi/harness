@@ -11,6 +11,7 @@ use super::output::{elapsed, tokens};
 use super::{Output, diff, text};
 use super::style::{DIM, YELLOW};
 use crate::agent::Observer;
+use crate::llm::advisor::Outcome;
 use crate::llm::{Usage, retry_reason};
 use crate::tools::ToolOutput;
 
@@ -69,6 +70,8 @@ pub struct Terminal {
     tool_name: String,
     tool_input: String,
     tool_labeled: bool,
+    /// The advisor's consultation under way: its record for Ctrl+O.
+    advising: Option<usize>,
 }
 
 impl Terminal {
@@ -92,6 +95,7 @@ impl Terminal {
             tool_name: String::new(),
             tool_input: String::new(),
             tool_labeled: false,
+            advising: None,
         }
     }
 
@@ -411,6 +415,44 @@ impl Observer for Terminal {
             self.out.note(&note);
         }
         self.enter(Phase::Waiting, WAITING);
+    }
+
+    fn on_advisor_start(&mut self, model: &str) {
+        self.end_text();
+        self.advising = Some(self.out.record_call("", "advisor", &serde_json::json!({ "name": model })));
+        self.enter(Phase::Running, &format!("Advising ({model})…"));
+    }
+
+    fn on_advisor_result(&mut self, outcome: &Outcome) {
+        let summary = outcome.summary();
+        let output = match outcome {
+            Outcome::Advice(advice) => ToolOutput::ok(format!("{summary}\n{advice}")),
+            Outcome::Redacted => ToolOutput::ok(summary),
+            Outcome::Unavailable(_) => ToolOutput::error(summary),
+        };
+        let Some(index) = self.advising.take() else { return };
+        let (name, input) = self.out.record_result(index, Some(&output));
+        if !self.out.presented() {
+            eprintln!("{}", output.content.lines().next().unwrap_or(""));
+        } else {
+            let width = text::terminal_width();
+            self.separate(Block::Tools);
+            let mut shown = call_lines(&self.out, &name, &input, width);
+            shown.extend(result_block(&self.out, &name, &output.content, output.is_error, width));
+            self.out.lines(&shown);
+        }
+        self.enter(Phase::Working, "Working…");
+    }
+
+    fn on_advisor_refused(&mut self, reason: &str) {
+        let note = format!("The API refused the advisor for this model; going on without it ({reason})");
+        if !self.out.presented() {
+            eprintln!("warning: {note}");
+            return;
+        }
+        self.end_text();
+        self.separate(Block::Tools);
+        self.out.warn(format!("⚑ {}", text::printable(&note)));
     }
 
     fn on_usage(&mut self, usage: &Usage) {
