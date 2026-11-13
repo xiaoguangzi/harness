@@ -3,14 +3,16 @@
 //! PostToolUse hooks see each result as it comes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde_json::{Value, json};
 
 use super::{Agent, Observer, show_notices};
-use crate::extensions::hooks::{self, Event, Outcome};
-use crate::security::permissions::{Decision, Request};
-use crate::tools::ToolOutput;
+use crate::extensions::hooks::{self, Event, Hooks, Outcome};
+use crate::security::permissions::{self, Decision, Permissions, Request};
+use crate::tools::{ToolOutput, ToolRegistry};
 
 /// What came of one call: its output, and what the hooks before and after
 /// it said (none ran after a call that did not run).
@@ -131,14 +133,32 @@ impl Agent {
         (results, true)
     }
 
-    /// Runs `call` unless its PreToolUse hooks (`check`) or the permissions
-    /// refuse it, then its PostToolUse hooks, whose feedback goes after its
-    /// output.
+    /// Runs `call` unless its streamed input was not valid JSON, its
+    /// PreToolUse hooks (`check`) or the permissions refuse it.
     async fn run_call(&self, call: &Value, check: Outcome, invalid: &HashMap<String, String>) -> Ran {
         let (id, name) = (call["id"].as_str().unwrap_or(""), call["name"].as_str().unwrap_or(""));
         if let Some(raw) = invalid.get(id) {
             return Ran::refused(ToolOutput::error(json!({"INVALID_JSON": raw}).to_string()), check);
         }
+        let caller = Caller { tools: &self.tools, hooks: &self.hooks, permissions: &self.permissions, model: self.client.spec() };
+        caller.run(id, name, &call["input"], check).await
+    }
+}
+
+/// What a call runs with: the conversation's tools, hooks, permissions and
+/// model.
+struct Caller<'a> {
+    tools: &'a ToolRegistry,
+    hooks: &'a Hooks,
+    permissions: &'a Arc<Permissions>,
+    model: &'a str,
+}
+
+impl Caller<'_> {
+    /// Runs the call `id` of `name` with `input` unless its PreToolUse hooks
+    /// (`check`) or the permissions refuse it, then its PostToolUse hooks,
+    /// whose feedback goes after its output.
+    async fn run(&self, id: &str, name: &str, input: &Value, check: Outcome) -> Ran {
         if let Some(reason) = &check.block {
             let text = hooks::feedback(Event::PreToolUse, &format!("The call was blocked: {reason}"));
             return Ran::refused(ToolOutput::error(text), check);
@@ -146,16 +166,25 @@ impl Agent {
         if check.halt.is_some() {
             return Ran::refused(ToolOutput::error("The call was not run: a hook stopped the turn"), check);
         }
-        let input = check.updated_input.clone().unwrap_or_else(|| call["input"].clone());
+        let input = check.updated_input.clone().unwrap_or_else(|| input.clone());
         if let Err(reason) = self.permitted(name, &input, &check).await {
             return Ran::refused(ToolOutput::error(reason), check);
         }
-        let model = self.client.spec();
-        let run = crate::security::permissions::scope(
-            self.permissions.clone(), self.hooks.subagent_label(), self.tools.run(name, input.clone()),
-        );
-        let mut output = crate::tools::question::scope(self.permissions.asker(), self.hooks.subagent_label(), run).await;
-        let post = self.hooks.post_tool_use(name, id, &input, &output, model).await;
+        // The calls a `code` script makes run as this conversation's.
+        let halted = Arc::new(Mutex::new(None));
+        let nested = Nested {
+            hooks: self.hooks.clone(),
+            permissions: self.permissions.clone(),
+            model: self.model.to_string(),
+            halted: halted.clone(),
+        };
+        let label = self.hooks.subagent_label();
+        let run = permissions::scope(self.permissions.clone(), label.clone(), self.tools.run(name, input.clone()));
+        let mut output = crate::tools::question::scope(self.permissions.asker(), label, NESTED.scope(nested, run)).await;
+        let mut post = self.hooks.post_tool_use(name, id, &input, &output, self.model).await;
+        if let Some(reason) = halted.lock().unwrap().take() {
+            post.halt = post.halt.or(Some(reason));
+        }
         let event = if output.is_error { Event::PostToolUseFailure } else { Event::PostToolUse };
         if let Some(text) = &post.updated_output {
             output.content = text.clone();
@@ -180,16 +209,62 @@ impl Agent {
             Decision::Deny(reason) => return Err(reason),
             Decision::Ask(reason) => reason,
         };
-        let suggestion = crate::security::permissions::suggestion(name, input);
-        let hooked = self.hooks.permission_request(name, input, &suggestion, self.client.spec()).await;
+        let suggestion = permissions::suggestion(name, input);
+        let hooked = self.hooks.permission_request(name, input, &suggestion, self.model).await;
         if let Some(reason) = hooked.block {
             return Err(format!("A PermissionRequest hook denied this call: {reason}"));
         }
-        if hooked.permission == Some(crate::security::permissions::HookDecision::Allow) {
+        if hooked.permission == Some(permissions::HookDecision::Allow) {
             return Ok(());
         }
         let agent = self.hooks.subagent_label();
         let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestion, agent };
         self.permissions.ask(request).await
     }
+}
+
+/// The conversation a tool's call runs for, for the calls a `code` script
+/// makes, and where one of their hooks says to stop the turn.
+#[derive(Clone)]
+struct Nested {
+    hooks: Hooks,
+    permissions: Arc<Permissions>,
+    model: String,
+    halted: Arc<Mutex<Option<String>>>,
+}
+
+tokio::task_local! {
+    static NESTED: Nested;
+}
+
+/// Runs a call of `name` with `input` that a `code` script made, from
+/// `tools` (what the script may call), as a call the model made directly
+/// would run: input normalized, PreToolUse hooks, permissions (asking if
+/// they say to), PostToolUse hooks. Returns its output, and whether a hook
+/// stopped the turn, which then stops once the `code` call returns.
+/// Outside a conversation's call it refuses, except in tests, where it
+/// only runs the tool.
+pub(crate) async fn run_nested(tools: &ToolRegistry, name: &str, mut input: Value) -> (ToolOutput, bool) {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    tools.normalize_input(name, &mut input);
+    if tools.get(name).is_none() {
+        return (ToolOutput::error(format!("Unknown tool: {name}")), false);
+    }
+    let Ok(nested) = NESTED.try_with(Clone::clone) else {
+        // Never skip the hooks and permissions outside tests.
+        #[cfg(test)]
+        return (tools.run(name, input).await, false);
+        #[cfg(not(test))]
+        return (ToolOutput::error("This call has no conversation to run in (internal error)"), false);
+    };
+    let id = format!("code_{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let mut check = nested.hooks.pre_tool_use(name, &id, &input, &nested.model).await;
+    if let Some(updated) = &mut check.updated_input {
+        tools.normalize_input(name, updated);
+    }
+    let caller = Caller { tools, hooks: &nested.hooks, permissions: &nested.permissions, model: &nested.model };
+    let Ran { output, check, post } = caller.run(&id, name, &input, check).await;
+    let Some(reason) = check.halt.or(post.and_then(|p| p.halt)) else { return (output, false) };
+    *nested.halted.lock().unwrap() = Some(reason);
+    (output, true)
 }

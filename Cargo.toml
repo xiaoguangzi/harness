@@ -14,6 +14,7 @@ libc = "0.2"
 regex = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "http2", "system-proxy", "stream"] }
 rmcp = { version = "3.4.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+rquickjs = "0.14"
 rustyline = { version = "18.0.1", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }

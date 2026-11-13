@@ -148,6 +148,10 @@ impl Env {
         if !self.ext.lsp.is_empty() {
             registry.register(lsp::LspTool::new(self.ext.lsp.clone()));
         }
+        // Last: it calls the tools registered so far.
+        if crate::tools::code::enabled() {
+            registry.register(crate::tools::code::CodeTool::new(&registry));
+        }
         registry
     }
 

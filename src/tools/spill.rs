@@ -47,10 +47,30 @@ fn note(omitted: usize, total: usize, path: Option<&PathBuf>) -> String {
     }
 }
 
+/// What a tool keeps of its output inside [`whole`].
+const WHOLE_MAX: usize = 8 << 20;
+
+tokio::task_local! {
+    static WHOLE: ();
+}
+
+/// Runs a tool call whose output a `code` script gets rather than the
+/// model: the script filters it, so it gets the whole of it, up to
+/// [`WHOLE_MAX`].
+pub(crate) async fn whole<F: std::future::Future>(future: F) -> F::Output {
+    WHOLE.scope((), future).await
+}
+
+/// `max`, or more inside [`whole`].
+fn limit(max: usize) -> usize {
+    if WHOLE.try_with(|_| ()).is_ok() { max.max(WHOLE_MAX) } else { max }
+}
+
 /// `text` if it is at most `max` bytes; otherwise its first two thirds and
 /// last third of `max`, the whole of it saved to a file the note between
 /// them names.
 pub(crate) fn shorten(text: &str, max: usize, tool: &str) -> String {
+    let max = limit(max);
     if text.len() <= max {
         return text.to_string();
     }
@@ -87,6 +107,7 @@ impl Capture {
     /// Keeps up to `max` bytes in memory: two thirds from the start, the
     /// rest from the end.
     pub(crate) fn new(tool: &'static str, max: usize) -> Self {
+        let max = limit(max);
         let head_max = max / 3 * 2;
         Self { tool, head_max, tail_max: max - head_max, head: Vec::new(), tail: Vec::new(), total: 0, file: None }
     }

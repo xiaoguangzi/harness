@@ -79,6 +79,7 @@ All configuration lives in one file, `~/.harness/settings.json` (or `--settings 
 | `model`, `subagent_model`, `effort`, `max_tokens`, `context_window`, `providers` | models and [LLM gateways](#llm-gateways) |
 | `advisor_model` | the [advisor](#advisor) the main model consults |
 | `idle_compaction`, `idle_compaction_min_tokens` | [idle compaction](#compaction) |
+| `code_mode` | the `code` tool: [code mode](#code-mode) |
 | `mcpServers` | [MCP servers](#mcp-servers) |
 | `sandbox` | the [sandbox](#sandbox) |
 | `permissions` | which tool calls ask first, or are refused: [permissions](#permissions) |
@@ -336,6 +337,25 @@ Tool results appear as soon as they finish, paired by call ID, while the model r
 ## Large outputs
 
 One `read` returns at most 2000 lines and about 256 kB, and says at which line to read on. Output too large to return whole (over 30,000 bytes from `bash`, `grep`, `glob` or `lsp`, 100,000 from an MCP tool, a subagent's report over its limit) is not just cut off: the model gets its first two thirds and its last third, so the end of a build or a test run is still there, with a note between them naming a file that holds all of it (`$TMPDIR/harness-<uid>/tool-output/`, readable by you only, up to 64 MB each). The model can then `read` or `grep` that file for the part it needs. `bash` writes the file while the command runs, keeping only the start and end in memory; stdout and stderr each get their own.
+
+## Code mode
+
+With `"code_mode": true` in the settings, the model also gets a `code` tool: it writes JavaScript that calls its other tools as async functions, so a chain or fan-out of calls takes one round trip, and only what the script prints comes back to the model rather than every tool result.
+
+```js
+const [defined, calls] = await Promise.all([
+  tools.grep({pattern: "fn run_nested", path: "src"}),
+  tools.grep({pattern: "run_nested\\(", path: "src", output_mode: "content"}),
+]);
+print(defined);
+return `${calls.split("\n").length} lines call it`;
+```
+
+- `code` is the body of an async function, run in a fresh QuickJS interpreter built into the harness (256 MB of memory at most). It has no Node or browser APIs, file system, network or timers: it reaches the outside only through `tools["name"](input)`, which takes the same input as the direct call and resolves to a string, the text the direct call shows (not JSON: `glob` and `grep` give one path per line, `bash` the command's output); a failed call rejects with an `Error`. `ALL_TOOLS` lists `{name, description, input_schema}` for each tool it can call. `print` / `console.log` add lines to the result; the returned value comes last.
+- Every tool call a script makes runs as the model's own would: input normalized, PreToolUse hooks, [permissions](#permissions) (an ask rule still asks), the workspace and file guards, `/rewind` checkpoints, PostToolUse hooks. A hook that stops the turn stops the script and then the turn. The `code` call itself needs no permission. Calls started together (`Promise.all`) run concurrently.
+- A script cannot call `agent`, `message_agent`, `stop_agent`, `wait_tasks`, `skill`, `tool_search`, `ask_user_question` or `code`. A subagent's `code` calls only the tools that subagent has, and a read-only subagent gets it only as a read-only tool.
+- Tool output reaches the script whole (up to 8 MB), not shortened as [large outputs](#large-outputs) are for the model, so the script can pick out what it needs; it is the text a direct call gives, so `read` still numbers lines and pages long files. The script's own result is shortened past 100,000 bytes. Images tools return are not passed on, and the files a script changes are not shown as diffs (the changes themselves are kept for `/rewind`).
+- `timeout_ms` (default 120000, at most 600000) bounds the whole script, its tool calls included; calls it did not await are cancelled when it ends, as when the turn is interrupted.
 
 ## Compaction
 
@@ -731,6 +751,7 @@ A plugin's language servers (Claude Code's `.lsp.json` format) give the model an
     - `manage.rs` — `harness plugin` and `/plugins …`: installing, enabling, configuring and removing plugins and marketplaces by editing the settings (and the secrets file)
 - `src/tools/` — `Tool` trait, registry, and `FileTracker` (shared read/edit/write state)
   - `bash.rs` — run a command via `bash -c` (timeout, large output saved through `spill.rs`); refuses commands that change files themselves (inline Python/Node/Perl scripts that write files, `sed -i`, heredocs or `echo` into a file), which go through `edit` / `write`
+  - `code/` — the `code` tool (code mode): the tool and its callable set, timeouts, results (`mod.rs`); the QuickJS script with `tools`, `print` and `ALL_TOOLS` (`engine.rs`)
   - `read.rs` — read a text file with line numbers (`offset` / `limit` paging), or an image or PDF for the model to view
   - `edit.rs` — replace an exact, unique string in a file (or every occurrence with `replace_all`), so a change costs as much as the change; the same read-first rule as `write`, and edits to one file from one response apply in order
   - `write.rs` — create or overwrite a file; an existing file must have been read first and be unchanged since

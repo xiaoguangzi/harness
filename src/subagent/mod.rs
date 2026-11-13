@@ -922,6 +922,25 @@ mod tests {
         assert_eq!(names(&tool.registry_for(&own.unwrap())), vec!["read"]);
     }
 
+    #[tokio::test]
+    async fn a_subagents_code_calls_only_its_own_tools() {
+        let mut base = ToolRegistry::with_defaults(FileTracker::default());
+        base.register(crate::tools::code::CodeTool::new(&base));
+        let tool = AgentTool::new(Arc::new(vec![]), base, client(), Arc::new(|_: &Value| {}));
+        let callable = |registry: ToolRegistry| async move {
+            let code = registry.get(crate::tools::code::NAME).expect("code is kept").clone();
+            assert_eq!(code.read_only(), registry.names().all(|n| registry.get(n).unwrap().read_only()));
+            code.run(json!({"code": "return ALL_TOOLS.map(t => t.name).join()"})).await.content
+        };
+        let mut def = explore();
+        def.tools = Some(vec!["code".into(), "grep".into(), "bash".into()]);
+        assert_eq!(callable(tool.registry_for(&def)).await, "grep", "read-only: no bash");
+        def.permission = Permission::Write;
+        assert_eq!(callable(tool.registry_for(&def)).await, "bash,grep");
+        def.tools = Some(vec!["grep".into()]);
+        assert!(tool.registry_for(&def).get(crate::tools::code::NAME).is_none(), "not listed");
+    }
+
     #[test]
     fn write_permission_and_tool_lists() {
         let mut def = explore();

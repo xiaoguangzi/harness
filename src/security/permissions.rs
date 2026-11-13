@@ -170,8 +170,8 @@ pub fn set(config: Config) {
 }
 
 /// The tools that start, steer or wait for other work, whose own calls
-/// are what is checked.
-const UNCHECKED: [&str; 6] = ["agent", "message_agent", "stop_agent", "wait_tasks", "bash_output", "kill_shell"];
+/// are what is checked; `code` checks each call its script makes.
+const UNCHECKED: [&str; 7] = ["agent", "message_agent", "stop_agent", "wait_tasks", "bash_output", "kill_shell", "code"];
 
 /// What happens to a call, before anyone is asked.
 #[derive(Debug, Clone, PartialEq)]

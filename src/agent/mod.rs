@@ -22,6 +22,7 @@ use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
 
 pub use compact::{is_compacted, set_idle as set_idle_compaction};
+pub(crate) use calls::run_nested;
 pub use inbox::Inbox;
 #[cfg(test)]
 pub(crate) use compact::tests as mock;
@@ -961,6 +962,66 @@ pub(crate) mod tests {
         let _ = requests.recv().await;
         let result = requests.recv().await.unwrap()["messages"].as_array().unwrap().last().unwrap()["content"][0].clone();
         assert_eq!(result["content"], "four\n", "the user said yes");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_calls_a_code_script_makes_go_through_hooks_and_permissions() {
+        let _guard = crate::util::lock_cwd();
+        use crate::security::permissions::Permissions;
+        let script = r#"
+            const run = (command) => tools.bash({command}).then((out) => out.trim(), (e) => "refused: " + e.message);
+            print(await run("echo one")); print(await run("echo two")); print(await run("echo rm"));
+        "#;
+        let call = json!({"type": "tool_use", "id": "c1", "name": "code", "input": {"code": script}});
+        let (client, mut requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![call.clone()], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let mut tools = ToolRegistry::with_defaults(crate::tools::FileTracker::default());
+        tools.register(crate::tools::code::CodeTool::new(&tools));
+        let mut agent = Agent::new(client, tools, "sys");
+        // Plan mode refuses `bash` unless a rule allows it; the script's own call runs.
+        let config = serde_json::from_value(json!({"defaultMode": "plan", "allow": ["Bash(echo two:*)", "Bash(echo rm:*)"]})).unwrap();
+        agent.set_permissions(Arc::new(Permissions::with_config(Arc::new(config))));
+        agent.set_hooks(crate::extensions::hooks::tests::hooks(json!({
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "grep -q 'echo rm' && { echo 'no rm' >&2; exit 2; }; exit 0"}]}],
+        })));
+        agent.run_turn(vec![text("go")], &mut Notices::default()).await.unwrap();
+        let _ = requests.recv().await;
+        let result = &requests.recv().await.unwrap()["messages"][2]["content"][0];
+        assert_eq!(result["is_error"], false, "{result}");
+        let lines: Vec<&str> = result["content"].as_str().unwrap().lines().collect();
+        assert!(lines[0].starts_with("refused: Plan mode is on"), "{lines:?}");
+        assert_eq!(lines[1], "two");
+        assert_eq!(lines[2..4], ["refused: <hook-feedback event=\"PreToolUse\">", "The call was blocked: no rm"]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_hook_stopping_a_code_scripts_call_stops_the_turn() {
+        let _guard = crate::util::lock_cwd();
+        let script = "await tools.bash({command: 'echo one'}); print('not reached');";
+        let call = json!({"type": "tool_use", "id": "c1", "name": "code", "input": {"code": script}});
+        let (client, mut requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![call.clone()], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let mut tools = ToolRegistry::with_defaults(crate::tools::FileTracker::default());
+        tools.register(crate::tools::code::CodeTool::new(&tools));
+        let mut agent = Agent::new(client, tools, "sys");
+        agent.set_hooks(crate::extensions::hooks::tests::hooks(json!({
+            "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo '{\"continue\": false, \"stopReason\": \"enough\"}'"}]}],
+        })));
+        let mut seen = Notices::default();
+        agent.run_turn(vec![text("go")], &mut seen).await.unwrap();
+        let _ = requests.recv().await;
+        assert!(requests.try_recv().is_err(), "no request after the hook stopped the turn");
+        let last = agent.messages().last().unwrap().content.clone();
+        assert!(last[0]["content"].as_str().unwrap().contains("The script was stopped: a hook stopped the turn"), "{last:?}");
+        assert!(seen.0.iter().any(|m| m.contains("A hook stopped the turn: enough")), "{:?}", seen.0);
     }
 
     #[tokio::test]

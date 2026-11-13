@@ -84,6 +84,13 @@ const GUIDANCE: &[(&str, &str)] = &[
     ("wait_tasks", "wait for background commands or subagents when your next step needs their results. Pass task_ids together, with mode any or all. Timeout leaves tasks running; continue independent work first."),
     ("kill_shell", "stop a background command you no longer need, such as a dev server once you are done with it."),
     (
+        "code",
+        "run a short JavaScript program that calls your other tools as async functions \
+         (`await tools[\"grep\"]({...})`) and returns only what it prints. Use it to chain or fan out many calls, or to \
+         pick what you need out of large outputs, when you know what to do with the results without reading each \
+         one; make a single call, or one whose result you need to read, directly.",
+    ),
+    (
         "skill",
         "load instructions for a specialised kind of task. When the request matches one of the \
          skills it lists, load that skill before starting and follow it.",

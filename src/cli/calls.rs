@@ -31,10 +31,10 @@ fn todo_lines(out: &Output, input: &Value) -> Vec<String> {
 /// A one-line view of a tool call: `bash(cargo test)`, `grep(foo · src)`.
 pub(super) fn call_label(name: &str, input: &Value, max: usize) -> String {
     // The fields that say the most about a call, most telling first.
-    const KEYS: [&str; 13] = [
+    const KEYS: [&str; 14] = [
         "question",
         "agent_type", "description", "agent_id", "message", "command", "pattern", "path", "file_path", "glob", "url",
-        "query", "name",
+        "query", "name", "code",
     ];
     let obj = input.as_object();
     let mut parts: Vec<String> = KEYS
@@ -42,7 +42,7 @@ pub(super) fn call_label(name: &str, input: &Value, max: usize) -> String {
         .filter_map(|k| obj?.get(*k)?.as_str())
         .filter(|v| !v.is_empty())
         .take(2)
-        .map(|v| v.lines().next().unwrap_or("").to_string())
+        .map(|v| v.trim_start().lines().next().unwrap_or("").to_string())
         .collect();
     if parts.is_empty() && obj.is_some_and(|o| !o.is_empty()) {
         parts.push(input.to_string());
@@ -132,6 +132,7 @@ mod tests {
     fn labels_calls_by_their_main_arguments() {
         assert_eq!(call_label("bash", &json!({"command": "cargo test\n--all", "timeout_ms": 5}), 80), "bash(cargo test)");
         assert_eq!(call_label("grep", &json!({"pattern": "fn main", "path": "src"}), 80), "grep(fn main · src)");
+        assert_eq!(call_label("code", &json!({"code": "\n  const a = 1;\nreturn a;"}), 80), "code(const a = 1;)");
         assert_eq!(
             call_label("agent", &json!({"agent_type": "explore", "description": "find traits", "prompt": "..."}), 80),
             "agent(explore · find traits)"

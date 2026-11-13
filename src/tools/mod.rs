@@ -6,6 +6,7 @@
 //! MCP and skill tools are registered at startup from configuration.
 
 pub mod bash;
+pub mod code;
 mod edit;
 mod glob;
 mod grep;
@@ -196,6 +197,10 @@ impl ToolRegistry {
             self.register(WriteTool::new(files.clone()));
         }
         self.files = Some(files.clone());
+        // `code` calls the file tools it was built with.
+        if self.get(code::NAME).is_some() {
+            self.register(code::CodeTool::new(self));
+        }
     }
 
     /// The tracker of the file tools, e.g. to re-attach the files read
@@ -216,9 +221,19 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
-    /// Keeps only the tools for which `keep` returns true.
+    /// Keeps only the tools for which `keep` returns true. `code` is built
+    /// again from those kept, so it never calls a tool the registry lost,
+    /// and is kept if `keep` takes it as rebuilt (read-only, say, once only
+    /// read-only tools are left).
     pub fn retain(&mut self, mut keep: impl FnMut(&dyn Tool) -> bool) {
+        let code = self.tools.remove(code::NAME);
         self.tools.retain(|_, t| keep(t.as_ref()));
+        if code.is_some() {
+            let rebuilt = code::CodeTool::new(self);
+            if keep(&rebuilt) {
+                self.register(rebuilt);
+            }
+        }
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
