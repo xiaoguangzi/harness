@@ -195,7 +195,7 @@ other harness's docs or source before acting on an entry. All findings here are 
   subagent's `lsp` looks at the main checkout (lsp.rs:212, 513; the README says so). (read)
 - [ ] `FileTracker` keys are not normalized (`..`, symlinks), staleness is mtime only, and a partial read counts
   as a full one for `write`. `edit`/`write` are not atomic (no temp file and rename).
-- [ ] Nothing in the system prompt says when to consult the advisor; `tool_search` gets no guidance line.
+- [ ] `tool_search` gets no guidance line (the `<deferred-tools>` notice explains it).
 - [ ] The date in the system prompt goes stale in long-lived web tasks (each prompt carries the time, so the
   model can tell).
 - [ ] Approvals of MCP and other tools show only `call_label`'s one line of the input (the bash command and a

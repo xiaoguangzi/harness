@@ -37,6 +37,26 @@ the user to approve. Don't change files or run commands that change things; such
 turns plan mode off.</permission-mode>";
 const PLAN_OFF: &str = "<permission-mode>Plan mode is off: you may change things now, such as carrying out the plan \
 the user approved.</permission-mode>";
+/// Tells the model it can consult the advisor, and when: the guidance
+/// Anthropic's advisor tool docs give for coding work, where models left to
+/// the tool's own description call it too seldom.
+pub const ADVISOR_START: &str = "<advisor>";
+const ADVISOR_ON: &str = "<advisor>You have access to an `advisor` tool backed by a stronger reviewer model. It takes \
+no parameters: when you call it, your entire conversation history is forwarded, so it sees the task, every tool call \
+you've made and every result you've seen.
+
+Call the advisor before substantive work: before writing, before committing to an interpretation, before building on \
+an assumption. If the task needs orientation first (finding files, seeing what's there), do that, then call it. \
+Orientation is not substantive work; writing, editing and declaring an answer are. Also call it when you believe the \
+task is complete (make your deliverable durable first: write the file, commit the change), when stuck (errors \
+recurring, an approach not converging, results that don't fit), and when considering a change of approach. On tasks \
+longer than a few steps, call it at least once before committing to an approach and once before declaring done; on \
+short reactive tasks where the next action follows from the output you just read, you don't need to.
+
+Give the advice serious weight. If you follow a step and it fails empirically, or you have primary-source evidence \
+that contradicts a specific claim, adapt. If what you found points one way and the advisor another, don't silently \
+switch: surface the conflict in one more advisor call.</advisor>";
+const ADVISOR_OFF: &str = "<advisor>The advisor is off now: the `advisor` tool is no longer available.</advisor>";
 /// Starts the block that tells the model when the user sent a message.
 pub const TIMESTAMP_START: &str = "<timestamp>";
 /// How the snapshot of the git repository a session starts with begins.
@@ -149,6 +169,8 @@ pub struct Agent {
     permissions: Arc<Permissions>,
     /// The permission mode the model was last told about, if any.
     told_mode: Option<Mode>,
+    /// Whether the model was last told it has the advisor, if it was told.
+    told_advisor: Option<bool>,
     /// Whether this conversation defers tools behind `tool_search`, once
     /// decided (see `deferred`).
     tool_search: Option<bool>,
@@ -203,6 +225,7 @@ impl Agent {
             compact_window: None,
             permissions,
             told_mode: None,
+            told_advisor: None,
             tool_search: None,
             switch_to: Arc::default(),
             last_request: Mutex::new(None),
@@ -242,6 +265,30 @@ impl Agent {
         } else if was == Some(Mode::Plan) {
             self.inbox.push(PLAN_OFF.to_string(), false);
         }
+    }
+
+    /// Tells the model, in the next user message, that it has the advisor
+    /// and when to consult it, or that it no longer has it: `/advisor`
+    /// changes it during a conversation, whose system prompt stays as it
+    /// was for the prompt cache. Subagents go by the tool's description.
+    fn tell_advisor(&mut self) {
+        let on = matches!(self.client.advisor_state(), crate::llm::AdvisorState::On(_));
+        let was = self.told_advisor.replace(on);
+        if was == Some(on) || self.hooks.is_subagent() {
+            return;
+        }
+        if on {
+            self.inbox.push(ADVISOR_ON.to_string(), false);
+        } else if was == Some(true) {
+            self.inbox.push(ADVISOR_OFF.to_string(), false);
+        }
+    }
+
+    /// Has the model told again what it was told about the permission mode
+    /// and the advisor, which went with the history.
+    pub(super) fn forget_told(&mut self) {
+        self.told_mode = None;
+        self.told_advisor = None;
     }
 
     /// The context window the conversation is compacted to fit: the
@@ -439,7 +486,7 @@ impl Agent {
         self.messages.clear();
         self.turn_start = None;
         self.context = None;
-        self.told_mode = None;
+        self.forget_told();
         self.tool_search = None;
         *self.last_request.lock().unwrap() = None;
         self.session_start = Some("clear");
@@ -521,6 +568,7 @@ impl Agent {
             self.prompt_hooks(&typed, &mut content, observer).await?;
         }
         self.tell_mode();
+        self.tell_advisor();
         let arrived = self.inbox.take();
         if content.is_empty() && arrived.is_empty() {
             return Ok(());
@@ -1044,6 +1092,31 @@ pub(crate) mod tests {
         let content = result["content"].as_str().unwrap();
         assert!(content.contains("1\tone") && !content.contains("two"), "{content}");
         assert!(second["messages"][1]["content"][0]["input"]["file_path"].is_string(), "the history keeps the call as made");
+    }
+
+    #[tokio::test]
+    async fn the_model_is_told_when_the_advisor_comes_and_goes() {
+        let (client, mut requests) =
+            compact::tests::gateway_with(json!({"advisor": true}), |_| (vec![text("ok")], "end_turn", 100)).await;
+        let mut client = client.switch("mock/claude-sonnet-5-5").unwrap();
+        client.set_advisor(Some("opus"));
+        let mut agent = Agent::new(client.clone(), ToolRegistry::new(), "sys");
+        let told = |request: &Value, index: usize| -> Vec<String> {
+            let blocks = request["messages"][index]["content"].as_array().unwrap();
+            blocks.iter().filter_map(|b| b["text"].as_str()).filter(|t| t.starts_with(ADVISOR_START)).map(String::from).collect()
+        };
+        agent.run_turn(vec![text("one")], &mut Notices::default()).await.unwrap();
+        let first = requests.recv().await.unwrap();
+        assert_eq!(told(&first, 0), [ADVISOR_ON], "{first}");
+        agent.run_turn(vec![text("two")], &mut Notices::default()).await.unwrap();
+        assert!(told(&requests.recv().await.unwrap(), 2).is_empty(), "told once");
+        agent.set_client(client.without_advisor());
+        agent.run_turn(vec![text("three")], &mut Notices::default()).await.unwrap();
+        assert_eq!(told(&requests.recv().await.unwrap(), 4), [ADVISOR_OFF]);
+        agent.set_client(client);
+        agent.clear();
+        agent.run_turn(vec![text("four")], &mut Notices::default()).await.unwrap();
+        assert_eq!(told(&requests.recv().await.unwrap(), 0), [ADVISOR_ON], "a new conversation is told again");
     }
 
     #[tokio::test]

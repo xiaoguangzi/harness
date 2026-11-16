@@ -240,6 +240,7 @@ impl Agent {
         self.messages.extend(pending);
         self.context = None;
         self.session_start = Some("compact");
+        self.forget_told();
         // The running turn now starts after the summary; if the summary took
         // in the turn's own prompt, it has none to remove after an error.
         if self.turn_start.is_some() {
@@ -405,7 +406,7 @@ fn latest_todos(history: &[Message]) -> Option<String> {
 /// attachments, reports from subagents and background commands, hooks'
 /// feedback, and what the harness adds. A compaction tells the model about
 /// the deferred tools anew.
-const NOT_TYPED: [&str; 14] = [
+const NOT_TYPED: [&str; 15] = [
     "<file ",
     "<directory ",
     "<subagent-notification>",
@@ -420,6 +421,7 @@ const NOT_TYPED: [&str; 14] = [
     super::deferred::NOTICE_START,
     super::TIMESTAMP_START,
     super::GIT_STATUS_START,
+    super::ADVISOR_START,
 ];
 
 /// The text of the user's own messages, oldest first, as much as fits in
