@@ -10,6 +10,10 @@ use tokio::io::AsyncWriteExt;
 /// Past this, a saved output is cut off rather than fill the disk.
 const MAX_SAVED_BYTES: usize = 64 << 20;
 
+/// Saved outputs not changed for this long are removed, once per process,
+/// the first time it saves one.
+const KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
 /// `$TMPDIR/harness-<uid>/tool-output`, readable by its owner only.
 fn dir() -> std::io::Result<PathBuf> {
     // SAFETY: getuid cannot fail.
@@ -21,7 +25,20 @@ fn dir() -> std::io::Result<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(dir.parent().unwrap_or(&dir), std::fs::Permissions::from_mode(0o700));
     }
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| remove_older(&dir, KEPT_FOR));
     Ok(dir)
+}
+
+/// Removes the files in `dir` not changed for `age`.
+fn remove_older(dir: &std::path::Path, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let old = entry.metadata().ok().filter(|m| m.is_file()).and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok());
+        if old.is_some_and(|elapsed| elapsed > age) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// A new file for `tool`'s output, created readable by its owner only.
@@ -173,6 +190,18 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removes_saved_outputs_left_for_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new) = (dir.path().join("1-1-bash.txt"), dir.path().join("2-1-bash.txt"));
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&new, "x").unwrap();
+        let week_ago = std::time::SystemTime::now() - KEPT_FOR - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(week_ago).unwrap();
+        remove_older(dir.path(), KEPT_FOR);
+        assert!(!old.exists() && new.exists());
+    }
 
     fn saved_path(text: &str) -> PathBuf {
         let at = text.find("the whole output is in ").unwrap() + "the whole output is in ".len();
