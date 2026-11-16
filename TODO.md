@@ -165,9 +165,7 @@ other harness's docs or source before acting on an entry. All findings here are 
   and output with a control protocol for approvals and an SDK; Codex `exec --json`, app-server and an SDK;
   OpenCode a client/server split; ACP for editors. They put the core behind one event protocol, where the harness
   has four channels (`Observer`, `Asker`, `Reporter`, `Inbox`). (mainstream: likely)
-- [ ] Missing tools: web fetch/search and a todo/plan tool (`todo_write` is commented out, tools/mod.rs:177).
-  Nearly every mainstream harness has both. The built-in `explore` has no `read` (only `grep`/`glob`); Claude
-  Code's Explore has Read and read-only Bash. (mainstream: sure)
+- [ ] Missing tools: web fetch and web search, which nearly every mainstream harness has. (mainstream: sure)
 - [ ] One level of context management (a full summary). Claude Code (microcompact), OpenCode (prune) and the
   Anthropic API (context editing) clear old tool results before summarizing. (mainstream: likely)
 - [ ] Worktree subagents do not run in parallel: the `Scheduler` is process-global and `Workspace` is not keyed
@@ -193,8 +191,6 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### Found on the way (not a comparison)
 
-- [ ] `POST /api/tools/{name}` calls `tool.run` with no normalization, hooks, permissions, checkpoint or
-  task-local scopes (web/mod.rs:421).
 - [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
 - [ ] `lsp` starts its servers at, and shows paths relative to, the directory the harness started in, so a worktree
   subagent's `lsp` looks at the main checkout (lsp.rs:212, 513; the README says so). (read)
@@ -213,6 +209,12 @@ other harness's docs or source before acting on an entry. All findings here are 
 - No cap on the number of a turn's rounds, unlike Claude Code's `--max-turns` or OpenCode's `steps`: on purpose,
   a turn runs until the model stops.
 - No cap on a Stop hook that keeps sending the model back: on purpose too (`stop_hook_active` tells the hook).
+- No `todo_write` for the model, unlike Claude Code's TodoWrite or Codex's `update_plan`: current models plan well
+  enough without it (adb4273); the tool, its rendering and its compaction handling stay, one line from being on.
+- The built-in `explore` has `grep` and `glob` only, no `read` (Claude Code's Explore has Read and read-only
+  Bash): its prompt is built around reading code through `grep`'s `content` mode with context lines.
+- The web UI's tool page (`POST /api/tools/{name}`) runs a tool on input the user wrote, without hooks,
+  permissions or a checkpoint, as `!command` does in the REPL: the user's own call, behind the token.
 
 ### Already in line with mainstream harnesses (for reference)
 
