@@ -763,6 +763,10 @@ mod tests {
             "git diff --output=x",
             "git log --ext-diff",
             "git grep -O foo",
+            "git grep -nO'touch x' pat",
+            "git grep --open='touch x' pat",
+            "git diff --out=x",
+            "git log --ext-d",
             "git stash",
             "cd /tmp && ls",
             "cd ../x",
@@ -775,7 +779,7 @@ mod tests {
         ] {
             assert!(matches!(decide(asks), Decision::Ask(_)), "{asks:?}");
         }
-        for denied in ["cat .env", "cat ./.env", "cat src/../.env", "grep -n key .env", "cat /etc/hosts", "cat *.txt", "head src/*.rs"] {
+        for denied in ["cat .env", "cat ./.env", "cat src/../.env", "cd src && cat ../.env", "grep -n key .env", "cat /etc/hosts", "cat *.txt", "head src/*.rs"] {
             assert!(!matches!(decide(denied), Decision::Allow), "{denied:?}");
         }
         let open = permissions(json!({"defaultMode": "default"}));

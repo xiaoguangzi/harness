@@ -445,14 +445,16 @@ const READ_ONLY: &[&str] = &[
 ];
 
 /// `git` subcommands that only read, with any options but those in
-/// [`GIT_WRITES`].
+/// [`GIT_WRITES`]. Not `grep`, whose `-O` runs a program and can hide in a
+/// bundle of short options (`-nOcmd`).
 const GIT_READS: &[&str] = &[
-    "blame", "cat-file", "describe", "diff", "grep", "log", "ls-files", "ls-tree", "merge-base", "rev-list",
-    "rev-parse", "show", "status",
+    "blame", "cat-file", "describe", "diff", "log", "ls-files", "ls-tree", "merge-base", "rev-list", "rev-parse",
+    "show", "status",
 ];
 
-/// `git` options that write a file or run a program.
-const GIT_WRITES: &[&str] = &["--output", "--ext-diff", "-O", "--open-files-in-pager"];
+/// `git` long options that write a file or run a program; an abbreviation
+/// of one (`--out=x`), which some commands take, counts too.
+const GIT_WRITES: &[&str] = &["--output", "--ext-diff", "--open-files-in-pager"];
 
 /// `find` actions that run a command, delete or write a file, or read the
 /// paths to search from one.
@@ -472,8 +474,13 @@ pub(crate) fn reads_only(command: &str, moves: bool, denied: &dyn Fn(Option<&str
     if first.glob || first.text != command_name(command) {
         return false;
     }
-    let names_denied =
-        args.iter().any(|a| if a.glob { denied(None) } else { !a.text.starts_with('-') && denied(Some(&a.text)) });
+    // After a `cd`, a relative path is not where the rules would look.
+    let moved = moves && first.text != "cd";
+    let names_denied = args.iter().any(|a| match a.text.starts_with('-') {
+        _ if a.glob => denied(None),
+        true => false,
+        false => denied(Some(&a.text)) || (moved && !a.text.starts_with('/') && denied(None)),
+    });
     if names_denied {
         return false;
     }
@@ -493,7 +500,10 @@ pub(crate) fn reads_only(command: &str, moves: bool, denied: &dyn Fn(Option<&str
             let listing = |options: &[&str]| rest.iter().all(|a| options.contains(&a.text.as_str()));
             !moves
                 && !glob
-                && !rest.iter().any(|a| GIT_WRITES.iter().any(|w| a.text.starts_with(w)))
+                && !rest.iter().any(|a| {
+                    let name = a.text.split('=').next().unwrap_or_default();
+                    GIT_WRITES.iter().any(|w| a.text.starts_with(w) || (name.len() > 2 && w.starts_with(name)))
+                })
                 && match sub.text.as_str() {
                     s if GIT_READS.contains(&s) => true,
                     "branch" => listing(&["-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current"]),
