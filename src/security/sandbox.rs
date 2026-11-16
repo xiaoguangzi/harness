@@ -410,6 +410,12 @@ impl Sandbox {
     }
 
     /// Whether `bash` runs without asking, contained by the sandbox.
+    /// Whether commands may reach the network beyond loopback, which the
+    /// harness's own `web_fetch` keeps to as well.
+    pub fn allows_network(&self) -> bool {
+        self.network
+    }
+
     pub fn auto_allows_bash(&self) -> bool {
         self.auto_allow_bash
     }

@@ -247,6 +247,8 @@ impl Condition {
                 .any(|part| {
                     !part.is_empty() && (pattern.is_match(part) || pattern.is_match(shell::strip_wrappers(part, true)))
                 }),
+            // `WebFetch(domain:docs.rs)`, `WebFetch(domain:*.github.com)`.
+            Some("web_fetch") => input["url"].as_str().and_then(url_host).is_some_and(|host| pattern.is_match(&format!("domain:{host}"))),
             Some("read" | "edit" | "write" | "grep" | "glob") => {
                 let Some(written) = input["file_path"].as_str().or(input["path"].as_str()) else { return false };
                 // `./.env` and `src/../.env` are `.env` too.
@@ -280,6 +282,11 @@ impl Condition {
     pub(crate) fn is_whole_tool(&self) -> bool {
         self.pattern.is_none()
     }
+}
+
+/// The host a URL names, lowercase.
+pub(crate) fn url_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url.trim()).ok()?.host_str().map(str::to_ascii_lowercase)
 }
 
 /// `path` with `.` and `dir/..` taken out, without looking at the disk.
@@ -434,6 +441,7 @@ pub(crate) const ALIASES: &[(&str, &[&str])] = &[
     ("skill", &["Skill"]),
     ("stop_agent", &["TaskStop"]),
     ("tool_search", &["ToolSearch"]),
+    ("web_fetch", &["WebFetch"]),
     ("write", &["Write"]),
 ];
 
@@ -1386,7 +1394,8 @@ pub(crate) mod tests {
         assert_eq!(tool_named("KillShell"), Some("kill_shell"));
         assert_eq!(tool_named("Glob"), Some("glob"));
         assert_eq!(tool_named("LS"), Some("glob"));
-        assert_eq!(tool_named("WebFetch"), None);
+        assert_eq!(tool_named("WebFetch"), Some("web_fetch"));
+        assert_eq!(tool_named("WebSearch"), None);
     }
 
     #[test]

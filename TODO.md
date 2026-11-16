@@ -73,7 +73,7 @@ MCP servers with keys the harness does not know.
 - [ ] Frontmatter that is not read: `maxTurns` (3 uses), `skills`, `isolation`, `background`, `memory`,
   `initialPrompt`, `color`. (read)
 - [ ] Tools the harness has no counterpart for are dropped from a plugin agent's list without a word
-  (`WebFetch`, `WebSearch`, `TodoWrite`, `NotebookRead`, `Task*`): on purpose today, but an agent that lists only
+  (`WebSearch`, `TodoWrite`, `NotebookRead`, `Task*`): on purpose today, but an agent that lists only
   such tools ends up with none. (read)
 - [ ] A `model` that is a Claude model id (`claude-opus-5-5`) or `fable` goes to the gateway as written, where
   only `<provider>/<model>` resolves; `sonnet`, `opus`, `haiku` and `inherit` already mean the default. (read)
@@ -166,7 +166,8 @@ other harness's docs or source before acting on an entry. All findings here are 
   and output with a control protocol for approvals and an SDK; Codex `exec --json`, app-server and an SDK;
   OpenCode a client/server split; ACP for editors. They put the core behind one event protocol, where the harness
   has four channels (`Observer`, `Asker`, `Reporter`, `Inbox`). (mainstream: likely)
-- [ ] Missing tools: web fetch and web search, which nearly every mainstream harness has. (mainstream: sure)
+- [ ] Missing tool: web search, which nearly every mainstream harness has (web fetch is `web_fetch` since
+  2026-11-16; search needs a search API or a provider's server tool). (mainstream: sure)
 - [ ] Engineering: Unix only (no `cfg(windows)`), no logging/tracing, no CI, no integration tests (web: 6 unit
   tests, no router/auth test). Codex and Claude Code run on Windows and log or export OTel. (mainstream: likely)
 

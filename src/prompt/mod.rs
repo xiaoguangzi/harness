@@ -54,6 +54,11 @@ const GUIDANCE: &[(&str, &str)] = &[
          start, mark each item in_progress as you begin it (one at a time) and completed as soon as \
          it is done, and add items you discover. Skip it for small tasks.",
     ),
+    (
+        "web_fetch",
+        "read a public web page (documentation, an issue, what an error means) as Markdown. Use it rather than \
+         curl through `bash`; it does not follow a redirect to another host, and says where it goes.",
+    ),
     ("grep", "search file contents by regular expression. Use it instead of running grep or rg through `bash`."),
     ("glob", "find files by name or path pattern. Use it instead of running find or ls -R through `bash`."),
     (
@@ -113,7 +118,7 @@ const GUIDANCE: &[(&str, &str)] = &[
 ];
 
 /// Claude Code tools the harness has no counterpart of.
-const MISSING: &str = "`WebFetch`, `WebSearch`, `TodoWrite`, `NotebookEdit`";
+const MISSING: &str = "`WebSearch`, `TodoWrite`, `NotebookEdit`";
 
 /// The main agent's system prompt, for the tools in `tools`.
 pub fn main(tools: &ToolRegistry) -> String {
@@ -451,7 +456,7 @@ mod tests {
         let prompt = main(&tools);
         assert!(prompt.contains("`Bash` is `bash`") && prompt.contains("`Glob` or `LS` is `glob`"), "{prompt}");
         assert!(prompt.contains("`Skill` is `skill`") && !prompt.contains("`Task` is"), "only registered tools");
-        assert!(prompt.contains("`WebFetch`"));
+        assert!(prompt.contains("`WebSearch`"));
         let mut def = crate::subagent::explore();
         assert!(!subagent(&def).contains("Claude Code"));
         def.name = "p:x".into();

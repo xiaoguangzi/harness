@@ -400,7 +400,8 @@ impl AgentTool {
     /// Whether every tool agent `def` gets only reads.
     fn only_reads(&self, def: &AgentDef) -> bool {
         let registry = self.registry_for(def);
-        registry.names().all(|name| registry.get(name).is_some_and(|t| t.read_only()))
+        // `web_fetch` changes no file, though it asks like a call that changes things.
+        registry.names().all(|name| name == crate::tools::web_fetch::NAME || registry.get(name).is_some_and(|t| t.read_only()))
     }
 
     /// Tool names in `defs` that no available tool matches.
@@ -907,7 +908,7 @@ mod tests {
         // Claude Code's names, some the harness lacks; `tools` is the whole list.
         let fixer = def("fixer", "tools: Read, Grep, Glob, LS, Edit, Bash, WebFetch\n");
         assert_eq!(fixer.permission, Permission::Write);
-        assert_eq!(names(&tool.registry_for(&fixer)), vec!["bash", "edit", "glob", "grep", "read"]);
+        assert_eq!(names(&tool.registry_for(&fixer)), vec!["bash", "edit", "glob", "grep", "read", "web_fetch"]);
         // Without `tools`, every tool but the subagent ones.
         let all = tool.registry_for(&def("all", ""));
         assert!(all.get("write").is_some() && all.get("bash").is_some(), "{:?}", names(&all));
@@ -916,7 +917,7 @@ mod tests {
         assert_eq!(names(&tool.registry_for(&reader)), vec!["read"]);
         // Labelled by what its tools can do, not by its permission.
         let explorer = def("explorer", "tools: Glob, Grep, LS, Read, NotebookRead, WebFetch, KillShell, BashOutput\n");
-        assert_eq!(names(&tool.registry_for(&explorer)), vec!["glob", "grep", "read"], "no shell helpers without bash");
+        assert_eq!(names(&tool.registry_for(&explorer)), vec!["glob", "grep", "read", "web_fetch"], "no shell helpers without bash");
         let listed = agent_tool(vec![explorer, fixer.clone()]);
         assert!(listed.description().contains("p:explorer (read-only)"), "{}", listed.description());
         assert!(listed.description().contains("p:fixer (can modify files)"));

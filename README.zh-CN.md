@@ -341,6 +341,14 @@ Host *
 
 `read` 一次最多返回 2000 行、约 256 kB，结果会注明从哪一行继续读。太大而无法整个返回的输出（`bash`、`grep`、`glob` 或 `lsp` 超过 30,000 字节，MCP 工具超过 100,000 字节，子代理报告超过上限）不会被直接截断：模型拿到它的前三分之二和后三分之一，所以构建或测试输出的结尾仍然在，中间的说明给出保存全部内容的文件（`$TMPDIR/harness-<uid>/tool-output/`，只有你能读，每个最多 64 MB，一周后删除）。模型可以再用 `read` 或 `grep` 读取需要的部分。`bash` 在命令运行时就写这个文件，内存里只留开头和结尾；stdout 和 stderr 各有各的文件。
 
+## 网页
+
+`web_fetch` 为模型读取公开网页（文档、issue、错误信息的解释），与 Claude Code 的 `WebFetch` 相当，不过它返回网页本身，而不是由小模型对网页作答。HTML 会转成 Markdown，开头是网页标题，去掉脚本、样式、图片、导航和页脚；其他文本（JSON、纯文本、XML）原样返回，其余内容（图片、PDF）会被拒绝。`http` 网址会改用 `https` 获取。同一站点内的重定向会跟随，最多 5 次；跳到其他主机的不跟随，而是告诉模型它指向哪里，需要的话再去获取。超过 40,000 字节的网页与[大输出](#大输出)一样，只返回开头和结尾，全文放在文件里；超过 10 MB 的会被截断。请求 30 秒超时。
+
+- 它只访问公开地址：不访问 `localhost`、不带点的主机名、`.local` 主机名，以及回环、私有和链路本地 IP 地址，因此模型无法借它访问本机或局域网中的 web UI 或其他服务。
+- 它不修改文件，但网址可能把数据带出去，所以不算只读工具：`default` 模式下会询问，只读子代理拿不到它，plan 模式下也是询问（它属于调研），而不是拒绝。规则按域名写，与 Claude Code 一致：`WebFetch(domain:docs.rs)`、`WebFetch(domain:*.github.com)`；在本会话中允许时，建议的规则是该网页的域名。
+- 开启[沙箱](#沙箱)且 `network` 关闭时，它不会获取网页，与命令一样。
+
 ## Code mode
 
 在配置中设置 `"code_mode": true` 后，模型多一个 `code` 工具：它写一段 JavaScript，把其他工具当作 async 函数调用，一连串或一大批调用只要一个来回，并且只有脚本打印的内容回到模型，而不是每个工具的结果。
@@ -665,7 +673,7 @@ harness --check-plugins                           # 全部加载一遍，说明�
 - Codex 和 Cursor 的目录结构同样识别：`.agents/plugins/marketplace.json` 或 `.cursor-plugin/marketplace.json` 中的市场目录（其中的路径从包含 `.agents/` 的目录算起）、`local` 来源和带 `path` 的 `url` 来源、`.codex-plugin/plugin.json` 或 `.cursor-plugin/plugin.json` 清单，以及根目录下的 [Agent Plugins](https://agent-plugins.org) `plugin.json`（技能在 `skills/`，MCP 服务器在 `mcp.json`，hook 在 `extensions."com.openai"` 下）。hook 和 MCP 服务器也会拿到 Codex 的 `PLUGIN_ROOT` / `PLUGIN_DATA`。Codex 的 apps（ChatGPT 连接器）会被略过；它的 MCP 设置中保留 `cwd`（在插件目录内解析），注释和超时设置则丢弃。
 - `${CLAUDE_PLUGIN_ROOT}` 和 `${CLAUDE_PLUGIN_DATA}`（或 `${PLUGIN_ROOT}` 和 `${PLUGIN_DATA}`）会在 hook 命令、MCP 与语言服务器配置以及技能、命令和代理的文本中被替换；hook 和 stdio MCP 服务器、语言服务器还会以环境变量的形式拿到它们。
 - 插件的 `userConfig` 声明它需要的设置（`type`：`string`、`number`、`boolean`、`directory` 或 `file`；`title`、`description`、`default`、`sensitive`）。`install` 和 `configure` 会逐项询问；答案存入配置的 `pluginConfigs`，但 `sensitive` 的存到 `~/.harness/plugins/secrets.json`（仅你可读）。它们替换 hook 命令、MCP 与语言服务器配置中的 `${user_config.<key>}`，非敏感的也替换技能、命令和代理文本（模型会读到）中的；hook、MCP 与语言服务器还会以 `CLAUDE_PLUGIN_OPTION_<KEY>` 环境变量拿到它们。缺少答案且没有默认值的插件照常加载，但会给出警告，提示运行 `harness plugin configure`。
-- 插件代理按 Claude Code 的方式获得 `tools`，即这份列表就是代理能用的全部工具：除非声明 `permission: read-only`，否则可以写（`bash`、`edit`、`write`），不写 `tools` 则获得除子代理工具外的全部工具。这和你的[自定义代理](#子代理subagents)默认只读不同：插件是你启用的，它的代理也是按这套规则写的。harness 没有的工具（`WebFetch`、`WebSearch`、`TodoWrite`）会被跳过。由于插件的技能、命令和代理用的是 Claude Code 的工具名（`Task`、`Bash`、`Read` 等），系统提示词（插件代理的也一样）会说明每个名字在这里对应哪个工具，以及哪些没有对应工具。
+- 插件代理按 Claude Code 的方式获得 `tools`，即这份列表就是代理能用的全部工具：除非声明 `permission: read-only`，否则可以写（`bash`、`edit`、`write`），不写 `tools` 则获得除子代理工具外的全部工具。这和你的[自定义代理](#子代理subagents)默认只读不同：插件是你启用的，它的代理也是按这套规则写的。harness 没有的工具（`WebSearch`、`TodoWrite`）会被跳过；`WebFetch` 对应 `web_fetch`。由于插件的技能、命令和代理用的是 Claude Code 的工具名（`Task`、`Bash`、`Read` 等），系统提示词（插件代理的也一样）会说明每个名字在这里对应哪个工具，以及哪些没有对应工具。
 - harness 用不了的部分会在启动时给出警告并略过，插件的其余部分照常加载：它不运行的 hook 事件或类型、MCP 包（`.mcpb`）、需要 OAuth 登录或被插件关闭（`enabled: false`）的 MCP 服务器、命令没有安装的语言服务器。MCP 服务器配置里 harness 用不上的键会被去掉（其中会改变行为的，如 Codex 的 `enabled_tools`，会给出警告），服务器照常运行；Codex 的 `bearer_token_env_var`、`http_headers` 和 `env_http_headers` 会变成它的 `headers`。manifest 里内联的 `hooks` 可以直接是事件（Claude Code 的写法），也可以放在 `hooks` 键下（Codex 的写法），hook 文件同样如此。输出风格、monitors、channels、默认的 `settings.json` 以及 `dependencies`（不会随之安装）不会被使用；`/plugins` 和 `--check-plugins` 会列出它们。
 - `/plugins`（以及 Web UI 的环境页）列出每个插件提供的内容、被略过的部分，或它未能加载的原因。`harness --check-plugins`（也可加 `--plugin-dir`，用来试正在编写的插件）不启动会话，加载所有已启用插件、启动它们的 MCP 服务器、检查语言服务器的命令是否存在，说明哪些加载了、哪些被略过及原因；有插件或服务器失败时以非零退出码退出。
 - `/reload-plugins` 重新读取配置，重新加载插件、技能、命令、代理和 hook，以及插件的 MCP 服务器。一个会话的工具和系统提示词保持不变（这是提示词缓存的前缀），所以新内容对下一个会话生效：当前会话还是空的则立即生效，否则从 `/clear` 或 `/resume` 起生效。provider、沙箱和你自己的 MCP 服务器需要重启才生效，Web UI 也需要重启。
@@ -777,6 +785,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
   - `grep.rs` — 通过 ugrep 的正则搜索（PCRE，遵循 `.gitignore`，`files_with_matches` / `content` / `count` 模式）
   - `glob.rs` — 通过 ugrep 按 glob 模式查找文件（`.gitignore` 与沙箱规则同 `grep`；支持 `{a,b}`；最近修改的在前，最多 `head_limit` 个，默认 100）
   - `tool_search.rs` — `tool_search`：按名字、服务器前缀或关键词加载延后的工具，以 `tool_reference` 块作答
+  - `web_fetch.rs` — `web_fetch`：把公开网页转成 Markdown（htmd），只跟随同站重定向，其余写入溢出文件
 
 在官方 Anthropic API 上，工具以 `eager_input_streaming` 声明，因此较大的输入（例如 `write` 的文件内容）会在生成时流式传输。此后 API 不再校验工具输入，所以每个内置工具都把输入解析成严格的结构体（拒绝未知字段），流式 JSON 解析失败的调用不会执行：模型会得到 `INVALID_JSON` 错误结果。MCP 工具保持输入缓冲开启，因此 API 会按服务器提供的 schema 校验其输入。
 

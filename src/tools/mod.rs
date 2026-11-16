@@ -22,6 +22,7 @@ mod wait;
 #[allow(dead_code)] // `todo_write` isn't registered; see `with_defaults`
 pub mod todo;
 pub mod tool_search;
+pub mod web_fetch;
 mod write;
 
 pub use bash::BashTool;
@@ -180,6 +181,7 @@ impl ToolRegistry {
         registry.register(ReadTool::new(files.clone()));
         registry.register(EditTool::new(files.clone()));
         registry.register(WriteTool::new(files.clone()));
+        registry.register(web_fetch::WebFetchTool::new());
         registry.files = Some(files);
         registry
     }

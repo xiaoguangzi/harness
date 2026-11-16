@@ -328,6 +328,8 @@ impl Permissions {
         match self.mode() {
             Mode::BypassPermissions => Decision::Allow,
             _ if reads => Decision::Allow,
+            // Research, which plan mode is for; it can send data out, so it asks.
+            Mode::Plan if name == crate::tools::web_fetch::NAME => Decision::Ask("it reaches the network".into()),
             Mode::Plan => Decision::Deny(
                 "Plan mode is on: only tools and commands that only read run. Finish researching and present your plan; the user \
                  turns plan mode off to have you carry it out."
@@ -406,6 +408,11 @@ impl Permissions {
     /// otherwise. None when they would not cover the whole command.
     pub fn suggestions(&self, tool: &str, input: &Value) -> Vec<String> {
         let name = hooks::hook_tool_name(tool);
+        if tool == "web_fetch"
+            && let Some(host) = input["url"].as_str().and_then(hooks::url_host)
+        {
+            return vec![format!("{name}(domain:{host})")];
+        }
         if tool != "bash" {
             return vec![name.to_string()];
         }
@@ -837,6 +844,21 @@ mod tests {
         }
         p.set_mode(Mode::BypassPermissions);
         assert!(matches!(decide("echo x > .env"), Decision::Deny(_)), "in every mode");
+    }
+
+    #[test]
+    fn web_fetch_rules_name_domains() {
+        let tools = ToolRegistry::with_defaults(FileTracker::default());
+        let p = permissions(json!({"defaultMode": "default", "allow": ["WebFetch(domain:docs.rs)", "WebFetch(domain:*.github.com)"], "deny": ["WebFetch(domain:evil.com)"]}));
+        let decide = |url: &str| p.decide("web_fetch", tools.get("web_fetch").map(|t| t.as_ref()), &json!({"url": url}), None);
+        assert_eq!(decide("https://docs.rs/serde/latest"), Decision::Allow);
+        assert_eq!(decide("https://api.GitHub.com/repos"), Decision::Allow, "hosts are matched in lowercase");
+        assert!(matches!(decide("https://example.com/"), Decision::Ask(_)), "it can send data out, so it asks");
+        assert!(matches!(decide("https://evil.com/x"), Decision::Deny(_)));
+        assert_eq!(p.suggestions("web_fetch", &json!({"url": "https://example.com/a"})), ["WebFetch(domain:example.com)"]);
+        p.set_mode(Mode::Plan);
+        assert!(matches!(decide("https://example.com/"), Decision::Ask(_)), "plan mode asks rather than refuse research");
+        assert_eq!(decide("https://docs.rs/"), Decision::Allow);
     }
 
     #[tokio::test]
