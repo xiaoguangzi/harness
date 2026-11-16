@@ -167,9 +167,6 @@ other harness's docs or source before acting on an entry. All findings here are 
   OpenCode a client/server split; ACP for editors. They put the core behind one event protocol, where the harness
   has four channels (`Observer`, `Asker`, `Reporter`, `Inbox`). (mainstream: likely)
 - [ ] Missing tools: web fetch and web search, which nearly every mainstream harness has. (mainstream: sure)
-- [ ] Worktrees are removed when let go of only if unchanged; one a stopped subagent changed is kept without the
-  parent being told where. A process killed outright leaves its worktrees, and nothing sweeps them later.
-  `settle` runs git while holding the child's std mutex (runtime.rs). (read)
 - [ ] Engineering: Unix only (no `cfg(windows)`), no logging/tracing, no CI, no integration tests (web: 6 unit
   tests, no router/auth test). Codex and Claude Code run on Windows and log or export OTel. (mainstream: likely)
 

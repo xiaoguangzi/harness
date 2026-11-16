@@ -5,7 +5,9 @@
 //! commands write) and start from the commit checked out now. One that holds
 //! nothing is removed when it is let go of: after a run that left nothing in
 //! it, or with its subagent (`/clear`, the conversation's end, a subagent
-//! forgotten to make room), or when the subagent could not start.
+//! forgotten to make room), or when the subagent could not start. One a
+//! process left behind when it was killed is removed by the next one that
+//! makes a worktree, if it holds nothing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +37,52 @@ pub struct Changes {
     pub commits: usize,
 }
 
+/// Where the worktrees are made. Beside them, `.owners/<dir name>` says
+/// which process made each, of which repository, on which branch and from
+/// which commit, so a later process can tell one left behind.
+fn root() -> PathBuf {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    std::env::temp_dir().join(format!("harness-{uid}")).join("worktrees")
+}
+
+fn owner_file(dir: &Path) -> Option<PathBuf> {
+    Some(dir.parent()?.join(".owners").join(dir.file_name()?))
+}
+
+/// Whether the process `pid` is running (or belongs to another user).
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    pid > 0 && (unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// Removes what processes that are gone left in `root`: a worktree with
+/// nothing in it, with its branch; a worktree's registration and branch
+/// when the directory itself went (a temp cleaner). One with changes stays.
+fn sweep(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root.join(".owners")) else { return };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        let [pid, repo, branch, base] = lines[..] else { continue };
+        if pid.parse().is_ok_and(alive) {
+            continue;
+        }
+        let dir = root.join(entry.file_name());
+        let tree = Worktree { repo: repo.into(), workdir: dir.clone(), dir, branch: branch.into(), base: base.into() };
+        if tree.dir.exists() {
+            // Removed when let go of, with its owner file, if it holds nothing.
+            continue;
+        }
+        let _ = git(&tree.repo, &["worktree", "prune"]);
+        let unmoved = git(&tree.repo, &["rev-list", "--count", &format!("{}..{}", tree.base, tree.branch)]).is_ok_and(|n| n == "0");
+        if unmoved {
+            let _ = git(&tree.repo, &["branch", "-D", &tree.branch]);
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git")?;
     if !output.status.success() {
@@ -50,15 +98,25 @@ impl Worktree {
         let repo = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"]).context("isolation: \"worktree\" needs a git repository")?);
         let base = git(&repo, &["rev-parse", "HEAD"]).context("the repository has no commit to start a worktree from")?;
         let inside = cwd.canonicalize().ok().and_then(|c| c.strip_prefix(repo.canonicalize().ok()?).ok().map(Path::to_path_buf));
-        // SAFETY: getuid cannot fail.
-        let uid = unsafe { libc::getuid() };
+        let root = root();
+        sweep(&root);
         let repo_name = repo.file_name().map_or("repo".into(), |n| n.to_string_lossy().into_owned());
-        let dir = std::env::temp_dir().join(format!("harness-{uid}")).join("worktrees").join(format!("{repo_name}-{name}"));
+        let dir = root.join(format!("{repo_name}-{name}"));
         let branch = format!("harness/{name}");
-        std::fs::create_dir_all(dir.parent().unwrap_or(&dir)).context("creating the worktrees directory")?;
+        std::fs::create_dir_all(root.join(".owners")).context("creating the worktrees directory")?;
         git(&repo, &["worktree", "add", "-b", &branch, &dir.display().to_string(), &base])?;
         let workdir = inside.map_or(dir.clone(), |inside| dir.join(inside));
-        Ok(Self { repo, dir, workdir, branch, base })
+        let tree = Self { repo, dir, workdir, branch, base };
+        tree.mark();
+        Ok(tree)
+    }
+
+    /// Records this process as the worktree's owner.
+    fn mark(&self) {
+        if let Some(file) = owner_file(&self.dir) {
+            let text = format!("{}\n{}\n{}\n{}\n", std::process::id(), self.repo.display(), self.branch, self.base);
+            let _ = std::fs::write(file, text);
+        }
     }
 
     /// Makes it again after [`Worktree::remove`], on its branch, which
@@ -71,7 +129,9 @@ impl Worktree {
         match git(&self.repo, &["worktree", "add", &dir, &self.branch]) {
             Ok(_) => Ok(()),
             Err(_) => git(&self.repo, &["worktree", "add", "-b", &self.branch, &dir, &self.base]).map(drop),
-        }
+        }?;
+        self.mark();
+        Ok(())
     }
 
     pub fn changes(&self) -> Result<Changes> {
@@ -84,6 +144,9 @@ impl Worktree {
     /// keeping.
     pub fn remove(&self) -> Result<()> {
         git(&self.repo, &["worktree", "remove", "--force", &self.dir.display().to_string()])?;
+        if let Some(file) = owner_file(&self.dir) {
+            let _ = std::fs::remove_file(file);
+        }
         git(&self.repo, &["branch", "-D", &self.branch]).map(drop)
     }
 
@@ -94,6 +157,15 @@ impl Worktree {
             return true;
         }
         matches!(self.changes(), Ok(Changes { files: 0, commits: 0 })) && self.remove().is_ok()
+    }
+
+    /// Where the worktree is, for a parent whose subagent stopped in it.
+    pub fn whereabouts(&self) -> String {
+        format!(
+            "Its git worktree, {}, on branch `{}`, stays as it is; message_agent continues it there.",
+            self.dir.display(),
+            self.branch
+        )
     }
 
     /// Settles the worktree after a run: removed if the subagent left
@@ -160,6 +232,43 @@ mod tests {
         assert!(dir.exists(), "kept when let go of, with its changes");
         git(repo.path(), &["worktree", "remove", "--force", &dir.display().to_string()]).unwrap();
         assert!(Worktree::create(&std::env::temp_dir(), "x").unwrap_err().to_string().contains("git repository"));
+    }
+
+    #[test]
+    fn worktrees_left_by_a_process_that_is_gone_are_swept() {
+        let repo = repo();
+        let dead = {
+            let mut child = Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let orphan = |name: &str| {
+            let tree = Worktree::create(repo.path(), &format!("{name}-{}", std::process::id())).unwrap();
+            let file = owner_file(&tree.dir).unwrap();
+            let text = std::fs::read_to_string(&file).unwrap();
+            std::fs::write(&file, text.replacen(&std::process::id().to_string(), &dead.to_string(), 1)).unwrap();
+            let kept = (tree.dir.clone(), tree.branch.clone(), file);
+            std::mem::forget(tree);
+            kept
+        };
+        let (empty, empty_branch, empty_owner) = orphan("test-sweep-empty");
+        let (changed, _, _) = orphan("test-sweep-changed");
+        std::fs::write(changed.join("work.txt"), "x").unwrap();
+        let (gone, gone_branch, gone_owner) = orphan("test-sweep-gone");
+        std::fs::remove_dir_all(&gone).unwrap();
+        let live = Worktree::create(repo.path(), &format!("test-sweep-live-{}", std::process::id())).unwrap();
+
+        sweep(&root());
+        assert!(!empty.exists() && !empty_owner.exists(), "nothing in it");
+        assert!(changed.exists(), "its changes are kept");
+        assert!(live.dir.exists(), "its process is running");
+        assert!(!gone_owner.exists());
+        let branches = git(repo.path(), &["branch", "--list", "harness/*"]).unwrap();
+        assert!(!branches.contains(&empty_branch) && !branches.contains(&gone_branch), "{branches}");
+        assert!(!git(repo.path(), &["worktree", "list"]).unwrap().contains(&gone.display().to_string()), "pruned");
+        git(repo.path(), &["worktree", "remove", "--force", &changed.display().to_string()]).unwrap();
+        let _ = std::fs::remove_file(owner_file(&changed).unwrap());
     }
 
     #[test]

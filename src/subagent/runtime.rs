@@ -286,6 +286,12 @@ impl Subagents {
         Ok(child.stop(None, by_user.then_some(&self.parent)))
     }
 
+    /// Where subagent `id` works, if in a git worktree of its own.
+    pub fn worktree_note(&self, id: &str) -> Option<String> {
+        let child = find(&self.children.lock().unwrap(), id).ok()?;
+        child.worktree.as_ref().map(|w| w.whereabouts())
+    }
+
     /// Stops every running subagent, as the user asked; returns how many.
     pub fn stop_all(&self) -> usize {
         let children = self.children.lock().unwrap().clone();
@@ -399,17 +405,24 @@ impl Child {
         loop {
             let turn = agent.run_turn(std::mem::take(&mut content), &mut observer);
             let result = crate::tools::workdir::scope(workdir.clone(), turn).await;
-            let mut state = self.state.lock().unwrap();
-            if state.run != run || state.status != Status::Running {
-                return;
+            {
+                let state = self.state.lock().unwrap();
+                if state.run != run || state.status != Status::Running {
+                    return;
+                }
             }
             // A message came in just as it finished: carry on with it.
             if result.is_ok() && self.inbox.wants_turn() {
                 continue;
             }
             let mut output = outcome(&agent, start, result, self.tool_calls.load(Ordering::Relaxed));
+            // Git runs outside the lock, which others take to look at the run.
             if let Some((worktree, _)) = &worktree {
                 output.content.push_str(&format!("\n\n({})", worktree.settle()));
+            }
+            let mut state = self.state.lock().unwrap();
+            if state.run != run || state.status != Status::Running {
+                return;
             }
             state.status = if output.is_error { Status::Failed } else { Status::Completed };
             state.took = Some(state.started.elapsed());
@@ -444,8 +457,11 @@ impl Child {
         if let Some(parent) = parent
             && self.background.load(Ordering::Relaxed)
         {
-            let note = "The user stopped this subagent before it finished; changes it made so far remain.";
-            parent.push(self.notification(Status::Stopped, note), false);
+            let mut note = "The user stopped this subagent before it finished; changes it made so far remain.".to_string();
+            if let Some(worktree) = &self.worktree {
+                note = format!("{note} {}", worktree.whereabouts());
+            }
+            parent.push(self.notification(Status::Stopped, &note), false);
         }
         true
     }

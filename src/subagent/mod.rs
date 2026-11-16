@@ -827,7 +827,10 @@ impl Tool for StopAgentTool {
         };
         let id = &input.agent_id;
         match subagents.stop(id, false) {
-            Ok(true) => ToolOutput::ok(format!("Stopped subagent {id}. message_agent can continue it.")),
+            Ok(true) => match subagents.worktree_note(id) {
+                Some(note) => ToolOutput::ok(format!("Stopped subagent {id}. {note}")),
+                None => ToolOutput::ok(format!("Stopped subagent {id}. message_agent can continue it.")),
+            },
             Ok(false) => ToolOutput::ok(format!("Subagent {id} was not running.")),
             Err(e) => ToolOutput::error(format!("{e:#}")),
         }
