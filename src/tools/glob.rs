@@ -14,10 +14,11 @@ const MAX_HEAD_LIMIT: usize = 1_000;
 const MAX_OUTPUT_BYTES: usize = 30_000;
 /// The most patterns one brace pattern expands into.
 const MAX_EXPANSIONS: usize = 64;
-/// A regular expression no line matches (`a`, then a word boundary, then
-/// `b`), so ugrep's `--files-without-match` lists every file, empty ones
-/// included.
-const NEVER: &str = r"a\bb";
+/// How ugrep lists files by name alone, each with a pattern that matches
+/// at a file's start so it reads no further: the empty pattern lists every
+/// file with a line, and with `--files-without-match` any character lists
+/// the empty ones (which ugrep's empty pattern leaves out either way).
+const LISTINGS: [(&str, &str); 2] = [("--files-with-matches", ""), ("--files-without-match", r"[\s\S]")];
 
 /// Finds files by name with a glob pattern, through ugrep like `grep`, so
 /// it honours .gitignore and the sandbox the same way.
@@ -32,11 +33,10 @@ struct Input {
 }
 
 impl Input {
-    fn ugrep_args(&self) -> Vec<String> {
+    /// The arguments of one of the [`LISTINGS`].
+    fn ugrep_args(&self, (listing, matching): (&str, &str)) -> Vec<String> {
         let mut args: Vec<String> =
-            ["--recursive", "--ignore-files", "--no-messages", "--color=never", "--files-without-match"]
-                .map(String::from)
-                .to_vec();
+            ["--recursive", "--ignore-files", "--no-messages", "--color=never", listing].map(String::from).to_vec();
         let root = self.path.as_deref().map(|p| p.trim_end_matches('/')).filter(|p| !p.is_empty() && *p != ".");
         let root = root.map(|r| r.strip_prefix("./").unwrap_or(r));
         for pattern in expand_braces(&self.pattern) {
@@ -51,7 +51,7 @@ impl Input {
             };
             args.push(format!("--glob={pattern}"));
         }
-        args.extend(["-e".into(), NEVER.into(), "--".into()]);
+        args.extend(["-e".into(), matching.into(), "--".into()]);
         args.push(self.path.clone().unwrap_or_else(|| ".".into()));
         args
     }
@@ -154,14 +154,16 @@ impl Tool for GlobTool {
         if super::workdir::current().is_some() {
             input.path = Some(super::workdir::resolve(input.path.as_deref().unwrap_or(".")));
         }
-        let stdout = match ugrep(input.ugrep_args()).await {
-            Ok(Some(stdout)) => stdout,
-            Ok(None) => return ToolOutput::ok("No files found"),
-            Err(e) => return e,
+        let (with_lines, empty) = tokio::join!(ugrep(input.ugrep_args(LISTINGS[0])), ugrep(input.ugrep_args(LISTINGS[1])));
+        let stdout = match (with_lines, empty) {
+            (Err(e), _) | (_, Err(e)) => return e,
+            (Ok(None), Ok(None)) => return ToolOutput::ok("No files found"),
+            (Ok(a), Ok(b)) => [a, b].into_iter().flatten().collect::<Vec<_>>().join("\n"),
         };
+        let mut seen = std::collections::HashSet::new();
         let modified =
             |path: &str| Path::new(path).metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-        let mut files: Vec<(SystemTime, &str)> = stdout.lines().map(|p| (modified(p), p)).collect();
+        let mut files: Vec<(SystemTime, &str)> = stdout.lines().filter(|p| !p.is_empty() && seen.insert(*p)).map(|p| (modified(p), p)).collect();
         files.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
         let total = files.len();
         let limit = input.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT).clamp(1, MAX_HEAD_LIMIT);
