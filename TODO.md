@@ -182,9 +182,6 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### To check: what mainstream harnesses do here is not known
 
-- [ ] Nothing caps a Stop hook that keeps sending the model back (only `stop_hook_active` tells the hook), and
-  agents' `maxTurns` frontmatter is ignored (see Plugins → Agents). Not covered by the decision against a turn cap;
-  ask before changing.
 - [ ] Allow rules, session rules and a hook's `allow` are checked before the mode, so they override plan mode.
 - [ ] A PreToolUse hook's `allow` skips the ask rules (Claude Code is thought to still apply them).
 - [ ] Interrupting a batch reports calls that already finished, side effects done, as interrupted
@@ -215,6 +212,7 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 - No cap on the number of a turn's rounds, unlike Claude Code's `--max-turns` or OpenCode's `steps`: on purpose,
   a turn runs until the model stops.
+- No cap on a Stop hook that keeps sending the model back: on purpose too (`stop_hook_active` tells the hook).
 
 ### Already in line with mainstream harnesses (for reference)
 
