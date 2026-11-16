@@ -35,7 +35,7 @@ use tokio::process::Command;
 use crate::agent::Inbox;
 use crate::extensions::skills::PluginDirs;
 use crate::llm::{Client, Message};
-use crate::security::permissions::HookDecision;
+use crate::security::permissions::{self, HookDecision};
 use crate::tools::{KillGroup, ToolOutput};
 
 /// How long a hook may run unless it sets `timeout`.
@@ -242,7 +242,10 @@ impl Condition {
                 .unwrap_or_default()
                 .split(['\n', ';', '|', '&'])
                 .map(str::trim)
-                .any(|part| !part.is_empty() && pattern.is_match(part)),
+                // Past wrappers and assignments too: `nohup FOO=1 rm -rf x` for `Bash(rm:*)`.
+                .any(|part| {
+                    !part.is_empty() && (pattern.is_match(part) || pattern.is_match(permissions::strip_wrappers(part, true)))
+                }),
             Some("read" | "edit" | "write" | "grep" | "glob") => {
                 let Some(path) = input["file_path"].as_str().or(input["path"].as_str()) else { return false };
                 // Relative to where the harness started, and to a worktree

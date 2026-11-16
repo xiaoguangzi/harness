@@ -147,11 +147,10 @@ other harness's docs or source before acting on an entry. All findings here are 
   replaces the built-in; a project skill's `` !`cmd` `` runs, unsandboxed, when the model loads it; a project
   agent can declare `permission: write`). Claude Code, Codex, Gemini CLI and Cursor read project config behind a
   per-directory trust prompt. (mainstream: likely)
-- [ ] Bash allow rules are still narrower than Claude Code's (checked against its permissions docs): wrappers
-  (`timeout`, `nice`, `nohup`, …) are not stripped, so `Bash(npm test:*)` does not allow `timeout 30 npm test`;
-  there is no built-in set of read-only commands (`ls`, `cat`, read-only `git`) that run without asking; heredocs
-  and comments are never allowed by a pattern; and redirection targets are not checked, so `Bash(cargo test:*)` allows
-  `cargo test > any/file`. Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit
+- [ ] Bash allow rules are still narrower than Claude Code's (checked against its permissions docs; wrappers and
+  leading assignments are stripped since then, as Claude Code does): there is no built-in set of read-only
+  commands (`ls`, `cat`, read-only `git`) that run without asking; heredocs and comments are never allowed by a
+  pattern; and redirection targets are not checked, so `Bash(cargo test:*)` allows `cargo test > any/file`. Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit
   Claude Code documents too. (read)
 - [ ] Sessions are rewritten whole (after each round of tool calls and each turn), compaction overwrites the
   history before it, and subagent transcripts are not kept (`agent_transcript_path` is null). Claude Code and

@@ -142,6 +142,12 @@ impl Rule {
         matches!(&self.matcher, Matcher::Tool(c) if c.matches_command(&hooks::tool_names("bash"), command))
     }
 
+    /// Whether the allow rule allows `command`, as written or without its
+    /// wrappers (`timeout 30 npm test` for `Bash(npm test:*)`).
+    fn allows_command(&self, command: &str) -> bool {
+        self.matches_command(command) || self.matches_command(strip_wrappers(command, false))
+    }
+
     fn matches(&self, tool: &str, input: &Value) -> bool {
         match &self.matcher {
             Matcher::Tool(condition) => condition.matches(&hooks::tool_names(tool), &hooks::input_for_hook(tool, input)),
@@ -334,7 +340,7 @@ impl Permissions {
             return true;
         }
         let Some(commands) = input["command"].as_str().and_then(commands) else { return false };
-        !commands.is_empty() && commands.iter().all(|c| rules.iter().any(|r| r.matches_command(c)))
+        !commands.is_empty() && commands.iter().all(|c| rules.iter().any(|r| r.allows_command(c)))
     }
 
     /// The rules that would allow calls like this one from now on, for
@@ -350,8 +356,8 @@ impl Permissions {
         let session = self.session.lock().unwrap();
         let rules: Vec<&Rule> = self.config.allow.iter().chain(session.iter()).collect();
         let mut suggested: Vec<String> = Vec::new();
-        for command in commands.iter().filter(|c| !rules.iter().any(|r| r.matches_command(c))) {
-            let Some(rule) = command_rule(name, command) else { return Vec::new() };
+        for command in commands.iter().filter(|c| !rules.iter().any(|r| r.allows_command(c))) {
+            let Some(rule) = command_rule(name, strip_wrappers(command, false)) else { return Vec::new() };
             if !suggested.contains(&rule) {
                 suggested.push(rule);
             }
@@ -533,6 +539,150 @@ fn commands(command: &str) -> Option<Vec<&str>> {
     Some(parts)
 }
 
+/// Variables a leading assignment of which an allow rule looks past
+/// (`NODE_ENV=test npm test`): they change what a program prints or how it
+/// logs, not what it runs. `PATH`, `NODE_OPTIONS`, `GIT_*`, `LD_*` and the
+/// like are not here: they can make a command run something else.
+const SAFE_VARS: &[&str] = &[
+    "CARGO_TERM_COLOR", "CI", "CLICOLOR", "CLICOLOR_FORCE", "COLUMNS", "DEBUG", "FORCE_COLOR", "LANG", "LANGUAGE",
+    "LC_ALL", "LC_CTYPE", "NO_COLOR", "NODE_ENV", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "RUST_BACKTRACE",
+    "RUST_LOG", "RUST_TEST_THREADS", "TERM", "TZ",
+];
+
+/// One command (a part of a compound one) without the wrappers that run
+/// their arguments as the command, as Claude Code strips them before
+/// matching rules: `timeout`, `time`, `nice`, `nohup`, `stdbuf`, `command`
+/// (not `command -v`), `builtin`, zsh's `noglob`, `xargs` without options,
+/// and leading assignments: of [`SAFE_VARS`] only for an allow rule, of any
+/// variable (`any_assignment`) for a deny or ask rule. A wrapper whose
+/// options are not plain is left on, so the command matches only rules for
+/// it as written.
+pub(crate) fn strip_wrappers(command: &str, any_assignment: bool) -> &str {
+    let mut rest = command.trim();
+    while let Some(inner) = strip_one(rest, any_assignment).map(str::trim_start) {
+        if inner.is_empty() {
+            break;
+        }
+        rest = inner;
+    }
+    rest
+}
+
+/// What follows the first word of `command`, if it is a wrapper (with its
+/// options) or an assignment that [`strip_wrappers`] strips.
+fn strip_one(command: &str, any_assignment: bool) -> Option<&str> {
+    let (word, mut rest) = split_word(command);
+    if let Some((name, value)) = word.split_once('=') {
+        let name_ok = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let safe = any_assignment || (SAFE_VARS.contains(&name) && !value.contains(['`', '$']));
+        return (name_ok && safe).then_some(rest);
+    }
+    // Takes an option's value, attached (`-n5`, `--signal=KILL`) or as the next word.
+    let value = |attached: &str, rest: &mut &str, ok: fn(&str) -> bool| -> bool {
+        let value = if attached.is_empty() {
+            let (next, after) = split_word(rest);
+            *rest = after;
+            next
+        } else {
+            attached
+        };
+        ok(value)
+    };
+    let number = |v: &str| v.strip_prefix(['-', '+']).unwrap_or(v).parse::<u32>().is_ok();
+    let duration = |v: &str| {
+        let digits = v.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(v);
+        !digits.is_empty() && digits.parse::<f64>().is_ok_and(|d| d >= 0.0) && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+    };
+    let plain = |v: &str| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric());
+    let next_is_option = |rest: &str| split_word(rest).0.starts_with('-');
+    match word {
+        "nohup" | "builtin" | "noglob" => Some(rest),
+        "command" | "xargs" => (!next_is_option(rest)).then_some(rest),
+        "time" => match split_word(rest) {
+            ("-p", after) => Some(after),
+            _ => Some(rest),
+        },
+        "nice" => {
+            let (option, after) = split_word(rest);
+            if let Some(attached) = option.strip_prefix("--adjustment=") {
+                return number(attached).then_some(after);
+            }
+            match option.strip_prefix("-n") {
+                Some(attached) => {
+                    rest = after;
+                    value(attached, &mut rest, number).then_some(rest)
+                }
+                None if option.starts_with('-') => number(option).then_some(after),
+                None => Some(rest),
+            }
+        }
+        "timeout" => {
+            loop {
+                let (option, after) = split_word(rest);
+                if !option.starts_with('-') {
+                    break;
+                }
+                rest = after;
+                let ok = match option {
+                    "--preserve-status" | "--foreground" | "-v" | "--verbose" => true,
+                    _ if option.starts_with("--signal=") => plain(&option[9..]),
+                    _ if option.starts_with("--kill-after=") => duration(&option[13..]),
+                    _ if option.starts_with("-s") => value(&option[2..], &mut rest, plain),
+                    _ if option.starts_with("-k") => value(&option[2..], &mut rest, duration),
+                    _ => false,
+                };
+                if !ok {
+                    return None;
+                }
+            }
+            let (limit, after) = split_word(rest);
+            duration(limit).then_some(after)
+        }
+        "stdbuf" => {
+            let mode = |v: &str| v == "L" || v.parse::<u64>().is_ok() || v.get(..v.len().saturating_sub(1)).is_some_and(|n| n.parse::<u64>().is_ok());
+            loop {
+                let (option, after) = split_word(rest);
+                if !option.starts_with('-') {
+                    return Some(rest);
+                }
+                rest = after;
+                let ok = match option.split_once('=') {
+                    Some(("--input" | "--output" | "--error", v)) => mode(v),
+                    _ if matches!(option.get(..2), Some("-i" | "-o" | "-e")) => value(&option[2..], &mut rest, mode),
+                    _ => false,
+                };
+                if !ok {
+                    return None;
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The first word of `command` and what follows it; a word runs to
+/// whitespace outside quotes.
+fn split_word(command: &str) -> (&str, &str) {
+    let command = command.trim_start();
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    let mut quote = None;
+    while i < bytes.len() {
+        match (quote, bytes[i]) {
+            (None, b'\\') => i += 1,
+            (None, b'\'' | b'"') => quote = Some(bytes[i]),
+            (Some(b'"'), b'\\') => i += 1,
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_ascii_whitespace() => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    let i = i.min(bytes.len());
+    (&command[..i], &command[i..])
+}
+
 /// The rule that allows `command` (one command, not compound) from now on:
 /// its first word and subcommand, `Bash(git commit:*)`. `None` when no rule
 /// can say that plainly (a subshell, a group).
@@ -652,6 +802,61 @@ mod tests {
         }
         let p = permissions(json!({"defaultMode": "default", "allow": ["Bash"]}));
         assert_eq!(p.decide("bash", None, &json!({"command": "make $(x) && y"}), None), Decision::Allow, "all of bash");
+    }
+
+    #[test]
+    fn rules_look_past_wrappers() {
+        let p = permissions(json!({
+            "defaultMode": "default",
+            "allow": ["Bash(npm test:*)"],
+            "ask": ["Bash(git push:*)"],
+            "deny": ["Bash(rm:*)"]
+        }));
+        let decide = |command: &str| p.decide("bash", None, &json!({"command": command}), None);
+        for allowed in [
+            "timeout 30 npm test",
+            "timeout -s KILL -k 5s --preserve-status 2m npm test",
+            "timeout --signal=TERM 1.5 npm test",
+            "time -p npm test",
+            "nice npm test",
+            "nice -n 10 npm test",
+            "nice -5 npm test",
+            "nohup nice -n5 npm test --watch=false",
+            "stdbuf -oL -e 0 npm test",
+            "stdbuf --output=L npm test",
+            "command npm test",
+            "builtin npm test",
+            "noglob npm test",
+            "NODE_ENV=test CI=1 npm test",
+            "FORCE_COLOR='1' timeout 30 npm test",
+            "xargs npm test",
+        ] {
+            assert_eq!(decide(allowed), Decision::Allow, "{allowed}");
+        }
+        for asks in [
+            "timeout npm test",
+            "timeout -x 30 npm test",
+            "timeout 30",
+            "nice -n x npm test",
+            "stdbuf -oX1 npm test",
+            "command -v npm test",
+            "xargs -n1 npm test",
+            "PATH=. npm test",
+            "NODE_OPTIONS=--require=x npm test",
+            "NODE_ENV=$(x) npm test",
+            "watch npm test",
+            "npx npm test",
+        ] {
+            assert!(matches!(decide(asks), Decision::Ask(_)), "{asks:?}");
+        }
+        for denied in ["timeout 5 rm -rf x", "FOO=bar rm -rf x", "PATH=/bin nohup rm x", "echo && nice -n 1 rm x"] {
+            assert!(matches!(decide(denied), Decision::Deny(_)), "{denied:?}");
+        }
+        assert!(matches!(decide("timeout 60 git push"), Decision::Ask(_)));
+        assert_eq!(p.suggestions("bash", &json!({"command": "timeout 30 cargo build --release"})), ["Bash(cargo build:*)"]);
+        assert_eq!(strip_wrappers("  nohup  ", false), "nohup", "a wrapper alone is the command");
+        assert_eq!(strip_wrappers("stdbuf -é x", false), "stdbuf -é x");
+        assert_eq!(strip_wrappers("stdbuf -oé x", false), "stdbuf -oé x");
     }
 
     #[tokio::test]

@@ -413,6 +413,7 @@ REPL 和一次性模式的每个会话都会在每一批工具调用之后以及
 
 - 规则使用 Claude Code 的权限语法，与 hook 的 `if` 相同：用工具名或 Claude Code 的叫法（`Bash`、`Edit`、`read`），括号里写命令的开头（`git commit:*`）或路径要匹配的模式（`src/**`，匹配原样的路径，或相对于工作目录、worktree 子代理的 worktree 的路径）。`mcp__<服务器>` 表示该服务器的所有工具，末尾的 `*` 表示名字以此开头的工具。
 - 复合命令（在引号外按 `&&`、`||`、`;`、`|`、`|&`、`&` 和换行拆分；`2>&1` 这类重定向不拆）只要有一段命中 deny 或 ask 规则就拒绝或询问；只有每一段都被允许（可以是不同的规则）时才直接放行：`Bash(cargo test:*)` 放行 `cargo test 2>&1`，但不放行 `cargo test && make`。带命令替换（`$(…)`、反引号、`<(…)`）、heredoc、`#` 注释或 `$'…'` 引号的命令，任何 `Bash(…)` 模式都不会放行；只写 `Bash` 则放行所有命令。
+- 和 Claude Code 一样，规则对每段命令既按原样匹配，也去掉包装命令后匹配：`timeout`、`time`、`nice`、`nohup`、`stdbuf`、`command`、`builtin`、`noglob` 以及不带选项的 `xargs`，所以 `Bash(npm test:*)` 放行 `timeout 30 npm test` 和 `nice -n 5 npm test`。allow 规则还会越过开头对只影响输出或日志的变量的赋值（`NODE_ENV`、`CI`、`RUST_LOG`、`NO_COLOR`、`LANG` 等），其他变量不行（`PATH=. npm test` 会询问）；deny 和 ask 规则越过任何赋值，所以 `Bash(rm:*)` 会拒绝 `FOO=1 nohup rm -rf x`。`npx`、`watch`、`docker exec` 这类运行器不会被去掉。
 - deny 规则在任何模式下都拒绝调用，即使 PreToolUse hook 给了 `allow`。其次，ask 规则（或 hook 的 `ask`）在任何模式下都会询问。再次，allow 规则或你在本会话中允许过的规则会直接放行。都不匹配时由模式决定：
 
 | 模式 | |
