@@ -168,9 +168,6 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] Missing tools: web fetch and web search, which nearly every mainstream harness has. (mainstream: sure)
 - [ ] One level of context management (a full summary). Claude Code (microcompact), OpenCode (prune) and the
   Anthropic API (context editing) clear old tool results before summarizing. (mainstream: likely)
-- [ ] Worktree subagents do not run in parallel: the `Scheduler` is process-global and `Workspace` is not keyed
-  by directory, so they serialize with each other, with the main agent and with every web task (all default bash
-  calls, `git status` too). Claude Code and Cursor use worktrees for parallel agents. (mainstream: likely)
 - [ ] Worktrees are removed when let go of only if unchanged; one a stopped subagent changed is kept without the
   parent being told where. A process killed outright leaves its worktrees, and nothing sweeps them later.
   `settle` runs git while holding the child's std mutex (runtime.rs). (read)
@@ -194,7 +191,6 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
 - [ ] `lsp` starts its servers at, and shows paths relative to, the directory the harness started in, so a worktree
   subagent's `lsp` looks at the main checkout (lsp.rs:212, 513; the README says so). (read)
-- [ ] The scheduler's file keys canonicalize the raw path before `workdir::resolve` (scheduling.rs:154).
 - [ ] `FileTracker` keys are not normalized (`..`, symlinks), staleness is mtime only, and a partial read counts
   as a full one for `write`. `edit`/`write` are not atomic (no temp file and rename).
 - [ ] Nothing in the system prompt says when to consult the advisor; `tool_search` gets no guidance line.
