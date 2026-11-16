@@ -245,10 +245,14 @@ impl Condition {
                 .any(|part| !part.is_empty() && pattern.is_match(part)),
             Some("read" | "edit" | "write" | "grep" | "glob") => {
                 let Some(path) = input["file_path"].as_str().or(input["path"].as_str()) else { return false };
-                // A worktree subagent's, for paths in its worktree.
-                let cwd = crate::tools::workdir::get();
-                let relative = std::path::Path::new(path).strip_prefix(&cwd).map(|p| p.display().to_string());
-                pattern.is_match(path) || relative.is_ok_and(|r| pattern.is_match(&r))
+                // Relative to where the harness started, and to a worktree
+                // subagent's worktree: a rule holds for the project's files
+                // in either.
+                let dirs = [std::env::current_dir().ok(), crate::tools::workdir::current()];
+                let relative = dirs.into_iter().flatten().filter_map(|dir| {
+                    std::path::Path::new(path).strip_prefix(&dir).ok().map(|p| p.display().to_string())
+                });
+                pattern.is_match(path) || relative.into_iter().any(|r| pattern.is_match(&r))
             }
             _ => false,
         }
@@ -1026,7 +1030,9 @@ async fn run_command(
     cmd.process_group(0).envs(env.iter().map(|(k, v)| (k, v)));
     // It starts where the agent works (a worktree subagent's worktree); the
     // project is where the harness started.
-    cmd.current_dir(crate::tools::workdir::get());
+    if let Some(dir) = crate::tools::workdir::current().filter(|d| d.is_dir()) {
+        cmd.current_dir(dir);
+    }
     if let Ok(dir) = std::env::current_dir() {
         cmd.env("CLAUDE_PROJECT_DIR", &dir).env("HARNESS_PROJECT_DIR", &dir);
     }
@@ -1077,15 +1083,18 @@ pub(crate) mod tests {
         let _guard = crate::util::lock_cwd();
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path().canonicalize().unwrap();
-        let h = hooks(json!({"UserPromptSubmit": [{"hooks": [
-            {"type": "command", "command": "pwd -P; python3 -c 'import json,sys; print(json.load(sys.stdin)[\"cwd\"])'"}]}]}));
+        let h = hooks(json!({"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "pwd -P; cat"}]}]}));
         let outcome = crate::tools::workdir::scope(Some(dir.clone()), h.user_prompt_submit("hi", "m")).await;
-        let shown = dir.display().to_string();
-        assert_eq!(outcome.context, [format!("{shown}\n{shown}")], "its process and its input's cwd");
+        let (process, input) = outcome.context[0].split_once('\n').unwrap();
+        assert_eq!(process, dir.display().to_string(), "its process");
+        assert_eq!(serde_json::from_str::<Value>(input).unwrap()["cwd"], dir.display().to_string(), "its input's cwd");
         let rule = Condition::parse("Edit(src/**)").unwrap();
-        let input = json!({"file_path": dir.join("src/a.rs").display().to_string()});
-        let matches = crate::tools::workdir::sync(Some(dir.clone()), || rule.matches(&tool_names("edit"), &input));
-        assert!(matches, "a path in the worktree, relative to it");
+        let matches = |path: std::path::PathBuf| {
+            let input = json!({"file_path": path.display().to_string()});
+            crate::tools::workdir::sync(Some(dir.clone()), || rule.matches(&tool_names("edit"), &input))
+        };
+        assert!(matches(dir.join("src/a.rs")), "a path in the worktree, relative to it");
+        assert!(matches(std::env::current_dir().unwrap().join("src/a.rs")), "and one in the main checkout, as before");
     }
 
     fn command(event: &str, matcher: &str, command: &str) -> Hooks {

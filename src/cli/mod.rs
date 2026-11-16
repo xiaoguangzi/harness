@@ -124,7 +124,8 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, prompt: Option<Vec<String
 /// follows `--` never gets here: it is the prompt as it is.
 fn prompt_args(args: Vec<String>) -> Result<Vec<String>> {
     match args.first().map(String::as_str) {
-        Some(option) if option.starts_with('-') && option.len() > 1 => anyhow::bail!(
+        // A quoted prompt (`"- [ ] fix it"`) has spaces; an option does not.
+        Some(option) if option.starts_with('-') && option.len() > 1 && !option.contains(char::is_whitespace) => anyhow::bail!(
             "unknown option `{option}` (`harness --help` lists them; a prompt that starts with `-` goes after `--`)"
         ),
         _ => Ok(args),
@@ -653,6 +654,7 @@ mod tests {
         assert!(args(&["--contineu"]).unwrap_err().to_string().contains("unknown option `--contineu`"));
         assert!(args(&["-x", "go"]).is_err());
         assert_eq!(args(&["-"]).unwrap(), ["-"]);
+        assert_eq!(args(&["- [ ] fix the tests"]).unwrap(), ["- [ ] fix the tests"], "a quoted prompt");
         assert!(args(&[]).unwrap().is_empty());
     }
 }
