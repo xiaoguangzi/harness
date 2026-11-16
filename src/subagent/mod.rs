@@ -1065,6 +1065,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_parent_saves_its_conversation() {
+        use crate::agent::mock::gateway;
+        let dir = tempfile::tempdir().unwrap();
+        let rec = crate::session::Recorder::new(crate::session::Store::new(dir.path()), "/p".into());
+        let (client, _requests) = gateway(move |n| match n {
+            0 => (vec![json!({"type": "tool_use", "id": "a1", "name": "agent", "input": {
+                "agent_type": "general-purpose", "description": "look", "prompt": "Look around"}})], "tool_use", 10),
+            1 => (vec![json!({"type": "tool_use", "id": "g1", "name": "glob", "input": {"pattern": "*.nothing"}})], "tool_use", 10),
+            2 => (vec![json!({"type": "text", "text": "looked"})], "end_turn", 10),
+            _ => (vec![json!({"type": "text", "text": "ok"})], "end_turn", 10),
+        })
+        .await;
+        let mut registry = ToolRegistry::with_defaults(FileTracker::default());
+        let tool = AgentTool::new(Arc::new(vec![general_purpose()]), registry.clone(), client.clone(), Arc::new(|_: &Value| {}));
+        registry.register(tool);
+        let mut parent = Agent::new(client, registry, "sys");
+        parent.set_autosave(Some(rec.autosave()));
+        parent.run_turn(vec![json!({"type": "text", "text": "go"})], &mut crate::agent::tests::Notices::default()).await.unwrap();
+        let (_, saved) = rec.store().load(&rec.meta().id).unwrap();
+        assert_eq!(saved.len(), 3, "the parent's prompt, call and result: {saved:?}");
+        assert_eq!(saved[1].content[0]["id"], "a1");
+        assert!(saved[2].content[0]["content"].as_str().unwrap_or_default().contains("looked"));
+    }
+
+    #[tokio::test]
     async fn isolated_subagents_change_files_in_a_worktree_of_their_own() {
         use crate::agent::mock::gateway;
         let repo = tempfile::tempdir().unwrap();

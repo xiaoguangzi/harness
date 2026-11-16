@@ -152,6 +152,9 @@ pub struct Agent {
     /// prompt cache is kept from then on, not from when the answer ended.
     /// `None` when no cache of it is known to be warm.
     last_request: Mutex<Option<Instant>>,
+    /// Where the conversation is saved after each round of tool calls, if
+    /// it is: a crash then loses at most the round under way.
+    autosave: Option<crate::session::Autosave>,
 }
 
 impl Agent {
@@ -191,6 +194,7 @@ impl Agent {
             tool_search: None,
             switch_to: Arc::default(),
             last_request: Mutex::new(None),
+            autosave: None,
         }
     }
 
@@ -367,6 +371,24 @@ impl Agent {
     /// its parent's.
     pub fn set_usage(&mut self, log: Arc<UsageLog>) {
         self.usage = log;
+    }
+
+    /// Saves the conversation through `autosave` after each round of tool
+    /// calls in a turn; the frontend still saves it when the turn ends.
+    pub fn set_autosave(&mut self, autosave: Option<crate::session::Autosave>) {
+        self.autosave = autosave;
+    }
+
+    /// Saves the conversation, valid as it is between rounds, and its
+    /// checkpoints. A failure is not reported here: the save at the turn's
+    /// end reports it.
+    fn save_round(&self) {
+        if let Some(autosave) = &self.autosave
+            && autosave.save(&self.messages, self.client.spec()).is_ok()
+            && self.checkpoints
+        {
+            let _ = self.history.save();
+        }
     }
 
     /// The checkpoints of this conversation's prompts.
@@ -684,6 +706,7 @@ impl Agent {
 
             let (results, halted) = self.run_calls(&tool_uses, &response.invalid_tool_inputs, observer).await;
             self.messages.push(Message::user(results));
+            self.save_round();
             if halted {
                 return Ok(());
             }
@@ -888,6 +911,34 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("has a secret"), "{error}");
         assert!(agent.messages().is_empty());
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_conversation_is_saved_after_each_round_of_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = crate::session::Recorder::new(crate::session::Store::new(dir.path()), "/p".into());
+        let call = json!({"type": "tool_use", "id": "t1", "name": "nothing", "input": {}});
+        let (client, _requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![call.clone()], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
+        agent.set_autosave(Some(rec.autosave()));
+        agent.run_turn(vec![text("go")], &mut Notices::default()).await.unwrap();
+        // Nothing saved the turn's end: what is there is the round's save.
+        let (_, saved) = rec.store().load(&rec.meta().id).unwrap();
+        assert_eq!(saved.len(), 3, "the prompt, the call and its result");
+        assert_eq!(saved[2].content[0]["tool_use_id"], "t1");
+
+        // What a crash then leaves goes on as a resumed conversation.
+        let (client, mut requests) = compact::tests::gateway(|_| (vec![text("again")], "end_turn", 100)).await;
+        let mut resumed = Agent::new(client, ToolRegistry::default(), "sys");
+        resumed.restore(saved);
+        resumed.run_turn(vec![text("go on")], &mut Notices::default()).await.unwrap();
+        let sent = requests.recv().await.unwrap();
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 4, "the saved three, then the new prompt");
+        assert_eq!(resumed.messages().last().unwrap().content, vec![text("again")]);
     }
 
     #[tokio::test]

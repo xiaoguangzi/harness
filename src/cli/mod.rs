@@ -239,8 +239,8 @@ impl<'a> Repl<'a> {
             self.out.set_status(Some(&format!("Waiting for {pending} background tasks…")));
         }
         let inbox = self.agent.inbox().clone();
-        let session = self.recorder.as_ref().map(|rec| (rec.meta().id.as_str(), rec.file()));
-        status_line::refresh(self.agent, session, &self.out);
+        let session = self.recorder.as_ref().map(|rec| (rec.meta().id, rec.file()));
+        status_line::refresh(self.agent, session.as_ref().map(|(id, file)| (id.as_str(), file.clone())), &self.out);
         let read = self.editor.helper().unwrap().read_box(&self.out, &mut self.typing, inbox, past);
         let read = match self.agent.idle_compaction_after() {
             Some(after) => compacting_while(read, after, self.agent, &self.out, self.recorder.as_mut()).await,

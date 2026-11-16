@@ -65,6 +65,10 @@ pub(super) async fn run_shown(
     mut input: Option<TurnInput<'_>>,
 ) -> Result<(), TurnEnd> {
     term.begin_turn();
+    // Titled first, for the saves made while the turn runs.
+    if let (Some(rec), Some(title)) = (&recorder, title) {
+        rec.set_title(title);
+    }
     let prompt = content.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
     if !prompt.is_empty() { out.transcript_text("❯ You", &prompt, false); }
     let inbox = agent.inbox().clone();
@@ -132,9 +136,6 @@ pub(super) async fn run_shown(
     }
     term.end_turn(&result);
     if let Some(rec) = recorder {
-        if let Some(title) = title {
-            rec.set_title(title);
-        }
         agent.settle();
         sessions::save(agent, rec, out);
     }

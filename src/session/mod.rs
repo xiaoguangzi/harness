@@ -13,6 +13,7 @@ pub mod checkpoint;
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -40,6 +41,7 @@ pub struct Meta {
 }
 
 /// Where sessions are saved.
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
 }
@@ -147,64 +149,89 @@ impl Store {
     }
 }
 
-/// Saves the conversation in progress after each turn: a new one, or one
+/// Saves the conversation in progress after each turn, and through its
+/// [`Autosave`] after each round of tool calls within one: a new one, or one
 /// that was resumed and continues under its id.
 pub struct Recorder {
+    saver: Autosave,
+}
+
+/// A handle on a [`Recorder`] that the agent saves its conversation through
+/// while a turn runs, so that a crash loses at most the round under way. It
+/// follows the recorder: after a `/clear` or `/resume` it saves the new
+/// conversation.
+#[derive(Clone)]
+pub struct Autosave {
     store: Store,
-    meta: Meta,
+    meta: Arc<Mutex<Meta>>,
+}
+
+impl Autosave {
+    /// Saves the conversation as it is now. Nothing is written until it
+    /// has a message; one rewound to its start is no longer saved.
+    pub fn save(&self, messages: &[Message], model: &str) -> Result<()> {
+        let mut meta = self.meta.lock().unwrap();
+        if messages.is_empty() {
+            return match std::fs::remove_file(self.store.path(&meta.id)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context("removing the saved conversation"),
+                _ => Ok(()),
+            };
+        }
+        meta.model = model.to_string();
+        meta.updated = now();
+        meta.messages = messages.len();
+        self.store.save(&meta, messages)
+    }
 }
 
 impl Recorder {
     pub fn new(store: Store, cwd: String) -> Self {
         let meta = Meta { id: String::new(), cwd, title: String::new(), model: String::new(), created: 0, updated: 0, messages: 0 };
-        let mut recorder = Self { store, meta };
+        let recorder = Self { saver: Autosave { store, meta: Arc::new(Mutex::new(meta)) } };
         recorder.restart();
         recorder
     }
 
     pub fn store(&self) -> &Store {
-        &self.store
+        &self.saver.store
     }
 
-    pub fn meta(&self) -> &Meta {
-        &self.meta
+    pub fn meta(&self) -> Meta {
+        self.saver.meta.lock().unwrap().clone()
+    }
+
+    /// The handle the agent saves through during a turn.
+    pub fn autosave(&self) -> Autosave {
+        self.saver.clone()
     }
 
     /// The file the conversation is saved to (once it has a message).
     pub fn file(&self) -> PathBuf {
-        self.store.path(&self.meta.id)
+        self.saver.store.path(&self.saver.meta.lock().unwrap().id)
     }
 
     /// Records a new conversation from here on, e.g. after `/clear`; the
-    /// previous one stays saved.
-    pub fn restart(&mut self) {
-        self.meta = Meta { id: new_id(), created: now(), title: String::new(), ..self.meta.clone() };
+    /// previous one stays saved. Changed in place, for [`Autosave`]s too.
+    pub fn restart(&self) {
+        let mut meta = self.saver.meta.lock().unwrap();
+        *meta = Meta { id: new_id(), created: now(), title: String::new(), ..meta.clone() };
     }
 
     /// Continues recording a resumed conversation, now in this directory.
-    pub fn resume(&mut self, meta: Meta) {
-        self.meta = Meta { cwd: std::mem::take(&mut self.meta.cwd), ..meta };
+    pub fn resume(&self, resumed: Meta) {
+        let mut meta = self.saver.meta.lock().unwrap();
+        *meta = Meta { cwd: std::mem::take(&mut meta.cwd), ..resumed };
     }
 
     /// Titles the conversation after its first prompt.
-    pub fn set_title(&mut self, line: &str) {
+    pub fn set_title(&self, line: &str) {
         let first = line.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-        self.meta.title = crate::util::ellipsize(first, 80);
+        self.saver.meta.lock().unwrap().title = crate::util::ellipsize(first, 80);
     }
 
-    /// Saves the conversation as it is now. Nothing is written until it
-    /// has a message; one rewound to its start is no longer saved.
-    pub fn save(&mut self, messages: &[Message], model: &str) -> Result<()> {
-        if messages.is_empty() {
-            return match std::fs::remove_file(self.file()) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context("removing the saved conversation"),
-                _ => Ok(()),
-            };
-        }
-        self.meta.model = model.to_string();
-        self.meta.updated = now();
-        self.meta.messages = messages.len();
-        self.store.save(&self.meta, messages)
+    /// Saves the conversation as it is now; see [`Autosave::save`].
+    pub fn save(&self, messages: &[Message], model: &str) -> Result<()> {
+        self.saver.save(messages, model)
     }
 }
 
@@ -374,6 +401,24 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let file = store.find("20260925-100000-aaaa").unwrap();
         assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn an_autosave_follows_the_recorder_to_a_new_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Recorder::new(Store::new(dir.path()), "/p".into());
+        let autosave = rec.autosave();
+        let one = [Message::user(vec![json!({"type": "text", "text": "hi"})])];
+        rec.set_title("first");
+        autosave.save(&one, "gw/m").unwrap();
+        let first = rec.meta().id;
+        rec.restart();
+        assert_ne!(rec.meta().id, first);
+        let two = [one[0].clone(), one[0].clone()];
+        autosave.save(&two, "gw/m").unwrap();
+        assert_eq!(rec.store().load(&first).unwrap().1.len(), 1, "the earlier conversation is left as it was");
+        let (meta, loaded) = rec.store().load(&rec.meta().id).unwrap();
+        assert_eq!((loaded.len(), meta.title.as_str()), (2, ""));
     }
 
     #[test]

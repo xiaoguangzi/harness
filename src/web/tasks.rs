@@ -230,7 +230,7 @@ impl Task {
     pub fn resumed(id: u64, files: FileTracker, agent: Agent, forks: Forks, store: Store, meta: session::Meta) -> Arc<Self> {
         let title = if meta.title.is_empty() { "(untitled)".to_string() } else { meta.title.clone() };
         let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
-        let mut recorder = Recorder::new(store, cwd);
+        let recorder = Recorder::new(store, cwd);
         recorder.resume(meta);
         let task = Self::recording(id, title, None, files, agent, forks, Some(recorder));
         task.meta.lock().unwrap().turns = 0;
@@ -242,11 +242,16 @@ impl Task {
         title: String,
         def: Option<AgentDef>,
         files: FileTracker,
-        agent: Agent,
+        mut agent: Agent,
         forks: Forks,
         recorder: Option<Recorder>,
     ) -> Arc<Self> {
         if let Some(rec) = &recorder {
+            // Titled from the start, for the saves made while a turn runs.
+            if rec.meta().title.is_empty() {
+                rec.set_title(&title);
+            }
+            agent.set_autosave(Some(rec.autosave()));
             agent.hooks().set_session(&rec.meta().id, Some(rec.file()));
             agent.file_history().set_dir(crate::session::checkpoint::session_dir(&rec.meta().id));
         }

@@ -75,6 +75,11 @@ async fn run_json(
     out: &Output,
 ) -> ExitCode {
     let session_id = recorder.as_ref().map(|rec| rec.meta().id.clone());
+    if let Some(rec) = &recorder
+        && agent.messages().is_empty()
+    {
+        rec.set_title(line);
+    }
     let mut events = json::Events::new(format);
     events.init(agent, session_id.as_deref());
     let start = agent.messages().len();

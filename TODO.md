@@ -153,7 +153,7 @@ other harness's docs or source before acting on an entry. All findings here are 
   and comments are never allowed by a pattern; and redirection targets are not checked, so `Bash(cargo test:*)` allows
   `cargo test > any/file`. Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit
   Claude Code documents too. (read)
-- [ ] Sessions are rewritten whole only at the end of a turn (a crash loses the turn), compaction overwrites the
+- [ ] Sessions are rewritten whole (after each round of tool calls and each turn), compaction overwrites the
   history before it, and subagent transcripts are not kept (`agent_transcript_path` is null). Claude Code and
   Codex append per message; Claude Code keeps the pre-compaction history behind a boundary record and saves
   subagent transcripts. (mainstream: sure)

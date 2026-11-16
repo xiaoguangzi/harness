@@ -102,8 +102,9 @@ pub(super) async fn resume(agent: &mut Agent, rec: &mut Recorder, id: &str, out:
     attach(agent, rec);
     if show {
         replay(out, agent.messages());
-        let title = if rec.meta().title.is_empty() { "conversation" } else { rec.meta().title.as_str() };
-        out.note(format!("resumed {} · {} · {}", text::printable(title), rec.meta().id, agent.model()));
+        let meta = rec.meta();
+        let title = if meta.title.is_empty() { "conversation" } else { meta.title.as_str() };
+        out.note(format!("resumed {} · {} · {}", text::printable(title), meta.id, agent.model()));
         out.line("");
     }
     for note in notes {
@@ -219,7 +220,8 @@ pub(super) fn show_hook_notices(out: &Output, notices: Vec<String>) {
 
 /// Tells the agent which saved conversation it is: its hooks run for it,
 /// and its checkpoints are saved with it.
-pub(super) fn attach(agent: &Agent, rec: &Recorder) {
+pub(super) fn attach(agent: &mut Agent, rec: &Recorder) {
+    agent.set_autosave(Some(rec.autosave()));
     agent.hooks().set_session(&rec.meta().id, Some(rec.file()));
     agent.file_history().set_dir(checkpoint::session_dir(&rec.meta().id));
 }
