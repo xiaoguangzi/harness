@@ -657,6 +657,9 @@ impl Agent {
 
             match stop_reason {
                 "tool_use" => {}
+                // Some gateways leave the reason out, or say `end_turn`, after
+                // tool calls: the calls stand, and must have results.
+                "" | "end_turn" if !tool_uses.is_empty() => {}
                 // A server tool paused the response: it goes on from here.
                 "pause_turn" => continue,
                 "max_tokens" if !tool_uses.is_empty() => {
@@ -669,6 +672,8 @@ impl Agent {
                     observer.on_text_end();
                     return Ok(());
                 }
+                // Another reason may have cut a call short, as max_tokens can.
+                _ if !tool_uses.is_empty() => bail!("the response stopped ({stop_reason}) while it made tool calls; they were not run"),
                 // Something arrived while the model was answering: it
                 // carries on with that rather than end the turn.
                 _ if self.inbox.wants_turn() => continue,
@@ -883,6 +888,30 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("has a secret"), "{error}");
         assert!(agent.messages().is_empty());
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_calls_run_when_a_gateway_gives_no_stop_reason_for_them() {
+        for stop in ["", "end_turn", "stop_sequence"] {
+            let call = json!({"type": "tool_use", "id": "t1", "name": "nothing", "input": {}});
+            let (client, mut requests) = compact::tests::gateway(move |n| match n {
+                0 => (vec![call.clone()], stop, 100),
+                _ => (vec![text("done")], "end_turn", 100),
+            })
+            .await;
+            let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
+            let result = agent.run_turn(vec![text("go")], &mut Notices::default()).await;
+            if stop == "stop_sequence" {
+                assert!(result.unwrap_err().to_string().contains("were not run"));
+                assert!(agent.messages.is_empty(), "no call is left without a result");
+                continue;
+            }
+            result.unwrap();
+            assert_eq!(agent.messages.last().unwrap().content, vec![text("done")], "{stop:?}");
+            let _ = requests.recv().await;
+            let second = requests.recv().await.unwrap();
+            assert_eq!(second["messages"][2]["content"][0]["tool_use_id"], "t1", "the call's result was sent");
+        }
     }
 
     #[tokio::test]

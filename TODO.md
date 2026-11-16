@@ -204,8 +204,7 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] A plugin hook's failure message embeds the command label expanded with sensitive `userConfig`; with
   `onFailure: "block"` it reaches the model (hooks.rs:845, 468).
 - [ ] Spilled output in `$TMPDIR/harness-<uid>/tool-output/` is never removed.
-- [ ] A response with `tool_use` blocks but no `stop_reason` ends the turn and leaves the calls unanswered
-  (agent/mod.rs:642, 677). Repairs look at `tool_use` only, not `server_tool_use`.
+- [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
 - [ ] One unrelated 400/422 turns tool search off for the rest of the run (`NO_TOOL_SEARCH`), and the advisor for
   that pairing (`NO_ADVISOR`, matched on "advisor" in the text).
 - [ ] Messages typed during a turn ride on tool-result user messages, which compaction does not keep word for word
