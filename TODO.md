@@ -131,3 +131,110 @@ MCP servers with keys the harness does not know.
 - [ ] Plugins in the web UI: the plugin list, and a permission question a skill's command raises (`WebAsker`).
 - [ ] 12 of the 262 plugins with `url` / `git-subdir` sources were installed; npm sources only in the unit test.
 - [ ] `/reload-plugins`, `plugin update`, `autoUpdate` and `plugin configure` with a real plugin.
+
+## Design review of 2026-11-16
+
+The whole design compared with mainstream harnesses (Claude Code, Codex CLI, Gemini CLI, OpenCode, Aider, Cline,
+Cursor). Four read-only passes over the code (loop and LLM layer; tools, sandbox, permissions; extensions and
+subagents; frontends), then a comparison drawn from what those harnesses are remembered to do, not checked against
+their docs: each entry gives that as **mainstream: sure / likely / unsure**. Check the mainstream claim against the
+other harness's docs or source before acting on an entry. All findings here are (read) unless marked.
+
+### Where the harness differs from what mainstream harnesses agree on
+
+- [ ] Nothing contains the model by default: the mode is `bypassPermissions` and the sandbox is off. Claude Code
+  asks for edits and bash unless `--dangerously-skip-permissions`; Codex defaults to a workspace-write sandbox
+  with no network; Gemini CLI and Cline ask per call. (mainstream: likely)
+- [ ] No trust step for a project: the settings refuse project config, yet the project's skills, agents and
+  `AGENTS.md` load without a question and take precedence over `~` and the built-ins (a project `explore.md`
+  replaces the built-in; a project skill's `` !`cmd` `` runs, unsandboxed, when the model loads it; a project
+  agent can declare `permission: write`). Claude Code, Codex, Gemini CLI and Cursor read project config behind a
+  per-directory trust prompt. (mainstream: likely)
+- [ ] An allow rule passes a compound command if any one part matches (`Condition::matches`, hooks.rs:230):
+  `Bash(cargo test:*)` allows `cargo test && <anything>`. Claude Code's rules see shell operators and do not.
+  Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit Claude Code documents too.
+  (mainstream: sure)
+- [ ] The terminal approval shows only the first line of a bash command (`call_label`, cli/calls.rs:45); Claude
+  Code and Codex show the whole command. The web asker was not checked. (mainstream: likely)
+- [ ] Sessions are rewritten whole only at the end of a turn (a crash loses the turn), compaction overwrites the
+  history before it, and subagent transcripts are not kept (`agent_transcript_path` is null). Claude Code and
+  Codex append per message; Claude Code keeps the pre-compaction history behind a boundary record and saves
+  subagent transcripts. (mainstream: sure)
+- [ ] No budget: no max turns, tokens or cost, nothing caps a Stop hook that keeps blocking, and agents'
+  `maxTurns` is ignored (see Plugins → Agents). Claude Code has `--max-turns` and agent `maxTurns`; Gemini CLI
+  `maxSessionTurns` and loop detection; OpenCode doom-loop detection and agent `steps`. (mainstream: likely)
+- [ ] `AGENTS.md` is read from the working directory only; `CLAUDE.md` never. Claude Code walks up from the cwd;
+  Codex concatenates from the git root down to the cwd; Gemini CLI and OpenCode walk up too, OpenCode falling back
+  to `CLAUDE.md`. The lazy subdirectory notes already match. (mainstream: sure)
+- [ ] No two-way programmatic interface: headless is one prompt in, events out (`--output-format stream-json`),
+  any call that would ask is refused, no subagent progress; no library target. Claude Code has stream-json input
+  and output with a control protocol for approvals and an SDK; Codex `exec --json`, app-server and an SDK;
+  OpenCode a client/server split; ACP for editors. They put the core behind one event protocol, where the harness
+  has four channels (`Observer`, `Asker`, `Reporter`, `Inbox`). (mainstream: likely)
+- [ ] Missing tools: web fetch/search and a todo/plan tool (`todo_write` is commented out, tools/mod.rs:177).
+  Nearly every mainstream harness has both. The built-in `explore` has no `read` (only `grep`/`glob`); Claude
+  Code's Explore has Read and read-only Bash. (mainstream: sure)
+- [ ] One level of context management (a full summary). Claude Code (microcompact), OpenCode (prune) and the
+  Anthropic API (context editing) clear old tool results before summarizing. (mainstream: likely)
+- [ ] Worktree subagents do not run in parallel: the `Scheduler` is process-global and `Workspace` is not keyed
+  by directory, so they serialize with each other, with the main agent and with every web task (all default bash
+  calls, `git status` too). Worktrees leak on error paths before the run (subagent/mod.rs:553-631) and on stop,
+  `/clear`, eviction and exit (no `Drop`; `settle` only on completion, running git under a std mutex). Claude
+  Code and Cursor use worktrees for parallel agents and remove unchanged ones. (mainstream: likely)
+- [ ] Engineering: Unix only (no `cfg(windows)`), no logging/tracing, no CI, no integration tests (web: 6 unit
+  tests, no router/auth test), unknown flags run as a one-shot prompt (`session::parse_args`). Codex and Claude
+  Code run on Windows, log or export OTel, and reject unknown flags. (mainstream: likely)
+- [ ] Smaller: no OpenAI `prompt_cache_key` (Codex sends one); retry backoff without jitter. (mainstream: likely)
+
+### To check: what mainstream harnesses do here is not known
+
+- [ ] Allow rules, session rules and a hook's `allow` are checked before the mode, so they override plan mode.
+- [ ] A PreToolUse hook's `allow` skips the ask rules (Claude Code is thought to still apply them).
+- [ ] Interrupting a batch reports calls that already finished, side effects done, as interrupted
+  (agent/mod.rs:611); partly streamed text is not kept.
+- [ ] Manual and idle compaction remove every `/rewind` point (`history.rebase(None, 1)`, compact.rs:231).
+- [ ] Calls inside a `code` script never enter history or reach the Observer (no diff shown). Keeping them out
+  of context is the point of programmatic tool calling; whether others show them to the user is not known.
+- [ ] Secrets in the user's shell rc files reach `bash` (only the harness's own credentials are hidden).
+
+### Found on the way (not a comparison)
+
+- [ ] `POST /api/tools/{name}` calls `tool.run` with no normalization, hooks, permissions, checkpoint or
+  task-local scopes (web/mod.rs:421).
+- [ ] A plugin hook's failure message embeds the command label expanded with sensitive `userConfig`; with
+  `onFailure: "block"` it reaches the model (hooks.rs:845, 468).
+- [ ] Spilled output in `$TMPDIR/harness-<uid>/tool-output/` is never removed.
+- [ ] A response with `tool_use` blocks but no `stop_reason` ends the turn and leaves the calls unanswered
+  (agent/mod.rs:642, 677). Repairs look at `tool_use` only, not `server_tool_use`.
+- [ ] One unrelated 400/422 turns tool search off for the rest of the run (`NO_TOOL_SEARCH`), and the advisor for
+  that pairing (`NO_ADVISOR`, matched on "advisor" in the text).
+- [ ] Messages typed during a turn ride on tool-result user messages, which compaction does not keep word for word
+  (`kept_user_messages`, compact.rs:426); `<hook-feedback>` / `<permission-mode>` are kept as if typed.
+- [ ] Hooks, the hook input's `cwd`, path `if` checks and `lsp` use `current_dir()`, not `workdir::get()`, so a
+  worktree subagent's hooks see the main checkout (hooks.rs:238, 822, 989; lsp.rs:212, 513).
+- [ ] The scheduler's file keys canonicalize the raw path before `workdir::resolve` (scheduling.rs:154).
+- [ ] `FileTracker` keys are not normalized (`..`, symlinks), staleness is mtime only, and a partial read counts
+  as a full one for `write`. `edit`/`write` are not atomic (no temp file and rename).
+- [ ] `glob` makes ugrep read every file's contents just to list names (glob.rs:20).
+- [ ] Nothing in the system prompt says when to consult the advisor; `tool_search` gets no guidance line.
+- [ ] The date in the system prompt goes stale in long-lived web tasks; no git branch or status in it.
+- [ ] Not verified: whether the Seatbelt profile (`allow default`) lets commands reach launchd services
+  (`open`, `osascript`).
+- [ ] CLAUDE.md disagrees with the code: the 1-hour cache TTL is off by default for every provider
+  (config.rs:578); there is a third built-in subagent, `fork`; the web does not turn every Observer callback into
+  an event (`on_usage`, `on_request_start` are skipped).
+
+### Already in line with mainstream harnesses (for reference)
+
+The system prompt fixed per conversation; compaction keeping the user's words, a summary and recent files
+(Codex, Claude Code); OpenAI `store: false` with encrypted reasoning (Codex); deferring MCP tools past 10% of the
+window (Claude Code); subagents that cannot spawn subagents and return only their final text; input typed during
+a turn delivered at the next tool boundary; read-before-write by mtime; a fresh process per command with a shell
+environment snapshot; an inline viewport rather than the alternate screen.
+
+Where mainstream harnesses disagree, the harness sides with one of them: exact-string `edit` (Claude Code; Codex
+uses patches, Aider/Cline search/replace, OpenCode fuzzy matching); `/rewind` tracking only `edit`/`write`
+(Claude Code; Cline, Gemini CLI and OpenCode snapshot with a shadow git); MCP tools only, no resources, prompts,
+`list_changed` or elicitation (like Codex; Claude Code has them — OAuth is under Plugins → MCP servers); Seatbelt
+and bwrap with file rules like Claude Code's and an on/off network like Codex's, without Claude Code's seccomp on
+Linux; hardcoded model tables (Codex; OpenCode and Aider use external metadata).
