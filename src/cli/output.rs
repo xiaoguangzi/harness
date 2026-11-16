@@ -221,7 +221,7 @@ impl Output {
             for block in &message.content {
                 match block["type"].as_str() {
                     Some("tool_use") => { state.transcript.push(Entry::Tool(index)); index += 1; }
-                    Some("text") if crate::agent::is_timestamp(block) => {}
+                    Some("text") if crate::agent::is_added(block) => {}
                     Some("text" | "thinking") => {
                         let thinking = block["type"] == "thinking";
                         let content = block[if thinking { "thinking" } else { "text" }].as_str().unwrap_or("");

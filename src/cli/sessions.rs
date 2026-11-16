@@ -151,7 +151,7 @@ fn replay(out: &Output, messages: &[Message]) {
             continue;
         }
         if m.role == "user" {
-            let prompt = m.content.iter().rev().filter(|b| b["type"] == "text" && !crate::agent::is_timestamp(b)).filter_map(|b| b["text"].as_str()).find(|t| *t != INTERRUPTED);
+            let prompt = m.content.iter().rev().filter(|b| b["type"] == "text" && !crate::agent::is_added(b)).filter_map(|b| b["text"].as_str()).find(|t| *t != INTERRUPTED);
             if let Some(prompt) = prompt.filter(|_| !m.content.iter().any(|b| b["type"] == "tool_result")) {
                 gap(&mut tools);
                 let lines: Vec<&str> = prompt.lines().collect();

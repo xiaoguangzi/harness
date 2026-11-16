@@ -39,6 +39,8 @@ const PLAN_OFF: &str = "<permission-mode>Plan mode is off: you may change things
 the user approved.</permission-mode>";
 /// Starts the block that tells the model when the user sent a message.
 pub const TIMESTAMP_START: &str = "<timestamp>";
+/// How the snapshot of the git repository a session starts with begins.
+pub const GIT_STATUS_START: &str = "<git-status>";
 /// Comes before a `/btw` question.
 const SIDE_QUESTION: &str = "A side question from the user, about the conversation so far. Answer it briefly from what \
 you already know, without calling any tools; neither the question nor your answer is kept in the conversation, so \
@@ -137,6 +139,10 @@ pub struct Agent {
     /// Whether SessionStart hooks ran for this conversation, so SessionEnd
     /// hooks run when it ends.
     in_session: bool,
+    /// Whether a session's first request carries a snapshot of the git
+    /// repository (`prompt::git_status`): the frontends' conversations, not
+    /// subagents.
+    git_status: bool,
     /// Compacts as if the context window were at most this big.
     compact_window: Option<u64>,
     /// Which tool calls run, ask or are refused; shared with the subagents.
@@ -193,6 +199,7 @@ impl Agent {
             hooks,
             session_start: Some("startup"),
             in_session: false,
+            git_status: false,
             compact_window: None,
             permissions,
             told_mode: None,
@@ -572,6 +579,15 @@ impl Agent {
     /// add goes with it.
     async fn session_hooks(&mut self, observer: &mut dyn Observer) {
         let Some(source) = self.session_start.take() else { return };
+        // In the first user message, not the system prompt, whose cached
+        // prefix other conversations in the project share.
+        if self.git_status
+            && matches!(source, "startup" | "clear")
+            && let Some(status) = crate::prompt::git_status(&crate::tools::workdir::get()).await
+            && let Some(last) = self.messages.last_mut().filter(|m| m.role == "user")
+        {
+            last.content.insert(0, json!({"type": "text", "text": status}));
+        }
         let (event, outcome) = if self.hooks.is_subagent() {
             if source != "startup" {
                 return;
@@ -594,6 +610,11 @@ impl Agent {
             Some(last) if last.role == "user" => last.content.extend(added),
             _ => self.messages.push(Message::user(added)),
         }
+    }
+
+    /// Has a session's first request carry a snapshot of the git repository.
+    pub fn set_git_status(&mut self, on: bool) {
+        self.git_status = on;
     }
 
     /// Runs the SessionEnd hooks for `reason` if this conversation started a
@@ -775,6 +796,12 @@ impl Agent {
 /// Whether `block` is the time [`Agent`] noted for a user's message.
 pub fn is_timestamp(block: &Value) -> bool {
     block["type"] == "text" && block["text"].as_str().is_some_and(|t| t.starts_with(TIMESTAMP_START))
+}
+
+/// Whether `block` is what [`Agent`] adds to a user's message on its own:
+/// the time, or the git snapshot a session starts with.
+pub fn is_added(block: &Value) -> bool {
+    is_timestamp(block) || (block["type"] == "text" && block["text"].as_str().is_some_and(|t| t.starts_with(GIT_STATUS_START)))
 }
 
 /// The prompt in a user message's `content`: its last text block.
@@ -1017,6 +1044,28 @@ pub(crate) mod tests {
         let content = result["content"].as_str().unwrap();
         assert!(content.contains("1\tone") && !content.contains("two"), "{content}");
         assert!(second["messages"][1]["content"][0]["input"]["file_path"].is_string(), "the history keeps the call as made");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_session_starts_with_a_snapshot_of_the_repository() {
+        let _guard = crate::util::lock_cwd();
+        let (client, mut requests) = compact::tests::gateway(|_| (vec![text("ok")], "end_turn", 100)).await;
+        let mut agent = Agent::new(client, ToolRegistry::new(), "sys");
+        agent.set_git_status(true);
+        agent.run_turn(vec![text("hi")], &mut Notices::default()).await.unwrap();
+        let first = requests.recv().await.unwrap();
+        let blocks = first["messages"][0]["content"].as_array().unwrap().clone();
+        assert!(is_added(&blocks[0]) && blocks[0]["text"].as_str().unwrap().contains("Current branch:"), "{blocks:?}");
+        assert_eq!(blocks.last().unwrap()["text"], "hi");
+        agent.run_turn(vec![text("again")], &mut Notices::default()).await.unwrap();
+        let second = requests.recv().await.unwrap();
+        let later = &second["messages"][2]["content"];
+        assert!(!later.as_array().unwrap().iter().any(|b| b["text"].as_str().is_some_and(|t| t.starts_with(GIT_STATUS_START))), "{later}");
+        agent.clear();
+        agent.run_turn(vec![text("fresh")], &mut Notices::default()).await.unwrap();
+        let cleared = requests.recv().await.unwrap();
+        assert!(is_added(&cleared["messages"][0]["content"][0]), "a cleared conversation starts a session too");
     }
 
     #[tokio::test]

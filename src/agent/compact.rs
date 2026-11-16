@@ -405,7 +405,7 @@ fn latest_todos(history: &[Message]) -> Option<String> {
 /// attachments, reports from subagents and background commands, hooks'
 /// feedback, and what the harness adds. A compaction tells the model about
 /// the deferred tools anew.
-const NOT_TYPED: [&str; 13] = [
+const NOT_TYPED: [&str; 14] = [
     "<file ",
     "<directory ",
     "<subagent-notification>",
@@ -419,6 +419,7 @@ const NOT_TYPED: [&str; 13] = [
     TOOLS_PREFIX,
     super::deferred::NOTICE_START,
     super::TIMESTAMP_START,
+    super::GIT_STATUS_START,
 ];
 
 /// The text of the user's own messages, oldest first, as much as fits in

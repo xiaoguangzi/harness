@@ -545,6 +545,8 @@ Hooks 在 agent 循环的特定时机运行你自己的命令：拦截危险命�
 
 不会查找其他文件（`CLAUDE.md`、上级目录中的文件）。
 
+在 git 仓库中，会话的第一条消息（REPL 的第一个会话、`/clear` 之后、每个新的 web 任务；子代理不带）还会像 Claude Code 一样附上仓库的快照：当前分支、主分支（`origin/HEAD`）、`git status --short`（最多 40 行）和最近 5 个提交，并注明这是会话开始时的状态。它放在消息里而不是系统提示词里，因为系统提示词的缓存前缀要与同一项目的其他会话共享。为此运行的 git 不会占用 index 锁，也不运行 fsmonitor 程序；对话记录和已保存会话的列表里不显示它。
+
 文件在会话开始时读取：REPL 的第一个会话、`/clear` 或 `/resume` 之后，以及每个新的 web 任务。`/init` 让模型根据代码、`README.md` 和写给其他代理的说明（`CLAUDE.md`、`.cursorrules`、`.github/copilot-instructions.md`，这些文件保持不动）编写它，已有时则改进它；`/init <说明>` 指定还要涵盖的内容。一次性模式（`harness /init`）和 web UI 中同样可用。
 
 ## 技能（Skills）

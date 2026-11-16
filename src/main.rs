@@ -168,6 +168,7 @@ async fn main() -> Result<ExitCode> {
     }
     let (registry, system) = env.conversation(&client);
     let mut agent = Agent::new(client, registry, system);
+    agent.set_git_status(true);
     let result = cli::run(&mut agent, args, prompt, &mut env, out).await;
     // The agent's tools hold the MCP connections; release them first.
     drop(agent);

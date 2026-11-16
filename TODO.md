@@ -196,7 +196,8 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] `FileTracker` keys are not normalized (`..`, symlinks), staleness is mtime only, and a partial read counts
   as a full one for `write`. `edit`/`write` are not atomic (no temp file and rename).
 - [ ] Nothing in the system prompt says when to consult the advisor; `tool_search` gets no guidance line.
-- [ ] The date in the system prompt goes stale in long-lived web tasks; no git branch or status in it.
+- [ ] The date in the system prompt goes stale in long-lived web tasks (each prompt carries the time, so the
+  model can tell).
 - [ ] Approvals of MCP and other tools show only `call_label`'s one line of the input (the bash command and a
   `code` script are shown whole). (read)
 - [ ] Not verified: whether the Seatbelt profile (`allow default`) lets commands reach launchd services

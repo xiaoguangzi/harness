@@ -672,7 +672,9 @@ async fn create_task(State(state): State<Shared>, Json(req): Json<NewTask>) -> A
             Some(def) => crate::prompt::subagent(def),
             None => crate::prompt::main(&tools),
         };
-        Agent::new(client, tools, system)
+        let mut agent = Agent::new(client, tools, system);
+        agent.set_git_status(true);
+        agent
     };
     let (work, user) = user_message(&state, prompt, &files).await?;
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);

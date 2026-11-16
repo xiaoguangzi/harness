@@ -544,6 +544,8 @@ If the working directory has an `AGENTS.md`, its contents go into the system pro
 
 No other file (a `CLAUDE.md`, one in a parent directory) is looked for.
 
+In a git repository, the first message of a conversation (the REPL's first one, after `/clear`, each new web task; not a subagent's) also carries a snapshot of it, as Claude Code's does: the branch, the main branch (`origin/HEAD`), `git status --short` (up to 40 lines) and the last 5 commits, marked as taken when the conversation started. It goes in the message rather than the system prompt, whose cached prefix other conversations in the project share. Git runs for it without taking the index lock and without an fsmonitor program; the transcript and saved-session lists leave it out.
+
 The file is read when a conversation starts: the REPL's first one, after `/clear` or `/resume`, and each new web task. `/init` has the model write it, or improve the one there is, from the code, the `README.md` and notes written for other agents (`CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`), which it leaves in place; `/init <notes>` says what else to cover. It also works one-shot (`harness /init`) and in the web UI.
 
 ## Skills

@@ -235,6 +235,51 @@ fn environment() -> String {
     lines.join("\n")
 }
 
+/// Status lines of `git status` shown at most; Claude Code's limit is
+/// counted in characters, this one in lines.
+const GIT_STATUS_LINES: usize = 40;
+
+/// A snapshot of the git repository at `dir` for the start of a
+/// conversation, as Claude Code gives one: the branch, the changed files and
+/// the latest commits. `None` outside a repository, or if git does not
+/// answer within a few seconds. Git takes no index lock for it and runs no
+/// fsmonitor program.
+pub async fn git_status(dir: &Path) -> Option<String> {
+    async fn git(dir: &Path, args: &[&str]) -> Option<String> {
+        let mut command = tokio::process::Command::new("git");
+        command.args(["-c", "core.fsmonitor=false", "--no-pager"]).args(args).current_dir(dir);
+        command.env("GIT_OPTIONAL_LOCKS", "0").stdin(std::process::Stdio::null()).kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(3), command.output()).await.ok()?.ok()?;
+        output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    }
+    let branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+    let (status, log, main) = tokio::join!(
+        git(dir, &["status", "--short"]),
+        git(dir, &["log", "--oneline", "-n", "5"]),
+        git(dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
+    );
+    let status = status.unwrap_or_default();
+    let lines: Vec<&str> = status.lines().collect();
+    let mut shown = lines.iter().take(GIT_STATUS_LINES).copied().collect::<Vec<_>>().join("\n");
+    if lines.len() > GIT_STATUS_LINES {
+        shown.push_str(&format!("\n… and {} more (run `git status` to see them)", lines.len() - GIT_STATUS_LINES));
+    }
+    let mut text = format!(
+        "{}\nThe git status when this conversation started; it does not change as the conversation goes on.\n\n\
+         Current branch: {branch}\n",
+        crate::agent::GIT_STATUS_START
+    );
+    if let Some(main) = main.as_deref().and_then(|m| m.strip_prefix("origin/")) {
+        text.push_str(&format!("Main branch: {main}\n"));
+    }
+    text.push_str(&format!("\nStatus:\n{}\n", if shown.is_empty() { "(clean)" } else { &shown }));
+    if let Some(log) = log.filter(|l| !l.is_empty()) {
+        text.push_str(&format!("\nRecent commits:\n{log}\n"));
+    }
+    text.push_str("</git-status>");
+    Some(text)
+}
+
 /// The section with `dir`'s `AGENTS.md`, empty when there is none (or it is
 /// blank). Past [`NOTES_LIMIT`] it is cut at a line, and the model is told
 /// to read the rest itself.
@@ -444,6 +489,28 @@ mod tests {
         assert_eq!(init(" "), INIT);
         let prompt = init(" focus on the tests ");
         assert!(prompt.starts_with(INIT) && prompt.ends_with("\nAlso: focus on the tests\n"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn snapshots_the_git_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(git_status(dir.path()).await, None, "not a repository");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git").args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).current_dir(dir.path()).output().unwrap().status.success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "trunk"]);
+        std::fs::write(dir.path().join("a"), "a").unwrap();
+        git(&["add", "a"]);
+        git(&["commit", "-qm", "first commit"]);
+        let clean = git_status(dir.path()).await.unwrap();
+        assert!(clean.starts_with("<git-status>") && clean.ends_with("</git-status>"), "{clean}");
+        assert!(clean.contains("Current branch: trunk") && clean.contains("(clean)") && clean.contains("first commit"), "{clean}");
+        for i in 0..45 {
+            std::fs::write(dir.path().join(format!("n{i:02}")), "").unwrap();
+        }
+        let busy = git_status(dir.path()).await.unwrap();
+        assert!(busy.contains("?? n00") && !busy.contains("?? n44") && busy.contains("… and 5 more"), "{busy}");
     }
 
     #[test]
