@@ -183,6 +183,9 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### To check: what mainstream harnesses do here is not known
 
+- [ ] Nothing caps a Stop hook that keeps sending the model back (only `stop_hook_active` tells the hook), and
+  agents' `maxTurns` frontmatter is ignored (see Plugins → Agents). Not covered by the decision against a turn cap;
+  ask before changing.
 - [ ] Allow rules, session rules and a hook's `allow` are checked before the mode, so they override plan mode.
 - [ ] A PreToolUse hook's `allow` skips the ask rules (Claude Code is thought to still apply them).
 - [ ] Interrupting a batch reports calls that already finished, side effects done, as interrupted
@@ -216,14 +219,11 @@ other harness's docs or source before acting on an entry. All findings here are 
   `code` script are shown whole). (read)
 - [ ] Not verified: whether the Seatbelt profile (`allow default`) lets commands reach launchd services
   (`open`, `osascript`).
-- [ ] CLAUDE.md disagrees with the code: the 1-hour cache TTL is off by default for every provider
-  (config.rs:578); there is a third built-in subagent, `fork`; the web does not turn every Observer callback into
-  an event (`on_usage`, `on_request_start` are skipped).
 
 ### Decided against
 
-- No cap on a turn's length (turns, tokens or cost), unlike Claude Code's `--max-turns` or OpenCode's `steps`: on
-  purpose, a turn runs until the model stops.
+- No cap on the number of a turn's rounds, unlike Claude Code's `--max-turns` or OpenCode's `steps`: on purpose,
+  a turn runs until the model stops.
 
 ### Already in line with mainstream harnesses (for reference)
 

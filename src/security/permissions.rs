@@ -514,7 +514,7 @@ fn commands(command: &str) -> Option<Vec<&str>> {
             // `&>`: a redirection.
             b'&' if bytes.get(i + 1) == Some(&b'>') => {}
             // A comment, which may hide a quote or a line's end.
-            b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() || b";&|()".contains(&bytes[i - 1]) => return None,
+            b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() || b";&|()<>".contains(&bytes[i - 1]) => return None,
             c @ (b'&' | b'|' | b';' | b'\n') => {
                 push(&mut parts, &command[start..i], wants_command)?;
                 let doubled = matches!(c, b'&' | b'|') && bytes.get(i + 1) == Some(&c);
@@ -643,6 +643,7 @@ mod tests {
             "cargo test \\<& rm -rf x",
             "cargo test #'\nrm -rf x #'",
             "cargo test # \\\nrm -rf x",
+            "cargo test >#'\nrm -rf x #'",
             "cargo test &&",
             "cargo test | ",
             "",
