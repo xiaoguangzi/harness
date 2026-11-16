@@ -245,7 +245,8 @@ impl Condition {
                 .any(|part| !part.is_empty() && pattern.is_match(part)),
             Some("read" | "edit" | "write" | "grep" | "glob") => {
                 let Some(path) = input["file_path"].as_str().or(input["path"].as_str()) else { return false };
-                let cwd = std::env::current_dir().unwrap_or_default();
+                // A worktree subagent's, for paths in its worktree.
+                let cwd = crate::tools::workdir::get();
                 let relative = std::path::Path::new(path).strip_prefix(&cwd).map(|p| p.display().to_string());
                 pattern.is_match(path) || relative.is_ok_and(|r| pattern.is_match(&r))
             }
@@ -826,7 +827,9 @@ impl Hooks {
             env: handler.env.clone(),
             label: handler.label.clone(),
         };
-        tokio::spawn(async move {
+        // In the working directory of the call that started it.
+        let dir = crate::tools::workdir::current();
+        tokio::spawn(crate::tools::workdir::scope(dir, async move {
             let reply = hooks.call(event, &handler, &input).await;
             let mut outcome = Outcome::default();
             outcome.add(event, &handler, reply);
@@ -849,12 +852,12 @@ impl Hooks {
             for text in texts {
                 inbox.push(feedback(event, &text), wake);
             }
-        });
+        }));
     }
 
     fn input(&self, event: Event, fields: Value, model: &str) -> Value {
         let session = self.session.lock().unwrap();
-        let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
+        let cwd = crate::tools::workdir::get().display().to_string();
         let mut input = json!({
             "session_id": session.id,
             "transcript_path": session.transcript.as_ref().map(|p| p.display().to_string()),
@@ -1021,6 +1024,9 @@ async fn run_command(
         }
     };
     cmd.process_group(0).envs(env.iter().map(|(k, v)| (k, v)));
+    // It starts where the agent works (a worktree subagent's worktree); the
+    // project is where the harness started.
+    cmd.current_dir(crate::tools::workdir::get());
     if let Ok(dir) = std::env::current_dir() {
         cmd.env("CLAUDE_PROJECT_DIR", &dir).env("HARNESS_PROJECT_DIR", &dir);
     }
@@ -1063,6 +1069,23 @@ pub(crate) mod tests {
     /// and deletes, making `sh` complain on stderr.
     pub(crate) fn hooks(config: Value) -> Hooks {
         Hooks::with_config(Arc::new(serde_json::from_value(config).unwrap()))
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn hooks_run_where_the_agent_works() {
+        let _guard = crate::util::lock_cwd();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let h = hooks(json!({"UserPromptSubmit": [{"hooks": [
+            {"type": "command", "command": "pwd -P; python3 -c 'import json,sys; print(json.load(sys.stdin)[\"cwd\"])'"}]}]}));
+        let outcome = crate::tools::workdir::scope(Some(dir.clone()), h.user_prompt_submit("hi", "m")).await;
+        let shown = dir.display().to_string();
+        assert_eq!(outcome.context, [format!("{shown}\n{shown}")], "its process and its input's cwd");
+        let rule = Condition::parse("Edit(src/**)").unwrap();
+        let input = json!({"file_path": dir.join("src/a.rs").display().to_string()});
+        let matches = crate::tools::workdir::sync(Some(dir.clone()), || rule.matches(&tool_names("edit"), &input));
+        assert!(matches, "a path in the worktree, relative to it");
     }
 
     fn command(event: &str, matcher: &str, command: &str) -> Hooks {

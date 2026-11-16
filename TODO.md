@@ -199,8 +199,8 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] `POST /api/tools/{name}` calls `tool.run` with no normalization, hooks, permissions, checkpoint or
   task-local scopes (web/mod.rs:421).
 - [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
-- [ ] Hooks, the hook input's `cwd`, path `if` checks and `lsp` use `current_dir()`, not `workdir::get()`, so a
-  worktree subagent's hooks see the main checkout (hooks.rs:238, 822, 989; lsp.rs:212, 513).
+- [ ] `lsp` starts its servers at, and shows paths relative to, the directory the harness started in, so a worktree
+  subagent's `lsp` looks at the main checkout (lsp.rs:212, 513; the README says so). (read)
 - [ ] The scheduler's file keys canonicalize the raw path before `workdir::resolve` (scheduling.rs:154).
 - [ ] `FileTracker` keys are not normalized (`..`, symlinks), staleness is mtime only, and a partial read counts
   as a full one for `write`. `edit`/`write` are not atomic (no temp file and rename).
