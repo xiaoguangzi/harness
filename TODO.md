@@ -167,8 +167,6 @@ other harness's docs or source before acting on an entry. All findings here are 
   OpenCode a client/server split; ACP for editors. They put the core behind one event protocol, where the harness
   has four channels (`Observer`, `Asker`, `Reporter`, `Inbox`). (mainstream: likely)
 - [ ] Missing tools: web fetch and web search, which nearly every mainstream harness has. (mainstream: sure)
-- [ ] One level of context management (a full summary). Claude Code (microcompact), OpenCode (prune) and the
-  Anthropic API (context editing) clear old tool results before summarizing. (mainstream: likely)
 - [ ] Worktrees are removed when let go of only if unchanged; one a stopped subagent changed is kept without the
   parent being told where. A process killed outright leaves its worktrees, and nothing sweeps them later.
   `settle` runs git while holding the child's std mutex (runtime.rs). (read)
@@ -224,8 +222,11 @@ window (Claude Code); subagents that cannot spawn subagents and return only thei
 a turn delivered at the next tool boundary; read-before-write by mtime; a fresh process per command with a shell
 environment snapshot; an inline viewport rather than the alternate screen.
 
-Where mainstream harnesses disagree, the harness sides with one of them: exact-string `edit` (Claude Code; Codex
-uses patches, Aider/Cline search/replace, OpenCode fuzzy matching); `/rewind` tracking only `edit`/`write`
+Where mainstream harnesses disagree, the harness sides with one of them: compaction to a summary with the user's
+messages and recent files (Codex, Claude Code), where OpenCode keeps about 15k tokens of the latest conversation
+verbatim beside its summary (its docs, checked 2026-11-16: it no longer prunes old tool results first; Claude
+Code's docs describe only the summary; Anthropic's context editing is an API option, not a harness's);
+exact-string `edit` (Claude Code; Codex uses patches, Aider/Cline search/replace, OpenCode fuzzy matching); `/rewind` tracking only `edit`/`write`
 (Claude Code; Cline, Gemini CLI and OpenCode snapshot with a shadow git); MCP tools only, no resources, prompts,
 `list_changed` or elicitation (like Codex; Claude Code has them — OAuth is under Plugins → MCP servers); Seatbelt
 and bwrap with file rules like Claude Code's and an on/off network like Codex's, without Claude Code's seccomp on
