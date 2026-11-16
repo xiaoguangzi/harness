@@ -251,6 +251,17 @@ mod tests {
         assert!(found[2].contains("showing the 2 most recently modified of 3 files"), "{found:?}");
     }
 
+    #[tokio::test]
+    async fn lists_each_file_once_whatever_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, text) in [("empty.txt", ""), ("newline.txt", "\n"), ("text.txt", "x"), ("bin.txt", "\0")] {
+            std::fs::write(dir.path().join(file), text).unwrap();
+        }
+        let mut found = lines(&glob(json!({"pattern": "*.txt", "path": dir.path()})).await, dir.path());
+        found.sort();
+        assert_eq!(found, ["bin.txt", "empty.txt", "newline.txt", "text.txt"]);
+    }
+
     #[test]
     fn expands_braces() {
         assert_eq!(expand_braces("src/*.rs"), ["src/*.rs"]);
