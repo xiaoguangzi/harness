@@ -68,13 +68,46 @@ fn refused(url: &Url, local: bool) -> Option<String> {
     if local {
         return None;
     }
-    let ip = host.trim_matches(['[', ']']).parse::<IpAddr>().ok();
-    let private = match ip {
-        Some(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
-        Some(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00,
-        None => !host.contains('.') || host.ends_with(".localhost") || host.ends_with(".local"),
+    // `localhost.` is `localhost`.
+    let name = host.trim_end_matches('.');
+    let private = match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(ip) => is_local(ip),
+        Err(_) => !name.contains('.') || name.ends_with(".localhost") || name.ends_with(".local"),
     };
     private.then(|| format!("{host} is on this machine or the local network; web_fetch fetches public web pages only."))
+}
+
+/// Whether `ip` is this machine's or the local network's.
+fn is_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, ..] = ip.octets();
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()
+                || a == 0 || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => is_local(IpAddr::V4(v4)),
+            None => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80,
+        },
+    }
+}
+
+/// Why `url`'s host is not fetched once it is looked up: a public name may
+/// point at this machine or the local network. Checked before each request
+/// (a redirect's too); the connection looks the name up again, so a name
+/// that changes its answer in between is not caught.
+async fn resolves_locally(url: &Url) -> Option<String> {
+    let host = url.host_str()?;
+    if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => addrs.map(|a| a.ip()).find(|ip| is_local(*ip)).map(|ip| {
+            format!("{host} points at {ip}, on this machine or the local network; web_fetch fetches public web pages only.")
+        }),
+        Err(e) => Some(format!("{host} could not be looked up: {e}")),
+    }
 }
 
 /// Whether a redirect from `from` to `to` stays on the site: the same host,
@@ -149,16 +182,22 @@ impl Tool for WebFetchTool {
             Ok(url) => url,
             Err(e) => return ToolOutput::error(format!("Not a URL: {e}")),
         };
-        if url.scheme() == "http" && !self.local {
-            let _ = url.set_scheme("https");
-        }
         let client = match self.client() {
             Ok(client) => client,
             Err(e) => return ToolOutput::error(format!("Could not set up the HTTP client: {e}")),
         };
         let mut redirects = 0;
         let response = loop {
+            // A redirect's too.
+            if url.scheme() == "http" && !self.local {
+                let _ = url.set_scheme("https");
+            }
             if let Some(reason) = refused(&url, self.local) {
+                return ToolOutput::error(reason);
+            }
+            if !self.local
+                && let Some(reason) = resolves_locally(&url).await
+            {
                 return ToolOutput::error(reason);
             }
             let request = client.get(url.clone()).header("accept", "text/html, text/markdown, text/plain, */*;q=0.5");
@@ -266,10 +305,23 @@ mod tests {
     #[test]
     fn fetches_public_pages_only() {
         let refused = |url: &str| refused(&Url::parse(url).unwrap(), false);
-        for local in ["http://localhost:8080/", "http://127.0.0.1/", "http://10.0.0.1/", "http://192.168.1.1/", "http://[::1]/", "http://intranet/", "http://printer.local/"] {
+        for local in [
+            "http://localhost:8080/",
+            "http://localhost./",
+            "http://127.0.0.1/",
+            "http://10.0.0.1/",
+            "http://192.168.1.1/",
+            "http://100.100.1.1/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[fe80::1]/",
+            "http://intranet/",
+            "http://printer.local/",
+        ] {
             assert!(refused(local).is_some(), "{local}");
         }
         assert!(refused("https://docs.rs/serde").is_none());
+        assert!(refused("https://8.8.8.8/").is_none());
         assert!(refused("ftp://example.com/").unwrap().contains("Only http"));
         assert!(same_site(&Url::parse("https://example.com/a").unwrap(), &Url::parse("https://www.example.com/b").unwrap()));
         assert!(!same_site(&Url::parse("https://example.com/").unwrap(), &Url::parse("https://evil.com/").unwrap()));

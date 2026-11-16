@@ -240,6 +240,14 @@ fn environment() -> String {
     lines.join("\n")
 }
 
+static GIT_STATUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether conversations start with a snapshot of the git repository
+/// (`"git_status": false` in the settings turns it off).
+pub fn set_git_status(on: bool) {
+    GIT_STATUS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Status lines of `git status` shown at most; Claude Code's limit is
 /// counted in characters, this one in lines.
 const GIT_STATUS_LINES: usize = 40;
@@ -250,6 +258,9 @@ const GIT_STATUS_LINES: usize = 40;
 /// answer within a few seconds. Git takes no index lock for it and runs no
 /// fsmonitor program.
 pub async fn git_status(dir: &Path) -> Option<String> {
+    if !GIT_STATUS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     async fn git(dir: &Path, args: &[&str]) -> Option<String> {
         let mut command = tokio::process::Command::new("git");
         command.args(["-c", "core.fsmonitor=false", "--no-pager"]).args(args).current_dir(dir);

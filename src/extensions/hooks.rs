@@ -286,7 +286,8 @@ impl Condition {
 
 /// The host a URL names, lowercase.
 pub(crate) fn url_host(url: &str) -> Option<String> {
-    reqwest::Url::parse(url.trim()).ok()?.host_str().map(str::to_ascii_lowercase)
+    // `evil.com.` is `evil.com`.
+    reqwest::Url::parse(url.trim()).ok()?.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase())
 }
 
 /// `path` with `.` and `dir/..` taken out, without looking at the disk.

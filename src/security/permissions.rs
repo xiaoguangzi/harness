@@ -855,6 +855,7 @@ mod tests {
         assert_eq!(decide("https://api.GitHub.com/repos"), Decision::Allow, "hosts are matched in lowercase");
         assert!(matches!(decide("https://example.com/"), Decision::Ask(_)), "it can send data out, so it asks");
         assert!(matches!(decide("https://evil.com/x"), Decision::Deny(_)));
+        assert!(matches!(decide("https://EVIL.com./x"), Decision::Deny(_)), "the same host");
         assert_eq!(p.suggestions("web_fetch", &json!({"url": "https://example.com/a"})), ["WebFetch(domain:example.com)"]);
         p.set_mode(Mode::Plan);
         assert!(matches!(decide("https://example.com/"), Decision::Ask(_)), "plan mode asks rather than refuse research");

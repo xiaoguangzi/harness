@@ -55,6 +55,8 @@ pub struct Settings {
     /// Give the model the `code` tool, JavaScript that calls its other
     /// tools. Default: off.
     pub code_mode: Option<bool>,
+    /// Start a conversation with a snapshot of the git repository. Default: on.
+    pub git_status: Option<bool>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default, rename = "mcpServers")]

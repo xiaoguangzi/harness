@@ -188,6 +188,12 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### Found on the way (not a comparison)
 
+- [ ] The sandbox keeps `.git/hooks/` and `.git/config` read-only but not `.git/commondir` or a worktree's
+  `.git/worktrees/<id>/commondir`, through which a sandboxed command could point git at a config of its making;
+  git the harness or the user runs later would read it. Worktree settling checks the worktree's `.git` link, not
+  its `commondir`. (read)
+- [ ] `web_fetch` decodes pages as UTF-8, so a page in another charset (GBK, Shift_JIS) comes out garbled. (read)
+
 - [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
 - [ ] `lsp` starts its servers at, and shows paths relative to, the directory the harness started in, so a worktree
   subagent's `lsp` looks at the main checkout (lsp.rs:212, 513; the README says so). (read)

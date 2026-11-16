@@ -39,7 +39,7 @@ const PLAN_OFF: &str = "<permission-mode>Plan mode is off: you may change things
 the user approved.</permission-mode>";
 /// Tells the model it can consult the advisor, and when: the guidance
 /// Anthropic's advisor tool docs give for coding work, where models left to
-/// the tool's own description call it too seldom.
+/// the tool's own description call it too seldom (see [`advisor_guidance`]).
 pub const ADVISOR_START: &str = "<advisor>";
 const ADVISOR_ON: &str = "<advisor>You have access to an `advisor` tool backed by a stronger reviewer model. It takes \
 no parameters: when you call it, your entire conversation history is forwarded, so it sees the task, every tool call \
@@ -56,7 +56,44 @@ short reactive tasks where the next action follows from the output you just read
 Give the advice serious weight. If you follow a step and it fails empirically, or you have primary-source evidence \
 that contradicts a specific claim, adapt. If what you found points one way and the advisor another, don't silently \
 switch: surface the conflict in one more advisor call.</advisor>";
+/// The docs' block for Haiku on coding work, in place of [`ADVISOR_ON`]:
+/// it applies the default guidance too conservatively there.
+const ADVISOR_HAIKU: &str = "<advisor>You have access to an `advisor` tool backed by a stronger reviewer model. It takes \
+no parameters: when you call it, your entire conversation history is forwarded, so it sees the task, every tool call \
+you've made and every result you've seen.
+
+Call the advisor before substantive work: before writing, before committing to an interpretation, before building on \
+an assumption. If the task needs orientation first (finding files, seeing what's there), do that, then call it. \
+Orientation is not substantive work; writing, editing and declaring an answer are. Also call it when you believe the \
+task is complete (make your deliverable durable first), when stuck, and when considering a change of approach.
+
+Give the advice serious weight. If you follow a step and it fails empirically, or you have primary-source evidence \
+that contradicts a specific claim, adapt. If what you found points one way and the advisor another, don't silently \
+switch: surface the conflict in one more advisor call.
+
+Call the advisor for design, architecture and risk questions where you won't touch a file. If your response would be \
+analysis or a recommendation with no other tool calls, call it first.
+
+Hard rule: your first edit, write or state-changing bash call on a task must be preceded by an advisor call in the \
+same or an earlier turn. Read-only orientation commands (ls, cat, grep, find) are not state-changing. This is a \
+checkpoint, not a difficulty judgment. It applies to one-line edits too.</advisor>";
 const ADVISOR_OFF: &str = "<advisor>The advisor is off now: the `advisor` tool is no longer available.</advisor>";
+
+/// What the model `spec` is told when it has the advisor, as Anthropic's
+/// advisor docs suggest for coding work: Sonnet the suggested blocks, Haiku
+/// its own; Opus calls it at a fitting rate without them (the docs advise
+/// against adding any by default), and Fable, which only Fable advises,
+/// is taken to as well.
+fn advisor_guidance(spec: &str) -> Option<&'static str> {
+    let model = spec.rsplit('/').next().unwrap_or(spec).to_ascii_lowercase();
+    if model.contains("haiku") {
+        Some(ADVISOR_HAIKU)
+    } else if ["opus", "fable", "mythos"].iter().any(|m| model.contains(m)) {
+        None
+    } else {
+        Some(ADVISOR_ON)
+    }
+}
 /// Starts the block that tells the model when the user sent a message.
 pub const TIMESTAMP_START: &str = "<timestamp>";
 /// How the snapshot of the git repository a session starts with begins.
@@ -169,8 +206,9 @@ pub struct Agent {
     permissions: Arc<Permissions>,
     /// The permission mode the model was last told about, if any.
     told_mode: Option<Mode>,
-    /// Whether the model was last told it has the advisor, if it was told.
-    told_advisor: Option<bool>,
+    /// What the model was last told about the advisor: the guidance for
+    /// it, or nothing (or that it is off); `None` before it was told.
+    told_advisor: Option<Option<&'static str>>,
     /// Whether this conversation defers tools behind `tool_search`, once
     /// decided (see `deferred`).
     tool_search: Option<bool>,
@@ -273,14 +311,16 @@ impl Agent {
     /// was for the prompt cache. Subagents go by the tool's description.
     fn tell_advisor(&mut self) {
         let on = matches!(self.client.advisor_state(), crate::llm::AdvisorState::On(_));
-        let was = self.told_advisor.replace(on);
-        if was == Some(on) || self.hooks.is_subagent() {
+        let guidance = on.then(|| advisor_guidance(self.client.spec())).flatten();
+        let was = self.told_advisor.replace(guidance);
+        if was == Some(guidance) || self.hooks.is_subagent() {
             return;
         }
-        if on {
-            self.inbox.push(ADVISOR_ON.to_string(), false);
-        } else if was == Some(true) {
-            self.inbox.push(ADVISOR_OFF.to_string(), false);
+        match guidance {
+            Some(text) => self.inbox.push(text.to_string(), false),
+            // Told how to use it, and it is gone.
+            None if !on && matches!(was, Some(Some(_))) => self.inbox.push(ADVISOR_OFF.to_string(), false),
+            None => {}
         }
     }
 
@@ -567,12 +607,14 @@ impl Agent {
         if !content.is_empty() && !self.hooks.is_subagent() {
             self.prompt_hooks(&typed, &mut content, observer).await?;
         }
-        self.tell_mode();
-        self.tell_advisor();
-        let arrived = self.inbox.take();
+        let mut arrived = self.inbox.take();
         if content.is_empty() && arrived.is_empty() {
             return Ok(());
         }
+        // Only for a turn that runs: what they push would start one.
+        self.tell_mode();
+        self.tell_advisor();
+        arrived.extend(self.inbox.take());
         let session_start = self.session_start;
         if let Some(prompt) = prompt.filter(|_| self.checkpoints) {
             self.history.begin(self.messages.len(), prompt);
@@ -1113,30 +1155,42 @@ pub(crate) mod tests {
         agent.set_client(client.without_advisor());
         agent.run_turn(vec![text("three")], &mut Notices::default()).await.unwrap();
         assert_eq!(told(&requests.recv().await.unwrap(), 4), [ADVISOR_OFF]);
-        agent.set_client(client);
+        agent.set_client(client.clone());
         agent.clear();
+        agent.run_turn(vec![], &mut Notices::default()).await.unwrap();
+        assert!(requests.try_recv().is_err(), "a wake with nothing for the model sends nothing");
         agent.run_turn(vec![text("four")], &mut Notices::default()).await.unwrap();
         assert_eq!(told(&requests.recv().await.unwrap(), 0), [ADVISOR_ON], "a new conversation is told again");
+        // Opus calls it well enough on its own; Haiku gets the docs' block of its own.
+        agent.set_client(client.switch("mock/claude-opus-5-5").unwrap());
+        agent.run_turn(vec![text("five")], &mut Notices::default()).await.unwrap();
+        assert!(told(&requests.recv().await.unwrap(), 2).is_empty(), "nothing for Opus, and not that it is off");
+        agent.set_client(client.switch("mock/claude-haiku-4-5").unwrap());
+        agent.run_turn(vec![text("six")], &mut Notices::default()).await.unwrap();
+        assert_eq!(told(&requests.recv().await.unwrap(), 4), [ADVISOR_HAIKU]);
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn a_session_starts_with_a_snapshot_of_the_repository() {
-        let _guard = crate::util::lock_cwd();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(repo.path()).output().unwrap();
+        git(&["init", "-q", "-b", "work"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "start"]);
         let (client, mut requests) = compact::tests::gateway(|_| (vec![text("ok")], "end_turn", 100)).await;
         let mut agent = Agent::new(client, ToolRegistry::new(), "sys");
         agent.set_git_status(true);
-        agent.run_turn(vec![text("hi")], &mut Notices::default()).await.unwrap();
+        let dir = Some(repo.path().to_path_buf());
+        crate::tools::workdir::scope(dir.clone(), agent.run_turn(vec![text("hi")], &mut Notices::default())).await.unwrap();
         let first = requests.recv().await.unwrap();
         let blocks = first["messages"][0]["content"].as_array().unwrap().clone();
-        assert!(is_added(&blocks[0]) && blocks[0]["text"].as_str().unwrap().contains("Current branch:"), "{blocks:?}");
+        assert!(is_added(&blocks[0]) && blocks[0]["text"].as_str().unwrap().contains("Current branch: work"), "{blocks:?}");
         assert_eq!(blocks.last().unwrap()["text"], "hi");
-        agent.run_turn(vec![text("again")], &mut Notices::default()).await.unwrap();
+        crate::tools::workdir::scope(dir.clone(), agent.run_turn(vec![text("again")], &mut Notices::default())).await.unwrap();
         let second = requests.recv().await.unwrap();
         let later = &second["messages"][2]["content"];
         assert!(!later.as_array().unwrap().iter().any(|b| b["text"].as_str().is_some_and(|t| t.starts_with(GIT_STATUS_START))), "{later}");
         agent.clear();
-        agent.run_turn(vec![text("fresh")], &mut Notices::default()).await.unwrap();
+        crate::tools::workdir::scope(dir, agent.run_turn(vec![text("fresh")], &mut Notices::default())).await.unwrap();
         let cleared = requests.recv().await.unwrap();
         assert!(is_added(&cleared["messages"][0]["content"][0]), "a cleared conversation starts a session too");
     }

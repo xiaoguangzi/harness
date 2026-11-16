@@ -81,6 +81,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `model`、`subagent_model`、`effort`、`max_tokens`、`context_window`、`providers` | 模型和 [LLM 网关](#llm-网关) |
 | `advisor_model` | 主模型咨询的[顾问](#顾问advisor) |
 | `idle_compaction`、`idle_compaction_min_tokens` | [空闲压缩](#上下文压缩) |
+| `git_status` | 设为 `false` 时，会话开头不带 [git 快照](#项目说明) |
 | `code_mode` | `code` 工具：[Code mode](#code-mode) |
 | `mcpServers` | [MCP 服务器](#mcp-服务器) |
 | `sandbox` | [沙箱](#沙箱) |
@@ -210,7 +211,7 @@ harness --advisor opus                  # 仅本次运行
 ```
 
 - **设置**：配置中的 `advisor_model`、`$HARNESS_ADVISOR_MODEL`，或只对本次运行生效的 `--advisor MODEL`（优先级最高）；`off` 表示关闭。`/advisor` 打开选择面板；`/advisor <model>` 和 `/advisor off` 设置本会话的顾问，并保存为配置中的 `advisor_model`。别名有 `fable`（`claude-fable-5-2`）、`opus`（`claude-opus-5-5`）、`sonnet`（`claude-sonnet-5-5`）和 `haiku`（`claude-haiku-5-5`）；也可以写任意模型 ID，按原样发送。单独输入 `/advisor` 会显示当前顾问以及是否生效；`/model` 和启动横幅也会显示。
-- **何时调用**：只靠工具自带的描述，模型在编码任务中调用顾问偏少，所以按 Anthropic advisor 文档的建议，会告诉主模型何时咨询（摸清情况后、动手做实质工作之前，卡住或想换思路时，宣布任务完成之前）并认真对待建议。这段话在顾问开始生效时放进下一条消息，而不是系统提示词（系统提示词为提示词缓存保持不变）；顾问不再生效时（`/advisor off`、换成它无法咨询的模型）也会告诉模型，`/clear` 或压缩之后会重新告知。子代理只依据工具自带的描述。
+- **何时调用**：只靠工具自带的描述，模型在编码任务中调用顾问偏少，所以按 Anthropic advisor 文档的建议，主模型是 Sonnet 时会告诉它何时咨询（摸清情况后、动手做实质工作之前，卡住或想换思路时，宣布任务完成之前）并认真对待建议；是 Haiku 时用文档为它准备的更严格的一段（第一次改动之前必须先咨询）；是 Opus 或 Fable 时什么都不加，因为文档发现 Opus 自己就会以合适的频率调用，并建议不要默认添加指引。这段话在顾问开始生效时放进下一条消息，而不是系统提示词（系统提示词为提示词缓存保持不变）；顾问不再生效时（`/advisor off`、换成它无法咨询的模型）也会告诉模型，`/clear` 或压缩之后会重新告知。子代理只依据工具自带的描述。
 - **搭配**：与 API 的检查一致，顾问必须不弱于被咨询的模型：Opus 5 / 5.5 接受 Fable 或 Opus 5 / 5.5 作顾问，Sonnet 5.5 接受 Fable、Opus 5 / 5.5 或 Sonnet 5.5，Fable 5.2 只接受 Fable 5.2，Haiku 4.5 可以被咨询但不能当顾问。不符合的搭配或 harness 不认识的模型不会带上顾问，`/advisor` 会说明原因。子代理继承顾问，并按自己的模型检查搭配。
 - **适用范围**：仅 Anthropic provider，`api.anthropic.com` 默认开启。能把请求原样转发给 Anthropic API 的网关需要在 provider 上设置 `"advisor": true`。如果 API 拒绝顾问（HTTP 400 且错误提到 advisor），请求会去掉顾问重发并给出警告；重发成功的话，本次运行中该模型之后的请求也不再带它。
 - **会话中的显示**：顾问阅读期间状态栏显示 `Advising (model)…`（响应在此期间暂停），之后显示 `● advisor(model)` 和 `⎿ Advisor reviewed the conversation`；咨询失败时显示 `Advisor unavailable (<error_code>)`，模型不带建议继续。较新的顾问模型返回加密的建议，只有主模型能读；明文建议（较早的顾问模型）显示在调用下方和 Ctrl+O 中。`stream-json` 会输出 `advisor`、`advisor_result` 和 `advisor_refused` 事件，Web UI 也会在任务中显示。
@@ -345,7 +346,7 @@ Host *
 
 `web_fetch` 为模型读取公开网页（文档、issue、错误信息的解释），与 Claude Code 的 `WebFetch` 相当，不过它返回网页本身，而不是由小模型对网页作答。HTML 会转成 Markdown，开头是网页标题，去掉脚本、样式、图片、导航和页脚；其他文本（JSON、纯文本、XML）原样返回，其余内容（图片、PDF）会被拒绝。`http` 网址会改用 `https` 获取。同一站点内的重定向会跟随，最多 5 次；跳到其他主机的不跟随，而是告诉模型它指向哪里，需要的话再去获取。超过 40,000 字节的网页与[大输出](#大输出)一样，只返回开头和结尾，全文放在文件里；超过 10 MB 的会被截断。请求 30 秒超时。
 
-- 它只访问公开地址：不访问 `localhost`、不带点的主机名、`.local` 主机名，以及回环、私有和链路本地 IP 地址，因此模型无法借它访问本机或局域网中的 web UI 或其他服务。
+- 它只访问公开地址：不访问 `localhost`、不带点的主机名、`.local` 主机名，回环、私有、链路本地和共享（100.64/10）地址，也不访问解析到这些地址的公网域名，每次请求和每次重定向之前都会检查。这让模型无法借它访问本机或局域网中的 web UI 或其他服务，但有两点限制：连接时会再解析一次域名，两次解析之间改变答案的域名能绕过；在自己解析域名的代理之后（TUN 代理的 fake-IP DNS 对所有域名都返回 198.18.x.x），这里看不到真实地址。
 - 它不修改文件，但网址可能把数据带出去，所以不算只读工具：`default` 模式下会询问，只读子代理拿不到它，plan 模式下也是询问（它属于调研），而不是拒绝。规则按域名写，与 Claude Code 一致：`WebFetch(domain:docs.rs)`、`WebFetch(domain:*.github.com)`；在本会话中允许时，建议的规则是该网页的域名。
 - 开启[沙箱](#沙箱)且 `network` 关闭时，它不会获取网页，与命令一样。
 
@@ -554,7 +555,7 @@ Hooks 在 agent 循环的特定时机运行你自己的命令：拦截危险命�
 
 不会查找其他文件（`CLAUDE.md`、上级目录中的文件）。
 
-在 git 仓库中，会话的第一条消息（REPL 的第一个会话、`/clear` 之后、每个新的 web 任务；子代理不带）还会像 Claude Code 一样附上仓库的快照：当前分支、主分支（`origin/HEAD`）、`git status --short`（最多 40 行）和最近 5 个提交，并注明这是会话开始时的状态。它放在消息里而不是系统提示词里，因为系统提示词的缓存前缀要与同一项目的其他会话共享。为此运行的 git 不会占用 index 锁，也不运行 fsmonitor 程序；对话记录和已保存会话的列表里不显示它。
+在 git 仓库中，会话的第一条消息（REPL 的第一个会话、`/clear` 之后、每个新的 web 任务；子代理不带）还会像 Claude Code 一样附上仓库的快照：当前分支、主分支（`origin/HEAD`）、`git status --short`（最多 40 行）和最近 5 个提交，并注明这是会话开始时的状态。它放在消息里而不是系统提示词里，因为系统提示词的缓存前缀要与同一项目的其他会话共享。为此运行的 git 不会占用 index 锁，也不运行 fsmonitor 程序；对话记录和已保存会话的列表里不显示它。在配置中设置 `"git_status": false` 可以关闭。
 
 文件在会话开始时读取：REPL 的第一个会话、`/clear` 或 `/resume` 之后，以及每个新的 web 任务。`/init` 让模型根据代码、`README.md` 和写给其他代理的说明（`CLAUDE.md`、`.cursorrules`、`.github/copilot-instructions.md`，这些文件保持不动）编写它，已有时则改进它；`/init <说明>` 指定还要涵盖的内容。一次性模式（`harness /init`）和 web UI 中同样可用。
 
@@ -617,7 +618,7 @@ Claude Code 的命令（技能的旧形式）同样可用：`.harness/commands/`
 - **后续追问**：每个子代理都保留自己的会话。`message_agent` 让已完成或已停止的子代理带着原有上下文处理一条新消息（等待其报告，或在后台运行）；仍在运行的子代理会在下一步收到这条消息，主代理同时得知它的进度（工具调用次数、耗时、最近的一次调用）。`stop_agent` 停止子代理，它已做的修改会保留。
 - `/tasks` 列出本会话的子代理；`/stop <id>` 停止一个，`/stop` 停止所有运行中的。你停止的子代理会随你的下一条消息告知主代理。Web UI 中每张子代理卡片都有停止按钮。
 - 同时运行的代理（主代理、它的子代理、Web 任务）逐个修改文件：如果某个文件在本代理读过之后被另一个代理改过，`edit` 和 `write` 会拒绝修改，而不是覆盖对方的改动。
-- **worktree 隔离**：`agent` 调用带上 `isolation: "worktree"` 时，子代理在自己的 git worktree 中工作：从当前检出的提交新建分支 `harness/<id>`，放在 `$TMPDIR/harness-<uid>/worktrees/`（沙箱允许命令写入这里）；它的相对路径和命令都从那里开始，并且位于仓库中相同的子目录。它只能看到已提交的文件，看不到未提交的改动。结束时，如果它在 worktree 中什么都没改，worktree 会被删除；子代理没能启动、被丢弃（`/clear`、会话结束、超过 32 个时最早的一个让位）或 harness 退出（包括 Ctrl-C）时，没有改动的 worktree 也会被删除。进程被强行杀死时会留下 worktree；下一个创建 worktree 的进程会删除其中没有改动的（连同分支），对于目录已被临时文件清理程序删掉的，则清除它的登记和没有新提交的分支（旁边的 `.owners/` 记录了每个 worktree 由哪个进程创建）。否则它的报告会说明改动在哪里（文件、提交、分支）以及如何审阅、合并和删除，这些由主代理决定；没做完就被停止的子代理会原样保留它的 worktree，并告诉主代理它在哪里。用 `message_agent` 追问时会继续在同一个 worktree 中工作。需要一个至少有一次提交的 git 仓库；`lsp` 仍然查看主检出目录。
+- **worktree 隔离**：`agent` 调用带上 `isolation: "worktree"` 时，子代理在自己的 git worktree 中工作：从当前检出的提交新建分支 `harness/<id>`，放在 `$TMPDIR/harness-<uid>/worktrees/`（沙箱允许命令写入这里）；它的相对路径和命令都从那里开始，并且位于仓库中相同的子目录。它只能看到已提交的文件，看不到未提交的改动。结束时，如果它在 worktree 中什么都没改，worktree 会被删除；子代理没能启动、被丢弃（`/clear`、会话结束、超过 32 个时最早的一个让位）或 harness 退出（包括 Ctrl-C）时，没有改动的 worktree 也会被删除。进程被强行杀死时会留下 worktree；下一个创建 worktree 的进程会删除其中没有改动的（连同分支），对于目录已被临时文件清理程序删掉的，则清除它的登记和没有新提交的分支（`~/.harness/worktrees/` 记录了每个 worktree 由哪个进程创建，沙箱中的命令写不到那里；只有 worktree 的 `.git` 仍指向原仓库时才会在其中运行 git，并且不运行 fsmonitor 程序）。否则它的报告会说明改动在哪里（文件、提交、分支）以及如何审阅、合并和删除，这些由主代理决定；没做完就被停止的子代理会原样保留它的 worktree，并告诉主代理它在哪里。用 `message_agent` 追问时会继续在同一个 worktree 中工作。需要一个至少有一次提交的 git 仓库；`lsp` 仍然查看主检出目录。
 - 每个会话最多同时运行 8 个子代理，保留最近的 32 个用于后续追问。它们只存在于内存中：`/clear`、`/resume`、删除 Web 任务或退出程序都会停止并遗忘它们。
 
 ## 插件（Plugins）

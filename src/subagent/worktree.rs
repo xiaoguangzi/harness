@@ -37,17 +37,28 @@ pub struct Changes {
     pub commits: usize,
 }
 
-/// Where the worktrees are made. Beside them, `.owners/<dir name>` says
-/// which process made each, of which repository, on which branch and from
-/// which commit, so a later process can tell one left behind.
+/// Where the worktrees are made.
 fn root() -> PathBuf {
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
     std::env::temp_dir().join(format!("harness-{uid}")).join("worktrees")
 }
 
+/// Where `~/.harness/worktrees/<dir name>` says which process made the
+/// worktree `dir`, of which repository, on which branch and from which
+/// commit, so a later process can tell one left behind. Not beside the
+/// worktrees: sandboxed commands may write the temp directory, and what
+/// these files say is run unsandboxed.
 fn owner_file(dir: &Path) -> Option<PathBuf> {
-    Some(dir.parent()?.join(".owners").join(dir.file_name()?))
+    Some(owners()?.join(dir.file_name()?))
+}
+
+fn owners() -> Option<PathBuf> {
+    // Tests keep out of the user's `~/.harness`.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!("harness-test-owners-{}", std::process::id())));
+    }
+    Some(crate::util::harness_home()?.join("worktrees"))
 }
 
 /// Whether the process `pid` is running (or belongs to another user).
@@ -59,13 +70,17 @@ fn alive(pid: i32) -> bool {
 /// Removes what processes that are gone left in `root`: a worktree with
 /// nothing in it, with its branch; a worktree's registration and branch
 /// when the directory itself went (a temp cleaner). One with changes stays.
-fn sweep(root: &Path) {
-    let Ok(entries) = std::fs::read_dir(root.join(".owners")) else { return };
+fn sweep(root: &Path, owners: &Path) {
+    let Ok(entries) = std::fs::read_dir(owners) else { return };
     for entry in entries.flatten() {
         let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
         let lines: Vec<&str> = text.lines().collect();
         let [pid, repo, branch, base] = lines[..] else { continue };
-        if pid.parse().is_ok_and(alive) {
+        // Only what the harness makes: its own branches, from a commit.
+        let ours = branch.strip_prefix("harness/").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+            && base.len() >= 40 && base.chars().all(|c| c.is_ascii_hexdigit())
+            && Path::new(repo).is_absolute();
+        if !ours || pid.parse().is_ok_and(alive) {
             continue;
         }
         let dir = root.join(entry.file_name());
@@ -83,8 +98,12 @@ fn sweep(root: &Path) {
     }
 }
 
+/// Runs git in `dir`, without an fsmonitor program: a worktree's commands
+/// are the subagent's, while this git runs outside the sandbox.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git")?;
+    let mut command = Command::new("git");
+    command.args(["-c", "core.fsmonitor=false", "-C"]).arg(dir).args(args).env("GIT_OPTIONAL_LOCKS", "0");
+    let output = command.output().context("running git")?;
     if !output.status.success() {
         bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -99,16 +118,34 @@ impl Worktree {
         let base = git(&repo, &["rev-parse", "HEAD"]).context("the repository has no commit to start a worktree from")?;
         let inside = cwd.canonicalize().ok().and_then(|c| c.strip_prefix(repo.canonicalize().ok()?).ok().map(Path::to_path_buf));
         let root = root();
-        sweep(&root);
+        if let Some(owners) = owners() {
+            sweep(&root, &owners);
+            let _ = std::fs::create_dir_all(owners);
+        }
         let repo_name = repo.file_name().map_or("repo".into(), |n| n.to_string_lossy().into_owned());
         let dir = root.join(format!("{repo_name}-{name}"));
         let branch = format!("harness/{name}");
-        std::fs::create_dir_all(root.join(".owners")).context("creating the worktrees directory")?;
+        std::fs::create_dir_all(&root).context("creating the worktrees directory")?;
         git(&repo, &["worktree", "add", "-b", &branch, &dir.display().to_string(), &base])?;
         let workdir = inside.map_or(dir.clone(), |inside| dir.join(inside));
         let tree = Self { repo, dir, workdir, branch, base };
         tree.mark();
         Ok(tree)
+    }
+
+    /// That the worktree's `.git` still names its place in the repository:
+    /// the subagent's commands could point it at a repository of their
+    /// making, whose config would run programs when git looks at it here.
+    fn check_link(&self) -> Result<()> {
+        let link = std::fs::read_to_string(self.dir.join(".git")).context("reading the worktree's .git")?;
+        let gitdir = link.trim().strip_prefix("gitdir: ").map(PathBuf::from).context("the worktree's .git is not a link")?;
+        let common = PathBuf::from(git(&self.repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let home = gitdir.parent().filter(|p| p.file_name().is_some_and(|n| n == "worktrees")).and_then(Path::parent);
+        if home.map(canonical) != Some(canonical(&common)) {
+            bail!("its .git no longer points into {}", common.display());
+        }
+        Ok(())
     }
 
     /// Records this process as the worktree's owner.
@@ -135,6 +172,7 @@ impl Worktree {
     }
 
     pub fn changes(&self) -> Result<Changes> {
+        self.check_link()?;
         let status = git(&self.dir, &["status", "--porcelain"])?;
         let commits = git(&self.dir, &["rev-list", "--count", &format!("{}..HEAD", self.base)])?;
         Ok(Changes { files: status.lines().count(), commits: commits.trim().parse().unwrap_or(0) })
@@ -259,7 +297,7 @@ mod tests {
         std::fs::remove_dir_all(&gone).unwrap();
         let live = Worktree::create(repo.path(), &format!("test-sweep-live-{}", std::process::id())).unwrap();
 
-        sweep(&root());
+        sweep(&root(), &owners().unwrap());
         assert!(!empty.exists() && !empty_owner.exists(), "nothing in it");
         assert!(changed.exists(), "its changes are kept");
         assert!(live.dir.exists(), "its process is running");
@@ -269,6 +307,19 @@ mod tests {
         assert!(!git(repo.path(), &["worktree", "list"]).unwrap().contains(&gone.display().to_string()), "pruned");
         git(repo.path(), &["worktree", "remove", "--force", &changed.display().to_string()]).unwrap();
         let _ = std::fs::remove_file(owner_file(&changed).unwrap());
+    }
+
+    #[test]
+    fn a_worktree_pointed_elsewhere_is_left_alone() {
+        let (repo, other) = (repo(), repo());
+        let tree = Worktree::create(repo.path(), &format!("test-link-{}", std::process::id())).unwrap();
+        std::fs::write(tree.dir.join(".git"), format!("gitdir: {}\n", other.path().join(".git").display())).unwrap();
+        assert!(format!("{:#}", tree.changes().unwrap_err()).contains("no longer points"));
+        assert!(!tree.discard_if_unchanged(), "kept, and git not run in it");
+        let dir = tree.dir.clone();
+        drop(tree);
+        std::fs::remove_dir_all(&dir).unwrap();
+        git(repo.path(), &["worktree", "prune"]).unwrap();
     }
 
     #[test]
