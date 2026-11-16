@@ -401,14 +401,18 @@ fn latest_todos(history: &[Message]) -> Option<String> {
 }
 
 /// How the text blocks of user messages start that are not the user's own:
-/// attachments, reports from subagents and background commands, and what
-/// the harness adds. A compaction tells the model about the deferred tools
-/// anew.
-const NOT_TYPED: [&str; 9] = [
+/// attachments, reports from subagents and background commands, hooks'
+/// feedback, and what the harness adds. A compaction tells the model about
+/// the deferred tools anew.
+const NOT_TYPED: [&str; 13] = [
     "<file ",
     "<directory ",
     "<subagent-notification>",
     "<shell-notification>",
+    "<user-shell-command>",
+    "<hook-feedback ",
+    "<permission-mode>",
+    "[Stopped by a hook",
     "The files read most recently",
     TODO_PREFIX,
     TOOLS_PREFIX,
@@ -419,11 +423,12 @@ const NOT_TYPED: [&str; 9] = [
 /// The text of the user's own messages, oldest first, as much as fits in
 /// [`KEPT_USER_BYTES`] counting from the newest; the one that crosses the
 /// limit is cut. Attachments, tool results, earlier summaries and reports
-/// from subagents are left out.
+/// from subagents are left out. What the user sent during a turn rides on
+/// the message with the tool results that went before it, and is kept too.
 fn kept_user_messages(history: &[Message]) -> Vec<String> {
     let texts = history
         .iter()
-        .filter(|m| m.role == "user" && !has_tool_results(m))
+        .filter(|m| m.role == "user")
         .flat_map(|m| &m.content)
         .filter(|b| !is_summary(b))
         .filter_map(|b| b["text"].as_str().filter(|_| b["type"] == "text"))
@@ -531,11 +536,14 @@ pub(crate) mod tests {
         let history = vec![
             Message::user(vec![text("<file path=\"a.rs\">\n1\tx\n</file>"), text("first")]),
             assistant(vec![call("t1")]),
-            results("t1"),
+            Message::user([results("t1").content, vec![text("typed during the turn")]].concat()),
+            assistant(vec![call("t2")]),
+            Message::user([results("t2").content, vec![text("<hook-feedback event=\"PostToolUse\">\nx\n</hook-feedback>")]].concat()),
             Message::user(vec![text("<subagent-notification>…</subagent-notification>"), text("second")]),
+            Message::user(vec![text("<permission-mode>Plan mode is on</permission-mode>"), text("[Stopped by a hook]")]),
             assistant(vec![text("done")]),
         ];
-        assert_eq!(kept_user_messages(&history), vec!["first", "second"]);
+        assert_eq!(kept_user_messages(&history), vec!["first", "typed during the turn", "second"]);
 
         let long = "x".repeat(KEPT_USER_BYTES - 10);
         let history = vec![user("oldest"), user(&"y".repeat(20)), user(&long)];

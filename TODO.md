@@ -199,8 +199,6 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] `POST /api/tools/{name}` calls `tool.run` with no normalization, hooks, permissions, checkpoint or
   task-local scopes (web/mod.rs:421).
 - [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
-- [ ] Messages typed during a turn ride on tool-result user messages, which compaction does not keep word for word
-  (`kept_user_messages`, compact.rs:426); `<hook-feedback>` / `<permission-mode>` are kept as if typed.
 - [ ] Hooks, the hook input's `cwd`, path `if` checks and `lsp` use `current_dir()`, not `workdir::get()`, so a
   worktree subagent's hooks see the main checkout (hooks.rs:238, 822, 989; lsp.rs:212, 513).
 - [ ] The scheduler's file keys canonicalize the raw path before `workdir::resolve` (scheduling.rs:154).
