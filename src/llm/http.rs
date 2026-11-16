@@ -70,19 +70,29 @@ pub fn status(error: &anyhow::Error) -> Option<u16> {
 /// When to send a request that failed with `error` again, as attempt
 /// `attempt` (from 1), and how many attempts that kind of failure gets:
 /// `None` if it is not [`Transient`] or its attempts are spent. The wait
-/// doubles from 1 s up to a minute, unless the server said how long.
+/// doubles from 1 s up to a minute, less up to a quarter at random so that
+/// clients failing together do not retry together (as Anthropic's SDKs
+/// do), unless the server said how long.
 pub fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<(Duration, u32)> {
     let transient = error.downcast_ref::<Transient>()?;
     let max = if transient.overloaded { MAX_OVERLOAD_RETRIES } else { MAX_RETRIES };
     if attempt == 0 || attempt > max {
         return None;
     }
-    let backoff = Duration::from_secs(1 << (attempt - 1).min(6)).min(MAX_BACKOFF);
+    let backoff = Duration::from_secs(1 << (attempt - 1).min(6)).min(MAX_BACKOFF).mul_f64(1.0 - 0.25 * random_fraction());
     match transient.retry_after {
         Some(wait) if wait > MAX_RETRY_AFTER => None,
         Some(wait) => Some((wait, max)),
         None => Some((backoff, max)),
     }
+}
+
+/// A number from 0 to 1, different each call; not for anything secret.
+fn random_fraction() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    // Each `RandomState` is keyed apart from the last.
+    let bits = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    (bits >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// An error the API reported in the stream; `kind` is its error type or
@@ -259,16 +269,23 @@ mod tests {
     #[test]
     fn overloads_are_waited_out_longer_than_other_failures() {
         let waits = |error: &anyhow::Error| -> Vec<u64> {
-            (1..).map_while(|attempt| retry_delay(error, attempt)).map(|(wait, _)| wait.as_secs()).collect()
+            (1..).map_while(|attempt| retry_delay(error, attempt)).map(|(wait, _)| wait.as_millis() as u64).collect()
         };
-        assert_eq!(waits(&transient(false, None)), [1, 2, 4]);
-        assert_eq!(waits(&transient(true, None)), [1, 2, 4, 8, 16, 32, 60, 60, 60, 60]);
+        // Each backoff less up to a quarter.
+        let backoffs = |waits: Vec<u64>, backoffs: &[u64]| {
+            waits.len() == backoffs.len() && waits.iter().zip(backoffs).all(|(&w, &b)| w <= b * 1000 && w >= b * 750)
+        };
+        assert!(backoffs(waits(&transient(false, None)), &[1, 2, 4]));
+        assert!(backoffs(waits(&transient(true, None)), &[1, 2, 4, 8, 16, 32, 60, 60, 60, 60]));
         assert_eq!(waits(&transient(true, Some(7))).len(), 10, "the server's wait");
-        assert_eq!(waits(&transient(true, Some(7)))[0], 7);
+        assert_eq!(waits(&transient(true, Some(7)))[0], 7000, "as the server says");
         assert!(retry_delay(&transient(true, Some(3600)), 1).is_none(), "too long to wait");
         assert!(retry_delay(&anyhow::anyhow!("API error 400"), 1).is_none());
         let wrapped = anyhow::Error::msg("inner").context(Transient::new("sending".into()));
-        assert_eq!(retry_delay(&wrapped, 1), Some((Duration::from_secs(1), MAX_RETRIES)));
+        let (wait, max) = retry_delay(&wrapped, 1).unwrap();
+        assert!(wait >= Duration::from_millis(750) && wait <= Duration::from_secs(1) && max == MAX_RETRIES, "{wait:?}");
+        let waits: std::collections::HashSet<Duration> = (0..8).filter_map(|_| retry_delay(&wrapped, 3)).map(|(w, _)| w).collect();
+        assert!(waits.len() > 1, "clients failing together do not wait alike");
     }
 
     /// Answers each request with `status`, recording its encoding and body.
