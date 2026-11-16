@@ -483,15 +483,17 @@ pub fn plugin_config(events: &Value, plugin: &PluginDirs, warnings: &mut Vec<Str
             let mut hooks = Vec::new();
             for handler in group["hooks"].as_array().into_iter().flatten() {
                 let text = |key: &str| handler[key].as_str().map(String::from);
-                let args = handler["args"].as_array().map(|args| {
-                    args.iter().map(|a| plugin.expand(a.as_str().map_or(&a.to_string(), |a| a))).collect()
-                });
+                let args_with = |expand: &dyn Fn(&str) -> String| -> Option<Vec<String>> {
+                    let args = handler["args"].as_array()?;
+                    Some(args.iter().map(|a| expand(a.as_str().map_or(&a.to_string(), |a| a))).collect())
+                };
+                let args = args_with(&|a| plugin.expand(a));
                 let kind = handler["type"].as_str().unwrap_or_default();
                 let mut label = None;
                 let action = match Action::new(kind, text("command"), args, text("prompt"), text("model")) {
                     Ok(Action::Command { command, args }) => {
-                        let shown = Action::Command { command: plugin.expand_prompt(&command), args: args.clone() };
-                        label = Some(shown.label());
+                        let shown_args = args_with(&|a| plugin.expand_prompt(a));
+                        label = Some(Action::Command { command: plugin.expand_prompt(&command), args: shown_args }.label());
                         Action::Command { command: plugin.expand(&command), args }
                     }
                     Ok(Action::Prompt { prompt, model }) => Action::Prompt { prompt: plugin.expand_prompt(&prompt), model },
@@ -1303,10 +1305,15 @@ pub(crate) mod tests {
         let input: Value = serde_json::from_str(outcome.notices[0].split_once(": ").unwrap().1).unwrap();
         assert_eq!((input["notification_type"].as_str(), input["message"].as_str()), (Some("idle_prompt"), Some("waiting")));
         assert!(hooks.notification("other", "x", "m").await.notices.is_empty(), "the matcher picks the type");
-        let failing = json!({"Stop": [{"hooks": [{"type": "command", "command": "exit 1 # ${user_config.token}", "onFailure": "block"}]}]});
-        let failing = Hooks::with_config(Arc::new(plugin_config(&failing, &plugin, &mut warnings)));
-        let block = failing.stop(false, "", "m").await.block.unwrap();
-        assert!(block.contains("${user_config.token}") && !block.contains("t0k"), "no secret for the model: {block}");
+        for failing in [
+            json!({"type": "command", "command": "exit 1 # ${user_config.token}", "onFailure": "block"}),
+            json!({"type": "command", "command": "false", "args": ["${user_config.token}"], "onFailure": "block"}),
+        ] {
+            let failing = json!({"Stop": [{"hooks": [failing]}]});
+            let failing = Hooks::with_config(Arc::new(plugin_config(&failing, &plugin, &mut warnings)));
+            let block = failing.stop(false, "", "m").await.block.unwrap();
+            assert!(block.contains("${user_config.token}") && !block.contains("t0k"), "no secret for the model: {block}");
+        }
         assert!(hooks.has(Event::Notification) && !hooks.has(Event::Stop));
         assert_eq!(tool_named("Bash"), Some("bash"));
         assert_eq!(tool_named("KillShell"), Some("kill_shell"));
