@@ -335,6 +335,108 @@ pub(crate) fn plain_words(command: &str) -> Option<Vec<Word>> {
     Some(words)
 }
 
+/// A redirection of a command to or from a file.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Redirect {
+    /// `>`, `>>`, `>|`, `&>`, `2>`; or `<`.
+    pub output: bool,
+    /// The file, quotes removed.
+    pub target: String,
+    /// Whether `target` is the file as the shell will name it: not when it
+    /// expands a variable or a command, a glob, braces or a leading `~`.
+    pub plain: bool,
+}
+
+/// The files `command` (one command of a compound one) redirects to or
+/// from; not the forms between descriptors (`2>&1`, `<&3`, `>&-`).
+pub(crate) fn redirects(command: &str) -> Vec<Redirect> {
+    let mut found = Vec::new();
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' => while chars.next().is_some_and(|c| c != '\'') {},
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            chars.next();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            '&' if chars.peek() == Some(&'>') => {}
+            '>' | '<' => {
+                let output = c == '>';
+                if chars.next_if(|&n| n == c || (output && n == '|')).is_some() && !output {
+                    // A heredoc or here-string: no file.
+                    chars.next_if_eq(&'<');
+                    continue;
+                }
+                // Not `>& file`, both outputs to the file.
+                if chars.next_if_eq(&'&').is_some() && chars.next_if(|c| c.is_ascii_digit() || *c == '-').is_some() {
+                    while chars.next_if(char::is_ascii_digit).is_some() {}
+                    continue;
+                }
+                while chars.next_if(|c| c.is_ascii_whitespace() && *c != '\n').is_some() {}
+                let (target, plain) = target_word(&mut chars);
+                found.push(Redirect { output, target, plain });
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The word a redirection names, read from `chars`, unquoted, and whether
+/// it is plain (see [`Redirect::plain`]).
+fn target_word(chars: &mut std::iter::Peekable<std::str::Chars>) -> (String, bool) {
+    let (mut text, mut plain) = (String::new(), true);
+    while let Some(c) = chars.next_if(|c| !c.is_ascii_whitespace() && !";|&<>()".contains(*c)) {
+        match c {
+            '\\' => text.extend(chars.next()),
+            '\'' => text.extend(chars.by_ref().take_while(|&c| c != '\'')),
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => text.extend(chars.next()),
+                        c => {
+                            plain &= !matches!(c, '$' | '`');
+                            text.push(c);
+                        }
+                    }
+                }
+            }
+            c => {
+                plain &= !matches!(c, '$' | '`' | '*' | '?' | '[' | '{') && !(c == '~' && text.is_empty());
+                text.push(c);
+            }
+        }
+    }
+    plain &= !text.is_empty();
+    (text, plain)
+}
+
+/// The files a `tee` command (`command`, without wrappers) writes; `None`
+/// when it is not `tee`, `Some` with an unplain target when its words
+/// cannot be read.
+pub(crate) fn tee_targets(command: &str) -> Option<Vec<Redirect>> {
+    let command = strip(command, false, false);
+    if split_word(command).0 != "tee" {
+        return None;
+    }
+    let Some(words) = plain_words(command) else {
+        return Some(vec![Redirect { output: true, target: String::new(), plain: false }]);
+    };
+    let files = words[1..].iter().filter(|w| !w.text.starts_with('-'));
+    Some(files.map(|w| Redirect { output: true, target: w.text.clone(), plain: !w.glob }).collect())
+}
+
 /// Commands that read and print, never change anything, whatever their
 /// options: they run without asking, as Claude Code's built-in set does.
 const READ_ONLY: &[&str] = &[
@@ -437,6 +539,21 @@ mod tests {
             assert_eq!(words(unread), None, "{unread}");
         }
         assert!(plain_words("ls *.rs a").unwrap()[1].glob);
+    }
+
+    #[test]
+    fn finds_the_files_a_command_redirects_to() {
+        let found = |command: &str| {
+            redirects(command).into_iter().map(|r| format!("{}{}{}", if r.output { ">" } else { "<" }, r.target, if r.plain { "" } else { "?" })).collect::<Vec<_>>()
+        };
+        assert_eq!(found("make 2>&1 >&- <&3 >/dev/null"), [">/dev/null"]);
+        assert_eq!(found("make > 'a b' 2>>err &>all >|x <in"), [">a b", ">err", ">all", ">x", "<in"]);
+        assert_eq!(found("make >$HOME/x >~/y >*.log >\"$(x)\" >& both"), [">$HOME/x?", ">~/y?", ">*.log?", ">$(x)?", ">both"]);
+        assert_eq!(found("echo '>no' \"<no\" \\>no x<<EOF"), Vec::<String>::new());
+        assert_eq!(found("echo a>b"), [">b"]);
+        assert_eq!(tee_targets("tee -a log out").unwrap().len(), 2);
+        assert!(!tee_targets("tee $LOG").unwrap()[0].plain);
+        assert!(tee_targets("make").is_none());
         assert!(!plain_words("ls '*.rs'").unwrap()[1].glob);
     }
 }

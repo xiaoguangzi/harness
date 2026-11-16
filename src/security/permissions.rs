@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::extensions::hooks::{self, Condition};
-use crate::security::shell::{self, commands, strip_wrappers};
+use crate::security::shell::{self, Redirect, commands, strip_wrappers};
 use crate::tools::Tool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -308,6 +308,9 @@ impl Permissions {
         if let Some(rule) = matching(&self.config.deny) {
             return Decision::Deny(format!("The permission rule `{rule}` denies this call."));
         }
+        if let Some(rule) = (name == "bash").then(|| self.denied_target(input)).flatten() {
+            return Decision::Deny(format!("The permission rule `{rule}` denies this call: it names a file the rule covers."));
+        }
         match hook {
             Some(HookDecision::Allow) => return Decision::Allow,
             Some(HookDecision::Ask(reason)) => return Decision::Ask(reason.clone()),
@@ -349,7 +352,35 @@ impl Permissions {
         }
         let Some(commands) = input["command"].as_str().and_then(commands) else { return false };
         let reads = self.reading(&commands);
-        !commands.is_empty() && commands.iter().all(|c| reads(c) || rules.iter().any(|r| r.allows_command(c)))
+        let targets_fine = |c: &str| files_written(c).iter().all(|t| self.target_fine(t, &rules));
+        !commands.is_empty()
+            && commands.iter().all(|c| reads(c) || (rules.iter().any(|r| r.allows_command(c)) && targets_fine(c)))
+    }
+
+    /// Whether a rule may allow a command that redirects to or from
+    /// `target` (or a `tee` writing it), as Claude Code checks it: a file
+    /// in the working directory or one an `Edit` (`Read`, for input) allow
+    /// rule covers, named plainly.
+    fn target_fine(&self, target: &Redirect, rules: &[&Rule]) -> bool {
+        if target.target == "/dev/null" {
+            return true;
+        }
+        let tool = if target.output { "edit" } else { "read" };
+        let input = serde_json::json!({"path": target.target});
+        target.plain && (path_in_working_dir(&target.target) || rules.iter().any(|r| r.matches(tool, &input)))
+    }
+
+    /// The deny rule a `bash` call's redirections (or `tee`) break: an
+    /// `Edit` one for a file written, a `Read` one for a file read.
+    fn denied_target(&self, input: &Value) -> Option<String> {
+        let command = input["command"].as_str()?;
+        let mut targets = shell::redirects(command);
+        targets.extend(commands(command).unwrap_or_default().into_iter().filter_map(shell::tee_targets).flatten());
+        targets.iter().find_map(|t| {
+            let input = serde_json::json!({"path": t.target});
+            let tool = if t.output { "edit" } else { "read" };
+            self.config.deny.iter().find(|r| r.matches(tool, &input)).map(|r| r.text.clone())
+        })
     }
 
     /// Which commands of a compound `bash` one (`commands`) only read, and
@@ -380,6 +411,10 @@ impl Permissions {
         let session = self.session.lock().unwrap();
         let rules: Vec<&Rule> = self.config.allow.iter().chain(session.iter()).collect();
         let reads = self.reading(&commands);
+        // No rule for a command would cover the file it writes.
+        if commands.iter().any(|c| !files_written(c).iter().all(|t| self.target_fine(t, &rules))) {
+            return Vec::new();
+        }
         let mut suggested: Vec<String> = Vec::new();
         for command in commands.iter().filter(|c| !reads(c) && !rules.iter().any(|r| r.allows_command(c))) {
             let Some(rule) = command_rule(name, strip_wrappers(command, false)) else { return Vec::new() };
@@ -477,11 +512,23 @@ pub enum HookDecision {
 /// Whether the file a call of `edit` or `write` changes is in the working
 /// directory.
 fn in_working_dir(input: &Value) -> bool {
-    let Some(path) = input["path"].as_str() else { return false };
+    input["path"].as_str().is_some_and(path_in_working_dir)
+}
+
+/// Whether `path` is in the working directory.
+fn path_in_working_dir(path: &str) -> bool {
     // A subagent's worktree, if it has one.
     let cwd = crate::tools::workdir::get();
     let path = cwd.join(path);
     path.starts_with(&cwd) && !path.components().any(|c| c == std::path::Component::ParentDir)
+}
+
+/// The files one command of a compound one redirects to or from, and those
+/// it writes with `tee`.
+fn files_written(command: &str) -> Vec<Redirect> {
+    let mut targets = shell::redirects(command);
+    targets.extend(shell::tee_targets(command).unwrap_or_default());
+    targets
 }
 
 /// Rules offered for one compound command, at most: Claude Code's limit.
@@ -737,6 +784,45 @@ mod tests {
         assert_eq!(decide("git diff"), Decision::Allow, "plan mode runs what only reads");
         assert!(matches!(decide("make"), Decision::Deny(_)));
         assert_eq!(p.suggestions("bash", &json!({"command": "git status && make"})), ["Bash(make:*)"]);
+    }
+
+    #[test]
+    fn a_rule_allows_the_command_not_the_file_it_writes() {
+        let _guard = crate::util::lock_cwd();
+        let p = permissions(json!({
+            "defaultMode": "default",
+            "allow": ["Bash(cargo test:*)", "Bash(make:*)", "Bash(tee:*)", "Edit(/tmp/logs/**)"],
+            "deny": ["Edit(.env)", "Read(secrets/**)"]
+        }));
+        let decide = |command: &str| p.decide("bash", None, &json!({"command": command}), None);
+        for allowed in [
+            "cargo test > out.log 2>&1",
+            "cargo test >> target/log",
+            "cargo test 2>/dev/null",
+            "cargo test > /tmp/logs/a.txt",
+            "make < input.txt",
+            "make | tee build.log",
+        ] {
+            assert_eq!(decide(allowed), Decision::Allow, "{allowed}");
+        }
+        for asks in [
+            "cargo test > /tmp/out",
+            "cargo test > ../out",
+            "cargo test > ~/out",
+            "cargo test > $OUT",
+            "cargo test > *.log",
+            "make < /etc/passwd",
+            "make | tee /etc/x",
+            "make | tee $LOG",
+        ] {
+            assert!(matches!(decide(asks), Decision::Ask(_)), "{asks:?}");
+        }
+        assert!(p.suggestions("bash", &json!({"command": "cargo test > /tmp/out && ninja"})).is_empty());
+        for denied in ["make > .env", "echo x >> ./.env", "make | tee -a .env", "make < secrets/key", "cat < secrets/key"] {
+            assert!(matches!(decide(denied), Decision::Deny(_)), "{denied:?}");
+        }
+        p.set_mode(Mode::BypassPermissions);
+        assert!(matches!(decide("echo x > .env"), Decision::Deny(_)), "in every mode");
     }
 
     #[tokio::test]
