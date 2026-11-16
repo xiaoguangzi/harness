@@ -150,7 +150,8 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] Bash allow rules are still narrower than Claude Code's (checked against its permissions docs; wrappers,
   leading assignments, a built-in set of commands that only read, and redirection and `tee` targets are handled
   since then): heredocs and comments are never allowed by a pattern; protected paths (`.git`, `.claude`) are not
-  checked for redirection targets; `cd` before a redirection is not followed. Deny and ask rules look past a wrapper only when its options are plain: `timeout --kill-after 5 10 rm x` keeps
+  checked for redirection targets; `cd` before a redirection is not followed; a heredoc's body is scanned for
+  redirections, so `> .env` written inside one is refused under an `Edit(.env)` deny rule. Deny and ask rules look past a wrapper only when its options are plain: `timeout --kill-after 5 10 rm x` keeps
   `timeout`, so `Bash(rm:*)` does not match it. Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit
   Claude Code documents too. (read)
 - [ ] Sessions are rewritten whole (after each round of tool calls and each turn), compaction overwrites the
