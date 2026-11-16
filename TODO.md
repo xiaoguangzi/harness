@@ -180,10 +180,10 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### To check: what mainstream harnesses do here is not known
 
+- [ ] An interrupted response's text, streamed in part, is not kept in the history (the assistant message is
+  pushed only once the response is whole).
 - [ ] Allow rules, session rules and a hook's `allow` are checked before the mode, so they override plan mode.
 - [ ] A PreToolUse hook's `allow` skips the ask rules (Claude Code is thought to still apply them).
-- [ ] Interrupting a batch reports calls that already finished, side effects done, as interrupted
-  (agent/mod.rs:611); partly streamed text is not kept.
 - [ ] Manual and idle compaction remove every `/rewind` point (`history.rebase(None, 1)`, compact.rs:231).
 - [ ] Calls inside a `code` script never enter history or reach the Observer (no diff shown). Keeping them out
   of context is the point of programmatic tool calling; whether others show them to the user is not known.

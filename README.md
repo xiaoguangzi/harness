@@ -281,7 +281,7 @@ Interactive command panels take the input box's place and are framed the way it 
 | Esc Esc | at an empty prompt: `/rewind` |
 | Shift+Tab | the next [permission mode](#permissions): default, accept edits, plan, bypass permissions |
 | ↑ while a turn runs | take the queued messages the model has not got yet back into the input box, to edit |
-| Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted. At the prompt, press it twice to quit |
+| Ctrl-C | interrupt the running turn: running commands are killed, and the model is told the request was interrupted (with the results of the calls that had finished, and which ones had not). At the prompt, press it twice to quit |
 | `\` at line end, Alt+Enter | continue the message on a new line (Shift+Enter also works when the terminal sends a distinct key sequence) |
 | `/` | open the command menu under the prompt; it narrows as you type, ↑/↓ select, Tab fills in, Enter runs. Run `/model` to configure main/subagent models and effort; `/model ` also offers model completion |
 | `@` | open the file menu (see [Attaching files](#attaching-files-with-)) |

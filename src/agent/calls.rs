@@ -104,6 +104,9 @@ impl Agent {
                     let t = &calls[i];
                     observer.on_tool_result_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), &done.output);
                     if let Some(post) = &done.post { show_notices(post, observer); }
+                    // Kept for an interrupt before the round ends.
+                    let id = t["id"].as_str().unwrap_or("").to_string();
+                    self.finished.lock().unwrap().insert(id, tool_result(t, &done.output));
                     ran[i] = Some(done);
                 }
             }
@@ -118,12 +121,7 @@ impl Agent {
         for (t, done) in calls.iter().zip(ran) {
             let Ran { output, check, post } = done.unwrap();
             halt = halt.or(check.halt).or(post.and_then(|p| p.halt));
-            results.push(json!({
-                "type": "tool_result",
-                "tool_use_id": t["id"],
-                "content": output.to_result_content(),
-                "is_error": output.is_error,
-            }));
+            results.push(tool_result(t, &output));
         }
         // A hook said to stop (`continue: false`): the turn ends here.
         let Some(reason) = halt else { return (results, false) };
@@ -221,6 +219,11 @@ impl Caller<'_> {
         let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestions, agent };
         self.permissions.ask(request).await
     }
+}
+
+/// The result block for `call`, the model's, with `output`.
+fn tool_result(call: &Value, output: &ToolOutput) -> Value {
+    json!({"type": "tool_result", "tool_use_id": call["id"], "content": output.to_result_content(), "is_error": output.is_error})
 }
 
 /// The conversation a tool's call runs for, for the calls a `code` script

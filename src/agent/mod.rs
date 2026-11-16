@@ -7,6 +7,7 @@ mod deferred;
 mod inbox;
 mod usage;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -155,6 +156,10 @@ pub struct Agent {
     /// Where the conversation is saved after each round of tool calls, if
     /// it is: a crash then loses at most the round under way.
     autosave: Option<crate::session::Autosave>,
+    /// The results of the running round's calls that have finished, by
+    /// call id: if the turn is interrupted, the model gets these rather
+    /// than hear that calls whose effects are done never ran.
+    finished: Mutex<HashMap<String, Value>>,
 }
 
 impl Agent {
@@ -195,6 +200,7 @@ impl Agent {
             switch_to: Arc::default(),
             last_request: Mutex::new(None),
             autosave: None,
+            finished: Mutex::default(),
         }
     }
 
@@ -622,8 +628,10 @@ impl Agent {
 
     /// Leaves the history valid after a cancelled turn, keeping what the
     /// user asked for so the model knows the request was cut short. Tool
-    /// calls that never finished get error results saying so.
+    /// calls that finished before it get their results; those that never
+    /// did get error results saying so.
     fn repair_after_interrupt(&mut self) {
+        let mut finished = std::mem::take(&mut *self.finished.lock().unwrap());
         let Some(last) = self.messages.last_mut() else { return };
         let note = json!({"type": "text", "text": INTERRUPTED});
         if last.role == "user" {
@@ -635,7 +643,8 @@ impl Agent {
             .iter()
             .filter(|b| b["type"] == "tool_use")
             .map(|t| {
-                json!({"type": "tool_result", "tool_use_id": t["id"], "content": INTERRUPTED, "is_error": true})
+                let done = t["id"].as_str().and_then(|id| finished.remove(id));
+                done.unwrap_or_else(|| json!({"type": "tool_result", "tool_use_id": t["id"], "content": INTERRUPTED, "is_error": true}))
             })
             .collect();
         if !results.is_empty() {
@@ -706,6 +715,7 @@ impl Agent {
 
             let (results, halted) = self.run_calls(&tool_uses, &response.invalid_tool_inputs, observer).await;
             self.messages.push(Message::user(results));
+            self.finished.lock().unwrap().clear();
             self.save_round();
             if halted {
                 return Ok(());
@@ -805,6 +815,24 @@ pub(crate) mod tests {
         a.repair_after_interrupt();
         assert_eq!(a.messages.len(), 1);
         assert_eq!(a.messages[0].content, vec![text("do it"), text(INTERRUPTED)]);
+    }
+
+    #[tokio::test]
+    async fn calls_done_before_an_interrupt_keep_their_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let quick = json!({"type": "tool_use", "id": "q1", "name": "glob", "input": {"pattern": "*.none", "path": dir.path()}});
+        let slow = json!({"type": "tool_use", "id": "s1", "name": "bash", "input": {"command": "sleep 30"}});
+        let (client, _requests) = compact::tests::gateway(move |_| (vec![quick.clone(), slow.clone()], "tool_use", 100)).await;
+        let mut agent = Agent::new(client, ToolRegistry::with_defaults(crate::tools::FileTracker::default()), "sys");
+        let mut notices = Notices::default();
+        let turn = agent.run_turn(vec![text("go")], &mut notices);
+        assert!(tokio::time::timeout(Duration::from_secs(2), turn).await.is_err(), "interrupted while sleep runs");
+        agent.settle();
+        let results = &agent.messages.last().unwrap().content;
+        assert_eq!((results[0]["tool_use_id"].as_str(), results[0]["content"].as_str()), (Some("q1"), Some("No files found")));
+        assert_eq!(results[0]["is_error"], false, "the finished call's own result");
+        assert_eq!((results[1]["tool_use_id"].as_str(), results[1]["content"].as_str()), (Some("s1"), Some(INTERRUPTED)));
+        assert_eq!(results[2], text(INTERRUPTED));
     }
 
     #[test]
