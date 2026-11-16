@@ -160,10 +160,7 @@ other harness's docs or source before acting on an entry. All findings here are 
   history before it, and subagent transcripts are not kept (`agent_transcript_path` is null). Claude Code and
   Codex append per message; Claude Code keeps the pre-compaction history behind a boundary record and saves
   subagent transcripts. (mainstream: sure)
-- [ ] No budget: no max turns, tokens or cost, nothing caps a Stop hook that keeps blocking, and agents'
-  `maxTurns` is ignored (see Plugins → Agents). Claude Code has `--max-turns` and agent `maxTurns`; Gemini CLI
-  `maxSessionTurns` and loop detection; OpenCode doom-loop detection and agent `steps`. (mainstream: likely)
-- [ ] `AGENTS.md` is read from the working directory only; `CLAUDE.md` never. Claude Code walks up from the cwd;
+- [ ] (Put off for now.) `AGENTS.md` is read from the working directory only; `CLAUDE.md` never. Claude Code walks up from the cwd;
   Codex concatenates from the git root down to the cwd; Gemini CLI and OpenCode walk up too, OpenCode falling back
   to `CLAUDE.md`. The lazy subdirectory notes already match. (mainstream: sure)
 - [ ] No two-way programmatic interface: headless is one prompt in, events out (`--output-format stream-json`),
@@ -224,6 +221,11 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] CLAUDE.md disagrees with the code: the 1-hour cache TTL is off by default for every provider
   (config.rs:578); there is a third built-in subagent, `fork`; the web does not turn every Observer callback into
   an event (`on_usage`, `on_request_start` are skipped).
+
+### Decided against
+
+- No cap on a turn's length (turns, tokens or cost), unlike Claude Code's `--max-turns` or OpenCode's `steps`: on
+  purpose, a turn runs until the model stops.
 
 ### Already in line with mainstream harnesses (for reference)
 
