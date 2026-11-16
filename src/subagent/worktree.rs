@@ -2,14 +2,17 @@
 //! works on a checkout of its own, on a branch of its own, so subagents
 //! changing files at once cannot get in each other's way, nor in the main
 //! agent's. The worktrees live in the temp directory (which the sandbox lets
-//! commands write) and start from the commit checked out now.
+//! commands write) and start from the commit checked out now. One that holds
+//! nothing is removed when it is let go of: after a run that left nothing in
+//! it, or with its subagent (`/clear`, the conversation's end, a subagent
+//! forgotten to make room), or when the subagent could not start.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Worktree {
     /// The repository it belongs to, its top level.
     repo: PathBuf,
@@ -84,6 +87,15 @@ impl Worktree {
         git(&self.repo, &["branch", "-D", &self.branch]).map(drop)
     }
 
+    /// Removes the worktree and its branch if they hold nothing: no changed
+    /// file and no commit. True if it is gone.
+    pub fn discard_if_unchanged(&self) -> bool {
+        if !self.dir.exists() {
+            return true;
+        }
+        matches!(self.changes(), Ok(Changes { files: 0, commits: 0 })) && self.remove().is_ok()
+    }
+
     /// Settles the worktree after a run: removed if the subagent left
     /// nothing in it, else kept, with what the parent is told about it.
     pub fn settle(&self) -> String {
@@ -106,6 +118,12 @@ impl Worktree {
             ),
             Err(e) => format!("It worked in a git worktree of its own, {}; what it left there is unknown ({e:#}).", self.dir.display()),
         }
+    }
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        self.discard_if_unchanged();
     }
 }
 
@@ -137,7 +155,20 @@ mod tests {
         let note = tree.settle();
         assert!(note.contains("left 1 changed file and 0 commits") && note.contains(&tree.branch), "{note}");
         assert!(tree.dir.exists(), "kept with its changes");
-        tree.remove().unwrap();
+        let dir = tree.dir.clone();
+        drop(tree);
+        assert!(dir.exists(), "kept when let go of, with its changes");
+        git(repo.path(), &["worktree", "remove", "--force", &dir.display().to_string()]).unwrap();
         assert!(Worktree::create(&std::env::temp_dir(), "x").unwrap_err().to_string().contains("git repository"));
+    }
+
+    #[test]
+    fn one_let_go_of_with_nothing_in_it_is_removed() {
+        let repo = repo();
+        let tree = Worktree::create(repo.path(), &format!("test-drop-{}", std::process::id())).unwrap();
+        let (dir, branch) = (tree.dir.clone(), tree.branch.clone());
+        drop(tree);
+        assert!(!dir.exists());
+        assert!(git(repo.path(), &["branch", "--list", &branch]).unwrap().is_empty(), "its branch went too");
     }
 }

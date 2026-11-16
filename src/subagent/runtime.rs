@@ -202,9 +202,11 @@ impl Subagents {
         check_capacity(&children)?;
         agent.set_usage(self.usage.clone());
         agent.set_file_history(self.history.clone());
+        // Let go of after the lock: a worktree with nothing in it is removed then.
+        let mut forgotten = Vec::new();
         while children.len() >= MAX_KEPT {
             let Some(oldest) = children.iter().position(|c| !c.is_running()) else { break };
-            children.remove(oldest);
+            forgotten.push(children.remove(oldest));
         }
         let id = new_id(&children);
         agent.set_hooks(self.hooks.lock().unwrap().for_subagent(&id, agent_type));
@@ -232,7 +234,10 @@ impl Subagents {
         });
         children.push(child.clone());
         // Started under the lock, so a message sent meanwhile cannot start it too.
-        Ok(self.start(&child, prompt, background))
+        let run = self.start(&child, prompt, background);
+        drop(children);
+        drop(forgotten);
+        Ok(run)
     }
 
     /// Sends `message` to subagent `id`: a running one reads it at its next

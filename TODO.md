@@ -118,9 +118,6 @@ MCP servers with keys the harness does not know.
 
 ### Tests
 
-- [ ] `cargo test` leaves git worktrees and `harness/<date>-…` branches registered in this repository (39 branches
-  on 2026-11-10, most of their directories gone): the worktree tests run against the checkout itself. Run them in
-  a temporary repository, or remove what they create. (seen)
 - [ ] `cli::menu::tests::files_list_the_directory_then_search_the_project` expects a `target/` directory in the
   checkout, so it fails with `CARGO_TARGET_DIR` set elsewhere. (seen)
 
@@ -175,9 +172,10 @@ other harness's docs or source before acting on an entry. All findings here are 
   Anthropic API (context editing) clear old tool results before summarizing. (mainstream: likely)
 - [ ] Worktree subagents do not run in parallel: the `Scheduler` is process-global and `Workspace` is not keyed
   by directory, so they serialize with each other, with the main agent and with every web task (all default bash
-  calls, `git status` too). Worktrees leak on error paths before the run (subagent/mod.rs:553-631) and on stop,
-  `/clear`, eviction and exit (no `Drop`; `settle` only on completion, running git under a std mutex). Claude
-  Code and Cursor use worktrees for parallel agents and remove unchanged ones. (mainstream: likely)
+  calls, `git status` too). Claude Code and Cursor use worktrees for parallel agents. (mainstream: likely)
+- [ ] Worktrees are removed when let go of only if unchanged; one a stopped subagent changed is kept without the
+  parent being told where. A process killed outright leaves its worktrees, and nothing sweeps them later.
+  `settle` runs git while holding the child's std mutex (runtime.rs). (read)
 - [ ] Engineering: Unix only (no `cfg(windows)`), no logging/tracing, no CI, no integration tests (web: 6 unit
   tests, no router/auth test), unknown flags run as a one-shot prompt (`session::parse_args`). Codex and Claude
   Code run on Windows, log or export OTel, and reject unknown flags. (mainstream: likely)

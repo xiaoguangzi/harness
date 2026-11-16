@@ -553,7 +553,9 @@ impl Tool for AgentTool {
         let worktree = match input.isolation {
             Some(Isolation::Worktree) => {
                 let name = crate::session::new_id();
-                match tokio::task::spawn_blocking(move || worktree::Worktree::create(&crate::tools::workdir::get(), &name)).await {
+                // Read here: the blocking thread has no working directory of the task's.
+                let dir = crate::tools::workdir::get();
+                match tokio::task::spawn_blocking(move || worktree::Worktree::create(&dir, &name)).await {
                     Ok(Ok(worktree)) => Some(worktree),
                     Ok(Err(e)) => return ToolOutput::error(format!("Could not make a git worktree: {e:#}")),
                     Err(e) => return ToolOutput::error(format!("Could not make a git worktree: {e}")),
