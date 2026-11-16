@@ -160,7 +160,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `prompt_cache` | Anthropic 提示词缓存，默认开启：会话末尾的自动断点，加上系统提示词上的一个断点，这样它之前的消息发生变化时（[压缩](#上下文压缩)、`/rewind`、`/clear`、同一项目里的新会话），以及同类型的每个子代理，仍然从缓存读取工具和系统提示词 |
 | `prompt_cache_ttl` | 仅 Anthropic：缓存在最后一次使用后保留多久，`5m`（默认）或 `1h`。写入 1 小时缓存的价格是输入价的 2 倍而不是 1.25 倍，常在 5 分钟到 1 小时之间停顿时更划算 |
 | `gzip` | 用 gzip 压缩 1 KiB 及以上的请求体；`api.anthropic.com` 默认开启，网关默认关闭，因为很多网关不接受 |
-| `tool_search` | 仅 Anthropic：MCP 工具定义会占上下文窗口十分之一以上时，把它们[延迟加载](#延迟加载的工具)到 `tool_search` 工具之后。`api.anthropic.com` 默认开启，网关默认关闭；provider 对这样的请求返回 HTTP 400 或 422 时，会把所有工具完整发送再试一次，成功的话本次运行剩下的时间里都这样发送 |
+| `tool_search` | 仅 Anthropic：MCP 工具定义会占上下文窗口十分之一以上时，把它们[延迟加载](#延迟加载的工具)到 `tool_search` 工具之后。`api.anthropic.com` 默认开启，网关默认关闭；某个模型对这样的请求返回 HTTP 400 或 422 时，会把所有工具完整发送再试一次，成功的话这个模型在本次运行剩下的时间里都这样发送（同一 provider 的其他模型仍会延迟加载） |
 | `models` | 按模型的覆盖项；列出的模型会显示在 `/model` 和 Tab 补全中 |
 | `sync` | `harness provider sync` 列出网关的哪些模型：`{"include": [...], "exclude": [...]}`，模式中 `*` 匹配任意一串字符（包括 `/`），`?` 匹配一个字符，不区分大小写；模型匹配某个 `include` 模式（没有 `include` 时匹配所有）且不匹配任何 `exclude` 模式时才会列出。命令的 `--include` / `--exclude` 会保存到这里 |
 | `price` | 按模型设置：每百万 token 的美元价格，`{"input": 1.25, "output": 10, "cache_read": 0.125}`（也可设 `cache_write`；默认缓存读取为输入价的十分之一、写入为 1.25 倍，1 小时缓存为 2 倍），用于 `/usage` 显示的费用估算。Claude 模型内置了官方价格 |

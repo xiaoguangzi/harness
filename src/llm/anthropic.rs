@@ -16,9 +16,10 @@ pub(super) const API_VERSION: &str = "2023-06-01";
 /// The server-side tool search tool, which earlier versions used: its
 /// calls in saved conversations are left out.
 const SERVER_TOOL_SEARCH: &str = "tool_search_tool_bm25";
-/// Providers whose requests failed with deferred tools and went through
-/// with every tool in full.
-static NO_TOOL_SEARCH: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// Models, as (base URL, model), whose requests failed with deferred tools
+/// and went through with every tool in full: one model of a gateway may
+/// take them where another does not.
+static NO_TOOL_SEARCH: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
 /// Server-side refusal fallback, `fallbacks: "default"` form.
 const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// Advisors the API refused for a model, as (base URL, model, advisor):
@@ -71,7 +72,7 @@ pub(super) async fn create(
         }
     };
     if deferring_refused {
-        NO_TOOL_SEARCH.lock().unwrap().insert(target.config.base_url.clone());
+        NO_TOOL_SEARCH.lock().unwrap().insert((target.config.base_url.clone(), target.model.to_string()));
     }
 
     let mut acc = Accumulator { provider: target.provider.to_string(), advisor: target.advisor.map(String::from), ..Default::default() };
@@ -112,7 +113,7 @@ fn request_headers(target: &Target<'_>, body: &Value) -> Vec<(String, String)> {
 /// with `tool_search`: when the provider has `tool_search` on and has not
 /// refused it.
 pub(super) fn defers(target: &Target<'_>) -> bool {
-    target.tool_search() && !NO_TOOL_SEARCH.lock().unwrap().contains(&target.config.base_url)
+    target.tool_search() && !NO_TOOL_SEARCH.lock().unwrap().contains(&(target.config.base_url.clone(), target.model.to_string()))
 }
 
 /// The request body. With `defer`, the tools marked so are sent with
@@ -590,6 +591,7 @@ mod tests {
         }
         assert_eq!(*seen.lock().unwrap(), [true, false, false], "tried once, then in full");
         assert!(!defers(&target));
+        assert!(defers(&providers.target("gw/other").unwrap()), "another model of the provider still defers");
     }
 
     #[test]

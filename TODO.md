@@ -203,8 +203,6 @@ other harness's docs or source before acting on an entry. All findings here are 
   `onFailure: "block"` it reaches the model (hooks.rs:845, 468).
 - [ ] Spilled output in `$TMPDIR/harness-<uid>/tool-output/` is never removed.
 - [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
-- [ ] One unrelated 400/422 turns tool search off for the rest of the run (`NO_TOOL_SEARCH`), and the advisor for
-  that pairing (`NO_ADVISOR`, matched on "advisor" in the text).
 - [ ] Messages typed during a turn ride on tool-result user messages, which compaction does not keep word for word
   (`kept_user_messages`, compact.rs:426); `<hook-feedback>` / `<permission-mode>` are kept as if typed.
 - [ ] Hooks, the hook input's `cwd`, path `if` checks and `lsp` use `current_dir()`, not `workdir::get()`, so a
