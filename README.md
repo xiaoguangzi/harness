@@ -21,6 +21,7 @@ cargo install --path .                  # into ~/.cargo/bin; or --root ~/.local 
 export ANTHROPIC_API_KEY=sk-ant-...     # or OPENAI_API_KEY, or configure gateways (below)
 harness                                 # interactive REPL (/exit to quit)
 harness "list the files"                # one-shot
+harness -- "-v is broken: fix it"       # a prompt that starts with `-` goes after `--` (an unknown option is refused)
 harness --continue                      # resume the latest conversation here (see below)
 harness --web                           # web UI at http://localhost:8787 (see below)
 harness --sandbox                       # run the model's commands in an OS sandbox (see below)

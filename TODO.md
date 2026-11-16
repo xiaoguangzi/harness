@@ -177,8 +177,7 @@ other harness's docs or source before acting on an entry. All findings here are 
   parent being told where. A process killed outright leaves its worktrees, and nothing sweeps them later.
   `settle` runs git while holding the child's std mutex (runtime.rs). (read)
 - [ ] Engineering: Unix only (no `cfg(windows)`), no logging/tracing, no CI, no integration tests (web: 6 unit
-  tests, no router/auth test), unknown flags run as a one-shot prompt (`session::parse_args`). Codex and Claude
-  Code run on Windows, log or export OTel, and reject unknown flags. (mainstream: likely)
+  tests, no router/auth test). Codex and Claude Code run on Windows and log or export OTel. (mainstream: likely)
 - [ ] Smaller: no OpenAI `prompt_cache_key` (Codex sends one); retry backoff without jitter. (mainstream: likely)
 
 ### To check: what mainstream harnesses do here is not known

@@ -22,6 +22,7 @@ cargo install --path .                  # 装到 ~/.cargo/bin；或加 --root ~/
 export ANTHROPIC_API_KEY=sk-ant-...     # 或 OPENAI_API_KEY，或按下文配置网关
 harness                                 # 交互式 REPL（/exit 退出）
 harness "list the files"                # 一次性模式
+harness -- "-v is broken: fix it"       # 以 `-` 开头的提示放在 `--` 之后（未知选项会报错）
 harness --continue                      # 继续当前目录最近的会话（见下文）
 harness --web                           # Web UI，地址 http://localhost:8787（见下文）
 harness --sandbox                       # 在操作系统沙箱中运行模型的命令（见下文）

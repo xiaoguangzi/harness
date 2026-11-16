@@ -31,7 +31,8 @@ Usage: harness [OPTIONS] [PROMPT...]
        harness plugin <command>   Install and manage plugins (harness plugin help)
        harness provider <command> Add LLM gateways and models (harness provider help)
 
-With no PROMPT, starts the interactive REPL; with one, runs it and exits.
+With no PROMPT, starts the interactive REPL; with one, runs it and exits. A PROMPT that
+starts with `-` goes after `--`; an unknown option is refused.
 
 Options:
   -c, --continue      Continue this directory's latest conversation

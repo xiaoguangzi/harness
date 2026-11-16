@@ -70,6 +70,7 @@ type Editor = rustyline::Editor<ReplHelper, rustyline::history::DefaultHistory>;
 pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Output) -> Result<ExitCode> {
     let (resume, args) = session::parse_args(args)?;
     let (format, args) = json::parse_flag(args)?;
+    let args = prompt_args(args)?;
     if format != json::Format::Text {
         if args.is_empty() {
             anyhow::bail!("--output-format json and stream-json need a prompt to run");
@@ -113,6 +114,22 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
         return one_shot::run(agent, env, &args.join(" "), format, recorder, &out).await;
     }
     Repl::new(agent, env, out, recorder, boxed)?.run().await
+}
+
+/// The one-shot prompt the arguments no option took make: an option no one
+/// took is refused, since `--contineu` is a typo rather than a prompt. After
+/// `--`, everything is the prompt, `-` at its start too.
+fn prompt_args(mut args: Vec<String>) -> Result<Vec<String>> {
+    match args.first().map(String::as_str) {
+        Some("--") => {
+            args.remove(0);
+            Ok(args)
+        }
+        Some(option) if option.starts_with('-') && option.len() > 1 => anyhow::bail!(
+            "unknown option `{option}` (`harness --help` lists them; a prompt that starts with `-` goes after `--`)"
+        ),
+        _ => Ok(args),
+    }
 }
 
 /// The interactive REPL, and what its loop keeps from one line to the next.
@@ -624,4 +641,20 @@ fn notify_when_idle(hooks: &Hooks, model: &str) -> tokio::task::JoinHandle<()> {
 
 fn history_path() -> Option<std::path::PathBuf> {
     crate::util::harness_home().map(|dir| dir.join("history"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_option_no_one_took_is_not_a_prompt() {
+        let args = |a: &[&str]| prompt_args(a.iter().map(|s| s.to_string()).collect());
+        assert_eq!(args(&["fix", "the", "-v", "flag"]).unwrap(), ["fix", "the", "-v", "flag"]);
+        assert!(args(&["--contineu"]).unwrap_err().to_string().contains("unknown option `--contineu`"));
+        assert!(args(&["-x", "go"]).is_err());
+        assert_eq!(args(&["--", "-x", "go"]).unwrap(), ["-x", "go"]);
+        assert_eq!(args(&["-"]).unwrap(), ["-"]);
+        assert!(args(&[]).unwrap().is_empty());
+    }
 }
