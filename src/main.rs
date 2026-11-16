@@ -31,8 +31,8 @@ Usage: harness [OPTIONS] [PROMPT...]
        harness plugin <command>   Install and manage plugins (harness plugin help)
        harness provider <command> Add LLM gateways and models (harness provider help)
 
-With no PROMPT, starts the interactive REPL; with one, runs it and exits. A PROMPT that
-starts with `-` goes after `--`; an unknown option is refused.
+With no PROMPT, starts the interactive REPL; with one, runs it and exits. After `--`,
+everything is the PROMPT, `-c` or `--sandbox` too; an unknown option is refused.
 
 Options:
   -c, --continue      Continue this directory's latest conversation
@@ -56,6 +56,12 @@ Settings: ~/.harness/settings.json (or $HARNESS_SETTINGS)
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // What follows `--` is the prompt, whatever it looks like: no option
+    // reads it.
+    let (args, prompt) = match args.iter().position(|a| a == "--") {
+        Some(at) => (args[..at].to_vec(), Some(args[at + 1..].to_vec())),
+        None => (args, None),
+    };
     if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
         print!("{USAGE}");
         return Ok(ExitCode::SUCCESS);
@@ -67,9 +73,14 @@ async fn main() -> Result<ExitCode> {
     let (settings_path, args) = settings::parse_flag(args)?;
     settings::set_path(settings_path);
     let ask = &mut plugins::manage::TerminalAsk;
+    // A subcommand takes its arguments as they were, `--` and all.
+    let whole = || -> Vec<String> {
+        let tail = prompt.iter().flat_map(|p| std::iter::once("--".to_string()).chain(p.iter().cloned()));
+        args[1..].iter().cloned().chain(tail).collect()
+    };
     let managed = match args.first().map(String::as_str) {
-        Some("plugin" | "plugins") => Some(tokio::task::block_in_place(|| plugins::manage::run(&args[1..], ask))),
-        Some("provider" | "providers") => Some(llm::manage::run(&args[1..], ask)),
+        Some("plugin" | "plugins") => Some(tokio::task::block_in_place(|| plugins::manage::run(&whole(), ask))),
+        Some("provider" | "providers") => Some(llm::manage::run(&whole(), ask)),
         _ => None,
     };
     if let Some(lines) = managed {
@@ -96,7 +107,7 @@ async fn main() -> Result<ExitCode> {
         warn(format!("{} is no longer read; move its settings into ~/.harness/settings.json", file.display()));
     }
     if args.iter().any(|a| a == "--check-plugins") {
-        if args.len() > 1 {
+        if args.len() > 1 || prompt.is_some() {
             anyhow::bail!("--check-plugins takes no other arguments");
         }
         return Ok(setup::check_plugins(&settings, &plugin_dirs).await);
@@ -119,6 +130,9 @@ async fn main() -> Result<ExitCode> {
         setup::auto_update(std::mem::take(&mut ext.auto_update));
     }
     let web_addr = web::parse_flag(&args)?;
+    if web_addr.is_some() && prompt.is_some() {
+        anyhow::bail!("--web takes no other arguments");
+    }
     // The web UI can fix a missing or broken provider setup, so it starts
     // without one.
     let providers = match Providers::from_settings(&settings) {
@@ -154,7 +168,7 @@ async fn main() -> Result<ExitCode> {
     }
     let (registry, system) = env.conversation(&client);
     let mut agent = Agent::new(client, registry, system);
-    let result = cli::run(&mut agent, args, &mut env, out).await;
+    let result = cli::run(&mut agent, args, prompt, &mut env, out).await;
     // The agent's tools hold the MCP connections; release them first.
     drop(agent);
     env.shutdown().await;

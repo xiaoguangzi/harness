@@ -22,7 +22,7 @@ cargo install --path .                  # 装到 ~/.cargo/bin；或加 --root ~/
 export ANTHROPIC_API_KEY=sk-ant-...     # 或 OPENAI_API_KEY，或按下文配置网关
 harness                                 # 交互式 REPL（/exit 退出）
 harness "list the files"                # 一次性模式
-harness -- "-v is broken: fix it"       # 以 `-` 开头的提示放在 `--` 之后（未知选项会报错）
+harness -- -v is broken: fix it         # `--` 之后的全部内容都是提示（未知选项会报错）
 harness --continue                      # 继续当前目录最近的会话（见下文）
 harness --web                           # Web UI，地址 http://localhost:8787（见下文）
 harness --sandbox                       # 在操作系统沙箱中运行模型的命令（见下文）
@@ -211,7 +211,7 @@ harness --advisor opus                  # 仅本次运行
 
 - **设置**：配置中的 `advisor_model`、`$HARNESS_ADVISOR_MODEL`，或只对本次运行生效的 `--advisor MODEL`（优先级最高）；`off` 表示关闭。`/advisor` 打开选择面板；`/advisor <model>` 和 `/advisor off` 设置本会话的顾问，并保存为配置中的 `advisor_model`。别名有 `fable`（`claude-fable-5-2`）、`opus`（`claude-opus-5-5`）、`sonnet`（`claude-sonnet-5-5`）和 `haiku`（`claude-haiku-5-5`）；也可以写任意模型 ID，按原样发送。单独输入 `/advisor` 会显示当前顾问以及是否生效；`/model` 和启动横幅也会显示。
 - **搭配**：与 API 的检查一致，顾问必须不弱于被咨询的模型：Opus 5 / 5.5 接受 Fable 或 Opus 5 / 5.5 作顾问，Sonnet 5.5 接受 Fable、Opus 5 / 5.5 或 Sonnet 5.5，Fable 5.2 只接受 Fable 5.2，Haiku 4.5 可以被咨询但不能当顾问。不符合的搭配或 harness 不认识的模型不会带上顾问，`/advisor` 会说明原因。子代理继承顾问，并按自己的模型检查搭配。
-- **适用范围**：仅 Anthropic provider，`api.anthropic.com` 默认开启。能把请求原样转发给 Anthropic API 的网关需要在 provider 上设置 `"advisor": true`。如果 API 拒绝顾问（HTTP 400 且错误提到 advisor），请求会去掉顾问重发，本次运行中该模型之后的请求也不再带它，并给出警告。
+- **适用范围**：仅 Anthropic provider，`api.anthropic.com` 默认开启。能把请求原样转发给 Anthropic API 的网关需要在 provider 上设置 `"advisor": true`。如果 API 拒绝顾问（HTTP 400 且错误提到 advisor），请求会去掉顾问重发并给出警告；重发成功的话，本次运行中该模型之后的请求也不再带它。
 - **会话中的显示**：顾问阅读期间状态栏显示 `Advising (model)…`（响应在此期间暂停），之后显示 `● advisor(model)` 和 `⎿ Advisor reviewed the conversation`；咨询失败时显示 `Advisor unavailable (<error_code>)`，模型不带建议继续。较新的顾问模型返回加密的建议，只有主模型能读；明文建议（较早的顾问模型）显示在调用下方和 Ctrl+O 中。`stream-json` 会输出 `advisor`、`advisor_result` 和 `advisor_refused` 事件，Web UI 也会在任务中显示。
 - **费用**：每次咨询都会按顾问模型的价格读取整个会话。顾问的 token 单独统计（`usage.iterations`），`/usage` 将其列在顾问模型名下；上下文大小取主模型最后一次请求的值，所以咨询不会让压缩提前。顾问的内容块保留在历史中，只发回调用它的模型；换成其他模型时，明文建议转为文本，加密建议则不发送。Prompt hook 提问时不带顾问。
 

@@ -67,10 +67,13 @@ const IDLE_NOTICE: Duration = Duration::from_secs(60);
 
 type Editor = rustyline::Editor<ReplHelper, rustyline::history::DefaultHistory>;
 
-pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Output) -> Result<ExitCode> {
+/// Runs the REPL, or the one-shot prompt that `args` (what no option of
+/// `main`'s took) and `prompt` (what followed `--`) make.
+pub async fn run(agent: &mut Agent, args: Vec<String>, prompt: Option<Vec<String>>, env: &mut Env, out: Output) -> Result<ExitCode> {
     let (resume, args) = session::parse_args(args)?;
     let (format, args) = json::parse_flag(args)?;
-    let args = prompt_args(args)?;
+    let mut args = prompt_args(args)?;
+    args.extend(prompt.into_iter().flatten());
     if format != json::Format::Text {
         if args.is_empty() {
             anyhow::bail!("--output-format json and stream-json need a prompt to run");
@@ -117,14 +120,10 @@ pub async fn run(agent: &mut Agent, args: Vec<String>, env: &mut Env, out: Outpu
 }
 
 /// The one-shot prompt the arguments no option took make: an option no one
-/// took is refused, since `--contineu` is a typo rather than a prompt. After
-/// `--`, everything is the prompt, `-` at its start too.
-fn prompt_args(mut args: Vec<String>) -> Result<Vec<String>> {
+/// took is refused, since `--contineu` is a typo rather than a prompt. What
+/// follows `--` never gets here: it is the prompt as it is.
+fn prompt_args(args: Vec<String>) -> Result<Vec<String>> {
     match args.first().map(String::as_str) {
-        Some("--") => {
-            args.remove(0);
-            Ok(args)
-        }
         Some(option) if option.starts_with('-') && option.len() > 1 => anyhow::bail!(
             "unknown option `{option}` (`harness --help` lists them; a prompt that starts with `-` goes after `--`)"
         ),
@@ -653,7 +652,6 @@ mod tests {
         assert_eq!(args(&["fix", "the", "-v", "flag"]).unwrap(), ["fix", "the", "-v", "flag"]);
         assert!(args(&["--contineu"]).unwrap_err().to_string().contains("unknown option `--contineu`"));
         assert!(args(&["-x", "go"]).is_err());
-        assert_eq!(args(&["--", "-x", "go"]).unwrap(), ["-x", "go"]);
         assert_eq!(args(&["-"]).unwrap(), ["-"]);
         assert!(args(&[]).unwrap().is_empty());
     }
