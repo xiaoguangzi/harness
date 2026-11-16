@@ -49,6 +49,8 @@ impl Agent {
             t
         }).collect();
         let calls = calls.as_slice();
+        // Left over from a round interrupted and not repaired: not this one's.
+        self.finished.lock().unwrap().clear();
         // A fork starts from the conversation as it is now.
         let forks = calls.iter().any(|t| t["name"] == "agent" && t["input"]["agent_type"] == crate::subagent::FORK);
         if forks {

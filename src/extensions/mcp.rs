@@ -360,6 +360,13 @@ impl Tool for McpTool {
         self.read_only
     }
 
+    /// A server is the process's, not a working directory's: one that may
+    /// change things keeps out the main agent's changes even when a worktree
+    /// subagent calls it.
+    fn access(&self, _input: &Value) -> crate::tools::scheduling::Access {
+        if self.read_only { crate::tools::scheduling::Access::Concurrent } else { crate::tools::scheduling::Access::Startup }
+    }
+
     fn deferred(&self) -> bool {
         !self.server.config.always_load
     }

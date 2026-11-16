@@ -12,7 +12,12 @@ use tokio::sync::{OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, 
 
 pub enum Access {
     Concurrent,
+    /// The workspace of the working directory the call runs in.
     Workspace,
+    /// The workspace of the directory the harness started in, whatever the
+    /// call's: for what changes things outside any working directory, such
+    /// as an MCP server, which all conversations and subagents share.
+    Startup,
     Resource(String),
     File(String),
 }
@@ -111,14 +116,17 @@ impl Scheduler {
     pub async fn acquire(&self, access: Access) -> Guard {
         let here = super::workdir::get();
         let (mut workspace, mut shared, mut resource) = (None, Vec::new(), None);
+        let start = std::env::current_dir().unwrap_or_else(|_| here.clone());
         let holds = match &access {
             Access::Workspace => Some(Held::Workspace(here.clone())),
+            Access::Startup => Some(Held::Workspace(start.clone())),
             Access::Resource(key) => Some(Held::Resource(key.clone())),
             Access::Concurrent | Access::File(_) => None,
         };
         match access {
             Access::Concurrent => {}
             Access::Workspace => workspace = Some(self.workspace(&here).write_owned().await),
+            Access::Startup => workspace = Some(self.workspace(&start).write_owned().await),
             Access::Resource(key) | Access::File(key) => {
                 if key.starts_with("file:") {
                     for dir in file_workspaces(&key, &here) {
@@ -156,6 +164,7 @@ impl Scheduler {
             Access::Concurrent => return Ok(self.acquire(access).await),
             Access::Resource(key) => vec![Held::Resource(key.clone())],
             Access::Workspace => vec![Held::Workspace(here)],
+            Access::Startup => vec![Held::Workspace(std::env::current_dir().unwrap_or(here))],
             Access::File(key) => file_workspaces(key, &here).into_iter().map(Held::Workspace).collect(),
         };
         let mut acquiring = std::pin::pin!(self.acquire(access));
@@ -255,6 +264,9 @@ mod tests {
         assert!(file.await.is_err());
         let own_file = format!("file:{}", one.join("x.rs").display());
         scope(Some(one.clone()), scheduler.acquire(Access::File(own_file))).await;
+        // An MCP server's change is the process's: it waits for the main agent's command too.
+        let mcp = scope(Some(one.clone()), tokio::time::timeout(short, scheduler.acquire(Access::Startup)));
+        assert!(mcp.await.is_err());
         drop(main);
         scope(Some(one), scheduler.acquire(Access::File(main_file))).await;
     }

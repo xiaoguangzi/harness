@@ -177,6 +177,10 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### To check: what mainstream harnesses do here is not known
 
+- [ ] File locks cover one direction only: the main agent changing a file inside a running worktree does not wait
+  for that worktree's commands, and "in the main checkout" means under the startup directory. Verify worktree
+  parallelism end to end (two background worktree subagents each running `sleep 3`). The interrupt test waits a
+  fixed 2 s; wait for the first result instead. (read)
 - [ ] An interrupted response's text, streamed in part, is not kept in the history (the assistant message is
   pushed only once the response is whole).
 - [ ] Allow rules, session rules and a hook's `allow` are checked before the mode, so they override plan mode.
