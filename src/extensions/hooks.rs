@@ -656,6 +656,11 @@ impl Hooks {
         *self.session.lock().unwrap() = Session { id: id.to_string(), transcript };
     }
 
+    /// The session's id, which subagents share.
+    pub fn session_id(&self) -> String {
+        self.session.lock().unwrap().id.clone()
+    }
+
     /// The hooks of subagent `id` of type `agent_type`, in this session.
     pub fn for_subagent(&self, id: &str, agent_type: &str) -> Self {
         Self { subagent: Some((id.to_string(), agent_type.to_string())), ..self.clone() }

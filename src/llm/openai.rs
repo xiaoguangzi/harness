@@ -66,6 +66,9 @@ fn build_body(target: &Target<'_>, system: &str, tools: &[ToolDef], messages: &[
         "include": ["reasoning.encrypted_content"],
         "reasoning": {"effort": target.effort.as_str()},
     });
+    if let Some(key) = target.prompt_cache_key() {
+        body["prompt_cache_key"] = json!(key);
+    }
     target.apply_extra_body(&mut body);
     body
 }
@@ -453,6 +456,12 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["reasoning"], json!({"effort": "high"}));
         assert!(body.get("include").is_none(), "extra_body null removes a default");
+        let keyed = Target { conversation: Some("s1"), ..p.target("gw/gpt-5").unwrap() };
+        assert!(build_body(&keyed, "sys", &tools, &[]).get("prompt_cache_key").is_none(), "a gateway may not take it");
+        let mut caching = p.provider("gw").unwrap().clone();
+        caching.prompt_cache = Some(true);
+        let keyed = Target { config: &caching, ..keyed };
+        assert_eq!(build_body(&keyed, "sys", &tools, &[])["prompt_cache_key"], "s1", "unless the provider says so");
 
         // The configured effort is sent as is; extra_body has the last word.
         let target = Target { effort: crate::llm::Effort::Low, ..target };

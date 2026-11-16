@@ -279,8 +279,9 @@ impl Agent {
             StreamEvent::PartialUsage(usage) => log.record(model, &usage),
             _ => {}
         };
+        let client = self.client.for_conversation(&self.hooks.session_id());
         let response = loop {
-            match self.client.create(&self.system, definitions, &request, &mut on_event).await {
+            match client.create(&self.system, definitions, &request, &mut on_event).await {
                 Err(e) if is_context_overflow(&e) && drop_oldest(&mut request) => {}
                 Err(e) => return Err(e.context("compacting the conversation")),
                 Ok(response) => break response,

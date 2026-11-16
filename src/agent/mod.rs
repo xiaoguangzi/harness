@@ -268,7 +268,8 @@ impl Agent {
             StreamEvent::PartialUsage(usage) => log.record(model, &usage),
             _ => {}
         };
-        let response = self.client.create(&self.system, &definitions, &request, &mut on_event).await?;
+        let client = self.client.for_conversation(&self.hooks.session_id());
+        let response = client.create(&self.system, &definitions, &request, &mut on_event).await?;
         if let Some(usage) = &response.usage {
             self.usage.record(self.client.spec(), usage);
         }
@@ -744,7 +745,8 @@ impl Agent {
             StreamEvent::AdvisorResult(outcome) => observer.on_advisor_result(&outcome),
             StreamEvent::AdvisorRefused(reason) => observer.on_advisor_refused(reason),
         };
-        let response = self.client.create(&self.system, definitions, &self.messages, &mut on_event).await?;
+        let client = self.client.for_conversation(&self.hooks.session_id());
+        let response = client.create(&self.system, definitions, &self.messages, &mut on_event).await?;
         if let Some(usage) = &response.usage {
             self.usage.record(self.client.spec(), usage);
             observer.on_usage(usage);

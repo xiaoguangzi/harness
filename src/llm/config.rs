@@ -50,6 +50,7 @@ const DEFAULT_MAX_TOKENS: u32 = 64_000;
 const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
 const DEFAULT_EFFORT: Effort = Effort::High;
 const OFFICIAL_ANTHROPIC_HOST: &str = "api.anthropic.com";
+const OFFICIAL_OPENAI_HOST: &str = "api.openai.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub enum Protocol {
@@ -137,7 +138,9 @@ pub struct ProviderConfig {
     /// own, which gateways that drop them from tool results still pass.
     /// Default as above.
     pub tool_result_media: Option<bool>,
-    /// Anthropic only: automatic prompt caching. Default: on.
+    /// Anthropic: automatic prompt caching, default on. OpenAI: requests
+    /// carry the conversation as `prompt_cache_key`, default on for the
+    /// official API, off for gateways.
     pub prompt_cache: Option<bool>,
     /// Anthropic only: how long cached prompts are kept. Default: `5m`.
     pub prompt_cache_ttl: Option<CacheTtl>,
@@ -295,6 +298,8 @@ pub struct Target<'a> {
     /// The advisor this request carries, if any: set by the client once it
     /// checked the pairing.
     pub advisor: Option<&'a str>,
+    /// The conversation the request is for, if the client knows it.
+    pub conversation: Option<&'a str>,
 }
 
 impl Providers {
@@ -430,6 +435,7 @@ impl Providers {
             default_max_tokens: self.max_tokens,
             default_context_window: self.context_window,
             advisor: None,
+            conversation: None,
         })
     }
 
@@ -494,8 +500,16 @@ impl ProviderConfig {
     }
 
     fn is_official_anthropic(&self) -> bool {
+        self.host() == OFFICIAL_ANTHROPIC_HOST
+    }
+
+    fn is_official_openai(&self) -> bool {
+        self.host() == OFFICIAL_OPENAI_HOST
+    }
+
+    fn host(&self) -> &str {
         let host = self.base_url.split("://").nth(1).unwrap_or(&self.base_url);
-        host.split(['/', ':']).next() == Some(OFFICIAL_ANTHROPIC_HOST)
+        host.split(['/', ':']).next().unwrap_or_default()
     }
 
     /// `{base_url}/v1/{path}`, not doubling a `/v1` already in `base_url`.
@@ -571,7 +585,16 @@ impl Target<'_> {
     }
 
     pub fn prompt_cache(&self) -> bool {
-        self.config.prompt_cache.unwrap_or(true)
+        match self.config.protocol {
+            Protocol::Anthropic => self.config.prompt_cache.unwrap_or(true),
+            // Gateways may refuse a parameter they do not know.
+            Protocol::OpenAiResponses => self.config.prompt_cache.unwrap_or_else(|| self.config.is_official_openai()),
+        }
+    }
+
+    /// OpenAI only: the `prompt_cache_key` the request carries.
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        (self.config.protocol == Protocol::OpenAiResponses && self.prompt_cache()).then_some(self.conversation).flatten()
     }
 
     /// How long the prompt cache keeps the conversation, when it is on.
@@ -741,6 +764,10 @@ pub(crate) mod tests {
         assert!(a.fallbacks() && a.eager_input_streaming() && a.gzip(), "official API gets its features");
         assert_eq!(p.target("openai/gpt-5").unwrap().cache_ttl(), None);
         assert_eq!(p.target("openai/gpt-5").unwrap().url("responses"), "https://api.openai.com/v1/responses");
+        let openai = Target { conversation: Some("s1"), ..p.target("openai/gpt-5").unwrap() };
+        assert_eq!(openai.prompt_cache_key(), Some("s1"), "the official API gets the conversation as its cache key");
+        assert_eq!(Target { conversation: Some("s1"), ..a }.prompt_cache_key(), None, "Anthropic has its own caching");
+        assert_eq!(p.target("openai/gpt-5").unwrap().prompt_cache_key(), None, "no conversation, no key");
     }
 
     #[test]

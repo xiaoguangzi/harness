@@ -162,6 +162,9 @@ pub struct Client {
     /// Session override of the advisor: unset uses config; `Some(None)`
     /// is off.
     advisor: Option<Option<String>>,
+    /// The conversation the requests are for, which an OpenAI provider gets
+    /// as `prompt_cache_key`.
+    conversation: Option<Arc<str>>,
 }
 
 /// Whether requests carry the advisor, and if not, why.
@@ -184,7 +187,15 @@ impl Client {
             effort: None,
             subagent_model: None,
             advisor: None,
+            conversation: None,
         })
+    }
+
+    /// This client, for requests of the conversation `id`: requests with
+    /// one key are routed to where their prefix is cached (OpenAI's
+    /// `prompt_cache_key`, which Codex derives from its session too).
+    pub fn for_conversation(&self, id: &str) -> Self {
+        Self { conversation: Some(id.into()), ..self.clone() }
     }
 
     /// The `provider/model` this client talks to.
@@ -330,6 +341,7 @@ impl Client {
         if let AdvisorState::On(model) = self.advisor_state() {
             target.advisor = Some(model);
         }
+        target.conversation = self.conversation.as_deref();
         let mut attempt = 0;
         loop {
             let result = match target.config.protocol {

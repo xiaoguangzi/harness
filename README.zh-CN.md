@@ -158,7 +158,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `fallbacks`、`eager_input_streaming` | 仅 Anthropic 的 API 特性；`api.anthropic.com` 默认开启，网关默认关闭 |
 | `advisor` | 仅 Anthropic：设置了顾问时请求带上 [advisor](#顾问advisor) 工具。`api.anthropic.com` 默认开启，网关默认关闭（网关可能不转发它） |
 | `tool_result_media` | 仅 Anthropic：工具返回的图片和 PDF（`read`、MCP 工具）放在 `tool_result` 里。`api.anthropic.com` 默认开启；网关默认关闭，此时它们放在同一条消息里、紧跟工具结果之后，因为很多网关会丢掉工具结果里的图片 |
-| `prompt_cache` | Anthropic 提示词缓存，默认开启：会话末尾的自动断点，加上系统提示词上的一个断点，这样它之前的消息发生变化时（[压缩](#上下文压缩)、`/rewind`、`/clear`、同一项目里的新会话），以及同类型的每个子代理，仍然从缓存读取工具和系统提示词 |
+| `prompt_cache` | Anthropic 提示词缓存，默认开启：会话末尾的自动断点，加上系统提示词上的一个断点，这样它之前的消息发生变化时（[压缩](#上下文压缩)、`/rewind`、`/clear`、同一项目里的新会话），以及同类型的每个子代理，仍然从缓存读取工具和系统提示词。OpenAI provider 的请求会像 Codex 一样带上会话 id 作为 `prompt_cache_key`，让请求落到缓存了其前缀的机器上；对 `api.openai.com` 默认开启，对网关默认关闭，因为网关可能拒绝不认识的参数 |
 | `prompt_cache_ttl` | 仅 Anthropic：缓存在最后一次使用后保留多久，`5m`（默认）或 `1h`。写入 1 小时缓存的价格是输入价的 2 倍而不是 1.25 倍，常在 5 分钟到 1 小时之间停顿时更划算 |
 | `gzip` | 用 gzip 压缩 1 KiB 及以上的请求体；`api.anthropic.com` 默认开启，网关默认关闭，因为很多网关不接受 |
 | `tool_search` | 仅 Anthropic：MCP 工具定义会占上下文窗口十分之一以上时，把它们[延迟加载](#延迟加载的工具)到 `tool_search` 工具之后。`api.anthropic.com` 默认开启，网关默认关闭；某个模型对这样的请求返回 HTTP 400 或 422 时，会把所有工具完整发送再试一次，成功的话这个模型在本次运行剩下的时间里都这样发送（同一 provider 的其他模型仍会延迟加载） |
