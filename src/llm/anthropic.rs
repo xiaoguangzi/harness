@@ -49,17 +49,17 @@ pub(super) async fn create(
     let mut target = *target;
     let mut defer = defers(&target) && tools.iter().any(|t| t.defer_loading);
     let mut deferring_refused = false;
+    let mut refused_advisor = None;
     let url = target.url("messages");
     let resp = loop {
         let body = build_body(&target, system, tools, messages, defer);
         let headers = request_headers(&target, &body);
         match http::post(http_client, &url, &headers, &body, target.gzip()).await {
-            // The API refused the advisor: without it, now and from now on
-            // for this model.
+            // The API refused the advisor: without it, now and, if that
+            // works, from now on for this model.
             Err(e) if target.advisor.is_some() && refuses_advisor(&e) => {
                 let advisor = target.advisor.take().unwrap_or_default();
-                let key = (target.config.base_url.clone(), target.model.to_string(), advisor.to_string());
-                NO_ADVISOR.lock().unwrap().insert(key);
+                refused_advisor = Some((target.config.base_url.clone(), target.model.to_string(), advisor.to_string()));
                 on_event(StreamEvent::AdvisorRefused(&super::retry_reason(&e)));
             }
             // Perhaps the model cannot defer tools: every tool in full then,
@@ -71,6 +71,9 @@ pub(super) async fn create(
             Ok(resp) => break resp,
         }
     };
+    if let Some(key) = refused_advisor {
+        NO_ADVISOR.lock().unwrap().insert(key);
+    }
     if deferring_refused {
         NO_TOOL_SEARCH.lock().unwrap().insert((target.config.base_url.clone(), target.model.to_string()));
     }
@@ -782,6 +785,19 @@ mod tests {
         assert_eq!(tools, [1, 0, 0], "tried once, then without it");
         assert_eq!(refused.len(), 1);
         assert!(matches!(client.advisor_state(), crate::llm::AdvisorState::Unused { .. }));
+    }
+
+    #[tokio::test]
+    async fn keeps_the_advisor_when_the_request_fails_without_it_too() {
+        let (url, _seen) = mock(|body| match body["tools"].as_array().unwrap().iter().any(|t| t["type"] == advisor::TOOL_TYPE) {
+            true => Err("the advisor tool is unavailable right now".into()),
+            false => Err("messages: something else is wrong".into()),
+        })
+        .await;
+        let client = advisor_client(&url, "claude-haiku-5-5");
+        let messages = [Message::user(vec![json!({"type": "text", "text": "hi"})])];
+        assert!(client.create("sys", &[], &messages, &mut |_| {}).await.is_err());
+        assert!(matches!(client.advisor_state(), crate::llm::AdvisorState::On(_)), "not given up for a failure of its own");
     }
 
     #[test]
