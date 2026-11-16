@@ -410,7 +410,7 @@ By default the harness runs every tool call without asking, as before; the OS [s
 ```
 
 - Rules take Claude Code's permission syntax, as hooks' `if` does: a tool by its name or Claude Code's (`Bash`, `Edit`, `read`), with what its command starts with (`git commit:*`) or what its path matches (`src/**`) in parentheses. `mcp__<server>` is all of that server's tools, and a trailing `*` any tool whose name starts so.
-- A compound command (split at `&&`, `||`, `;`, `|`, `|&`, `&` and newlines, outside quotes; redirections such as `2>&1` do not split it) is denied or asked about when any of its commands is, and allowed without asking only when every one of them is allowed, by one rule or another: `Bash(cargo test:*)` allows `cargo test 2>&1` but not `cargo test && make`. A `Bash(…)` pattern never allows a command with a command substitution (`$(…)`, backticks, `<(…)`), a heredoc or `$'…'` quoting; `Bash` alone allows every command.
+- A compound command (split at `&&`, `||`, `;`, `|`, `|&`, `&` and newlines, outside quotes; redirections such as `2>&1` do not split it) is denied or asked about when any of its commands is, and allowed without asking only when every one of them is allowed, by one rule or another: `Bash(cargo test:*)` allows `cargo test 2>&1` but not `cargo test && make`. A `Bash(…)` pattern never allows a command with a command substitution (`$(…)`, backticks, `<(…)`), a heredoc, a `#` comment or `$'…'` quoting; `Bash` alone allows every command.
 - A deny rule refuses a call in every mode, a PreToolUse hook's `allow` included. Then an ask rule (or a hook's `ask`) asks, in every mode. Then an allow rule, or one you allowed for the session, lets it run. Otherwise the mode decides:
 
 | Mode | |

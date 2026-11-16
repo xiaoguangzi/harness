@@ -296,11 +296,12 @@ impl Output {
             self.show(&mut state, "");
             return true;
         }
-        let Some(question) = state.question.as_mut() else { return false };
-        // Ctrl+O opens the transcript over it, to see the whole call.
-        if *key == Key::ToolOutput {
+        // Ctrl+O opens the transcript over it, to see the whole call; keys
+        // go there until it closes.
+        if state.question.is_some() && (*key == Key::ToolOutput || state.tool_panel.is_some()) {
             return false;
         }
+        let Some(question) = state.question.as_mut() else { return false };
         if question.key(key) {
             state.question = None;
         }
@@ -869,6 +870,27 @@ impl Output {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn the_transcript_takes_keys_over_a_permission_question() {
+        use crate::security::permissions::{Answer, Asker, Request};
+        let out = Output::capture();
+        let _routed = out.route_keys();
+        let asker = super::super::approve::TerminalAsker::new(out.clone());
+        let input = json!({"command": "make\nmake install"});
+        let request = Request { tool: "bash".into(), input, reason: "it changes things".into(), suggestions: Vec::new(), agent: None };
+        let mut pending = Box::pin(asker.ask(&request));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        // As the key readers route them: the question first, then the transcript.
+        let key = |k: Key| out.question_key(&k) || out.tool_output_key(&k);
+        for k in [Key::ToolOutput, Key::Text("i".into()), Key::Down, Key::Enter, Key::Esc] {
+            assert!(key(k));
+        }
+        assert!(futures::poll!(pending.as_mut()).is_pending(), "Esc closed the transcript, answering nothing");
+        assert!(out.state.lock().unwrap().tool_panel.is_none());
+        key(Key::Enter);
+        assert_eq!(pending.await, Some(Answer::Allow));
+    }
 
     #[tokio::test]
     async fn model_questions_preserve_drafts_and_close_when_the_call_is_dropped() {

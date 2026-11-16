@@ -458,9 +458,10 @@ const MAX_SUGGESTIONS: usize = 5;
 
 /// The commands of a compound `bash` command, split where the shell runs one
 /// after another or pipes one into the next (`&&`, `||`, `;`, `|`, `|&`, `&`,
-/// newlines), outside quotes; `None` if it cannot be split with certainty, or
-/// runs a command substitution (`$(…)`, backticks, `<(…)`) that no rule can be
-/// said to allow. Redirections (`2>&1`, `&>`) do not split.
+/// newlines), outside quotes; `None` if it cannot be split with certainty (a
+/// comment, a heredoc, `$'…'`), or runs a command substitution (`$(…)`,
+/// backticks, `<(…)`) that no rule can be said to allow. Redirections (`2>&1`,
+/// `&>`) do not split, nor newlines in quotes or after a backslash.
 fn commands(command: &str) -> Option<Vec<&str>> {
     let bytes = command.as_bytes();
     let mut parts = Vec::new();
@@ -503,11 +504,17 @@ fn commands(command: &str) -> Option<Vec<&str>> {
             b'`' => return None,
             // ANSI-C quoting and heredocs: not followed here.
             b'$' if matches!(bytes.get(i + 1), Some(b'(' | b'\'')) => return None,
-            b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => return None,
-            b'<' if bytes.get(i + 1) == Some(&b'<') => return None,
-            // `>&`, `<&`, `&>`: a redirection.
-            b'&' if i > 0 && matches!(bytes[i - 1], b'>' | b'<') => {}
+            c @ (b'<' | b'>') => match bytes.get(i + 1) {
+                Some(b'(') => return None,
+                Some(b'<') if c == b'<' => return None,
+                // `>&`, `<&`: the `&` is the redirection's.
+                Some(b'&') => i += 1,
+                _ => {}
+            },
+            // `&>`: a redirection.
             b'&' if bytes.get(i + 1) == Some(&b'>') => {}
+            // A comment, which may hide a quote or a line's end.
+            b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() || b";&|()".contains(&bytes[i - 1]) => return None,
             c @ (b'&' | b'|' | b';' | b'\n') => {
                 push(&mut parts, &command[start..i], wants_command)?;
                 let doubled = matches!(c, b'&' | b'|') && bytes.get(i + 1) == Some(&c);
@@ -613,6 +620,9 @@ mod tests {
             "cargo test -- 'a && b' \"c | d\"",
             "cargo test \\; rm",
             "cargo test 'it $(is) quoted'",
+            "cargo test -- \"a\nb\"",
+            "cargo test \\\n  --lib",
+            "cargo test x\"#\" y#z",
         ] {
             assert_eq!(decide(allowed), Decision::Allow, "{allowed}");
         }
@@ -629,6 +639,10 @@ mod tests {
             "cargo test $'\\'' ; rm -rf x #'",
             "cargo test 'unclosed ; rm -rf x",
             "cargo test <<EOF\nx\nEOF",
+            "cargo test \\>& rm -rf x",
+            "cargo test \\<& rm -rf x",
+            "cargo test #'\nrm -rf x #'",
+            "cargo test # \\\nrm -rf x",
             "cargo test &&",
             "cargo test | ",
             "",

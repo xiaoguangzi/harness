@@ -264,7 +264,8 @@ fn rule_regex(pattern: &str, command: bool) -> Result<Regex, String> {
         Some(body) if command => (body, r"(\s.*)?"),
         _ => (pattern, ""),
     };
-    let mut regex = String::from("^");
+    // A command's quoted argument may span lines.
+    let mut regex = String::from(if command { "(?s)^" } else { "^" });
     let mut chars = body.chars().peekable();
     while let Some(c) = chars.next() {
         match c {

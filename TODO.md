@@ -153,7 +153,7 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] Bash allow rules are still narrower than Claude Code's (checked against its permissions docs): wrappers
   (`timeout`, `nice`, `nohup`, …) are not stripped, so `Bash(npm test:*)` does not allow `timeout 30 npm test`;
   there is no built-in set of read-only commands (`ls`, `cat`, read-only `git`) that run without asking; heredocs
-  are never allowed by a pattern; and redirection targets are not checked, so `Bash(cargo test:*)` allows
+  and comments are never allowed by a pattern; and redirection targets are not checked, so `Bash(cargo test:*)` allows
   `cargo test > any/file`. Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit
   Claude Code documents too. (read)
 - [ ] Sessions are rewritten whole only at the end of a turn (a crash loses the turn), compaction overwrites the
