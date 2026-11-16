@@ -178,8 +178,8 @@ other harness's docs or source before acting on an entry. All findings here are 
   fixed 2 s; wait for the first result instead. (read)
 - [ ] An interrupted response's text, streamed in part, is not kept in the history (the assistant message is
   pushed only once the response is whole).
-- [ ] Allow rules, session rules and a hook's `allow` are checked before the mode, so they override plan mode.
-- [ ] A PreToolUse hook's `allow` skips the ask rules (Claude Code is thought to still apply them).
+- [ ] Allow rules and session rules are checked before the mode, so they override plan mode. Claude Code's docs
+  (checked 2026-11-16) say a hook's `allow` does not (now matched) but do not say what its allow rules do there.
 - [ ] Manual and idle compaction remove every `/rewind` point (`history.rebase(None, 1)`, compact.rs:231).
 - [ ] Calls inside a `code` script never enter history or reach the Observer (no diff shown). Keeping them out
   of context is the point of programmatic tool calling; whether others show them to the user is not known.

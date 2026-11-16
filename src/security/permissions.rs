@@ -311,18 +311,20 @@ impl Permissions {
         if let Some(rule) = (name == "bash").then(|| self.denied_target(input)).flatten() {
             return Decision::Deny(format!("The permission rule `{rule}` denies this call: it names a file the rule covers."));
         }
-        match hook {
-            Some(HookDecision::Allow) => return Decision::Allow,
-            Some(HookDecision::Ask(reason)) => return Decision::Ask(reason.clone()),
-            None => {}
-        }
+        // An ask rule asks even when a hook allowed the call, as in Claude Code.
         if let Some(rule) = matching(&self.config.ask) {
             return Decision::Ask(format!("the rule `{rule}` asks for it"));
+        }
+        let reads = tool.is_some_and(|t| t.read_only());
+        match hook {
+            // In plan mode a hook's allow does nothing for a call that changes things.
+            Some(HookDecision::Allow) if reads || self.mode() != Mode::Plan => return Decision::Allow,
+            Some(HookDecision::Ask(reason)) => return Decision::Ask(reason.clone()),
+            _ => {}
         }
         if UNCHECKED.contains(&name) || self.allowed(name, input) {
             return Decision::Allow;
         }
-        let reads = tool.is_some_and(|t| t.read_only());
         match self.mode() {
             Mode::BypassPermissions => Decision::Allow,
             _ if reads => Decision::Allow,
@@ -503,7 +505,7 @@ pub async fn nested(name: &str, input: &Value) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HookDecision {
     /// `permissionDecision: "allow"`: it runs without asking, unless a deny
-    /// rule refuses it.
+    /// rule refuses it or an ask rule asks; in plan mode, only if it reads.
     Allow,
     /// `permissionDecision: "ask"`, with the hook's reason.
     Ask(String),
@@ -596,6 +598,14 @@ mod tests {
         let hook = HookDecision::Ask("the hook wants it".into());
         assert_eq!(p.decide("bash", None, &json!({"command": "cargo test"}), Some(&hook)), Decision::Ask("the hook wants it".into()));
         assert!(matches!(p.decide("bash", None, &json!({"command": "rm -rf x"}), Some(&HookDecision::Allow)), Decision::Deny(_)));
+        let allow = |command: &str| p.decide("bash", None, &json!({"command": command}), Some(&HookDecision::Allow));
+        assert_eq!(allow("make"), Decision::Allow, "the hook allows it");
+        assert!(matches!(allow("git push origin"), Decision::Ask(_)), "an ask rule still asks");
+        p.set_mode(Mode::Plan);
+        assert!(matches!(allow("make"), Decision::Deny(_)), "plan mode: the hook's allow does nothing for a change");
+        let hook_read = p.decide("grep", tools.get("grep").map(|t| t.as_ref()), &json!({"pattern": "x"}), Some(&HookDecision::Allow));
+        assert_eq!(hook_read, Decision::Allow);
+        p.set_mode(Mode::Default);
 
         p.set_mode(Mode::AcceptEdits);
         assert_eq!(decide("edit", json!({"path": "src/main.rs"})), Decision::Allow);
