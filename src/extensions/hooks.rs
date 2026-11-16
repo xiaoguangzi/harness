@@ -129,6 +129,16 @@ struct Handler {
     block_on_failure: bool,
     /// Set for a plugin's hooks: `CLAUDE_PLUGIN_ROOT` and the like.
     env: Vec<(String, String)>,
+    /// How messages name the hook, when not by its action: a plugin's
+    /// command without its sensitive options filled in, which the action
+    /// has, since a failure's message can reach the model.
+    label: Option<String>,
+}
+
+impl Handler {
+    fn label(&self) -> String {
+        self.label.clone().unwrap_or_else(|| self.action.label())
+    }
 }
 
 /// `onFailure` in a hook's settings: `continue` (the default) or `block`.
@@ -301,7 +311,7 @@ impl TryFrom<RawHandler> for Handler {
         let condition = raw.condition.as_deref().map(Condition::parse).transpose()?;
         let mode = Mode::new(raw.background, raw.rewake, raw.rewake_message);
         let block_on_failure = block_on_failure(raw.on_failure.as_deref(), &action)?;
-        Ok(Handler { action, condition, mode, timeout: raw.timeout, block_on_failure, env: Vec::new() })
+        Ok(Handler { action, condition, mode, timeout: raw.timeout, block_on_failure, env: Vec::new(), label: None })
     }
 }
 
@@ -477,8 +487,13 @@ pub fn plugin_config(events: &Value, plugin: &PluginDirs, warnings: &mut Vec<Str
                     args.iter().map(|a| plugin.expand(a.as_str().map_or(&a.to_string(), |a| a))).collect()
                 });
                 let kind = handler["type"].as_str().unwrap_or_default();
+                let mut label = None;
                 let action = match Action::new(kind, text("command"), args, text("prompt"), text("model")) {
-                    Ok(Action::Command { command, args }) => Action::Command { command: plugin.expand(&command), args },
+                    Ok(Action::Command { command, args }) => {
+                        let shown = Action::Command { command: plugin.expand_prompt(&command), args: args.clone() };
+                        label = Some(shown.label());
+                        Action::Command { command: plugin.expand(&command), args }
+                    }
                     Ok(Action::Prompt { prompt, model }) => Action::Prompt { prompt: plugin.expand_prompt(&prompt), model },
                     Err(e) => {
                         warnings.push(format!("{name} hook: {e}; left out"));
@@ -503,7 +518,7 @@ pub fn plugin_config(events: &Value, plugin: &PluginDirs, warnings: &mut Vec<Str
                     }
                 };
                 let timeout = handler["timeout"].as_u64();
-                hooks.push(Handler { action, condition, mode, timeout, block_on_failure, env: plugin.env() });
+                hooks.push(Handler { action, condition, mode, timeout, block_on_failure, env: plugin.env(), label });
             }
             if !hooks.is_empty() {
                 config.entry(event).or_default().push(Group { matcher, hooks });
@@ -807,6 +822,7 @@ impl Hooks {
             timeout: handler.timeout,
             block_on_failure: handler.block_on_failure,
             env: handler.env.clone(),
+            label: handler.label.clone(),
         };
         tokio::spawn(async move {
             let reply = hooks.call(event, &handler, &input).await;
@@ -859,7 +875,7 @@ impl Hooks {
 impl Outcome {
     /// Takes in what the hook `handler` answered.
     fn add(&mut self, event: Event, handler: &Handler, reply: Result<Reply, String>) {
-        let name = format!("{} hook `{}`", event.as_str(), crate::util::ellipsize(&handler.action.label(), 60));
+        let name = format!("{} hook `{}`", event.as_str(), crate::util::ellipsize(&handler.label(), 60));
         let failed = |outcome: &mut Self, failure: String| {
             if handler.block_on_failure {
                 outcome.block(&format!("{failure}, and it blocks when it fails"));
@@ -1287,6 +1303,10 @@ pub(crate) mod tests {
         let input: Value = serde_json::from_str(outcome.notices[0].split_once(": ").unwrap().1).unwrap();
         assert_eq!((input["notification_type"].as_str(), input["message"].as_str()), (Some("idle_prompt"), Some("waiting")));
         assert!(hooks.notification("other", "x", "m").await.notices.is_empty(), "the matcher picks the type");
+        let failing = json!({"Stop": [{"hooks": [{"type": "command", "command": "exit 1 # ${user_config.token}", "onFailure": "block"}]}]});
+        let failing = Hooks::with_config(Arc::new(plugin_config(&failing, &plugin, &mut warnings)));
+        let block = failing.stop(false, "", "m").await.block.unwrap();
+        assert!(block.contains("${user_config.token}") && !block.contains("t0k"), "no secret for the model: {block}");
         assert!(hooks.has(Event::Notification) && !hooks.has(Event::Stop));
         assert_eq!(tool_named("Bash"), Some("bash"));
         assert_eq!(tool_named("KillShell"), Some("kill_shell"));
