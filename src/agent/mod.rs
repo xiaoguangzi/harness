@@ -1025,7 +1025,7 @@ pub(crate) mod tests {
         use compact::tests::texts;
         let bash = |id: &str, command: &str| json!({"type": "tool_use", "id": id, "name": "bash", "input": {"command": command}});
         let (client, mut requests) = compact::tests::gateway(move |n| match n {
-            0 => (vec![bash("t1", "echo one"), bash("t2", "echo two")], "tool_use", 100),
+            0 => (vec![bash("t1", "printf one"), bash("t2", "echo two")], "tool_use", 100),
             _ => (vec![text("done")], "end_turn", 100),
         })
         .await;
@@ -1048,7 +1048,7 @@ pub(crate) mod tests {
         }
         agent.permissions().set_mode(Mode::Default);
         let (client, mut requests) = compact::tests::gateway(move |n| match n {
-            0 => (vec![bash("t3", "echo three")], "tool_use", 100),
+            0 => (vec![bash("t3", "printf three")], "tool_use", 100),
             _ => (vec![text("done")], "end_turn", 100),
         })
         .await;
@@ -1061,7 +1061,7 @@ pub(crate) mod tests {
         assert!(result["content"].as_str().unwrap().contains("cannot be asked for here"), "no one to ask: {result}");
         agent.permissions().set_asker(Some(Arc::new(Yes)));
         let (client, mut requests) = compact::tests::gateway(move |n| match n {
-            0 => (vec![bash("t4", "echo four")], "tool_use", 100),
+            0 => (vec![bash("t4", "printf 'four\\n'")], "tool_use", 100),
             _ => (vec![text("done")], "end_turn", 100),
         })
         .await;
@@ -1079,7 +1079,7 @@ pub(crate) mod tests {
         use crate::security::permissions::Permissions;
         let script = r#"
             const run = (command) => tools.bash({command}).then((out) => out.trim(), (e) => "refused: " + e.message);
-            print(await run("echo one")); print(await run("echo two")); print(await run("echo rm"));
+            print(await run("printf one")); print(await run("echo two")); print(await run("echo rm"));
         "#;
         let call = json!({"type": "tool_use", "id": "c1", "name": "code", "input": {"code": script}});
         let (client, mut requests) = compact::tests::gateway(move |n| match n {

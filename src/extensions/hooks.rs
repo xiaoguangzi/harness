@@ -35,7 +35,8 @@ use tokio::process::Command;
 use crate::agent::Inbox;
 use crate::extensions::skills::PluginDirs;
 use crate::llm::{Client, Message};
-use crate::security::permissions::{self, HookDecision};
+use crate::security::permissions::HookDecision;
+use crate::security::shell;
 use crate::tools::{KillGroup, ToolOutput};
 
 /// How long a hook may run unless it sets `timeout`.
@@ -244,18 +245,20 @@ impl Condition {
                 .map(str::trim)
                 // Past wrappers and assignments too: `nohup FOO=1 rm -rf x` for `Bash(rm:*)`.
                 .any(|part| {
-                    !part.is_empty() && (pattern.is_match(part) || pattern.is_match(permissions::strip_wrappers(part, true)))
+                    !part.is_empty() && (pattern.is_match(part) || pattern.is_match(shell::strip_wrappers(part, true)))
                 }),
             Some("read" | "edit" | "write" | "grep" | "glob") => {
-                let Some(path) = input["file_path"].as_str().or(input["path"].as_str()) else { return false };
+                let Some(written) = input["file_path"].as_str().or(input["path"].as_str()) else { return false };
+                // `./.env` and `src/../.env` are `.env` too.
+                let path = lexical(written);
                 // Relative to where the harness started, and to a worktree
                 // subagent's worktree: a rule holds for the project's files
                 // in either.
                 let dirs = [std::env::current_dir().ok(), crate::tools::workdir::current()];
                 let relative = dirs.into_iter().flatten().filter_map(|dir| {
-                    std::path::Path::new(path).strip_prefix(&dir).ok().map(|p| p.display().to_string())
+                    std::path::Path::new(&path).strip_prefix(&dir).ok().map(|p| p.display().to_string())
                 });
-                pattern.is_match(path) || relative.into_iter().any(|r| pattern.is_match(&r))
+                pattern.is_match(written) || pattern.is_match(&path) || relative.into_iter().any(|r| pattern.is_match(&r))
             }
             _ => false,
         }
@@ -268,10 +271,34 @@ impl Condition {
         names.iter().any(|n| *n == self.tool) && self.pattern.as_ref().is_none_or(|p| p.is_match(command))
     }
 
+    /// Whether the rule is for the tool named `names` (with its aliases).
+    pub(crate) fn is_for(&self, names: &[&str]) -> bool {
+        names.iter().any(|n| *n == self.tool)
+    }
+
     /// Whether the rule has no pattern, and so is for every call of its tool.
     pub(crate) fn is_whole_tool(&self) -> bool {
         self.pattern.is_none()
     }
+}
+
+/// `path` with `.` and `dir/..` taken out, without looking at the disk.
+fn lexical(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|p| *p != "..") => {
+                parts.pop();
+            }
+            // Above the root is the root.
+            ".." if absolute => {}
+            part => parts.push(part),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute { format!("/{joined}") } else if joined.is_empty() { ".".into() } else { joined }
 }
 
 /// A rule's pattern as a regular expression for a whole command (`*` is

@@ -19,7 +19,8 @@
 //! `a; b`) is denied or asked about if any of its commands is, and allowed
 //! only if every one of them is; a command substitution (`$(…)`, backticks)
 //! is never allowed by a `Bash(…)` pattern. Deny rules win, then ask, then allow,
-//! then the mode: `default` runs what only reads (and, in the sandbox,
+//! then the mode: `default` runs what only reads (tools that read, and
+//! `bash` commands of a built-in set that only read; in the sandbox, any
 //! `bash`) and asks for the rest; `acceptEdits` also edits files in the
 //! working directory; `plan` refuses anything that changes things;
 //! `bypassPermissions`, the default, asks for nothing. A conversation's
@@ -32,6 +33,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::extensions::hooks::{self, Condition};
+use crate::security::shell::{self, commands, strip_wrappers};
 use crate::tools::Tool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -140,6 +142,11 @@ impl Rule {
     /// Whether the rule allows `command`, one command of a compound one.
     fn matches_command(&self, command: &str) -> bool {
         matches!(&self.matcher, Matcher::Tool(c) if c.matches_command(&hooks::tool_names("bash"), command))
+    }
+
+    /// Whether the rule is for the built-in tool `tool`, whatever its input.
+    fn is_for(&self, tool: &str) -> bool {
+        matches!(&self.matcher, Matcher::Tool(c) if c.is_for(&hooks::tool_names(tool)))
     }
 
     /// Whether the allow rule allows `command`, as written or without its
@@ -317,7 +324,7 @@ impl Permissions {
             Mode::BypassPermissions => Decision::Allow,
             _ if reads => Decision::Allow,
             Mode::Plan => Decision::Deny(
-                "Plan mode is on: only tools that read run. Finish researching and present your plan; the user \
+                "Plan mode is on: only tools and commands that only read run. Finish researching and present your plan; the user \
                  turns plan mode off to have you carry it out."
                     .into(),
             ),
@@ -329,7 +336,8 @@ impl Permissions {
 
     /// Whether the allow rules or the session's rules allow the call. Each
     /// command of a compound `bash` command must be allowed, by one rule or
-    /// another; a command the parts of which cannot be told apart is not.
+    /// another or by only reading ([`shell::reads_only`]); a command the
+    /// parts of which cannot be told apart is not.
     fn allowed(&self, name: &str, input: &Value) -> bool {
         let session = self.session.lock().unwrap();
         let rules: Vec<&Rule> = self.config.allow.iter().chain(session.iter()).collect();
@@ -340,7 +348,23 @@ impl Permissions {
             return true;
         }
         let Some(commands) = input["command"].as_str().and_then(commands) else { return false };
-        !commands.is_empty() && commands.iter().all(|c| rules.iter().any(|r| r.allows_command(c)))
+        let reads = self.reading(&commands);
+        !commands.is_empty() && commands.iter().all(|c| reads(c) || rules.iter().any(|r| r.allows_command(c)))
+    }
+
+    /// Which commands of a compound `bash` one (`commands`) only read, and
+    /// so run without a rule; a command naming a file a `Read` deny rule
+    /// covers does not count, nor one with a glob while there is such a rule.
+    fn reading<'a>(&'a self, commands: &[&str]) -> impl Fn(&str) -> bool + 'a {
+        let moves = commands.iter().any(|c| shell::changes_dir(c));
+        let denied = |path: Option<&str>| match path {
+            Some(path) => {
+                let input = serde_json::json!({"path": path});
+                self.config.deny.iter().any(|r| r.matches("read", &input))
+            }
+            None => self.config.deny.iter().any(|r| r.is_for("read")),
+        };
+        move |command| shell::reads_only(command, moves, &denied)
     }
 
     /// The rules that would allow calls like this one from now on, for
@@ -355,8 +379,9 @@ impl Permissions {
         let Some(commands) = input["command"].as_str().and_then(commands) else { return Vec::new() };
         let session = self.session.lock().unwrap();
         let rules: Vec<&Rule> = self.config.allow.iter().chain(session.iter()).collect();
+        let reads = self.reading(&commands);
         let mut suggested: Vec<String> = Vec::new();
-        for command in commands.iter().filter(|c| !rules.iter().any(|r| r.allows_command(c))) {
+        for command in commands.iter().filter(|c| !reads(c) && !rules.iter().any(|r| r.allows_command(c))) {
             let Some(rule) = command_rule(name, strip_wrappers(command, false)) else { return Vec::new() };
             if !suggested.contains(&rule) {
                 suggested.push(rule);
@@ -462,226 +487,6 @@ fn in_working_dir(input: &Value) -> bool {
 /// Rules offered for one compound command, at most: Claude Code's limit.
 const MAX_SUGGESTIONS: usize = 5;
 
-/// The commands of a compound `bash` command, split where the shell runs one
-/// after another or pipes one into the next (`&&`, `||`, `;`, `|`, `|&`, `&`,
-/// newlines), outside quotes; `None` if it cannot be split with certainty (a
-/// comment, a heredoc, `$'…'`), or runs a command substitution (`$(…)`,
-/// backticks, `<(…)`) that no rule can be said to allow. Redirections (`2>&1`,
-/// `&>`) do not split, nor newlines in quotes or after a backslash.
-fn commands(command: &str) -> Option<Vec<&str>> {
-    let bytes = command.as_bytes();
-    let mut parts = Vec::new();
-    let (mut start, mut i) = (0, 0);
-    // Whether a command must follow the last operator (`&&`, `||`, `|`).
-    let mut wants_command = false;
-    // An empty part is fine after `;` or `&`, not where a command must follow.
-    fn push<'a>(parts: &mut Vec<&'a str>, part: &'a str, wants: bool) -> Option<()> {
-        let part = part.trim();
-        if !part.is_empty() {
-            parts.push(part);
-        }
-        (!part.is_empty() || !wants).then_some(())
-    }
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 1,
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    i += 1;
-                }
-                if i == bytes.len() {
-                    return None;
-                }
-            }
-            b'"' => {
-                i += 1;
-                loop {
-                    match bytes.get(i)? {
-                        b'"' => break,
-                        b'\\' => i += 1,
-                        b'`' => return None,
-                        b'$' if bytes.get(i + 1) == Some(&b'(') => return None,
-                        _ => {}
-                    }
-                    i += 1;
-                }
-            }
-            b'`' => return None,
-            // ANSI-C quoting and heredocs: not followed here.
-            b'$' if matches!(bytes.get(i + 1), Some(b'(' | b'\'')) => return None,
-            c @ (b'<' | b'>') => match bytes.get(i + 1) {
-                Some(b'(') => return None,
-                Some(b'<') if c == b'<' => return None,
-                // `>&`, `<&`: the `&` is the redirection's.
-                Some(b'&') => i += 1,
-                _ => {}
-            },
-            // `&>`: a redirection.
-            b'&' if bytes.get(i + 1) == Some(&b'>') => {}
-            // A comment, which may hide a quote or a line's end.
-            b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() || b";&|()<>".contains(&bytes[i - 1]) => return None,
-            c @ (b'&' | b'|' | b';' | b'\n') => {
-                push(&mut parts, &command[start..i], wants_command)?;
-                let doubled = matches!(c, b'&' | b'|') && bytes.get(i + 1) == Some(&c);
-                let piped_stderr = c == b'|' && bytes.get(i + 1) == Some(&b'&');
-                if doubled || piped_stderr {
-                    i += 1;
-                }
-                wants_command = doubled || c == b'|';
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    push(&mut parts, &command[start..], wants_command)?;
-    Some(parts)
-}
-
-/// Variables a leading assignment of which an allow rule looks past
-/// (`NODE_ENV=test npm test`): they change what a program prints or how it
-/// logs, not what it runs. `PATH`, `NODE_OPTIONS`, `GIT_*`, `LD_*` and the
-/// like are not here: they can make a command run something else.
-const SAFE_VARS: &[&str] = &[
-    "CARGO_TERM_COLOR", "CI", "CLICOLOR", "CLICOLOR_FORCE", "COLUMNS", "DEBUG", "FORCE_COLOR", "LANG", "LANGUAGE",
-    "LC_ALL", "LC_CTYPE", "NO_COLOR", "NODE_ENV", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "RUST_BACKTRACE",
-    "RUST_LOG", "RUST_TEST_THREADS", "TERM", "TZ",
-];
-
-/// One command (a part of a compound one) without the wrappers that run
-/// their arguments as the command, as Claude Code strips them before
-/// matching rules: `timeout`, `time`, `nice`, `nohup`, `stdbuf`, `command`
-/// (not `command -v`), `builtin`, zsh's `noglob`, `xargs` without options,
-/// and leading assignments: of [`SAFE_VARS`] only for an allow rule, of any
-/// variable (`any_assignment`) for a deny or ask rule. A wrapper whose
-/// options are not plain is left on, so the command matches only rules for
-/// it as written.
-pub(crate) fn strip_wrappers(command: &str, any_assignment: bool) -> &str {
-    let mut rest = command.trim();
-    while let Some(inner) = strip_one(rest, any_assignment).map(str::trim_start) {
-        if inner.is_empty() {
-            break;
-        }
-        rest = inner;
-    }
-    rest
-}
-
-/// What follows the first word of `command`, if it is a wrapper (with its
-/// options) or an assignment that [`strip_wrappers`] strips.
-fn strip_one(command: &str, any_assignment: bool) -> Option<&str> {
-    let (word, mut rest) = split_word(command);
-    if let Some((name, value)) = word.split_once('=') {
-        let name_ok = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        let safe = any_assignment || (SAFE_VARS.contains(&name) && !value.contains(['`', '$']));
-        return (name_ok && safe).then_some(rest);
-    }
-    // Takes an option's value, attached (`-n5`, `--signal=KILL`) or as the next word.
-    let value = |attached: &str, rest: &mut &str, ok: fn(&str) -> bool| -> bool {
-        let value = if attached.is_empty() {
-            let (next, after) = split_word(rest);
-            *rest = after;
-            next
-        } else {
-            attached
-        };
-        ok(value)
-    };
-    let number = |v: &str| v.strip_prefix(['-', '+']).unwrap_or(v).parse::<u32>().is_ok();
-    let duration = |v: &str| {
-        let digits = v.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(v);
-        !digits.is_empty() && digits.parse::<f64>().is_ok_and(|d| d >= 0.0) && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
-    };
-    let plain = |v: &str| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric());
-    let next_is_option = |rest: &str| split_word(rest).0.starts_with('-');
-    match word {
-        "nohup" | "builtin" | "noglob" => Some(rest),
-        "command" | "xargs" => (!next_is_option(rest)).then_some(rest),
-        "time" => match split_word(rest) {
-            ("-p", after) => Some(after),
-            _ => Some(rest),
-        },
-        "nice" => {
-            let (option, after) = split_word(rest);
-            if let Some(attached) = option.strip_prefix("--adjustment=") {
-                return number(attached).then_some(after);
-            }
-            match option.strip_prefix("-n") {
-                Some(attached) => {
-                    rest = after;
-                    value(attached, &mut rest, number).then_some(rest)
-                }
-                None if option.starts_with('-') => number(option).then_some(after),
-                None => Some(rest),
-            }
-        }
-        "timeout" => {
-            loop {
-                let (option, after) = split_word(rest);
-                if !option.starts_with('-') {
-                    break;
-                }
-                rest = after;
-                let ok = match option {
-                    "--preserve-status" | "--foreground" | "-v" | "--verbose" => true,
-                    _ if option.starts_with("--signal=") => plain(&option[9..]),
-                    _ if option.starts_with("--kill-after=") => duration(&option[13..]),
-                    _ if option.starts_with("-s") => value(&option[2..], &mut rest, plain),
-                    _ if option.starts_with("-k") => value(&option[2..], &mut rest, duration),
-                    _ => false,
-                };
-                if !ok {
-                    return None;
-                }
-            }
-            let (limit, after) = split_word(rest);
-            duration(limit).then_some(after)
-        }
-        "stdbuf" => {
-            let mode = |v: &str| v == "L" || v.parse::<u64>().is_ok() || v.get(..v.len().saturating_sub(1)).is_some_and(|n| n.parse::<u64>().is_ok());
-            loop {
-                let (option, after) = split_word(rest);
-                if !option.starts_with('-') {
-                    return Some(rest);
-                }
-                rest = after;
-                let ok = match option.split_once('=') {
-                    Some(("--input" | "--output" | "--error", v)) => mode(v),
-                    _ if matches!(option.get(..2), Some("-i" | "-o" | "-e")) => value(&option[2..], &mut rest, mode),
-                    _ => false,
-                };
-                if !ok {
-                    return None;
-                }
-            }
-        }
-        _ => None,
-    }
-}
-
-/// The first word of `command` and what follows it; a word runs to
-/// whitespace outside quotes.
-fn split_word(command: &str) -> (&str, &str) {
-    let command = command.trim_start();
-    let bytes = command.as_bytes();
-    let mut i = 0;
-    let mut quote = None;
-    while i < bytes.len() {
-        match (quote, bytes[i]) {
-            (None, b'\\') => i += 1,
-            (None, b'\'' | b'"') => quote = Some(bytes[i]),
-            (Some(b'"'), b'\\') => i += 1,
-            (Some(q), c) if c == q => quote = None,
-            (None, c) if c.is_ascii_whitespace() => break,
-            _ => {}
-        }
-        i += 1;
-    }
-    let i = i.min(bytes.len());
-    (&command[..i], &command[i..])
-}
 
 /// The rule that allows `command` (one command, not compound) from now on:
 /// its first word and subcommand, `Bash(git commit:*)`. `None` when no rule
@@ -736,6 +541,7 @@ mod tests {
         assert!(matches!(decide("bash", json!({"command": "make"})), Decision::Ask(_)), "default mode asks");
         assert_eq!(decide("read", json!({"path": "src/main.rs"})), Decision::Allow, "it only reads");
         assert!(matches!(decide("read", json!({"path": ".env"})), Decision::Deny(_)));
+        assert!(matches!(decide("read", json!({"path": "./src/../.env"})), Decision::Deny(_)), "the same file");
         assert_eq!(decide("mcp__exa__search", json!({})), Decision::Allow, "all of the server's tools");
         assert!(matches!(decide("mcp__exa2__search", json!({})), Decision::Ask(_)), "not another server's");
         assert!(matches!(decide("mcp__gh__delete_repo", json!({})), Decision::Deny(_)));
@@ -859,6 +665,80 @@ mod tests {
         assert_eq!(strip_wrappers("stdbuf -oé x", false), "stdbuf -oé x");
     }
 
+    #[test]
+    fn commands_that_only_read_run_without_a_rule() {
+        let p = permissions(json!({
+            "defaultMode": "default",
+            "allow": ["Bash(cargo test:*)"],
+            "ask": ["Bash(git log:*)"],
+            "deny": ["Read(.env)", "Bash(cat /etc/*)"]
+        }));
+        let decide = |command: &str| p.decide("bash", None, &json!({"command": command}), None);
+        for allowed in [
+            "ls -la",
+            "cat src/main.rs | head -20",
+            "grep -rn foo src 2>/dev/null | wc -l",
+            "git status",
+            "git --no-pager diff HEAD~1 | cat",
+            "git branch -a",
+            "git stash list",
+            "git tag -l 'v*'",
+            "timeout 5 git status",
+            "find . -name '*.rs' -type f",
+            "cd src && ls",
+            "cd . && git status",
+            "which -a cargo",
+            "echo hi >&2",
+            "cargo test && git status",
+        ] {
+            assert_eq!(decide(allowed), Decision::Allow, "{allowed}");
+        }
+        for asks in [
+            "ls > out.txt",
+            "ls >> ~/.zshrc",
+            "echo x>file",
+            "ls 2>err.log",
+            "cat < /etc/passwd",
+            "cat $HOME/.ssh/id_rsa",
+            "cat ~/.ssh/id_rsa",
+            "/bin/ls",
+            "\"ls\"",
+            "l\\s",
+            "find . -delete",
+            "find . -name x -exec rm {} \\;",
+            "find . -fprint out",
+            "find . -name *.rs",
+            "git -C /tmp status",
+            "git commit -m x",
+            "git branch new",
+            "git branch -D x",
+            "git config --get user.name",
+            "git diff --output=x",
+            "git log --ext-diff",
+            "git grep -O foo",
+            "git stash",
+            "cd /tmp && ls",
+            "cd ../x",
+            "cd src && git status",
+            "echo -delete | xargs find .",
+            "ls; rm x",
+            "PATH=. ls",
+            "sort -o x y",
+            "git log -1",
+        ] {
+            assert!(matches!(decide(asks), Decision::Ask(_)), "{asks:?}");
+        }
+        for denied in ["cat .env", "cat ./.env", "cat src/../.env", "grep -n key .env", "cat /etc/hosts", "cat *.txt", "head src/*.rs"] {
+            assert!(!matches!(decide(denied), Decision::Allow), "{denied:?}");
+        }
+        let open = permissions(json!({"defaultMode": "default"}));
+        assert_eq!(open.decide("bash", None, &json!({"command": "wc -l src/*.rs"}), None), Decision::Allow, "no Read deny rule");
+        p.set_mode(Mode::Plan);
+        assert_eq!(decide("git diff"), Decision::Allow, "plan mode runs what only reads");
+        assert!(matches!(decide("make"), Decision::Deny(_)));
+        assert_eq!(p.suggestions("bash", &json!({"command": "git status && make"})), ["Bash(make:*)"]);
+    }
+
     #[tokio::test]
     async fn asks_the_user_and_remembers_for_the_session() {
         let p = permissions(json!({"defaultMode": "default"}));
@@ -903,7 +783,8 @@ mod tests {
         let p = permissions(json!({"allow": ["Bash(cd:*)"]}));
         let suggestion = |tool: &str, command: &str| p.suggestions(tool, &json!({"command": command, "path": "a"})).join(", ");
         assert_eq!(suggestion("bash", "git commit -m x"), "Bash(git commit:*)");
-        assert_eq!(suggestion("bash", "ls -la"), "Bash(ls:*)");
+        assert_eq!(suggestion("bash", "make -j4"), "Bash(make:*)");
+        assert_eq!(suggestion("bash", "ls -la"), "", "it only reads");
         assert_eq!(suggestion("bash", "./run.sh x"), "Bash(./run.sh x:*)");
         assert_eq!(suggestion("bash", "cd app && make && make install | tee log"), "Bash(make:*), Bash(make install:*), Bash(tee log:*)");
         assert_eq!(suggestion("bash", "make $(cat target)"), "", "no rule would allow it");

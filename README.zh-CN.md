@@ -411,17 +411,18 @@ REPL 和一次性模式的每个会话都会在每一批工具调用之后以及
 }
 ```
 
-- 规则使用 Claude Code 的权限语法，与 hook 的 `if` 相同：用工具名或 Claude Code 的叫法（`Bash`、`Edit`、`read`），括号里写命令的开头（`git commit:*`）或路径要匹配的模式（`src/**`，匹配原样的路径，或相对于工作目录、worktree 子代理的 worktree 的路径）。`mcp__<服务器>` 表示该服务器的所有工具，末尾的 `*` 表示名字以此开头的工具。
+- 规则使用 Claude Code 的权限语法，与 hook 的 `if` 相同：用工具名或 Claude Code 的叫法（`Bash`、`Edit`、`read`），括号里写命令的开头（`git commit:*`）或路径要匹配的模式（`src/**`，匹配原样的路径，或相对于工作目录、worktree 子代理的 worktree 的路径；`.` 和 `目录/..` 会先去掉，所以 `Read(.env)` 也管 `./.env`）。`mcp__<服务器>` 表示该服务器的所有工具，末尾的 `*` 表示名字以此开头的工具。
 - 复合命令（在引号外按 `&&`、`||`、`;`、`|`、`|&`、`&` 和换行拆分；`2>&1` 这类重定向不拆）只要有一段命中 deny 或 ask 规则就拒绝或询问；只有每一段都被允许（可以是不同的规则）时才直接放行：`Bash(cargo test:*)` 放行 `cargo test 2>&1`，但不放行 `cargo test && make`。带命令替换（`$(…)`、反引号、`<(…)`）、heredoc、`#` 注释或 `$'…'` 引号的命令，任何 `Bash(…)` 模式都不会放行；只写 `Bash` 则放行所有命令。
 - 和 Claude Code 一样，规则对每段命令既按原样匹配，也去掉包装命令后匹配：`timeout`、`time`、`nice`、`nohup`、`stdbuf`、`command`、`builtin`、`noglob` 以及不带选项的 `xargs`，所以 `Bash(npm test:*)` 放行 `timeout 30 npm test` 和 `nice -n 5 npm test`。allow 规则还会越过开头对只影响输出或日志的变量的赋值（`NODE_ENV`、`CI`、`RUST_LOG`、`NO_COLOR`、`LANG` 等），其他变量不行（`PATH=. npm test` 会询问）；deny 和 ask 规则越过任何赋值，所以 `Bash(rm:*)` 会拒绝 `FOO=1 nohup rm -rf x`。`npx`、`watch`、`docker exec` 这类运行器不会被去掉。
+- 和 Claude Code 内置的那组命令一样，只读的命令无需规则即可运行，在任何模式下都如此，除非 deny 或 ask 规则另有规定：`ls`、`cat`、`head`、`tail`、`grep`、`wc`、`diff`、`stat`、`du`、`echo`、`pwd`、`cut`、`tr`、`basename`、`dirname`、`realpath`、`which`（`-a`、`-s`）、不带 `-exec`、`-delete`、`-fprint` 等动作的 `find`、进入工作目录下某个目录的 `cd`，以及只读形式的 `git`（`status`、`diff`、`log`、`show`、`blame`、`grep`、`ls-files`、`rev-parse` 等；`branch`、`tag`、`remote`、`stash` 只限列出；子命令前除 `--no-pager` 外不能有选项，不能带 `--output` 或 `--ext-diff`）。这份清单是 harness 自己定的：Claude Code 没有公布它的完整清单。这类命令在以下情况仍会询问：重定向到文件或从文件读入（只允许 `/dev/null` 和 `2>&1` 这类重定向）、展开了什么（`$VAR`、`~`）、用路径或引号写命令名（`/bin/ls`）、指名了 `Read` deny 规则覆盖的文件，或在存在这类规则时带有未加引号的通配符（`find` 和 `git` 一律不接受通配符）；同一条命令里 `cd` 到别处之后的 `git` 也会询问，因为它可能运行另一个仓库的 hooks。所以 `cargo test && git status` 只需要 `Bash(cargo test:*)`。
 - deny 规则在任何模式下都拒绝调用，即使 PreToolUse hook 给了 `allow`。其次，ask 规则（或 hook 的 `ask`）在任何模式下都会询问。再次，allow 规则或你在本会话中允许过的规则会直接放行。都不匹配时由模式决定：
 
 | 模式 | |
 |---|---|
 | `bypassPermissions`（默认） | 全部运行 |
-| `default` | 只读的调用直接运行（`read`、`grep`、`glob`、`lsp`、标记为只读的 MCP 工具），开启沙箱时 `bash` 也直接运行（在 `sandbox` 部分设置 `"auto_allow_bash": false` 则它也要询问）；其余都要询问 |
+| `default` | 只读的调用直接运行（`read`、`grep`、`glob`、`lsp`、标记为只读的 MCP 工具，以及上面那些只读的命令），开启沙箱时 `bash` 也直接运行（在 `sandbox` 部分设置 `"auto_allow_bash": false` 则它也要询问）；其余都要询问 |
 | `acceptEdits` | 同 `default`，另外工作目录中文件的 `edit` 和 `write` 直接运行 |
-| `plan` | 只运行只读的调用，其余都拒绝，并告诉模型先调研、再给出计划；离开 plan 模式时会告诉它可以动手了 |
+| `plan` | 只运行只读的调用（包括只读的命令），其余都拒绝，并告诉模型先调研、再给出计划；离开 plan 模式时会告诉它可以动手了 |
 
 - 启动或等待其他工作的工具（`agent`、`message_agent`、`stop_agent`、`wait_tasks`、`bash_output`、`kill_shell`）从不询问；它们启动的子代理的调用会询问，因为子代理共享所在会话的权限和模式。后台子代理的询问和主代理的一样显示。
 - 在 REPL 中，询问会占据输入框的位置：显示 `Allow bash(make)?` 和需要询问的原因（编辑还会显示改动的行；标题只显示了命令或 `code` 脚本的一部分时会显示全文，最多 12 行，其余可在询问时按 Ctrl+O 查看），按 1 允许，按 2 允许并在本会话中放行同类调用（如 `Bash(make:*)`、`Edit`；复合命令会为每段尚未放行的命令各加一条规则，最多五条；规则无法覆盖整条命令时不提供这一项），按最后一项或 Esc 拒绝并让模型换个做法。在 web UI 中，询问显示在任务里，带有按钮和完整命令。会先运行 `PermissionRequest` [hook](#hooks)，它可以代你决定。无法询问时（一次性模式、重定向的输入、fork 运行的技能），调用会被拒绝，并告诉模型怎样才能被允许。
@@ -531,7 +532,7 @@ Hooks 在 agent 循环的特定时机运行你自己的命令：拦截危险命�
 - `prompt` 类型的 hook（`{"type": "prompt", "prompt": "…", "model": "…", "timeout": 30}`）不运行命令，而是询问模型：当前会话的模型，或者 `model` 指定的、provider 认识的模型（Claude Code 的 `haiku` 之类别名不算）。事件的输入 JSON 替换 prompt 中的 `$ARGUMENTS`（没有占位符时附在末尾），模型回答 `{"ok": true}` 或 `{"ok": false, "reason": "…"}`；`ok: false` 等同于退出码 2 加上该原因，所以 Stop 上的 prompt hook 能让模型继续干活。默认 30 秒，可用 `timeout` 设置；它的请求不计入 `/usage`。
 - 匹配同一事件的所有 hook 同时运行，最多同时 12 个；同一条命令列出两次只运行一次。hooks 在子代理（用 `SubagentStop` 代替 `Stop`）和 web 任务中同样生效。
 - hook 给模型的内容放在 `<hook-feedback>` 块中；给你的内容（`systemMessage`、拒绝原因、运行失败）显示为 `⚑` 开头的一行。
-- `if` 用 Claude Code 的权限规则语法把工具事件的 hook 限定到部分调用：`Bash(git commit:*)` 或 `Bash(git push *)`（命令，或复合命令中的某一段，以此开头；`*` 匹配任意内容）、`Edit(src/**/*.ts)`（文件路径），或只写工具名。`async: true` 的 hook 在后台运行，不阻塞调用；它给模型的内容随下一个请求发出。`asyncRewake: true` 同样在后台运行，若以退出码 2 结束，则用 `rewakeMessage` 加上 hook 给出的原因唤醒模型，模型空闲时会单独开一个回合。
+- `if` 用 Claude Code 的权限规则语法把工具事件的 hook 限定到部分调用：`Bash(git commit:*)` 或 `Bash(git push *)`（命令，或复合命令中的某一段，以此开头，去掉权限规则会越过的包装命令和赋值后也算；`*` 匹配任意内容）、`Edit(src/**/*.ts)`（文件路径），或只写工具名。`async: true` 的 hook 在后台运行，不阻塞调用；它给模型的内容随下一个请求发出。`asyncRewake: true` 同样在后台运行，若以退出码 2 结束，则用 `rewakeMessage` 加上 hook 给出的原因唤醒模型，模型空闲时会单独开一个回合。
 - 只支持 `command` 和 `prompt` 类型的 hook 以及上面这些事件；其他 hook 类型（`http`、`agent`、`mcp_tool`）以及其他事件（`Elicitation` 等）在配置中会报错（[插件](#插件plugins)中的则给出警告并略过）。hooks 只来自配置文件及其启用的插件，仓库无法自行添加；修改在下次启动时生效，或在 `/reload-plugins` 后对下一个会话生效。
 
 ## 项目说明
@@ -741,6 +742,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
 - `src/mentions.rs` — `@路径` 的解析与展开为附件块；粘贴图片的附件块
 - `src/security/` — 限制模型工具调用的机制
   - `permissions.rs` — 权限：配置中的规则、各个模式、哪些调用直接运行、询问或拒绝，以及通过前端询问
+  - `shell.rs` — 为规则解读 `bash` 命令：拆分复合命令、去掉包装命令、识别只读的命令
   - `sandbox.rs` — 操作系统沙箱：配置、Seatbelt 配置文件与 bwrap 参数、`read`、`edit` 和 `write` 检查的路径规则
 - `src/subagent/` — 子代理定义（`explore`、`general-purpose`、自定义文件）、权限、`agent`、`message_agent` 和 `stop_agent` 工具 (`mod.rs`)
   - `worktree.rs` — `isolation: "worktree"` 子代理的 git worktree：创建、结算与删除

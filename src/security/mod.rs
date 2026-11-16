@@ -3,3 +3,4 @@
 
 pub mod permissions;
 pub mod sandbox;
+pub mod shell;
