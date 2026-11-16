@@ -18,6 +18,10 @@ use crate::security::permissions::{Answer, Asker, Request};
 /// Lines of an edit shown with the question, for each side.
 const EDIT_LINES: usize = 4;
 
+/// Rows of a command (or a script) shown with the question; Ctrl+O shows
+/// the rest.
+const COMMAND_ROWS: usize = 12;
+
 /// A question waiting for the user's answer.
 pub struct Question {
     title: String,
@@ -37,6 +41,17 @@ impl Question {
             title.push_str(&format!("  (from the {agent} subagent)"));
         }
         let mut detail = vec![format!("It needs asking: {}.", request.reason)];
+        let script = match request.tool.as_str() {
+            "bash" => request.input["command"].as_str(),
+            "code" => request.input["code"].as_str(),
+            _ => None,
+        };
+        // The whole command, unless the title already shows all of it.
+        if let Some(script) = script
+            && (script.trim().lines().count() > 1 || call_label(&request.tool, &request.input, width) != call_label(&request.tool, &request.input, usize::MAX))
+        {
+            detail.extend(script_rows(script, text::terminal_width().saturating_sub(7).max(20)));
+        }
         if request.tool == "edit" {
             let lines = |key: &str, sign: char| -> Vec<String> {
                 let text = request.input[key].as_str().unwrap_or_default();
@@ -112,6 +127,18 @@ impl Question {
         rows.push(paint(DIM, &super::input::rule(width)));
         rows
     }
+}
+
+/// `script` wrapped into rows indented under the question, at most
+/// [`COMMAND_ROWS`] of them, saying how many more there are.
+fn script_rows(script: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = script.trim().lines().flat_map(|l| text::wrap(&text::printable(l), width)).map(|r| format!("  {r}")).collect();
+    if rows.len() > COMMAND_ROWS {
+        let more = rows.len() - (COMMAND_ROWS - 1);
+        rows.truncate(COMMAND_ROWS - 1);
+        rows.push(format!("  … {more} more {} (ctrl+o, then i, shows them)", text::plural(more, "row")));
+    }
+    rows
 }
 
 /// Asks in the terminal through `out`, where keys reach it.
@@ -200,6 +227,27 @@ mod tests {
         let (mut q, mut rx) = question();
         assert!(q.key(&Key::Text("1".into())));
         assert_eq!(rx.try_recv(), Ok(Answer::Allow));
+    }
+
+    #[test]
+    fn shows_the_whole_command() {
+        let ask = |command: &str| {
+            let request = Request {
+                tool: "bash".into(),
+                input: json!({"command": command}),
+                reason: "it changes things".into(),
+                suggestions: Vec::new(),
+                agent: None,
+            };
+            Question::new(&request, 0, oneshot::channel().0).render(200, &|_, s| s.to_string())
+        };
+        let rows = ask("make");
+        assert!(!rows.iter().any(|r| r.starts_with("    ")), "the title has it all: {rows:?}");
+        let rows = ask("echo safe\nrm -rf ~\x1b[2K");
+        assert!(rows.iter().any(|r| r == "    echo safe") && rows.iter().any(|r| r == "    rm -rf ~"), "escapes dropped: {rows:?}");
+        let long: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
+        let rows = ask(&long.join("\n"));
+        assert!(rows.iter().any(|r| r.contains("… 19 more rows")) && !rows.iter().any(|r| r.contains("step 11")), "{rows:?}");
     }
 
     #[test]

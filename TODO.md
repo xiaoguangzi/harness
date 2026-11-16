@@ -156,8 +156,6 @@ other harness's docs or source before acting on an entry. All findings here are 
   are never allowed by a pattern; and redirection targets are not checked, so `Bash(cargo test:*)` allows
   `cargo test > any/file`. Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit
   Claude Code documents too. (read)
-- [ ] The terminal approval shows only the first line of a bash command (`call_label`, cli/calls.rs:45); Claude
-  Code and Codex show the whole command. The web asker was not checked. (mainstream: likely)
 - [ ] Sessions are rewritten whole only at the end of a turn (a crash loses the turn), compaction overwrites the
   history before it, and subagent transcripts are not kept (`agent_transcript_path` is null). Claude Code and
   Codex append per message; Claude Code keeps the pre-compaction history behind a boundary record and saves
@@ -220,6 +218,8 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] `glob` makes ugrep read every file's contents just to list names (glob.rs:20).
 - [ ] Nothing in the system prompt says when to consult the advisor; `tool_search` gets no guidance line.
 - [ ] The date in the system prompt goes stale in long-lived web tasks; no git branch or status in it.
+- [ ] Approvals of MCP and other tools show only `call_label`'s one line of the input (the bash command and a
+  `code` script are shown whole). (read)
 - [ ] Not verified: whether the Seatbelt profile (`allow default`) lets commands reach launchd services
   (`open`, `osascript`).
 - [ ] CLAUDE.md disagrees with the code: the 1-hour cache TTL is off by default for every provider

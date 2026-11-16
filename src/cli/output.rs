@@ -297,6 +297,10 @@ impl Output {
             return true;
         }
         let Some(question) = state.question.as_mut() else { return false };
+        // Ctrl+O opens the transcript over it, to see the whole call.
+        if *key == Key::ToolOutput {
+            return false;
+        }
         if question.key(key) {
             state.question = None;
         }

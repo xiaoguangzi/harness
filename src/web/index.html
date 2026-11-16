@@ -211,6 +211,7 @@ details.tool.subagent { border-left: 3px solid var(--accent); }
 .card.rewind { display: flex; flex-direction: column; gap: 10px; margin: 0 0 12px; }
 .rewind-item { border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 4px; }
 .note.permission { color: var(--text); font-size: 13px; border: 1px solid var(--warn); background: var(--warn-soft); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.note.permission pre.command { background: var(--code); padding: 9px 11px; border-radius: 8px; max-height: 360px; overflow: auto; }
 .ask {
   border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: var(--shadow-sm);
   padding: 12px 14px; margin: 0 0 10px; display: grid; gap: 10px; animation: fadeUp .18s ease;
@@ -514,6 +515,13 @@ function appendAssistant(el, text) {
 }
 
 // What a tool call is about, for its collapsed summary line.
+/** The whole command or script of a call waiting for approval, when its summary shows only part of it. */
+function wholeCommand(ev) {
+  const text = ev.tool === "bash" ? ev.input?.command : ev.tool === "code" ? ev.input?.code : null;
+  if (typeof text !== "string" || (!text.trim().includes("\n") && text.length <= 80)) return null;
+  return h("pre", { class: "command" }, text);
+}
+
 function toolSummary(name, input) {
   if (input && typeof input === "object") {
     if (name === "bash" && typeof input.command === "string") return input.command.split("\n")[0] + (input.run_in_background ? "  (后台)" : "");
@@ -763,6 +771,7 @@ function permissionCard(ev) {
   const el = h("div", { class: "note permission" },
     h("div", {}, `？允许 ${ev.tool} ${toolSummary(ev.tool, ev.input)}` + (ev.agent ? `（来自子代理 ${ev.agent}）` : "")),
     h("div", { class: "muted" }, "需要确认：" + ev.reason),
+    wholeCommand(ev),
     buttons);
   questions.set(ev.id, { el, buttons });
   return el;
