@@ -16,7 +16,7 @@ use super::screen::Screen;
 use super::text;
 use super::tool_output::{self, Record};
 use super::transcript::{Entry, Transcript};
-use super::style::{DIM, GREEN, RED, YELLOW};
+use super::style::{DIM, GREEN, QUESTION, RED, YELLOW};
 use crate::agent::Inbox;
 use crate::llm::Message;
 use crate::tools::ToolOutput;
@@ -723,8 +723,14 @@ fn render(state: &State, paint: impl Fn(&str, &str) -> String) -> (Vec<String>, 
         return question.render(width, text::terminal_height().unwrap_or(24), &paint);
     }
     if let Some(panel) = &state.tool_panel {
-        return panel.render(&state.transcript, &state.tool_records, width,
+        let (mut rows, cursor) = panel.render(&state.transcript, &state.tool_records, width,
             text::terminal_height().unwrap_or(24), &paint);
+        // The question it covers holds up the turn: say so in its title.
+        if state.question.is_some() && !rows.is_empty() {
+            let note = "  A permission question waits under this · Esc or Ctrl+O to answer it";
+            rows[0] = paint(QUESTION, &text::fit(note, width.saturating_sub(1).max(1)));
+        }
+        return (rows, cursor);
     }
     if let Some(panel) = &state.panel {
         return panel.lock().unwrap().render(width, text::terminal_height().unwrap_or(24), &paint);
@@ -887,6 +893,10 @@ mod tests {
             assert!(key(k));
         }
         assert!(futures::poll!(pending.as_mut()).is_pending(), "Esc closed the transcript, answering nothing");
+        key(Key::ToolOutput);
+        let (rows, _) = render(&out.state.lock().unwrap(), |_, s| s.to_string());
+        assert!(rows[0].contains("permission question waits"), "{:?}", rows.first());
+        key(Key::ToolOutput);
         assert!(out.state.lock().unwrap().tool_panel.is_none());
         key(Key::Enter);
         assert_eq!(pending.await, Some(Answer::Allow));
