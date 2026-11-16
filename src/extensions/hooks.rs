@@ -242,6 +242,18 @@ impl Condition {
             _ => false,
         }
     }
+
+    /// Whether the rule is for the tool named `names` and its pattern, if it
+    /// has one, matches `command` as a whole: one of a compound command's
+    /// parts, which permissions' allow rules must each match.
+    pub(crate) fn matches_command(&self, names: &[&str], command: &str) -> bool {
+        names.iter().any(|n| *n == self.tool) && self.pattern.as_ref().is_none_or(|p| p.is_match(command))
+    }
+
+    /// Whether the rule has no pattern, and so is for every call of its tool.
+    pub(crate) fn is_whole_tool(&self) -> bool {
+        self.pattern.is_none()
+    }
 }
 
 /// A rule's pattern as a regular expression for a whole command (`*` is
@@ -627,11 +639,15 @@ impl Hooks {
 
     /// `PermissionRequest` before the user is asked about a call: a hook
     /// may allow it (`permission`) or deny it (`block`) instead.
-    pub async fn permission_request(&self, tool: &str, input: &Value, suggestion: &str, model: &str) -> Outcome {
+    pub async fn permission_request(&self, tool: &str, input: &Value, suggestions: &[String], model: &str) -> Outcome {
+        let offered: Vec<Value> = match suggestions {
+            [] => Vec::new(),
+            rules => vec![json!({"type": "addRules", "rules": rules, "behavior": "allow", "destination": "session"})],
+        };
         let fields = json!({
             "tool_name": hook_tool_name(tool),
             "tool_input": input_for_hook(tool, input),
-            "permission_suggestions": [{"type": "addRules", "rules": [suggestion], "behavior": "allow", "destination": "session"}],
+            "permission_suggestions": offered,
         });
         self.run(Event::PermissionRequest, &tool_names(tool), fields, model).await
     }

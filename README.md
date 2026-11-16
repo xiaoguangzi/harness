@@ -409,7 +409,8 @@ By default the harness runs every tool call without asking, as before; the OS [s
 }
 ```
 
-- Rules take Claude Code's permission syntax, as hooks' `if` does: a tool by its name or Claude Code's (`Bash`, `Edit`, `read`), with what its command starts with (`git commit:*`; each part of a compound command counts) or what its path matches (`src/**`) in parentheses. `mcp__<server>` is all of that server's tools, and a trailing `*` any tool whose name starts so.
+- Rules take Claude Code's permission syntax, as hooks' `if` does: a tool by its name or Claude Code's (`Bash`, `Edit`, `read`), with what its command starts with (`git commit:*`) or what its path matches (`src/**`) in parentheses. `mcp__<server>` is all of that server's tools, and a trailing `*` any tool whose name starts so.
+- A compound command (split at `&&`, `||`, `;`, `|`, `|&`, `&` and newlines, outside quotes; redirections such as `2>&1` do not split it) is denied or asked about when any of its commands is, and allowed without asking only when every one of them is allowed, by one rule or another: `Bash(cargo test:*)` allows `cargo test 2>&1` but not `cargo test && make`. A `Bash(…)` pattern never allows a command with a command substitution (`$(…)`, backticks, `<(…)`), a heredoc or `$'…'` quoting; `Bash` alone allows every command.
 - A deny rule refuses a call in every mode, a PreToolUse hook's `allow` included. Then an ask rule (or a hook's `ask`) asks, in every mode. Then an allow rule, or one you allowed for the session, lets it run. Otherwise the mode decides:
 
 | Mode | |
@@ -420,7 +421,7 @@ By default the harness runs every tool call without asking, as before; the OS [s
 | `plan` | only what reads runs; the rest is refused, and the model is told to research and present a plan. Leaving plan mode tells it it may go ahead |
 
 - The tools that start or wait for other work (`agent`, `message_agent`, `stop_agent`, `wait_tasks`, `bash_output`, `kill_shell`) never ask; the calls of the subagents they start do, as subagents share their conversation's permissions and mode. A background subagent's question shows like the main agent's.
-- In the REPL a question takes the input box's place: `Allow bash(make)?` with what it needs asking for (an edit's lines too), and 1 to allow it, 2 to allow it and calls like it for the session (`Bash(make:*)`, `Edit`), or 3 or Esc to refuse it, telling the model to do something else. In the web UI it shows in the task with buttons. A `PermissionRequest` [hook](#hooks) runs first and may decide instead. Where no one can be asked (one-shot mode, redirected input, a forked skill), the call is refused, and the model is told how it could be allowed.
+- In the REPL a question takes the input box's place: `Allow bash(make)?` with what it needs asking for (an edit's lines too), and 1 to allow it, 2 to allow it and calls like it for the session (`Bash(make:*)`, `Edit`; a rule for each command of a compound one not allowed yet, up to five, and no such choice when rules could not cover the whole command), or the last choice or Esc to refuse it, telling the model to do something else. In the web UI it shows in the task with buttons. A `PermissionRequest` [hook](#hooks) runs first and may decide instead. Where no one can be asked (one-shot mode, redirected input, a forked skill), the call is refused, and the model is told how it could be allowed.
 - Shift+Tab, `/permissions` or `--permission-mode MODE` change the mode; a mode other than the starting one shows under the input box. The web UI sets it per task under `⋯`.
 
 ## Sandbox

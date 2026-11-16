@@ -15,7 +15,10 @@
 //! Rules take Claude Code's permission syntax, as hooks' `if` does: a tool
 //! (`Bash`, `edit`), with what its command starts with or what its path
 //! matches in parentheses; `mcp__<server>` is all of a server's tools and a
-//! trailing `*` any name it starts. Deny rules win, then ask, then allow,
+//! trailing `*` any name it starts. A compound command (`a && b`, `a | b`,
+//! `a; b`) is denied or asked about if any of its commands is, and allowed
+//! only if every one of them is; a command substitution (`$(…)`, backticks)
+//! is never allowed by a `Bash(…)` pattern. Deny rules win, then ask, then allow,
 //! then the mode: `default` runs what only reads (and, in the sandbox,
 //! `bash`) and asks for the rest; `acceptEdits` also edits files in the
 //! working directory; `plan` refuses anything that changes things;
@@ -129,6 +132,16 @@ impl TryFrom<String> for Rule {
 }
 
 impl Rule {
+    /// Whether the rule is for every call of `bash`, whatever it runs.
+    fn is_all_commands(&self) -> bool {
+        matches!(&self.matcher, Matcher::Tool(c) if c.is_whole_tool() && c.matches_command(&hooks::tool_names("bash"), ""))
+    }
+
+    /// Whether the rule allows `command`, one command of a compound one.
+    fn matches_command(&self, command: &str) -> bool {
+        matches!(&self.matcher, Matcher::Tool(c) if c.matches_command(&hooks::tool_names("bash"), command))
+    }
+
     fn matches(&self, tool: &str, input: &Value) -> bool {
         match &self.matcher {
             Matcher::Tool(condition) => condition.matches(&hooks::tool_names(tool), &hooks::input_for_hook(tool, input)),
@@ -190,8 +203,9 @@ pub struct Request {
     pub input: Value,
     /// Why it needs asking.
     pub reason: String,
-    /// The rule that would allow calls like it, for "don't ask again".
-    pub suggestion: String,
+    /// The rules that would allow calls like it, for "don't ask again":
+    /// none when they could not cover all of it.
+    pub suggestions: Vec<String>,
     /// The subagent asking, if it is one.
     pub agent: Option<String>,
 }
@@ -289,7 +303,7 @@ impl Permissions {
         if let Some(rule) = matching(&self.config.ask) {
             return Decision::Ask(format!("the rule `{rule}` asks for it"));
         }
-        if UNCHECKED.contains(&name) || matching(&self.config.allow).is_some() || matching(&self.session.lock().unwrap()).is_some() {
+        if UNCHECKED.contains(&name) || self.allowed(name, input) {
             return Decision::Allow;
         }
         let reads = tool.is_some_and(|t| t.read_only());
@@ -305,6 +319,44 @@ impl Permissions {
             _ if name == "bash" && crate::security::sandbox::active().is_some_and(|s| s.auto_allows_bash()) => Decision::Allow,
             _ => Decision::Ask("it changes things".into()),
         }
+    }
+
+    /// Whether the allow rules or the session's rules allow the call. Each
+    /// command of a compound `bash` command must be allowed, by one rule or
+    /// another; a command the parts of which cannot be told apart is not.
+    fn allowed(&self, name: &str, input: &Value) -> bool {
+        let session = self.session.lock().unwrap();
+        let rules: Vec<&Rule> = self.config.allow.iter().chain(session.iter()).collect();
+        if name != "bash" {
+            return rules.iter().any(|r| r.matches(name, input));
+        }
+        if rules.iter().any(|r| r.is_all_commands()) {
+            return true;
+        }
+        let Some(commands) = input["command"].as_str().and_then(commands) else { return false };
+        !commands.is_empty() && commands.iter().all(|c| rules.iter().any(|r| r.matches_command(c)))
+    }
+
+    /// The rules that would allow calls like this one from now on, for
+    /// "don't ask again": a rule for each command of a compound `bash` one
+    /// that is not allowed yet (at most [`MAX_SUGGESTIONS`]), the tool
+    /// otherwise. None when they would not cover the whole command.
+    pub fn suggestions(&self, tool: &str, input: &Value) -> Vec<String> {
+        let name = hooks::hook_tool_name(tool);
+        if tool != "bash" {
+            return vec![name.to_string()];
+        }
+        let Some(commands) = input["command"].as_str().and_then(commands) else { return Vec::new() };
+        let session = self.session.lock().unwrap();
+        let rules: Vec<&Rule> = self.config.allow.iter().chain(session.iter()).collect();
+        let mut suggested: Vec<String> = Vec::new();
+        for command in commands.iter().filter(|c| !rules.iter().any(|r| r.matches_command(c))) {
+            let Some(rule) = command_rule(name, command) else { return Vec::new() };
+            if !suggested.contains(&rule) {
+                suggested.push(rule);
+            }
+        }
+        if suggested.len() > MAX_SUGGESTIONS { Vec::new() } else { suggested }
     }
 
     /// What the rules say about a call a tool makes on its own while its
@@ -334,9 +386,8 @@ impl Permissions {
         match answer {
             Some(Answer::Allow) => Ok(()),
             Some(Answer::AllowAlways) => {
-                if let Ok(rule) = Rule::try_from(request.suggestion.clone()) {
-                    self.session.lock().unwrap().push(rule);
-                }
+                let rules = request.suggestions.iter().filter_map(|s| Rule::try_from(s.clone()).ok());
+                self.session.lock().unwrap().extend(rules);
                 Ok(())
             }
             Some(Answer::Deny(message)) => Err(match message {
@@ -377,7 +428,8 @@ pub async fn nested(name: &str, input: &Value) -> Result<(), String> {
         Decision::Deny(reason) => return Err(reason),
         Decision::Ask(reason) => reason,
     };
-    let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestion: suggestion(name, input), agent };
+    let suggestions = permissions.suggestions(name, input);
+    let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestions, agent };
     permissions.ask(request).await
 }
 
@@ -401,21 +453,94 @@ fn in_working_dir(input: &Value) -> bool {
     path.starts_with(&cwd) && !path.components().any(|c| c == std::path::Component::ParentDir)
 }
 
-/// The rule that would allow calls like this one: a command's first word
-/// (and its subcommand), or the tool.
-pub fn suggestion(tool: &str, input: &Value) -> String {
-    let name = hooks::hook_tool_name(tool);
-    if tool != "bash" {
-        return name.to_string();
+/// Rules offered for one compound command, at most: Claude Code's limit.
+const MAX_SUGGESTIONS: usize = 5;
+
+/// The commands of a compound `bash` command, split where the shell runs one
+/// after another or pipes one into the next (`&&`, `||`, `;`, `|`, `|&`, `&`,
+/// newlines), outside quotes; `None` if it cannot be split with certainty, or
+/// runs a command substitution (`$(…)`, backticks, `<(…)`) that no rule can be
+/// said to allow. Redirections (`2>&1`, `&>`) do not split.
+fn commands(command: &str) -> Option<Vec<&str>> {
+    let bytes = command.as_bytes();
+    let mut parts = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    // Whether a command must follow the last operator (`&&`, `||`, `|`).
+    let mut wants_command = false;
+    // An empty part is fine after `;` or `&`, not where a command must follow.
+    fn push<'a>(parts: &mut Vec<&'a str>, part: &'a str, wants: bool) -> Option<()> {
+        let part = part.trim();
+        if !part.is_empty() {
+            parts.push(part);
+        }
+        (!part.is_empty() || !wants).then_some(())
     }
-    let command = input["command"].as_str().unwrap_or_default();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i == bytes.len() {
+                    return None;
+                }
+            }
+            b'"' => {
+                i += 1;
+                loop {
+                    match bytes.get(i)? {
+                        b'"' => break,
+                        b'\\' => i += 1,
+                        b'`' => return None,
+                        b'$' if bytes.get(i + 1) == Some(&b'(') => return None,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            b'`' => return None,
+            // ANSI-C quoting and heredocs: not followed here.
+            b'$' if matches!(bytes.get(i + 1), Some(b'(' | b'\'')) => return None,
+            b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => return None,
+            b'<' if bytes.get(i + 1) == Some(&b'<') => return None,
+            // `>&`, `<&`, `&>`: a redirection.
+            b'&' if i > 0 && matches!(bytes[i - 1], b'>' | b'<') => {}
+            b'&' if bytes.get(i + 1) == Some(&b'>') => {}
+            c @ (b'&' | b'|' | b';' | b'\n') => {
+                push(&mut parts, &command[start..i], wants_command)?;
+                let doubled = matches!(c, b'&' | b'|') && bytes.get(i + 1) == Some(&c);
+                let piped_stderr = c == b'|' && bytes.get(i + 1) == Some(&b'&');
+                if doubled || piped_stderr {
+                    i += 1;
+                }
+                wants_command = doubled || c == b'|';
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    push(&mut parts, &command[start..], wants_command)?;
+    Some(parts)
+}
+
+/// The rule that allows `command` (one command, not compound) from now on:
+/// its first word and subcommand, `Bash(git commit:*)`. `None` when no rule
+/// can say that plainly (a subshell, a group).
+fn command_rule(name: &str, command: &str) -> Option<String> {
     let mut words = command.split_whitespace();
-    let Some(first) = words.next() else { return name.to_string() };
+    let first = words.next()?;
+    if first.contains(['(', ')', '{', '}', '<', '>', '=']) || matches!(first, "!" | "[[" | "if" | "for" | "while" | "do" | "then" | "case") {
+        return None;
+    }
     let sub = words.next().filter(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && !w.starts_with('-'));
-    match sub {
+    let rule = match sub {
         Some(sub) => format!("{name}({first} {sub}:*)"),
         None => format!("{name}({first}:*)"),
-    }
+    };
+    Rule::try_from(rule.clone()).ok().filter(|r| r.matches_command(command)).map(|_| rule)
 }
 
 #[cfg(test)]
@@ -474,6 +599,46 @@ mod tests {
         assert!(matches!(decide("bash", json!({"command": "git push"})), Decision::Ask(_)), "ask rules still ask");
     }
 
+    #[test]
+    fn every_command_of_a_compound_one_must_be_allowed() {
+        let p = permissions(json!({"defaultMode": "default", "allow": ["Bash(cargo test:*)", "Bash(git status)"]}));
+        let decide = |command: &str| p.decide("bash", None, &json!({"command": command}), None);
+        for allowed in [
+            "cargo test",
+            "cargo test --lib 2>&1",
+            "cargo test &> log",
+            "cargo test |& cargo test",
+            "cargo test && git status",
+            "git status; cargo test;",
+            "cargo test -- 'a && b' \"c | d\"",
+            "cargo test \\; rm",
+            "cargo test 'it $(is) quoted'",
+        ] {
+            assert_eq!(decide(allowed), Decision::Allow, "{allowed}");
+        }
+        for asks in [
+            "cargo test && make",
+            "make || cargo test",
+            "cargo test | sh",
+            "cargo test & rm -rf x",
+            "cargo test\nrm -rf x",
+            "cargo test $(rm -rf x)",
+            "cargo test `rm -rf x`",
+            "cargo test \"$(rm -rf x)\"",
+            "cargo test <(rm -rf x)",
+            "cargo test $'\\'' ; rm -rf x #'",
+            "cargo test 'unclosed ; rm -rf x",
+            "cargo test <<EOF\nx\nEOF",
+            "cargo test &&",
+            "cargo test | ",
+            "",
+        ] {
+            assert!(matches!(decide(asks), Decision::Ask(_)), "{asks:?}");
+        }
+        let p = permissions(json!({"defaultMode": "default", "allow": ["Bash"]}));
+        assert_eq!(p.decide("bash", None, &json!({"command": "make $(x) && y"}), None), Decision::Allow, "all of bash");
+    }
+
     #[tokio::test]
     async fn asks_the_user_and_remembers_for_the_session() {
         let p = permissions(json!({"defaultMode": "default"}));
@@ -481,7 +646,7 @@ mod tests {
             tool: "bash".into(),
             input: json!({"command": command}),
             reason: "it changes things".into(),
-            suggestion: suggestion("bash", &json!({"command": command})),
+            suggestions: p.suggestions("bash", &json!({"command": command})),
             agent: None,
         };
         assert!(p.ask(request("make")).await.unwrap_err().contains("cannot be asked for here"));
@@ -492,6 +657,10 @@ mod tests {
         assert!(matches!(p.decide("bash", None, &json!({"command": "cargo run"}), None), Decision::Ask(_)));
         assert!(p.ask(request("make")).await.unwrap_err().contains("use ninja"));
         assert_eq!(p.rules()[3].1, ["Bash(cargo build:*)"]);
+        p.set_asker(Some(Arc::new(Answers(Mutex::new(vec![Answer::AllowAlways])))));
+        assert_eq!(p.ask(request("cargo build && make check")).await, Ok(()));
+        assert_eq!(p.rules()[3].1, ["Bash(cargo build:*)", "Bash(make check:*)"], "only the command not allowed yet");
+        assert_eq!(p.decide("bash", None, &json!({"command": "make check && cargo build -q"}), None), Decision::Allow);
     }
 
     #[tokio::test]
@@ -511,11 +680,17 @@ mod tests {
 
     #[test]
     fn suggests_rules_and_parses_modes() {
-        assert_eq!(suggestion("bash", &json!({"command": "git commit -m x"})), "Bash(git commit:*)");
-        assert_eq!(suggestion("bash", &json!({"command": "ls -la"})), "Bash(ls:*)");
-        assert_eq!(suggestion("bash", &json!({"command": "./run.sh x"})), "Bash(./run.sh x:*)");
-        assert_eq!(suggestion("edit", &json!({"path": "a"})), "Edit");
-        assert_eq!(suggestion("mcp__gh__issues", &json!({})), "mcp__gh__issues");
+        let p = permissions(json!({"allow": ["Bash(cd:*)"]}));
+        let suggestion = |tool: &str, command: &str| p.suggestions(tool, &json!({"command": command, "path": "a"})).join(", ");
+        assert_eq!(suggestion("bash", "git commit -m x"), "Bash(git commit:*)");
+        assert_eq!(suggestion("bash", "ls -la"), "Bash(ls:*)");
+        assert_eq!(suggestion("bash", "./run.sh x"), "Bash(./run.sh x:*)");
+        assert_eq!(suggestion("bash", "cd app && make && make install | tee log"), "Bash(make:*), Bash(make install:*), Bash(tee log:*)");
+        assert_eq!(suggestion("bash", "make $(cat target)"), "", "no rule would allow it");
+        assert_eq!(suggestion("bash", "(cd app; make)"), "", "nor a subshell");
+        assert_eq!(suggestion("bash", "a; b; c; d; e; f"), "", "more than five");
+        assert_eq!(suggestion("edit", ""), "Edit");
+        assert_eq!(suggestion("mcp__gh__issues", ""), "mcp__gh__issues");
         assert_eq!(Mode::parse("acceptedits").unwrap(), Mode::AcceptEdits);
         assert!(Mode::parse("yolo").is_err());
         assert_eq!(Mode::BypassPermissions.next(), Mode::Default);

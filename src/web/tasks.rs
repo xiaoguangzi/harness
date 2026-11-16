@@ -196,7 +196,7 @@ impl Asker for WebAsker {
             "tool": request.tool,
             "input": request.input,
             "reason": request.reason,
-            "suggestion": request.suggestion,
+            "suggestion": request.suggestions.join(", "),
             "agent": request.agent,
         }));
         drop(task);

@@ -23,12 +23,14 @@ pub struct Question {
     title: String,
     detail: Vec<String>,
     options: Vec<String>,
+    /// Whether the second option allows calls like it for the session.
+    always: bool,
     selected: usize,
-    answer: Option<oneshot::Sender<usize>>,
+    answer: Option<oneshot::Sender<Answer>>,
 }
 
 impl Question {
-    fn new(request: &Request, waiting: usize, answer: oneshot::Sender<usize>) -> Self {
+    fn new(request: &Request, waiting: usize, answer: oneshot::Sender<Answer>) -> Self {
         let width = text::terminal_width().saturating_sub(16).max(20);
         let mut title = format!("Allow {}?", call_label(&request.tool, &request.input, width));
         if let Some(agent) = &request.agent {
@@ -54,17 +56,28 @@ impl Question {
             let calls = if waiting == 1 { "call waits" } else { "calls wait" };
             detail.push(format!("{waiting} more {calls} after this one."));
         }
-        let options = vec![
-            "Yes".to_string(),
-            format!("Yes, and don't ask again this session for {}", request.suggestion),
-            "No, and tell the model to do something else (Esc)".to_string(),
-        ];
-        Self { title, detail, options, selected: 0, answer: Some(answer) }
+        // Offered only when its rules cover the whole call.
+        let always = !request.suggestions.is_empty();
+        let mut options = vec!["Yes".to_string()];
+        if always {
+            options.push(format!("Yes, and don't ask again this session for {}", request.suggestions.join(", ")));
+        }
+        options.push("No, and tell the model to do something else (Esc)".to_string());
+        Self { title, detail, options, always, selected: 0, answer: Some(answer) }
+    }
+
+    /// What option `chosen` answers.
+    fn answer_for(&self, chosen: usize) -> Answer {
+        match chosen {
+            0 => Answer::Allow,
+            1 if self.always => Answer::AllowAlways,
+            _ => Answer::Deny(None),
+        }
     }
 
     /// Takes `key`; true once it is answered.
     pub fn key(&mut self, key: &Key) -> bool {
-        let chosen = match key {
+        let chosen: Option<usize> = match key {
             Key::Up => {
                 self.selected = self.selected.checked_sub(1).unwrap_or(self.options.len() - 1);
                 None
@@ -80,7 +93,7 @@ impl Question {
         };
         let Some(chosen) = chosen else { return false };
         if let Some(answer) = self.answer.take() {
-            let _ = answer.send(chosen);
+            let _ = answer.send(self.answer_for(chosen));
         }
         true
     }
@@ -148,12 +161,7 @@ impl Asker for TerminalAsker {
         let (tx, rx) = oneshot::channel();
         self.out.set_question(Some(Question::new(request, waiting, tx)));
         let _close = Close(&self.out);
-        let chosen = rx.await.ok();
-        match chosen? {
-            0 => Some(Answer::Allow),
-            1 => Some(Answer::AllowAlways),
-            _ => Some(Answer::Deny(None)),
-        }
+        rx.await.ok()
     }
 }
 
@@ -163,12 +171,12 @@ mod tests {
 
     use super::*;
 
-    fn question() -> (Question, oneshot::Receiver<usize>) {
+    fn question() -> (Question, oneshot::Receiver<Answer>) {
         let request = Request {
             tool: "edit".into(),
             input: json!({"path": "a.rs", "old_string": "one\ntwo", "new_string": "three"}),
             reason: "it changes things".into(),
-            suggestion: "Edit".into(),
+            suggestions: vec!["Edit".into()],
             agent: Some("general-purpose agent_1".into()),
         };
         let (tx, rx) = oneshot::channel();
@@ -185,12 +193,29 @@ mod tests {
         assert!(rows.iter().any(|r| r.starts_with("❯ 1. Yes")));
         assert!(!q.key(&Key::Down) && !q.key(&Key::Text("x".into())));
         assert!(q.key(&Key::Enter));
-        assert_eq!(rx.try_recv(), Ok(1), "the second option");
+        assert_eq!(rx.try_recv(), Ok(Answer::AllowAlways), "the second option");
         let (mut q, mut rx) = question();
         assert!(q.key(&Key::Esc));
-        assert_eq!(rx.try_recv(), Ok(2));
+        assert_eq!(rx.try_recv(), Ok(Answer::Deny(None)));
         let (mut q, mut rx) = question();
         assert!(q.key(&Key::Text("1".into())));
-        assert_eq!(rx.try_recv(), Ok(0));
+        assert_eq!(rx.try_recv(), Ok(Answer::Allow));
+    }
+
+    #[test]
+    fn offers_no_rule_that_would_not_cover_the_call() {
+        let request = Request {
+            tool: "bash".into(),
+            input: json!({"command": "make $(cat target)"}),
+            reason: "it changes things".into(),
+            suggestions: Vec::new(),
+            agent: None,
+        };
+        let (tx, mut rx) = oneshot::channel();
+        let mut q = Question::new(&request, 0, tx);
+        let rows = q.render(80, &|_, s| s.to_string());
+        assert!(!rows.iter().any(|r| r.contains("don't ask again")), "{rows:?}");
+        assert!(!q.key(&Key::Down) && q.key(&Key::Enter));
+        assert_eq!(rx.try_recv(), Ok(Answer::Deny(None)), "the second option is No");
     }
 }

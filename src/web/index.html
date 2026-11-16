@@ -758,7 +758,7 @@ function permissionCard(ev) {
   };
   const buttons = h("div", { class: "row" },
     h("button", { class: "btn primary", onclick: () => answer("allow") }, "允许"),
-    h("button", { class: "btn", onclick: () => answer("always") }, "本会话都允许 " + ev.suggestion),
+    ev.suggestion ? h("button", { class: "btn", onclick: () => answer("always") }, "本会话都允许 " + ev.suggestion) : null,
     h("button", { class: "btn danger", onclick: () => answer("deny") }, "拒绝"));
   const el = h("div", { class: "note permission" },
     h("div", {}, `？允许 ${ev.tool} ${toolSummary(ev.tool, ev.input)}` + (ev.agent ? `（来自子代理 ${ev.agent}）` : "")),

@@ -209,8 +209,8 @@ impl Caller<'_> {
             Decision::Deny(reason) => return Err(reason),
             Decision::Ask(reason) => reason,
         };
-        let suggestion = permissions::suggestion(name, input);
-        let hooked = self.hooks.permission_request(name, input, &suggestion, self.model).await;
+        let suggestions = self.permissions.suggestions(name, input);
+        let hooked = self.hooks.permission_request(name, input, &suggestions, self.model).await;
         if let Some(reason) = hooked.block {
             return Err(format!("A PermissionRequest hook denied this call: {reason}"));
         }
@@ -218,7 +218,7 @@ impl Caller<'_> {
             return Ok(());
         }
         let agent = self.hooks.subagent_label();
-        let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestion, agent };
+        let request = Request { tool: name.to_string(), input: input.clone(), reason, suggestions, agent };
         self.permissions.ask(request).await
     }
 }

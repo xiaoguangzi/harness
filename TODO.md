@@ -150,10 +150,12 @@ other harness's docs or source before acting on an entry. All findings here are 
   replaces the built-in; a project skill's `` !`cmd` `` runs, unsandboxed, when the model loads it; a project
   agent can declare `permission: write`). Claude Code, Codex, Gemini CLI and Cursor read project config behind a
   per-directory trust prompt. (mainstream: likely)
-- [ ] An allow rule passes a compound command if any one part matches (`Condition::matches`, hooks.rs:230):
-  `Bash(cargo test:*)` allows `cargo test && <anything>`. Claude Code's rules see shell operators and do not.
-  Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit Claude Code documents too.
-  (mainstream: sure)
+- [ ] Bash allow rules are still narrower than Claude Code's (checked against its permissions docs): wrappers
+  (`timeout`, `nice`, `nohup`, …) are not stripped, so `Bash(npm test:*)` does not allow `timeout 30 npm test`;
+  there is no built-in set of read-only commands (`ls`, `cat`, read-only `git`) that run without asking; heredocs
+  are never allowed by a pattern; and redirection targets are not checked, so `Bash(cargo test:*)` allows
+  `cargo test > any/file`. Deny prefixes being easy to get around (`$(…)`, `bash -c`, `/bin/rm`) is a limit
+  Claude Code documents too. (read)
 - [ ] The terminal approval shows only the first line of a bash command (`call_label`, cli/calls.rs:45); Claude
   Code and Codex show the whole command. The web asker was not checked. (mainstream: likely)
 - [ ] Sessions are rewritten whole only at the end of a turn (a crash loses the turn), compaction overwrites the
