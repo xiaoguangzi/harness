@@ -226,10 +226,13 @@ impl Caller<'_> {
         let event = if output.is_error { Event::PostToolUseFailure } else { Event::PostToolUse };
         if let Some(text) = &post.updated_output {
             output.content = text.clone();
+            output.value = None;
         }
         let added = check.context.iter().map(|c| hooks::feedback(Event::PreToolUse, c));
         let added = added.chain(post.block.iter().chain(&post.context).map(|c| hooks::feedback(event, c)));
         for text in added {
+            // A script gets the text, with what the hooks added to it.
+            output.value = None;
             output.content.truncate(output.content.trim_end().len());
             output.content.push_str(&format!("\n\n{text}"));
         }

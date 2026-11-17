@@ -27,6 +27,21 @@ enum OutputMode {
     Count,
 }
 
+impl OutputMode {
+    /// What a `code` script gets for these output lines: the paths, each
+    /// path's count, or the lines as text.
+    fn value(self, lines: &[&str]) -> Value {
+        match self {
+            Self::FilesWithMatches => json!(lines),
+            Self::Count => {
+                let counts = lines.iter().filter_map(|l| l.rsplit_once(':')).filter_map(|(path, n)| Some((path, n.parse::<u64>().ok()?)));
+                Value::Object(counts.map(|(path, n)| (path.to_string(), json!(n))).collect())
+            }
+            Self::Content => json!(lines.join("\n")),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
@@ -165,16 +180,21 @@ impl Tool for GrepTool {
 
         let stdout = match ugrep(input.ugrep_args()).await {
             Ok(Some(stdout)) => stdout,
-            Ok(None) => return ToolOutput::ok("No matches found"),
+            Ok(None) => return ToolOutput::ok("No matches found").with_value(input.output_mode.value(&[])),
             Err(e) => return e,
         };
-        let limit = input.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT).max(1);
+        // A script gets all the lines unless it asks for fewer.
+        let limit = match (input.head_limit, spill::for_script()) {
+            (None, true) => usize::MAX,
+            (n, _) => n.unwrap_or(DEFAULT_HEAD_LIMIT).max(1),
+        };
         let total = stdout.lines().count();
-        let mut text: String = stdout.lines().take(limit).collect::<Vec<_>>().join("\n");
+        let lines: Vec<&str> = stdout.lines().take(limit).collect();
+        let mut text = lines.join("\n");
         if total > limit {
             text.push_str(&format!("\n... [showing {limit} of {total} lines; raise head_limit or narrow the search]"));
         }
-        ToolOutput::ok(spill::shorten(&text, MAX_OUTPUT_BYTES, "grep"))
+        ToolOutput::ok(spill::shorten(&text, MAX_OUTPUT_BYTES, "grep")).with_value(input.output_mode.value(&lines))
     }
 }
 
@@ -289,10 +309,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_script_gets_paths_counts_or_lines() {
+        let dir = fixture();
+        let p = dir.path().display().to_string();
+        let find = |mode: &str, pattern: &str| {
+            let input = json!({"pattern": pattern, "path": dir.path(), "output_mode": mode, "case_insensitive": true});
+            async move { *spill::whole(grep(input)).await.value.unwrap() }
+        };
+        assert_eq!(find("files_with_matches", "main").await, json!([format!("{p}/a.rs"), format!("{p}/b.txt")]));
+        // Files with none too, as ugrep counts them.
+        assert_eq!(find("count", "fn").await, json!({format!("{p}/a.rs"): 2, format!("{p}/b.txt"): 0}));
+        assert_eq!(find("content", "thing").await, json!(format!("{p}/b.txt:1:Main thing")));
+        assert_eq!(find("count", "zzz_nothing").await, json!({}));
+        assert_eq!(find("content", "zzz_nothing").await, json!(""));
+    }
+
+    #[tokio::test]
     async fn no_matches_is_not_an_error() {
         let dir = fixture();
         let out = grep(json!({"pattern": "zzz_nothing", "path": dir.path()})).await;
-        assert_eq!(out, ToolOutput::ok("No matches found"));
+        assert_eq!(out, ToolOutput::ok("No matches found").with_value(json!([])));
     }
 
     #[tokio::test]

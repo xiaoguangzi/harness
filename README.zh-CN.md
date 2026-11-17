@@ -363,7 +363,7 @@ print(defined);
 ```
 
 - 脚本在 harness 内置的 QuickJS 解释器中运行，每个会话（以及每个子代理）一个持久的上下文，跑在单独的线程上，内存上限 256 MB。脚本顶层声明的变量和函数会留给下一次：顶层的 `let` 和 `const` 会变成 `var`，所以再次声明同名变量就是替换它。支持顶层 `await`。`/clear` 和 `/resume` 会换一个新的上下文；fork 出的子代理有自己的上下文。按旧写法写成 async 函数体、用 `return` 返回值的脚本仍然能运行，但它声明的东西不会保留。脚本按调用顺序逐个运行。
-- 没有 Node 或浏览器 API、文件系统、网络和定时器：脚本只能通过 `tools["name"](input)` 接触外部，入参与直接调用该工具相同，结果是字符串，即直接调用时看到的文本（不是 JSON：`glob` 和 `grep` 每行一个路径，`bash` 是命令输出）；调用失败则以 `Error` reject。`ALL_TOOLS` 列出每个可调用工具的 `{name, description, input_schema}`。`print` / `console.log` 向结果追加一行，脚本最后一个表达式的值放在最后（是 promise 则等它完成）。
+- 没有 Node 或浏览器 API、文件系统、网络和定时器：脚本只能通过 `tools["name"](input)` 接触外部，入参与直接调用该工具相同，结果是直接调用时看到的文本（`bash` 是命令输出，`read` 带行号）。列表类结果例外，免得脚本自己解析：`glob` 给出路径数组；`grep` 给出路径数组、每个路径对应匹配数的对象（`count` 模式）或拼成一个字符串的匹配行（`content` 模式），没有匹配时为空，而不是 "No files found" 这样的提示。在脚本中调用时，`glob` 和 `grep` 没有默认的 `head_limit`：除非脚本自己限定数量，否则拿到全部匹配。如果 hook 改写或追加了输出，脚本拿到的是那段文本。调用失败则以 `Error` reject。`ALL_TOOLS` 列出每个可调用工具的 `{name, description, input_schema}`。`print` / `console.log` 向结果追加一行，脚本最后一个表达式的值放在最后（是 promise 则等它完成）。
 - 脚本发出的每个工具调用都和模型直接调用一样执行：规整入参、PreToolUse hook、[权限](#权限)（ask 规则照样询问）、工作区和文件锁、`/rewind` 检查点、PostToolUse hook。REPL 和 Web 界面会像显示直接调用那样逐个显示这些调用（改动的文件显示为 diff），排在 `code` 调用自己的结果之前；模型给出的 `description`（用几个词说明脚本做什么）作为 `code` 调用的标签。hook 要求停止回合时，脚本先停，随后回合也停止。`code` 调用本身不需要权限。同时发起的调用（`Promise.all`）并发执行。这些调用不进入会话历史，所以恢复的会话里只显示 `code` 调用。
 - 脚本不能调用 `agent`、`message_agent`、`stop_agent`、`wait_tasks`、`skill`、`tool_search`、`ask_user_question` 和 `code`。子代理的 `code` 只能调用该子代理拥有的工具；只读子代理只在它是只读工具时才会拿到它。
 - 工具输出完整地交给脚本（最多 8 MB），不像给模型的[大输出](#大输出)那样截断，脚本可以从中挑出需要的部分；内容与直接调用时相同，因此 `read` 仍带行号并对长文件分页。脚本自己的结果超过 100,000 字节时截断。脚本中的调用返回的图片和 PDF（用 `read` 读图片或 PDF）会随结果一起交给模型，最多 8 张图片和 4 个 PDF，超出的数量会在结果中注明。

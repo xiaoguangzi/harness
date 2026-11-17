@@ -62,6 +62,9 @@ pub struct ToolOutput {
     /// Deferred tools to load, sent as `tool_reference` blocks in place of
     /// the text, which is then only for the user (see [`tool_search`]).
     pub references: Vec<String>,
+    /// What a `code` script gets in place of the text, when the text is a
+    /// listing a script would otherwise have to parse (`glob`'s paths).
+    pub value: Option<Box<Value>>,
 }
 
 /// A file's contents before and after a tool changed it.
@@ -75,11 +78,16 @@ pub struct FileChange {
 
 impl ToolOutput {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false, images: Vec::new(), change: None, references: Vec::new() }
+        Self { content: content.into(), is_error: false, images: Vec::new(), change: None, references: Vec::new(), value: None }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true, images: Vec::new(), change: None, references: Vec::new() }
+        Self { content: content.into(), is_error: true, images: Vec::new(), change: None, references: Vec::new(), value: None }
+    }
+
+    /// With `value` for a `code` script.
+    pub fn with_value(self, value: Value) -> Self {
+        Self { value: Some(Box::new(value)), ..self }
     }
 
     pub fn with_change(self, change: FileChange) -> Self {

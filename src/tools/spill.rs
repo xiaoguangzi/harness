@@ -78,6 +78,11 @@ pub(crate) async fn whole<F: std::future::Future>(future: F) -> F::Output {
     WHOLE.scope((), future).await
 }
 
+/// Whether this call is a `code` script's: its output is for the script.
+pub(crate) fn for_script() -> bool {
+    WHOLE.try_with(|_| ()).is_ok()
+}
+
 /// `max`, or more inside [`whole`].
 fn limit(max: usize) -> usize {
     if WHOLE.try_with(|_| ()).is_ok() { max.max(WHOLE_MAX) } else { max }

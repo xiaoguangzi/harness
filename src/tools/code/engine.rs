@@ -29,10 +29,12 @@ pub(super) struct Call {
     pub input: Json,
 }
 
-/// The result of the call `id`: its text, or the error it gave.
+/// The result of the call `id`: its text, or the error it gave. With
+/// `json`, the text is JSON the script gets parsed.
 pub(super) struct Reply {
     pub id: u64,
     pub result: Result<String, String>,
+    pub json: bool,
 }
 
 /// How a script ended.
@@ -270,7 +272,7 @@ fn execute(
         };
         // An exception here is the script's own (a throwing callback);
         // it surfaces through the main promise.
-        match settle.call::<_, ()>((reply.id as f64, ok, text)) {
+        match settle.call::<_, ()>((reply.id as f64, ok, text, reply.json)) {
             Ok(()) | Err(rquickjs::Error::Exception) => {}
             Err(e) => return Err(e),
         }
@@ -332,11 +334,11 @@ const PRELUDE: &str = r#"
   delete globalThis.__send; delete globalThis.__print; delete globalThis.__tools;
   const fixed = (name, value) => Object.defineProperty(globalThis, name, { value, enumerable: false });
   let pending = new Map();
-  fixed("__settle", (id, ok, text) => {
+  fixed("__settle", (id, ok, text, json) => {
     const p = pending.get(id);
     if (!p) return;
     pending.delete(id);
-    if (ok) p.resolve(text); else p.reject(new Error(text));
+    if (ok) p.resolve(json ? JSON.parse(text) : text); else p.reject(new Error(text));
   });
   // A new script: calls an earlier one left unanswered never will be.
   fixed("__forget", () => { pending = new Map(); });
@@ -548,6 +550,7 @@ mod tests {
     fn tools() -> Vec<Callable> {
         vec![
             Callable { name: "echo".into(), description: "echoes".into(), schema: serde_json::json!({"type": "object"}) },
+            Callable { name: "json".into(), description: "answers JSON".into(), schema: serde_json::json!({}) },
             Callable { name: "mcp__a-b__c".into(), description: "dashed".into(), schema: serde_json::json!({}) },
         ]
     }
@@ -562,7 +565,8 @@ mod tests {
         let mut seen = Vec::new();
         while let Some(call) = call_rx.blocking_recv() {
             seen.push(format!("{}:{}", call.name, call.input));
-            let _ = reply_tx.send(Reply { id: call.id, result: answer(&call) });
+            let json = call.name == "json";
+            let _ = reply_tx.send(Reply { id: call.id, result: answer(&call), json });
         }
         let (text, end) = loop {
             match done_rx.try_recv() {
@@ -670,7 +674,15 @@ mod tests {
         let (text, end, _) = script(code, |_| Ok(String::new()));
         assert_eq!(end, End::Done);
         let shown: Json = serde_json::from_str(&text).unwrap();
-        assert_eq!(shown, serde_json::json!(["echo,mcp__a-b__c", "undefined", "undefined", "undefined", "undefined", "function"]));
+        let expected = ["echo,json,mcp__a-b__c", "undefined", "undefined", "undefined", "undefined", "function"];
+        assert_eq!(shown, serde_json::json!(expected));
+    }
+
+    #[test]
+    fn a_call_with_a_value_resolves_to_it() {
+        let (text, end, _) = script("const files = await tools.json({}); [files.length, files[1]]", |_| Ok(r#"["a","b"]"#.into()));
+        assert_eq!(end, End::Done);
+        assert_eq!(serde_json::from_str::<Json>(&text).unwrap(), serde_json::json!([2, "b"]));
     }
 
     #[test]

@@ -157,7 +157,7 @@ impl Tool for GlobTool {
         let (with_lines, empty) = tokio::join!(ugrep(input.ugrep_args(LISTINGS[0])), ugrep(input.ugrep_args(LISTINGS[1])));
         let stdout = match (with_lines, empty) {
             (Err(e), _) | (_, Err(e)) => return e,
-            (Ok(None), Ok(None)) => return ToolOutput::ok("No files found"),
+            (Ok(None), Ok(None)) => return ToolOutput::ok("No files found").with_value(json!([])),
             (Ok(a), Ok(b)) => [a, b].into_iter().flatten().collect::<Vec<_>>().join("\n"),
         };
         let mut seen = std::collections::HashSet::new();
@@ -166,15 +166,21 @@ impl Tool for GlobTool {
         let mut files: Vec<(SystemTime, &str)> = stdout.lines().filter(|p| !p.is_empty() && seen.insert(*p)).map(|p| (modified(p), p)).collect();
         files.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
         let total = files.len();
-        let limit = input.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT).clamp(1, MAX_HEAD_LIMIT);
-        let mut text = files.iter().take(limit).map(|(_, p)| *p).collect::<Vec<_>>().join("\n");
+        // A script gets all the paths unless it asks for fewer.
+        let limit = match (input.head_limit, spill::for_script()) {
+            (Some(n), true) => n.max(1),
+            (None, true) => usize::MAX,
+            (n, false) => n.unwrap_or(DEFAULT_HEAD_LIMIT).clamp(1, MAX_HEAD_LIMIT),
+        };
+        let paths: Vec<&str> = files.iter().take(limit).map(|(_, p)| *p).collect();
+        let mut text = paths.join("\n");
         if total > limit {
             text.push_str(&format!(
                 "\n... [showing the {limit} most recently modified of {total} files; narrow the pattern or path, \
                  or raise head_limit]"
             ));
         }
-        ToolOutput::ok(spill::shorten(&text, MAX_OUTPUT_BYTES, "glob"))
+        ToolOutput::ok(spill::shorten(&text, MAX_OUTPUT_BYTES, "glob")).with_value(json!(paths))
     }
 }
 
@@ -185,6 +191,24 @@ mod tests {
     // These tests need ugrep on PATH.
     async fn glob(input: Value) -> ToolOutput {
         GlobTool.run(input).await
+    }
+
+    #[tokio::test]
+    async fn a_script_gets_every_path_as_a_list() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..DEFAULT_HEAD_LIMIT + 5 {
+            std::fs::write(dir.path().join(format!("f{i}.rs")), "").unwrap();
+        }
+        let input = json!({"pattern": "*.rs", "path": dir.path()});
+        let out = glob(input.clone()).await;
+        assert_eq!(out.value.unwrap().as_array().unwrap().len(), DEFAULT_HEAD_LIMIT);
+        assert!(out.content.contains("[showing the 100 most recently modified of 105 files"), "{}", out.content);
+        let out = spill::whole(glob(input)).await;
+        let paths = out.value.unwrap();
+        assert_eq!(paths.as_array().unwrap().len(), DEFAULT_HEAD_LIMIT + 5);
+        assert!(paths.as_array().unwrap().iter().all(|p| p.as_str().unwrap().ends_with(".rs")));
+        let out = spill::whole(glob(json!({"pattern": "*.rs", "path": dir.path(), "head_limit": 3}))).await;
+        assert_eq!(out.value.unwrap().as_array().unwrap().len(), 3, "unless it asks for fewer");
     }
 
     fn fixture() -> tempfile::TempDir {
@@ -226,10 +250,11 @@ mod tests {
         assert_eq!(find("src/tools/*.rs").await, ["src/tools/bin.rs", "src/tools/empty.rs"], "starts at `path`");
         assert_eq!(find("/*.{toml,md}").await, ["Cargo.toml", "README.md"]);
         assert_eq!(find("*.{toml,md}").await, ["Cargo.toml", "README.md"]);
+        let none = ToolOutput::ok("No files found").with_value(json!([]));
         let out = glob(json!({"pattern": "tools/*.rs", "path": root})).await;
-        assert_eq!(out, ToolOutput::ok("No files found"));
+        assert_eq!(out, none);
         let out = glob(json!({"pattern": "src/*.rs", "path": root.join("src")})).await;
-        assert_eq!(out, ToolOutput::ok("No files found"), "a pattern with `/` starts at `path`");
+        assert_eq!(out, none, "a pattern with `/` starts at `path`");
         assert!(glob(json!({"pattern": "*.rs", "regex": true})).await.is_error);
     }
 

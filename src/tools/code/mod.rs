@@ -59,10 +59,13 @@ Scripts run in one persistent QuickJS context: what a script defines at its top 
 in the next call, so keep results you may need again in variables instead of reading a file or running a command \
 again. Declaring a name again replaces it. Top-level `await` works. It is plain modern JavaScript with no Node or \
 browser APIs (no file system, network, `require`, `fetch` or timers); it reaches the outside only through the tools:
-- `await tools[\"name\"](input)` calls the tool `name` with the same input object as calling it directly, and resolves \
-to a string: the text the direct call shows, not JSON (`glob` and `grep` give one path per line, `bash` the command's \
-output, `read` numbered lines). Parse it as JSON only where the tool says it returns JSON. A call that fails rejects \
-with an Error whose message is the output. Bracket syntax works for every name, including MCP tools whose names contain `-`.
+- `await tools[\"name\"](input)` calls the tool `name` with the same input object as calling it directly. It resolves \
+to the text the direct call shows (`bash` the command's output, `read` numbered lines), except for listings: `glob` \
+gives an array of paths and `grep` an array of paths, an object mapping each path to its count (`output_mode: \
+\"count\"`) or its lines as one string (`\"content\"`); empty when nothing matches. In a script they have no default \
+`head_limit`: you get every match unless you ask for fewer. Parse text as JSON only where the tool says it returns \
+JSON. A call that fails rejects with an Error whose message is the output. Bracket syntax works for every name, \
+including MCP tools whose names contain `-`.
 - `ALL_TOOLS` lists `{name, description, input_schema}` for each tool you can call. Not callable: agent, message_agent, \
 stop_agent, wait_tasks, skill, tool_search, ask_user_question and code itself.
 - Calls started together (`Promise.all`) run concurrently. Each goes through the same hooks and permission checks as a \
@@ -202,8 +205,12 @@ impl Tool for CodeTool {
                         stop.store(true, Ordering::Relaxed);
                         reply_tx = None;
                     } else if let Some(tx) = &reply_tx {
-                        let result = if output.is_error { Err(output.content) } else { Ok(output.content) };
-                        let _ = tx.send(Reply { id, result });
+                        let reply = match (output.is_error, output.value) {
+                            (true, _) => Reply { id, result: Err(output.content), json: false },
+                            (false, Some(value)) => Reply { id, result: Ok(value.to_string()), json: true },
+                            (false, None) => Reply { id, result: Ok(output.content), json: false },
+                        };
+                        let _ = tx.send(reply);
                     }
                 }
                 () = &mut deadline, if stopped.is_none() => {
