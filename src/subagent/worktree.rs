@@ -133,17 +133,23 @@ impl Worktree {
         Ok(tree)
     }
 
-    /// That the worktree's `.git` still names its place in the repository:
-    /// the subagent's commands could point it at a repository of their
-    /// making, whose config would run programs when git looks at it here.
+    /// That the worktree's `.git` still names its place in the repository,
+    /// and that place's `commondir` the repository: the subagent's commands
+    /// could point either at a repository of their making, whose config
+    /// would run programs when git looks at it here.
     fn check_link(&self) -> Result<()> {
         let link = std::fs::read_to_string(self.dir.join(".git")).context("reading the worktree's .git")?;
-        let gitdir = link.trim().strip_prefix("gitdir: ").map(PathBuf::from).context("the worktree's .git is not a link")?;
+        let gitdir = link.trim().strip_prefix("gitdir: ").context("the worktree's .git is not a link")?;
+        let gitdir = self.dir.join(gitdir);
         let common = PathBuf::from(git(&self.repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
         let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let home = gitdir.parent().filter(|p| p.file_name().is_some_and(|n| n == "worktrees")).and_then(Path::parent);
         if home.map(canonical) != Some(canonical(&common)) {
             bail!("its .git no longer points into {}", common.display());
+        }
+        let named = std::fs::read_to_string(gitdir.join("commondir")).context("reading the worktree's commondir")?;
+        if canonical(&gitdir.join(named.trim_end_matches(['\n', '\r']))) != canonical(&common) {
+            bail!("its commondir no longer names {}", common.display());
         }
         Ok(())
     }
@@ -320,6 +326,20 @@ mod tests {
         drop(tree);
         std::fs::remove_dir_all(&dir).unwrap();
         git(repo.path(), &["worktree", "prune"]).unwrap();
+    }
+
+    #[test]
+    fn a_worktree_whose_commondir_names_another_repository_is_left_alone() {
+        let (repo, other) = (repo(), repo());
+        let tree = Worktree::create(repo.path(), &format!("test-common-{}", std::process::id())).unwrap();
+        assert_eq!(tree.changes().unwrap().files, 0);
+        let link = std::fs::read_to_string(tree.dir.join(".git")).unwrap();
+        let commondir = PathBuf::from(link.trim().strip_prefix("gitdir: ").unwrap()).join("commondir");
+        let kept = std::fs::read_to_string(&commondir).unwrap();
+        std::fs::write(&commondir, format!("{}\n", other.path().join(".git").display())).unwrap();
+        assert!(format!("{:#}", tree.changes().unwrap_err()).contains("commondir no longer names"));
+        assert!(!tree.discard_if_unchanged(), "kept, and git not run in it");
+        std::fs::write(&commondir, kept).unwrap();
     }
 
     #[test]

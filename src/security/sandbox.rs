@@ -14,6 +14,7 @@
 //! comes only from the user's settings file (`settings.rs`), so a repository
 //! cannot loosen it.
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -25,11 +26,25 @@ use tokio::process::Command;
 
 use crate::util::expand_env;
 
-/// Paths in the working directory that stay read-only, and whether each is
-/// a directory: the harness's and Claude Code's config, and git's hooks and
-/// config (which can name commands for git to run).
-const PROTECTED: [(&str, bool); 5] =
-    [(".harness", true), (".claude", true), (".mcp.json", false), (".git/hooks", true), (".git/config", false)];
+/// Paths in the working directory that stay read-only, and what stands in
+/// for each on Linux while it does not exist: the harness's and Claude
+/// Code's config, and git's hooks and config (which can name commands for
+/// git to run), with `commondir`, which names the repository whose config
+/// git reads. An empty `commondir` would stop git, so on Linux one that
+/// does not exist yet is not protected.
+const PROTECTED: [(&str, StandIn); 7] = [
+    (".harness", StandIn::Dir),
+    (".claude", StandIn::Dir),
+    (".mcp.json", StandIn::File),
+    (".git/hooks", StandIn::Dir),
+    (".git/config", StandIn::File),
+    (".git/config.worktree", StandIn::File),
+    (".git/commondir", StandIn::Nothing),
+];
+
+/// The same files in the git directory of each of the repository's linked
+/// worktrees, `.git/worktrees/<id>/`, which git reads when it runs there.
+const WORKTREE_PROTECTED: [(&str, StandIn); 2] = [("config.worktree", StandIn::File), ("commondir", StandIn::Nothing)];
 
 /// Devices that commands write to as a matter of course.
 const SEATBELT_DEVICES: &str =
@@ -81,14 +96,22 @@ impl Backend {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Access {
     Write,
-    /// Readable only. `dir` says what to stand in for it on Linux while it
-    /// does not exist.
-    ReadOnly { dir: bool },
+    /// Readable only.
+    ReadOnly { stand_in: StandIn },
     Hidden,
     /// A directory that cannot be renamed or removed, so the read-only
     /// paths under it stay where they are; its contents follow the rules
     /// above it.
     Pinned,
+}
+
+/// What bwrap mounts for a read-only path that does not exist yet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StandIn {
+    Dir,
+    File,
+    /// Nothing, leaving the path unprotected until it exists.
+    Nothing,
 }
 
 /// Each rule covers its path and everything under it; the deepest rule
@@ -176,7 +199,7 @@ impl Sandbox {
         for path in &config.allow_write {
             add(&expand_path(path, home, &cwd), Access::Write);
         }
-        for (name, dir) in PROTECTED {
+        for (name, stand_in) in PROTECTED {
             let path = cwd.join(name);
             // `.git/...` only in a repository, so `git init` still works
             // elsewhere.
@@ -186,7 +209,7 @@ impl Sandbox {
             for between in path.ancestors().skip(1).take_while(|a| *a != cwd) {
                 add(between, Access::Pinned);
             }
-            add(&path, Access::ReadOnly { dir });
+            add(&path, Access::ReadOnly { stand_in });
         }
         for path in &config.deny_read {
             add(&expand_path(path, home, &cwd), Access::Hidden);
@@ -279,7 +302,7 @@ impl Sandbox {
             params.push(define);
             format!("(param \"{key}\")")
         };
-        for rule in &self.rules {
+        for rule in self.rules().iter() {
             let p = param(&rule.path);
             profile.push_str(&match rule.access {
                 Access::Write => format!("(allow file-read* file-write* (subpath {p}))\n"),
@@ -318,14 +341,14 @@ impl Sandbox {
             args.push(to.into());
         };
         let none = Path::new("");
-        for Rule { path, access } in &self.rules {
+        for Rule { path, access } in self.rules().iter() {
             let exists = path.symlink_metadata().ok();
             match (access, exists) {
                 // A mount point cannot be renamed or removed.
                 (Access::Write | Access::Pinned, Some(_)) => mount("--bind", path, path),
                 (Access::ReadOnly { .. }, Some(_)) => mount("--ro-bind", path, path),
-                (Access::ReadOnly { dir }, None) if path.parent().is_some_and(Path::is_dir) => {
-                    if *dir {
+                (Access::ReadOnly { stand_in }, None) if *stand_in != StandIn::Nothing && path.parent().is_some_and(Path::is_dir) => {
+                    if *stand_in == StandIn::Dir {
                         mount("--tmpfs", none, path);
                         mount("--remount-ro", none, path);
                     } else {
@@ -348,10 +371,33 @@ impl Sandbox {
         args
     }
 
+    /// The rules, with those for the repository's linked worktrees as they
+    /// are now (`WORKTREE_PROTECTED`). Their directories are pinned, so a
+    /// command cannot put one of its making in their place; removing a
+    /// worktree (`git worktree remove`) is left to commands outside it.
+    fn rules(&self) -> Cow<'_, [Rule]> {
+        let worktrees = self.cwd.join(".git/worktrees");
+        let Ok(entries) = std::fs::read_dir(&worktrees) else { return Cow::Borrowed(&self.rules) };
+        let mut rules = self.rules.clone();
+        rules.push(Rule { path: worktrees, access: Access::Pinned });
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let dir = entry.path();
+            for (name, stand_in) in WORKTREE_PROTECTED {
+                rules.push(Rule { path: dir.join(name), access: Access::ReadOnly { stand_in } });
+            }
+            rules.push(Rule { path: dir, access: Access::Pinned });
+        }
+        rules.sort_by_key(|r| r.path.components().count());
+        Cow::Owned(rules)
+    }
+
     /// The deepest rule covering `path`, with symlinks resolved.
     fn access(&self, path: &Path) -> Option<Access> {
         let path = fold_case(&resolve(path));
-        self.rules
+        self.rules()
             .iter()
             .rev()
             .filter(|r| r.access != Access::Pinned)
@@ -399,7 +445,7 @@ impl Sandbox {
         let mut items = vec![
             ("backend", backend.to_string()),
             ("writable", self.paths(Access::Write).join(", ")),
-            ("read-only", self.paths(Access::ReadOnly { dir: false }).join(", ")),
+            ("read-only", self.paths(Access::ReadOnly { stand_in: StandIn::File }).join(", ")),
         ];
         let hidden = self.paths(Access::Hidden);
         if !hidden.is_empty() {
@@ -623,7 +669,16 @@ mod tests {
         let s = sandbox(Backend::Seatbelt, &cwd, "{}");
         assert_eq!(s.check_write(&cwd.join("src/main.rs")), Ok(()));
         assert_eq!(s.check_write(&cwd.join(".git/objects/ab")), Ok(()));
-        for path in [".harness/settings.json", ".mcp.json", ".claude/settings.json", ".git/hooks/pre-commit", ".git/config"] {
+        let protected = [
+            ".harness/settings.json",
+            ".mcp.json",
+            ".claude/settings.json",
+            ".git/hooks/pre-commit",
+            ".git/config",
+            ".git/config.worktree",
+            ".git/commondir",
+        ];
+        for path in protected {
             let err = s.check_write(&cwd.join(path)).unwrap_err();
             assert!(err.contains("read-only"), "{path}: {err}");
         }
@@ -631,6 +686,34 @@ mod tests {
         assert!(s.check_write(&cwd.join("missing/../.mcp.json")).unwrap_err().contains("read-only"));
         assert!(s.check_write(Path::new("/tmp/../etc/escape")).is_err());
         assert!(s.rules.contains(&Rule { path: cwd.join(".git"), access: Access::Pinned }));
+    }
+
+    #[test]
+    fn protects_what_names_a_linked_worktrees_config() {
+        let dir = repo();
+        let cwd = resolve(dir.path());
+        let s = sandbox(Backend::Seatbelt, &cwd, "{}");
+        // Made after startup, as a subagent's worktree is.
+        std::fs::create_dir_all(cwd.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(cwd.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        for path in ["commondir", "config.worktree"] {
+            let err = s.check_write(&cwd.join(".git/worktrees/wt").join(path)).unwrap_err();
+            assert!(err.contains("read-only"), "{path}: {err}");
+        }
+        assert_eq!(s.check_write(&cwd.join(".git/worktrees/wt/index")), Ok(()));
+        let profile = s.seatbelt_args().iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        assert!(profile.contains(&format!("={}", cwd.join(".git/worktrees/wt/commondir").display())), "{profile}");
+        let rules = s.rules();
+        assert!(rules.contains(&Rule { path: cwd.join(".git/worktrees/wt"), access: Access::Pinned }));
+        assert!(rules.iter().map(|r| r.path.components().count()).is_sorted());
+
+        let linux = sandbox(Backend::Bubblewrap, &cwd, "{}");
+        let args = linux.bwrap_args(&mut Vec::new()).iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let args = args.join(" ");
+        let c = cwd.display();
+        assert!(args.contains(&format!("--ro-bind {c}/.git/worktrees/wt/commondir {c}/.git/worktrees/wt/commondir")), "{args}");
+        // An empty stand-in would stop git.
+        assert!(!args.contains(&format!("{c}/.git/commondir")), "{args}");
     }
 
     #[test]
@@ -699,7 +782,10 @@ mod tests {
         assert!(at[0] < at[1] && at[1] < at[5], "{args}");
         assert!(!args.contains("missing"), "{args}");
         assert!(args.ends_with(&format!("--chdir {c}")), "{args}");
-        assert_eq!(placeholders, [cwd.join(".harness"), cwd.join(".claude"), cwd.join(".mcp.json")]);
+        assert_eq!(
+            placeholders,
+            [cwd.join(".harness"), cwd.join(".claude"), cwd.join(".mcp.json"), cwd.join(".git/config.worktree")]
+        );
     }
 
     #[test]
@@ -731,6 +817,8 @@ mod tests {
         let cwd = resolve(dir.path());
         let s = sandbox(Backend::Seatbelt, &cwd, r#"{"deny_read": ["secret"]}"#);
         std::fs::write(cwd.join("secret"), "hush").unwrap();
+        std::fs::create_dir_all(cwd.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(cwd.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
         s.probe().await.unwrap();
 
         let out = run_seatbelt(&s, "echo ok > inside && cat inside && echo tmp > \"$TMPDIR/harness-sb\" && echo fine > /dev/null").await;
@@ -741,6 +829,9 @@ mod tests {
             "mkdir -p .harness",
             "echo x > .git/hooks/pre-commit",
             "echo x >> .git/config",
+            "echo /tmp/x > .git/commondir",
+            "echo /tmp/x > .git/worktrees/wt/commondir",
+            "mv .git/worktrees/wt .git/worktrees/old",
             "mv .git .g",
             "ln .git/config linked",
             "cat secret",
@@ -750,7 +841,8 @@ mod tests {
             let out = run_seatbelt(&s, script).await;
             assert!(!out.status.success(), "`{script}` was allowed");
         }
-        assert!(!cwd.join(".mcp.json").exists());
+        assert!(!cwd.join(".mcp.json").exists() && !cwd.join(".git/commondir").exists());
+        assert!(run_seatbelt(&s, "echo x > .git/worktrees/wt/index").await.status.success(), "the rest stays writable");
         assert!(!Path::new(&std::env::var("HOME").unwrap()).join(".harness-sandbox-test").exists());
         // It leads its own process group, which a timeout kills.
         let out = run_seatbelt(&s, "exec perl -e 'print \"$$ \", getpgrp()'").await;

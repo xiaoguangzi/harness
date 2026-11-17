@@ -444,7 +444,7 @@ REPL 和一次性模式的每个会话都会在每一批工具调用之后以及
 `harness --sandbox`（或 `HARNESS_SANDBOX=1`，或在配置的 `sandbox` 部分写 `"enabled": true`）让模型的 `bash` 命令和 `grep` / `glob` 搜索在操作系统沙箱里运行：macOS 用系统自带的 Seatbelt（`sandbox-exec`），Linux 用 [bubblewrap](https://github.com/containers/bubblewrap)（`apt install bubblewrap` / `dnf install bubblewrap`；它需要非特权用户命名空间，有些容器里没有）。`--no-sandbox` 或 `HARNESS_SANDBOX=0` 可以单次关闭。沙箱无法启动时，harness 直接退出，不会在没有沙箱的情况下运行。
 
 - **读**：除 `deny_read` 以外都可读。
-- **写**：只能写工作目录、临时目录（`/tmp`、`/var/tmp`、`$TMPDIR`，macOS 上还有每用户的临时和缓存目录）以及 `allow_write`。工作目录中的 `.harness/`、`.claude/`、`.mcp.json`，以及 git 仓库中的 `.git/hooks/` 和 `.git/config` 保持只读，因为它们会让代码之后在沙箱外运行（MCP 服务器、hooks、`core.fsmonitor`）；`.git` 本身不能被重命名或删除。
+- **写**：只能写工作目录、临时目录（`/tmp`、`/var/tmp`、`$TMPDIR`，macOS 上还有每用户的临时和缓存目录）以及 `allow_write`。工作目录中的 `.harness/`、`.claude/`、`.mcp.json`，以及 git 仓库中的 `.git/hooks/`、`.git/config`、`.git/config.worktree` 和 `.git/commondir`（它指明 git 读取哪个仓库的配置）保持只读，因为它们会让代码之后在沙箱外运行（MCP 服务器、hooks、`core.fsmonitor`）；每个关联 worktree 的 `.git/worktrees/<id>/` 中的 `commondir` 和 `config.worktree` 同样只读。`.git` 和这些 worktree 目录不能被重命名或删除（因此 `git worktree remove` 要在沙箱外运行）。Linux 上尚不存在的 `.git/commondir` 不受保护：bwrap 的空占位文件会让 git 无法运行。
 - **网络**：只允许回环地址（本地服务和测试可用，DNS 和外连会失败），除非设置 `"network": true`。
 - 命令在没有终端的新会话中运行。Linux 上还有独立的 PID 命名空间，后台任务随命令一起结束；macOS 上无法运行 setuid 程序（`sudo`、`ps`）。
 
