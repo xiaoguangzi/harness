@@ -517,7 +517,16 @@ function appendAssistant(el, text) {
 // What a tool call is about, for its collapsed summary line.
 /** The whole command or script of a call waiting for approval, when its summary shows only part of it. */
 function wholeCommand(ev) {
-  const text = ev.tool === "bash" ? ev.input?.command : ev.tool === "code" ? ev.input?.code : null;
+  const script = ev.tool === "bash" || ev.tool === "code";
+  if (!script && ["edit", "write"].includes(ev.tool)) return null;
+  let text = ev.tool === "bash" ? ev.input?.command : ev.tool === "code" ? ev.input?.code : null;
+  // Other tools (an MCP tool, say): what they are sent, field by field.
+  if (!script && ev.input && typeof ev.input === "object") {
+    const fields = Object.entries(ev.input);
+    const lines = fields.map(([k, v]) => k + ": " + (typeof v === "string" ? v.trim() : JSON.stringify(v)));
+    if (fields.length > 1 || lines.some(l => l.includes("\n"))) return h("pre", { class: "command" }, lines.join("\n"));
+    text = lines[0];
+  }
   if (typeof text !== "string" || (!text.trim().includes("\n") && text.length <= 80)) return null;
   return h("pre", { class: "command" }, text);
 }

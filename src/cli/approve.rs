@@ -52,6 +52,12 @@ impl Question {
         {
             detail.extend(script_rows(script, text::terminal_width().saturating_sub(7).max(20)));
         }
+        if script.is_none()
+            && !matches!(request.tool.as_str(), "edit" | "write")
+            && let Some(fields) = input_text(&request.input, call_label(&request.tool, &request.input, width) != call_label(&request.tool, &request.input, usize::MAX))
+        {
+            detail.extend(script_rows(&fields, text::terminal_width().saturating_sub(7).max(20)));
+        }
         if request.tool == "edit" {
             let lines = |key: &str, sign: char| -> Vec<String> {
                 let text = request.input[key].as_str().unwrap_or_default();
@@ -127,6 +133,22 @@ impl Question {
         rows.push(paint(DIM, &super::input::rule(width)));
         rows
     }
+}
+
+/// The input of a call whose title shows only a line of it (an MCP tool's,
+/// say) as `field: value` lines, unless the title (not `cut`) has it all:
+/// one field, on one line.
+fn input_text(input: &serde_json::Value, cut: bool) -> Option<String> {
+    let fields = input.as_object().filter(|o| !o.is_empty())?;
+    let multiline = fields.values().any(|v| v.as_str().is_some_and(|s| s.trim().contains('\n')));
+    if fields.len() == 1 && !cut && !multiline {
+        return None;
+    }
+    let line = |(key, value): (&String, &serde_json::Value)| match value.as_str() {
+        Some(text) => format!("{key}: {}", text.trim()),
+        None => format!("{key}: {value}"),
+    };
+    Some(fields.iter().map(line).collect::<Vec<_>>().join("\n"))
 }
 
 /// `script` wrapped into rows indented under the question, at most
@@ -248,6 +270,22 @@ mod tests {
         let long: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
         let rows = ask(&long.join("\n"));
         assert!(rows.iter().any(|r| r.contains("… 19 more rows")) && !rows.iter().any(|r| r.contains("step 11")), "{rows:?}");
+    }
+
+    #[test]
+    fn shows_what_other_tools_are_sent() {
+        let ask = |tool: &str, input: serde_json::Value| {
+            let request = Request { tool: tool.into(), input, reason: "it is asked".into(), suggestions: Vec::new(), agent: None };
+            Question::new(&request, 0, oneshot::channel().0).render(200, &|_, s| s.to_string())
+        };
+        let rows = ask("mcp__db__query", json!({"sql": "DELETE FROM users\nWHERE id = 1", "database": "prod", "limit": 5}));
+        for row in ["    sql: DELETE FROM users", "    WHERE id = 1", "    database: prod", "    limit: 5"] {
+            assert!(rows.iter().any(|r| r == row), "{row} in {rows:?}");
+        }
+        let rows = ask("web_fetch", json!({"url": "https://example.com/"}));
+        assert!(!rows.iter().any(|r| r.starts_with("    ")), "the title has it all: {rows:?}");
+        let rows = ask("edit", json!({"path": "a.rs", "old_string": "a", "new_string": "b"}));
+        assert!(!rows.iter().any(|r| r.contains("old_string")), "an edit shows its diff: {rows:?}");
     }
 
     #[test]

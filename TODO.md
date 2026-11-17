@@ -196,8 +196,6 @@ other harness's docs or source before acting on an entry. All findings here are 
 - [ ] `tool_search` gets no guidance line (the `<deferred-tools>` notice explains it).
 - [ ] The date in the system prompt goes stale in long-lived web tasks (each prompt carries the time, so the
   model can tell).
-- [ ] Approvals of MCP and other tools show only `call_label`'s one line of the input (the bash command and a
-  `code` script are shown whole). (read)
 - [ ] Not verified: whether the Seatbelt profile (`allow default`) lets commands reach launchd services
   (`open`, `osascript`).
 
