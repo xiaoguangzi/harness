@@ -3,11 +3,13 @@
 //! a prompt about the page; this returns the page itself, or its start and
 //! end with the whole in a file to `read` or `grep`, as other large outputs.
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use encoding_rs::Encoding;
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -117,11 +119,35 @@ fn same_site(from: &Url, to: &Url) -> bool {
     bare(from) == bare(to)
 }
 
+/// `body` as text, in the charset named by a byte-order mark, else by
+/// `content_type`, else by the page itself (an HTML `<meta>` or an XML
+/// declaration near its start); UTF-8 if none is, or the name is unknown.
+fn decode<'a>(content_type: &str, body: &'a [u8]) -> Cow<'a, str> {
+    static NAMED: OnceLock<regex::Regex> = OnceLock::new();
+    let named = NAMED.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(?:\bcharset|<\?xml[^>]*\bencoding)\s*=\s*["']?\s*([a-z0-9._:-]+)"#).unwrap()
+    });
+    let label = |text: &str| named.captures(text).map(|c| c[1].to_string());
+    let header = content_type.split(';').skip(1).find_map(label);
+    let encoding = match header.and_then(|l| Encoding::for_label(l.as_bytes())) {
+        Some(encoding) => encoding,
+        None => {
+            // A page that says it is UTF-16 in ASCII is not (as browsers
+            // take it).
+            let start = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+            let found = label(&start).and_then(|l| Encoding::for_label(l.as_bytes()));
+            found.map_or(encoding_rs::UTF_8, Encoding::output_encoding)
+        }
+    };
+    // A byte-order mark goes before both.
+    encoding.decode(body).0
+}
+
 /// The page's text: Markdown for HTML, as it is for other text; `Err` for
 /// what is not text.
 fn page_text(content_type: &str, body: &[u8]) -> Result<String, String> {
     let kind = content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
-    let text = String::from_utf8_lossy(body);
+    let text = decode(content_type, body);
     let k = kind.as_str();
     let html = matches!(k, "text/html" | "application/xhtml+xml") || (k.is_empty() && text.trim_start().starts_with('<'));
     if html {
@@ -244,7 +270,7 @@ impl Tool for WebFetchTool {
             }
         }
         if !status.is_success() {
-            let text = String::from_utf8_lossy(&body);
+            let text = decode(&content_type, &body);
             let excerpt: String = text.chars().take(500).collect();
             return ToolOutput::error(format!("{url} answered {status}.\n{excerpt}"));
         }
@@ -272,6 +298,22 @@ mod tests {
                     ([("content-type", "text/html; charset=utf-8")], html)
                 }),
             )
+            .route(
+                "/gbk",
+                axum::routing::get(|| async {
+                    // "<p>中文</p>" in GBK, named by the header.
+                    ([("content-type", "text/html; charset=GBK")], b"<p>\xd6\xd0\xce\xc4</p>".to_vec())
+                }),
+            )
+            .route(
+                "/sjis",
+                axum::routing::get(|| async {
+                    // "日本" in Shift_JIS, named only by the page.
+                    let page = b"<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=Shift_JIS\">\
+                                 </head><body><p>\x93\xfa\x96\x7b</p></body></html>";
+                    ([("content-type", "text/html")], page.to_vec())
+                }),
+            )
             .route("/data", axum::routing::get(|| async { ([("content-type", "application/json")], "{\"a\": 1}") }))
             .route("/image", axum::routing::get(|| async { ([("content-type", "image/png")], vec![0u8; 4]) }))
             .route("/missing", axum::routing::get(|| async { (axum::http::StatusCode::NOT_FOUND, "no such page") }))
@@ -293,6 +335,9 @@ mod tests {
         assert!(page.content.contains("# Title") && page.content.contains("[link](/x)"), "{}", page.content);
         assert!(page.content.contains("Title: T\n"), "the page's title: {}", page.content);
         assert!(!page.content.contains("alert") && !page.content.contains("p{}"), "{}", page.content);
+        assert!(fetch("/gbk").await.content.ends_with("中文"), "the header's charset");
+        let sjis = fetch("/sjis").await;
+        assert!(sjis.content.ends_with("日本"), "the page's own charset: {}", sjis.content);
         assert!(fetch("/data").await.content.ends_with("{\"a\": 1}"));
         assert!(fetch("/image").await.content.contains("image/png"));
         let missing = fetch("/missing").await;
@@ -300,6 +345,16 @@ mod tests {
         assert!(fetch("/here").await.content.contains("# Title"), "followed on the same host");
         let away = fetch("/away").await;
         assert!(!away.is_error && away.content.contains("redirects to https://example.com/"), "{}", away.content);
+    }
+
+    #[test]
+    fn decodes_the_charset_named() {
+        assert_eq!(decode("text/plain; charset=\"iso-8859-1\"", b"caf\xe9"), "café");
+        assert_eq!(decode("text/plain", b"\xef\xbb\xbfok"), "ok", "a byte-order mark");
+        assert_eq!(decode("text/plain; charset=gbk", b"\xef\xbb\xbfok"), "ok", "the mark goes first");
+        assert_eq!(decode("application/xml", b"<?xml version=\"1.0\" encoding=\"GB2312\"?><a>\xd6\xd0</a>"), "<?xml version=\"1.0\" encoding=\"GB2312\"?><a>中</a>");
+        assert_eq!(decode("text/html", b"<meta charset=utf-16><p>x</p>"), "<meta charset=utf-16><p>x</p>", "UTF-16 named in ASCII is not");
+        assert_eq!(decode("text/html; charset=nonsense", "é".as_bytes()), "é");
     }
 
     #[test]

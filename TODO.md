@@ -188,8 +188,6 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### Found on the way (not a comparison)
 
-- [ ] `web_fetch` decodes pages as UTF-8, so a page in another charset (GBK, Shift_JIS) comes out garbled. (read)
-
 - [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
 - [ ] `lsp` starts its servers at, and shows paths relative to, the directory the harness started in, so a worktree
   subagent's `lsp` looks at the main checkout (lsp.rs:212, 513; the README says so). (read)
