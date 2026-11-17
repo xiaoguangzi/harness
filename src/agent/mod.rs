@@ -769,18 +769,24 @@ impl Agent {
 
     /// Takes the server tool calls (`server_tool_use`) that have no result
     /// out of a last assistant message, as a paused response (`pause_turn`)
-    /// can leave them: the API answers them only when that message is sent
-    /// last, to go on with it, and refuses them before another message.
-    /// The message goes if nothing but thinking is left of it.
+    /// can leave them: the API runs them when that message is sent last, to
+    /// go on with it, and may refuse them before another message. The
+    /// message goes if nothing but thinking is left of it.
     fn drop_unanswered_server_calls(&mut self) {
         let Some(last) = self.messages.last_mut().filter(|m| m.role == "assistant") else { return };
         let answered: HashSet<String> =
             last.content.iter().filter_map(|b| b["tool_use_id"].as_str()).map(str::to_string).collect();
+        let before = last.content.len();
         last.content.retain(|b| b["type"] != "server_tool_use" || b["id"].as_str().is_some_and(|id| answered.contains(id)));
+        if last.content.len() == before {
+            return;
+        }
         let thinking = |b: &Value| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking" | "openai_reasoning"));
         if last.content.iter().all(thinking) {
             self.messages.pop();
         }
+        // The size counted with it no longer holds.
+        self.context = None;
     }
 
     async fn run_loop(&mut self, observer: &mut dyn Observer) -> Result<()> {
@@ -1005,6 +1011,18 @@ pub(crate) mod tests {
         a.repair_after_interrupt();
         assert_eq!(a.messages[1].content, vec![search("s1"), found, text("so")], "the answered call stays");
         assert_eq!(a.messages.len(), 2, "no note: nothing was left unanswered for the user to see");
+
+        // An ordinary round: the advisor's call and answer stay with the call.
+        let advisor = json!({"type": "server_tool_use", "id": "a1", "name": "advisor", "input": {}});
+        let advice = json!({"type": "advisor_tool_result", "tool_use_id": "a1", "content": {"type": "advisor_result", "text": "ok"}});
+        let call = json!({"type": "tool_use", "id": "t1", "name": "bash", "input": {}});
+        let round = Message { role: "assistant", content: vec![advisor.clone(), advice.clone(), call.clone()], source: None };
+        let mut a = agent(vec![Message::user(vec![text("run it")]), round]);
+        a.context = Some((2, 1000));
+        a.repair_after_interrupt();
+        assert_eq!(a.messages[1].content, vec![advisor, advice, call]);
+        assert_eq!(a.context, Some((2, 1000)), "nothing changed");
+        assert_eq!(a.messages[2].content[0]["tool_use_id"], "t1");
 
         let thinking = json!({"type": "thinking", "thinking": "t", "signature": "x"});
         let only = Message { role: "assistant", content: vec![thinking, search("s3")], source: None };
