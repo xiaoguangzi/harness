@@ -188,6 +188,10 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### Found on the way (not a comparison)
 
+- [ ] On Linux a `.git/commondir` that does not exist yet (the usual case in a main checkout) is not protected by
+  the sandbox: bwrap's empty stand-in would make git fail ("failed to read .git/commondir"). A stand-in holding
+  `.` would do, but bwrap creates the mount point empty on the host, where git outside reads it meanwhile. The
+  bwrap side of the `commondir` change (2026-11-17) was not run on Linux either. (read)
 - [ ] Repairs after an error or an interrupt look at `tool_use` only, not `server_tool_use`.
 - [ ] `lsp` starts its servers at, and shows paths relative to, the directory the harness started in, so a worktree
   subagent's `lsp` looks at the main checkout (lsp.rs:212, 513; the README says so). (read)

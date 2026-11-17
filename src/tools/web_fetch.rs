@@ -120,24 +120,30 @@ fn same_site(from: &Url, to: &Url) -> bool {
 }
 
 /// `body` as text, in the charset named by a byte-order mark, else by
-/// `content_type`, else by the page itself (an HTML `<meta>` or an XML
-/// declaration near its start); UTF-8 if none is, or the name is unknown.
+/// `content_type`, else, in HTML or XML, by a `<meta>` or XML declaration
+/// near the page's start; UTF-8 if none is, or the name is unknown.
 fn decode<'a>(content_type: &str, body: &'a [u8]) -> Cow<'a, str> {
-    static NAMED: OnceLock<regex::Regex> = OnceLock::new();
-    let named = NAMED.get_or_init(|| {
-        regex::Regex::new(r#"(?i)(?:\bcharset|<\?xml[^>]*\bencoding)\s*=\s*["']?\s*([a-z0-9._:-]+)"#).unwrap()
+    static DECLARED: OnceLock<regex::Regex> = OnceLock::new();
+    let declared = DECLARED.get_or_init(|| {
+        let value = r#"\s*=\s*["']?\s*([a-z0-9._:-]+)"#;
+        regex::Regex::new(&format!(r"(?i)<meta\s[^>]*?\bcharset{value}|<\?xml\s[^>]*?\bencoding{value}")).unwrap()
     });
-    let label = |text: &str| named.captures(text).map(|c| c[1].to_string());
-    let header = content_type.split(';').skip(1).find_map(label);
+    let mut params = content_type.split(';');
+    let kind = params.next().unwrap_or_default().trim().to_ascii_lowercase();
+    let header = params.find_map(|p| {
+        let (name, value) = p.split_once('=')?;
+        name.trim().eq_ignore_ascii_case("charset").then(|| value.trim().trim_matches(['"', '\'']).to_string())
+    });
     let encoding = match header.and_then(|l| Encoding::for_label(l.as_bytes())) {
         Some(encoding) => encoding,
-        None => {
+        None if kind.is_empty() || kind.contains("html") || kind.contains("xml") => {
+            let start = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+            let label = declared.captures(&start).and_then(|c| c.get(1).or_else(|| c.get(2))).map(|m| m.as_str().to_string());
             // A page that says it is UTF-16 in ASCII is not (as browsers
             // take it).
-            let start = String::from_utf8_lossy(&body[..body.len().min(4096)]);
-            let found = label(&start).and_then(|l| Encoding::for_label(l.as_bytes()));
-            found.map_or(encoding_rs::UTF_8, Encoding::output_encoding)
+            label.and_then(|l| Encoding::for_label(l.as_bytes())).map_or(encoding_rs::UTF_8, Encoding::output_encoding)
         }
+        None => encoding_rs::UTF_8,
     };
     // A byte-order mark goes before both.
     encoding.decode(body).0
@@ -355,6 +361,10 @@ mod tests {
         assert_eq!(decode("application/xml", b"<?xml version=\"1.0\" encoding=\"GB2312\"?><a>\xd6\xd0</a>"), "<?xml version=\"1.0\" encoding=\"GB2312\"?><a>中</a>");
         assert_eq!(decode("text/html", b"<meta charset=utf-16><p>x</p>"), "<meta charset=utf-16><p>x</p>", "UTF-16 named in ASCII is not");
         assert_eq!(decode("text/html; charset=nonsense", "é".as_bytes()), "é");
+        let json = "{\"note\": \"<meta charset=gbk>\", \"name\": \"é\"}";
+        assert_eq!(decode("application/json", json.as_bytes()), json, "only HTML and XML name their own");
+        let html = "<form accept-charset=\"latin1\"><p>é</p></form>";
+        assert_eq!(decode("text/html", html.as_bytes()), html, "only a <meta>");
     }
 
     #[test]

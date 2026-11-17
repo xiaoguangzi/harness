@@ -144,8 +144,9 @@ fn input_text(input: &serde_json::Value, cut: bool) -> Option<String> {
     if fields.len() == 1 && !cut && !multiline {
         return None;
     }
+    // A value's later lines are indented, so none passes for a field.
     let line = |(key, value): (&String, &serde_json::Value)| match value.as_str() {
-        Some(text) => format!("{key}: {}", text.trim()),
+        Some(text) => format!("{key}: {}", text.trim().lines().collect::<Vec<_>>().join("\n  ")),
         None => format!("{key}: {value}"),
     };
     Some(fields.iter().map(line).collect::<Vec<_>>().join("\n"))
@@ -279,7 +280,7 @@ mod tests {
             Question::new(&request, 0, oneshot::channel().0).render(200, &|_, s| s.to_string())
         };
         let rows = ask("mcp__db__query", json!({"sql": "DELETE FROM users\nWHERE id = 1", "database": "prod", "limit": 5}));
-        for row in ["    sql: DELETE FROM users", "    WHERE id = 1", "    database: prod", "    limit: 5"] {
+        for row in ["    sql: DELETE FROM users", "      WHERE id = 1", "    database: prod", "    limit: 5"] {
             assert!(rows.iter().any(|r| r == row), "{row} in {rows:?}");
         }
         let rows = ask("web_fetch", json!({"url": "https://example.com/"}));

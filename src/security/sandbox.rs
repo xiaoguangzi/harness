@@ -872,12 +872,24 @@ mod tests {
             eprintln!("{e:#}; skipping");
             return;
         }
-        let out = run_bwrap(&s, "echo ok > inside && cat inside").await;
+        std::fs::create_dir_all(cwd.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(cwd.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        let out = run_bwrap(&s, "echo ok > inside && cat inside && echo x > .git/worktrees/wt/index").await;
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        for script in ["echo x > .mcp.json", "echo x > .harness/x", "echo x > .git/hooks/pre-commit", "mv .git .g", "exec 3<>/dev/tcp/1.1.1.1/80"] {
+        for script in [
+            "echo x > .mcp.json",
+            "echo x > .harness/x",
+            "echo x > .git/hooks/pre-commit",
+            "echo x > .git/config.worktree",
+            "echo /tmp/x > .git/worktrees/wt/commondir",
+            "mv .git/worktrees/wt .git/worktrees/old",
+            "mv .git .g",
+            "exec 3<>/dev/tcp/1.1.1.1/80",
+        ] {
             assert!(!run_bwrap(&s, script).await.status.success(), "`{script}` was allowed");
         }
         // The stand-ins are gone once nothing runs.
         assert!(!cwd.join(".mcp.json").exists() && !cwd.join(".harness").exists());
+        assert!(!cwd.join(".git/config.worktree").exists() && !cwd.join(".git/worktrees/wt/config.worktree").exists());
     }
 }

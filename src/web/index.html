@@ -523,7 +523,8 @@ function wholeCommand(ev) {
   // Other tools (an MCP tool, say): what they are sent, field by field.
   if (!script && ev.input && typeof ev.input === "object") {
     const fields = Object.entries(ev.input);
-    const lines = fields.map(([k, v]) => k + ": " + (typeof v === "string" ? v.trim() : JSON.stringify(v)));
+    // A value's later lines are indented, so none passes for a field.
+    const lines = fields.map(([k, v]) => k + ": " + (typeof v === "string" ? v.trim().replaceAll("\n", "\n  ") : JSON.stringify(v)));
     if (fields.length > 1 || lines.some(l => l.includes("\n"))) return h("pre", { class: "command" }, lines.join("\n"));
     text = lines[0];
   }
