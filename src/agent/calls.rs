@@ -78,22 +78,27 @@ impl Agent {
             show_notices(check, observer);
         }
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        // The calls `code` scripts make, to show as they run.
+        let (shown_tx, mut shown_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut running: FuturesUnordered<_> = calls
             .iter()
             .zip(checks)
             .enumerate()
             .map(|(i, (call, check))| {
                 let id = call["id"].as_str().unwrap_or("").to_string();
-                let run = crate::tools::progress::scope(id, progress_tx.clone(), self.run_call(call, check, invalid));
+                let run = self.run_call(call, check, invalid, shown_tx.clone());
+                let run = crate::tools::progress::scope(id, progress_tx.clone(), run);
                 async move { (i, run.await) }
             })
             .collect();
-        drop(progress_tx);
+        drop((progress_tx, shown_tx));
         let mut ran: Vec<Option<Ran>> = (0..calls.len()).map(|_| None).collect();
         let mut waiting = BTreeMap::new();
         let mut progress_open = true;
         while !running.is_empty() {
             tokio::select! {
+                biased;
+                Some(nested) = shown_rx.recv() => nested.show(observer),
                 event = progress_rx.recv(), if progress_open => match event {
                     Some((id, tasks)) => {
                         if tasks.is_empty() { waiting.remove(&id); } else { waiting.insert(id, tasks); }
@@ -103,6 +108,11 @@ impl Agent {
                     None => progress_open = false,
                 },
                 Some((i, done)) = running.next() => {
+                    // What a `code` script's calls sent before it ended (in
+                    // this same poll, maybe) goes first.
+                    while let Ok(nested) = shown_rx.try_recv() {
+                        nested.show(observer);
+                    }
                     let t = &calls[i];
                     observer.on_tool_result_id(t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), &done.output);
                     if let Some(post) = &done.post { show_notices(post, observer); }
@@ -112,6 +122,9 @@ impl Agent {
                     ran[i] = Some(done);
                 }
             }
+        }
+        while let Ok(nested) = shown_rx.try_recv() {
+            nested.show(observer);
         }
         observer.on_waiting(&[]);
         if forks {
@@ -135,23 +148,47 @@ impl Agent {
 
     /// Runs `call` unless its streamed input was not valid JSON, its
     /// PreToolUse hooks (`check`) or the permissions refuse it.
-    async fn run_call(&self, call: &Value, check: Outcome, invalid: &HashMap<String, String>) -> Ran {
+    /// The calls a `code` script makes go to `shown`.
+    async fn run_call(&self, call: &Value, check: Outcome, invalid: &HashMap<String, String>, shown: Shown) -> Ran {
         let (id, name) = (call["id"].as_str().unwrap_or(""), call["name"].as_str().unwrap_or(""));
         if let Some(raw) = invalid.get(id) {
             return Ran::refused(ToolOutput::error(json!({"INVALID_JSON": raw}).to_string()), check);
         }
-        let caller = Caller { tools: &self.tools, hooks: &self.hooks, permissions: &self.permissions, model: self.client.spec() };
+        let (tools, hooks, permissions, model) = (&self.tools, &self.hooks, &self.permissions, self.client.spec());
+        let caller = Caller { tools, hooks, permissions, model, shown };
         caller.run(id, name, &call["input"], check).await
     }
 }
 
+/// Where the calls a `code` script makes are sent to be shown.
+type Shown = tokio::sync::mpsc::UnboundedSender<NestedEvent>;
+
+/// A call a `code` script made, for the frontend: it started, a hook has a
+/// notice about it, or it ended.
+enum NestedEvent {
+    Call { id: String, name: String, input: Value },
+    Notices(Vec<String>),
+    Result { id: String, name: String, output: ToolOutput },
+}
+
+impl NestedEvent {
+    fn show(self, observer: &mut dyn Observer) {
+        match self {
+            Self::Call { id, name, input } => observer.on_tool_call_id(&id, &name, &input),
+            Self::Notices(notices) => notices.iter().for_each(|n| observer.on_hook(n)),
+            Self::Result { id, name, output } => observer.on_tool_result_id(&id, &name, &output),
+        }
+    }
+}
+
 /// What a call runs with: the conversation's tools, hooks, permissions and
-/// model.
+/// model, and where the calls of a `code` script it runs are shown.
 struct Caller<'a> {
     tools: &'a ToolRegistry,
     hooks: &'a Hooks,
     permissions: &'a Arc<Permissions>,
     model: &'a str,
+    shown: Shown,
 }
 
 impl Caller<'_> {
@@ -177,6 +214,7 @@ impl Caller<'_> {
             permissions: self.permissions.clone(),
             model: self.model.to_string(),
             halted: halted.clone(),
+            shown: self.shown.clone(),
         };
         let label = self.hooks.subagent_label();
         let run = permissions::scope(self.permissions.clone(), label.clone(), self.tools.run(name, input.clone()));
@@ -229,13 +267,15 @@ fn tool_result(call: &Value, output: &ToolOutput) -> Value {
 }
 
 /// The conversation a tool's call runs for, for the calls a `code` script
-/// makes, and where one of their hooks says to stop the turn.
+/// makes, where one of their hooks says to stop the turn, and where they
+/// are shown.
 #[derive(Clone)]
 struct Nested {
     hooks: Hooks,
     permissions: Arc<Permissions>,
     model: String,
     halted: Arc<Mutex<Option<String>>>,
+    shown: Shown,
 }
 
 tokio::task_local! {
@@ -245,7 +285,8 @@ tokio::task_local! {
 /// Runs a call of `name` with `input` that a `code` script made, from
 /// `tools` (what the script may call), as a call the model made directly
 /// would run: input normalized, PreToolUse hooks, permissions (asking if
-/// they say to), PostToolUse hooks. Returns its output, and whether a hook
+/// they say to), PostToolUse hooks. The frontend shows it as it would that
+/// call, under an id of its own. Returns its output, and whether a hook
 /// stopped the turn, which then stops once the `code` call returns.
 /// Outside a conversation's call it refuses, except in tests, where it
 /// only runs the tool.
@@ -267,9 +308,34 @@ pub(crate) async fn run_nested(tools: &ToolRegistry, name: &str, mut input: Valu
     if let Some(updated) = &mut check.updated_input {
         tools.normalize_input(name, updated);
     }
-    let caller = Caller { tools, hooks: &nested.hooks, permissions: &nested.permissions, model: &nested.model };
+    let shown = check.updated_input.clone().unwrap_or_else(|| input.clone());
+    let _ = nested.shown.send(NestedEvent::Call { id: id.clone(), name: name.to_string(), input: shown });
+    let _ = nested.shown.send(NestedEvent::Notices(check.notices.clone()));
+    let mut unfinished = Unfinished(Some((nested.shown.clone(), id.clone(), name.to_string())));
+    let (hooks, permissions, model) = (&nested.hooks, &nested.permissions, nested.model.as_str());
+    let caller = Caller { tools, hooks, permissions, model, shown: nested.shown.clone() };
     let Ran { output, check, post } = caller.run(&id, name, &input, check).await;
+    unfinished.0 = None;
+    let result = NestedEvent::Result { id, name: name.to_string(), output: output.clone() };
+    let _ = nested.shown.send(result);
+    if let Some(post) = &post {
+        let _ = nested.shown.send(NestedEvent::Notices(post.notices.clone()));
+    }
     let Some(reason) = check.halt.or(post.and_then(|p| p.halt)) else { return (output, false) };
     *nested.halted.lock().unwrap() = Some(reason);
     (output, true)
+}
+
+/// A script's call under way: dropped before it ends (the script ended
+/// without awaiting it, timed out or was interrupted), it is shown as
+/// cancelled.
+struct Unfinished(Option<(Shown, String, String)>);
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if let Some((shown, id, name)) = self.0.take() {
+            let output = ToolOutput::error("Cancelled: the script ended before this call did.");
+            let _ = shown.send(NestedEvent::Result { id, name, output });
+        }
+    }
 }

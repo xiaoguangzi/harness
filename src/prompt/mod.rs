@@ -91,9 +91,10 @@ const GUIDANCE: &[(&str, &str)] = &[
     (
         "code",
         "run a short JavaScript program that calls your other tools as async functions \
-         (`await tools[\"grep\"]({...})`) and returns only what it prints. Use it to chain or fan out many calls, or to \
-         pick what you need out of large outputs, when you know what to do with the results without reading each \
-         one; make a single call, or one whose result you need to read, directly.",
+         (`await tools[\"grep\"]({...})`) and returns only what it prints and its last value. Use it to chain or fan \
+         out many calls, or to pick what you need out of large outputs, when you know what to do with the results \
+         without reading each one; make a single call, or one whose result you need to read, directly. Its variables \
+         stay from one call to the next, so keep what you may need again in them.",
     ),
     (
         "skill",

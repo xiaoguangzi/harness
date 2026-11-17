@@ -537,6 +537,7 @@ function toolSummary(name, input) {
     if (name === "bash" && typeof input.command === "string") return input.command.split("\n")[0] + (input.run_in_background ? "  (后台)" : "");
     if ((name === "read" || name === "write" || name === "edit") && typeof input.path === "string") return input.path;
     if (name === "grep" && typeof input.pattern === "string") return input.pattern + (input.path ? "  in " + input.path : "");
+    if (name === "code" && typeof input.code === "string") return input.description || input.code.trim().split("\n")[0];
     if (name === "todo" && Array.isArray(input.todos)) return input.todos.filter(t => t.status === "completed").length + "/" + input.todos.length + " 完成";
   }
   return oneLine(input);

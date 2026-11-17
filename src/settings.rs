@@ -48,7 +48,7 @@ pub struct Settings {
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
     /// Give the model the `code` tool, JavaScript that calls its other
-    /// tools. Default: off.
+    /// tools. Default: on.
     pub code_mode: Option<bool>,
     /// Start a conversation with a snapshot of the git repository. Default: on.
     pub git_status: Option<bool>,

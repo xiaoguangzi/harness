@@ -50,10 +50,8 @@ pub struct Terminal {
     phase: Phase,
     /// Unstyled output only: a text line is open.
     raw_open: bool,
-    /// Tool calls in the current batch, and how many results came back.
-    calls: usize,
-    results: usize,
-    /// Call IDs and retained output indexes awaiting results.
+    /// Call IDs and retained output indexes awaiting results: the calls of
+    /// the current batch, and those a `code` script among them makes.
     pending: Vec<(String, usize)>,
     started: Instant,
     requests: usize,
@@ -82,8 +80,6 @@ impl Terminal {
             last: Block::None,
             phase: Phase::Waiting,
             raw_open: false,
-            calls: 0,
-            results: 0,
             pending: Vec::new(),
             started: Instant::now(),
             requests: 0,
@@ -299,20 +295,16 @@ impl Observer for Terminal {
     }
 
     fn on_tool_call_id(&mut self, id: &str, name: &str, input: &Value) {
-        if self.results > 0 {
-            (self.calls, self.results) = (0, 0);
-        }
-        self.calls += 1;
-        let status = if self.calls == 1 { format!("Running {name}…") } else { format!("Running {} tools…", self.calls) };
-        self.enter(Phase::Running, &status);
-        self.separate(Block::Tools);
         let index = self.out.record_call(id, name, input);
         self.pending.push((id.to_string(), index));
+        let running = self.pending.len();
+        let status = if running == 1 { format!("Running {name}…") } else { format!("Running {running} tools…") };
+        self.enter(Phase::Running, &status);
+        self.separate(Block::Tools);
         self.out.set_status_detail(&call_label(name, input, text::terminal_width().saturating_sub(6)));
     }
 
     fn on_tool_result_id(&mut self, id: &str, name: &str, output: &ToolOutput) {
-        self.results += 1;
         let width = text::terminal_width();
         let mut shown = Vec::new();
         if let Some(position) = self.pending.iter().position(|(call_id, _)| call_id == id) {
@@ -330,7 +322,7 @@ impl Observer for Terminal {
         };
         shown.extend(result);
         self.out.lines(&shown);
-        if self.results == self.calls {
+        if self.pending.is_empty() {
             self.enter(Phase::Waiting, WAITING);
         }
     }

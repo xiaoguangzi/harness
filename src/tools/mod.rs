@@ -205,6 +205,14 @@ impl ToolRegistry {
         }
     }
 
+    /// Gives `code`, if there is one, a new context, so nothing an earlier
+    /// conversation's scripts defined is left.
+    pub fn renew_code(&mut self) {
+        if self.get(code::NAME).is_some() {
+            self.register(code::CodeTool::new(self));
+        }
+    }
+
     /// The tracker of the file tools, e.g. to re-attach the files read
     /// most recently after compacting the conversation.
     pub fn files(&self) -> Option<&FileTracker> {

@@ -81,7 +81,7 @@ harness --bare --output-format json "列出 src 里的 TODO 注释" | jq -r .res
 | `model`、`subagent_model`、`effort`、`max_tokens`、`context_window`、`providers` | 模型和 [LLM 网关](#llm-网关) |
 | `advisor_model` | 主模型咨询的[顾问](#顾问advisor) |
 | `git_status` | 设为 `false` 时，会话开头不带 [git 快照](#项目说明) |
-| `code_mode` | `code` 工具：[Code mode](#code-mode) |
+| `code_mode` | 设为 `false` 时没有 `code` 工具：[Code mode](#code-mode) |
 | `mcpServers` | [MCP 服务器](#mcp-服务器) |
 | `sandbox` | [沙箱](#沙箱) |
 | `permissions` | 哪些工具调用先询问或被拒绝：[权限](#权限) |
@@ -351,7 +351,7 @@ Host *
 
 ## Code mode
 
-在配置中设置 `"code_mode": true` 后，模型多一个 `code` 工具：它写一段 JavaScript，把其他工具当作 async 函数调用，一连串或一大批调用只要一个来回，并且只有脚本打印的内容回到模型，而不是每个工具的结果。
+除非配置中写了 `"code_mode": false`，模型还有一个 `code` 工具：它写一段 JavaScript，把其他工具当作 async 函数调用，一连串或一大批调用只要一个来回，并且回到模型的只有脚本打印的内容和最后一个表达式的值，而不是每个工具的结果。与 Claude Code 的 REPL 一样，各次脚本共用一个上下文：一次存进变量的结果，下一次可以直接用，不必再读文件或再跑命令。
 
 ```js
 const [defined, calls] = await Promise.all([
@@ -359,14 +359,15 @@ const [defined, calls] = await Promise.all([
   tools.grep({pattern: "run_nested\\(", path: "src", output_mode: "content"}),
 ]);
 print(defined);
-return `${calls.split("\n").length} lines call it`;
+`${calls.split("\n").length} lines call it`
 ```
 
-- `code` 是一个 async 函数体，在 harness 内置的全新 QuickJS 解释器中运行（内存上限 256 MB）。没有 Node 或浏览器 API、文件系统、网络和定时器：它只能通过 `tools["name"](input)` 接触外部，入参与直接调用该工具相同，结果是字符串，即直接调用时看到的文本（不是 JSON：`glob` 和 `grep` 每行一个路径，`bash` 是命令输出）；调用失败则以 `Error` reject。`ALL_TOOLS` 列出每个可调用工具的 `{name, description, input_schema}`。`print` / `console.log` 向结果追加一行，返回值放在最后。
-- 脚本发出的每个工具调用都和模型直接调用一样执行：规整入参、PreToolUse hook、[权限](#权限)（ask 规则照样询问）、工作区和文件锁、`/rewind` 检查点、PostToolUse hook。hook 要求停止回合时，脚本先停，随后回合也停止。`code` 调用本身不需要权限。同时发起的调用（`Promise.all`）并发执行。
+- 脚本在 harness 内置的 QuickJS 解释器中运行，每个会话（以及每个子代理）一个持久的上下文，跑在单独的线程上，内存上限 256 MB。脚本顶层声明的变量和函数会留给下一次：顶层的 `let` 和 `const` 会变成 `var`，所以再次声明同名变量就是替换它。支持顶层 `await`。`/clear` 和 `/resume` 会换一个新的上下文；fork 出的子代理有自己的上下文。按旧写法写成 async 函数体、用 `return` 返回值的脚本仍然能运行，但它声明的东西不会保留。脚本按调用顺序逐个运行。
+- 没有 Node 或浏览器 API、文件系统、网络和定时器：脚本只能通过 `tools["name"](input)` 接触外部，入参与直接调用该工具相同，结果是字符串，即直接调用时看到的文本（不是 JSON：`glob` 和 `grep` 每行一个路径，`bash` 是命令输出）；调用失败则以 `Error` reject。`ALL_TOOLS` 列出每个可调用工具的 `{name, description, input_schema}`。`print` / `console.log` 向结果追加一行，脚本最后一个表达式的值放在最后（是 promise 则等它完成）。
+- 脚本发出的每个工具调用都和模型直接调用一样执行：规整入参、PreToolUse hook、[权限](#权限)（ask 规则照样询问）、工作区和文件锁、`/rewind` 检查点、PostToolUse hook。REPL 和 Web 界面会像显示直接调用那样逐个显示这些调用（改动的文件显示为 diff），排在 `code` 调用自己的结果之前；模型给出的 `description`（用几个词说明脚本做什么）作为 `code` 调用的标签。hook 要求停止回合时，脚本先停，随后回合也停止。`code` 调用本身不需要权限。同时发起的调用（`Promise.all`）并发执行。这些调用不进入会话历史，所以恢复的会话里只显示 `code` 调用。
 - 脚本不能调用 `agent`、`message_agent`、`stop_agent`、`wait_tasks`、`skill`、`tool_search`、`ask_user_question` 和 `code`。子代理的 `code` 只能调用该子代理拥有的工具；只读子代理只在它是只读工具时才会拿到它。
-- 工具输出完整地交给脚本（最多 8 MB），不像给模型的[大输出](#大输出)那样截断，脚本可以从中挑出需要的部分；内容与直接调用时相同，因此 `read` 仍带行号并对长文件分页。脚本自己的结果超过 100,000 字节时截断。工具返回的图片不会传递，脚本改动的文件也不会以 diff 形式显示（改动本身仍会记入 `/rewind` 的检查点）。
-- `timeout_ms`（默认 120000，最大 600000）限制整个脚本的运行时间，包括其中的工具调用；脚本结束时未 await 的调用会被取消，与中断回合时相同。
+- 工具输出完整地交给脚本（最多 8 MB），不像给模型的[大输出](#大输出)那样截断，脚本可以从中挑出需要的部分；内容与直接调用时相同，因此 `read` 仍带行号并对长文件分页。脚本自己的结果超过 100,000 字节时截断。脚本中的调用返回的图片和 PDF（用 `read` 读图片或 PDF）会随结果一起交给模型，最多 8 张图片和 4 个 PDF，超出的数量会在结果中注明。
+- `timeout_ms`（默认 120000，最大 600000）限制整个脚本的运行时间，包括其中的工具调用，以及排在前面的脚本占用的等待时间；脚本结束时未 await 的调用会被取消，与中断回合时相同。
 
 ## 上下文压缩
 
@@ -767,7 +768,7 @@ harness /hello:greet                          # 或在 REPL 中输入 /hello:gre
     - `manage.rs` — `harness plugin` 与 `/plugins …`：通过修改配置（及敏感设置文件）安装、启用、配置和移除插件与市场
 - `src/tools/` — `Tool` trait、注册表和 `FileTracker`（共享的读/改/写状态）
   - `bash.rs` — 通过 `bash -c` 运行命令（超时、大输出经 `spill.rs` 保存）；拒绝自行修改文件的命令（写文件的内联 Python/Node/Perl 脚本、`sed -i`、写入文件的 heredoc 或 `echo`），这些修改应走 `edit` / `write`
-  - `code/` — `code` 工具（code mode）：工具本身与可调用的工具、超时、结果（`mod.rs`）；带 `tools`、`print` 和 `ALL_TOOLS` 的 QuickJS 脚本（`engine.rs`）
+  - `code/` — `code` 工具（code mode）：工具本身与可调用的工具、超时、带上调用所返回图片的结果（`mod.rs`）；单独线程上持久的 QuickJS 上下文，带 `tools`、`print` 和 `ALL_TOOLS`（`engine.rs`）
   - `read.rs` — 读取文本文件并带行号（`offset` / `limit` 分页），或读取图片、PDF 供模型查看
   - `edit.rs` — 把文件中一段精确且唯一的文本替换掉（`replace_all` 则替换全部出现），修改的开销只取决于改动本身；与 `write` 相同的先读规则，同一次回复中对同一文件的多个修改按顺序生效
   - `write.rs` — 创建或覆盖文件；已存在的文件必须先被读取且此后未被修改

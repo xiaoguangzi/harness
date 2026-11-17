@@ -513,6 +513,7 @@ impl Agent {
         self.context = None;
         self.forget_told();
         self.tool_search = None;
+        self.tools.renew_code();
         self.session_start = Some("clear");
         if self.checkpoints {
             self.history.clear();
@@ -1351,6 +1352,71 @@ pub(crate) mod tests {
         assert!(lines[0].starts_with("refused: Plan mode is on"), "{lines:?}");
         assert_eq!(lines[1], "two");
         assert_eq!(lines[2..4], ["refused: <hook-feedback event=\"PreToolUse\">", "The call was blocked: no rm"]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_calls_a_code_script_makes_are_shown_before_its_result() {
+        let _guard = crate::util::lock_cwd();
+        #[derive(Default)]
+        struct Calls(Vec<String>);
+        impl Observer for Calls {
+            fn on_text_delta(&mut self, _: &str) {}
+            fn on_text_end(&mut self) {}
+            fn on_tool_call(&mut self, _: &str, _: &Value) {}
+            fn on_tool_result(&mut self, _: &str, _: &ToolOutput) {}
+            fn on_tool_call_id(&mut self, id: &str, name: &str, input: &Value) {
+                let shown = input.get("command").unwrap_or(&Value::Null);
+                self.0.push(format!("call {} {name} {shown}", id.split('_').next().unwrap()));
+            }
+            fn on_tool_result_id(&mut self, id: &str, name: &str, output: &ToolOutput) {
+                self.0.push(format!("result {} {name} {}", id.split('_').next().unwrap(), output.content.trim()));
+            }
+            fn on_hook(&mut self, message: &str) {
+                self.0.push(format!("hook {message}"));
+            }
+        }
+        let script = "const a = await tools.bash({command: 'echo one'}); await tools.bash({command: 'echo two'}); a";
+        let call = json!({"type": "tool_use", "id": "c1", "name": "code", "input": {"code": script}});
+        let (client, _requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![call.clone()], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let mut tools = ToolRegistry::with_defaults(crate::tools::FileTracker::default());
+        tools.register(crate::tools::code::CodeTool::new(&tools));
+        let mut agent = Agent::new(client, tools, "sys");
+        agent.set_hooks(crate::extensions::hooks::tests::hooks(json!({
+            "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo '{\"systemMessage\": \"seen\"}'"}]}],
+        })));
+        let mut seen = Calls::default();
+        agent.run_turn(vec![text("go")], &mut seen).await.unwrap();
+        assert_eq!(&seen.0[..], [
+            "call c1 code null",
+            "call code bash \"echo one\"",
+            "result code bash one",
+            "hook seen",
+            "call code bash \"echo two\"",
+            "result code bash two",
+            "hook seen",
+            "result c1 code one",
+        ]);
+        // A call under way when the script times out is shown cancelled.
+        let script = "await tools.bash({command: 'sleep 5'})";
+        let call = json!({"type": "tool_use", "id": "c2", "name": "code", "input": {"code": script, "timeout_ms": 500}});
+        let (client, _requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![call.clone()], "tool_use", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        agent.set_client(client);
+        seen.0.clear();
+        agent.run_turn(vec![text("go")], &mut seen).await.unwrap();
+        assert_eq!(&seen.0[1..], [
+            "call code bash \"sleep 5\"",
+            "result code bash Cancelled: the script ended before this call did.",
+            "result c2 code The script was stopped: it ran past its timeout of 500 ms.",
+        ]);
     }
 
     #[tokio::test]
