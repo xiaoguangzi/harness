@@ -190,7 +190,10 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 - [ ] The bwrap side of the `commondir` protection (2026-11-17: read-only `commondir`s, pinned worktree
   directories, the `.git/commondir` stand-in holding `.`) was never run on Linux; `bwrap_confines_commands`
-  covers it (`cargo test bwrap_confines_commands` on a Linux machine with bwrap). Its Mac unit tests pass. (read)
+  covers it (`cargo test bwrap_confines_commands -- --nocapture` on a Linux machine with bwrap; output saying
+  "skipping" means it did not run). Its Mac unit tests pass. (read)
+- [ ] On a filesystem without hard links the `.git/commondir` stand-in cannot be put in place, so a missing one
+  stays open to sandboxed commands on Linux. (read)
 - [ ] Not verified: two harness processes sandboxing one repository on Linux. Stand-ins are tracked per process,
   so one's cleanup removes a stand-in (`.mcp.json`, `.git/commondir`) the other's running command has mounted,
   which Linux is believed to unmount there, leaving the path open to that command. (read)

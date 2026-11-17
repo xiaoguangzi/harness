@@ -16,6 +16,7 @@
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
+use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -339,26 +340,31 @@ impl Sandbox {
     /// Puts a file holding [`HERE`] at each missing read-only path that
     /// stands in so, for bwrap to mount read-only like any file that exists;
     /// returns them, and those a run killed before it removed them left,
-    /// to remove after. Made under another name and linked into place, so
-    /// git never finds it empty and a file made meanwhile is never
-    /// replaced. Where it cannot be made, the command could not make one
-    /// either.
+    /// to remove after. Made under a name sandboxed commands cannot guess
+    /// (they can write where it is made) and linked into place, so git
+    /// never finds it empty and a file made meanwhile is never replaced.
+    /// Where it cannot be made (no hard links), the path stays open.
     fn put_here_stand_ins(&self) -> Vec<PathBuf> {
+        // Only a file of its own holding `HERE`, not a link to one.
+        let is_stand_in = |path: &Path| {
+            path.symlink_metadata().is_ok_and(|m| m.is_file()) && std::fs::read(path).is_ok_and(|c| c == HERE)
+        };
         let mut made = Vec::new();
         for rule in self.rules.iter().filter(|r| r.access == Access::ReadOnly { stand_in: StandIn::Here }) {
             let path = &rule.path;
-            match std::fs::read(path) {
-                Ok(content) if content == HERE => made.push(path.clone()),
-                Ok(_) => {}
-                Err(_) if path.parent().is_some_and(Path::is_dir) => {
-                    let temp = path.with_extension(format!("harness-{}", std::process::id()));
-                    let linked = std::fs::write(&temp, HERE).and_then(|()| std::fs::hard_link(&temp, path));
-                    let _ = std::fs::remove_file(&temp);
-                    if linked.is_ok() {
-                        made.push(path.clone());
-                    }
+            if path.symlink_metadata().is_err() && path.parent().is_some_and(Path::is_dir) {
+                let random = std::hash::RandomState::new().hash_one((std::process::id(), std::time::SystemTime::now()));
+                let temp = path.with_extension(format!("harness-{random:016x}"));
+                let written = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp).and_then(|mut f| {
+                    std::io::Write::write_all(&mut f, HERE)
+                });
+                if written.is_ok() {
+                    let _ = std::fs::hard_link(&temp, path);
                 }
-                Err(_) => {}
+                let _ = std::fs::remove_file(&temp);
+            }
+            if is_stand_in(path) {
+                made.push(path.clone());
             }
         }
         made
@@ -858,6 +864,32 @@ mod tests {
     }
 
     #[test]
+    fn a_commondir_stand_in_cannot_be_planted_on() {
+        let dir = repo();
+        let cwd = resolve(dir.path());
+        let s = sandbox(Backend::Bubblewrap, &cwd, "{}");
+        let (commondir, outside) = (cwd.join(".git/commondir"), cwd.join("outside"));
+        std::fs::write(&outside, "kept\n").unwrap();
+        // What a sandboxed command could put where a stand-in is made.
+        let guess = |n: u32| cwd.join(format!(".git/commondir.harness-{n}"));
+        std::os::unix::fs::symlink(&outside, guess(std::process::id())).unwrap();
+        assert_eq!(s.put_here_stand_ins(), vec![commondir.clone()]);
+        assert!(std::fs::symlink_metadata(&commondir).unwrap().is_file());
+        assert_eq!(std::fs::read(&commondir).unwrap(), HERE);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept\n", "nothing written through the link");
+        remove_if_empty(&commondir);
+        std::fs::remove_file(guess(std::process::id())).unwrap();
+        std::fs::create_dir(guess(std::process::id())).unwrap();
+        assert_eq!(s.put_here_stand_ins(), vec![commondir.clone()], "made all the same");
+        remove_if_empty(&commondir);
+
+        // One that is not a file of its own is not taken up as a stand-in.
+        std::fs::write(&outside, HERE).unwrap();
+        std::os::unix::fs::symlink(&outside, &commondir).unwrap();
+        assert!(s.put_here_stand_ins().is_empty());
+    }
+
+    #[test]
     fn removes_only_empty_placeholders() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
@@ -923,13 +955,11 @@ mod tests {
         assert_eq!(ids[0], ids[1], "{text}");
     }
 
-    #[cfg(target_os = "linux")]
     async fn run_bwrap(s: &Sandbox, script: &str) -> std::process::Output {
         let (mut command, _guard) = s.command("bash", ["-c", script]).unwrap();
         command.output().await.unwrap()
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bwrap_confines_commands() {
         if find_program("bwrap").is_none() {
