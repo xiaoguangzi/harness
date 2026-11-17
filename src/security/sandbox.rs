@@ -30,8 +30,7 @@ use crate::util::expand_env;
 /// for each on Linux while it does not exist: the harness's and Claude
 /// Code's config, and git's hooks and config (which can name commands for
 /// git to run), with `commondir`, which names the repository whose config
-/// git reads. An empty `commondir` would stop git, so on Linux one that
-/// does not exist yet is not protected.
+/// git reads.
 const PROTECTED: [(&str, StandIn); 7] = [
     (".harness", StandIn::Dir),
     (".claude", StandIn::Dir),
@@ -39,11 +38,17 @@ const PROTECTED: [(&str, StandIn); 7] = [
     (".git/hooks", StandIn::Dir),
     (".git/config", StandIn::File),
     (".git/config.worktree", StandIn::File),
-    (".git/commondir", StandIn::Nothing),
+    (".git/commondir", StandIn::Here),
 ];
+
+/// What a `commondir` stand-in holds: the directory it is in, which is what
+/// git takes when there is none. An empty one would stop git.
+const HERE: &[u8] = b".\n";
 
 /// The same files in the git directory of each of the repository's linked
 /// worktrees, `.git/worktrees/<id>/`, which git reads when it runs there.
+/// Their `commondir` always exists (`.` there would name the wrong
+/// repository).
 const WORKTREE_PROTECTED: [(&str, StandIn); 2] = [("config.worktree", StandIn::File), ("commondir", StandIn::Nothing)];
 
 /// Devices that commands write to as a matter of course.
@@ -112,6 +117,10 @@ enum StandIn {
     File,
     /// Nothing, leaving the path unprotected until it exists.
     Nothing,
+    /// A file holding [`HERE`], which [`Sandbox::command`] puts in place on
+    /// the host before bwrap starts: bwrap's own stand-in would be empty,
+    /// and git outside the sandbox reads it meanwhile.
+    Here,
 }
 
 /// Each rule covers its path and everything under it; the deepest rule
@@ -274,6 +283,11 @@ impl Sandbox {
             Backend::Bubblewrap => {
                 let mut placeholders = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
                 placeholders.running += 1;
+                for path in self.put_here_stand_ins() {
+                    if !placeholders.paths.contains(&path) {
+                        placeholders.paths.push(path);
+                    }
+                }
                 (self.bwrap_args(&mut placeholders.paths), Guard(true))
             }
         };
@@ -322,6 +336,34 @@ impl Sandbox {
         args
     }
 
+    /// Puts a file holding [`HERE`] at each missing read-only path that
+    /// stands in so, for bwrap to mount read-only like any file that exists;
+    /// returns them, and those a run killed before it removed them left,
+    /// to remove after. Made under another name and linked into place, so
+    /// git never finds it empty and a file made meanwhile is never
+    /// replaced. Where it cannot be made, the command could not make one
+    /// either.
+    fn put_here_stand_ins(&self) -> Vec<PathBuf> {
+        let mut made = Vec::new();
+        for rule in self.rules.iter().filter(|r| r.access == Access::ReadOnly { stand_in: StandIn::Here }) {
+            let path = &rule.path;
+            match std::fs::read(path) {
+                Ok(content) if content == HERE => made.push(path.clone()),
+                Ok(_) => {}
+                Err(_) if path.parent().is_some_and(Path::is_dir) => {
+                    let temp = path.with_extension(format!("harness-{}", std::process::id()));
+                    let linked = std::fs::write(&temp, HERE).and_then(|()| std::fs::hard_link(&temp, path));
+                    let _ = std::fs::remove_file(&temp);
+                    if linked.is_ok() {
+                        made.push(path.clone());
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        made
+    }
+
     /// bwrap's options. A read-only path that does not exist yet gets an
     /// empty stand-in, which bwrap creates on the host as a mount point;
     /// it is added to `placeholders` to be removed afterwards.
@@ -347,7 +389,7 @@ impl Sandbox {
                 // A mount point cannot be renamed or removed.
                 (Access::Write | Access::Pinned, Some(_)) => mount("--bind", path, path),
                 (Access::ReadOnly { .. }, Some(_)) => mount("--ro-bind", path, path),
-                (Access::ReadOnly { stand_in }, None) if *stand_in != StandIn::Nothing && path.parent().is_some_and(Path::is_dir) => {
+                (Access::ReadOnly { stand_in }, None) if matches!(stand_in, StandIn::Dir | StandIn::File) && path.parent().is_some_and(Path::is_dir) => {
                     if *stand_in == StandIn::Dir {
                         mount("--tmpfs", none, path);
                         mount("--remount-ro", none, path);
@@ -513,12 +555,13 @@ impl Drop for Guard {
     }
 }
 
-/// Removes an empty file or directory: a stand-in nothing replaced.
+/// Removes an empty file or directory, or a file holding [`HERE`]: a
+/// stand-in nothing replaced.
 fn remove_if_empty(path: &Path) {
     let Ok(meta) = path.symlink_metadata() else { return };
     if meta.is_dir() {
         let _ = std::fs::remove_dir(path);
-    } else if meta.is_file() && meta.len() == 0 {
+    } else if meta.is_file() && (meta.len() == 0 || std::fs::read(path).is_ok_and(|c| c == HERE)) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -712,8 +755,9 @@ mod tests {
         let args = args.join(" ");
         let c = cwd.display();
         assert!(args.contains(&format!("--ro-bind {c}/.git/worktrees/wt/commondir {c}/.git/worktrees/wt/commondir")), "{args}");
-        // An empty stand-in would stop git.
+        // bwrap's own stand-in would be empty, which stops git.
         assert!(!args.contains(&format!("{c}/.git/commondir")), "{args}");
+        assert!(!cwd.join(".git/commondir").exists());
     }
 
     #[test]
@@ -789,6 +833,31 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_commondir_stands_in_as_the_git_directory() {
+        let dir = repo();
+        let cwd = resolve(dir.path());
+        let s = sandbox(Backend::Bubblewrap, &cwd, "{}");
+        let commondir = cwd.join(".git/commondir");
+        assert_eq!(s.put_here_stand_ins(), vec![commondir.clone()]);
+        assert_eq!(std::fs::read(&commondir).unwrap(), HERE);
+        let left: Vec<_> = std::fs::read_dir(cwd.join(".git")).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(!left.iter().any(|n| n.to_string_lossy().contains("harness-")), "no temp file left: {left:?}");
+        let args = s.bwrap_args(&mut Vec::new()).iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
+        assert!(args.contains(&format!("--ro-bind {0} {0}", commondir.display())), "{args}");
+        assert_eq!(s.put_here_stand_ins(), vec![commondir.clone()], "one left behind is taken up again");
+        let status = std::process::Command::new("git").arg("-C").arg(&cwd).args(["init", "-q"]).status().unwrap();
+        assert!(status.success());
+        let out = std::process::Command::new("git").arg("-C").arg(&cwd).args(["status", "--short"]).output().unwrap();
+        assert!(out.status.success(), "git reads it: {}", String::from_utf8_lossy(&out.stderr));
+        remove_if_empty(&commondir);
+        assert!(!commondir.exists());
+
+        std::fs::write(&commondir, "../other\n").unwrap();
+        assert!(s.put_here_stand_ins().is_empty(), "a real one is left as it is");
+        assert_eq!(std::fs::read_to_string(&commondir).unwrap(), "../other\n");
+    }
+
+    #[test]
     fn removes_only_empty_placeholders() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
@@ -796,11 +865,13 @@ mod tests {
         std::fs::create_dir_all(p.join("full/x")).unwrap();
         std::fs::write(p.join("blank.json"), "").unwrap();
         std::fs::write(p.join("real.json"), "{}").unwrap();
-        for name in ["empty", "full", "blank.json", "real.json", "absent"] {
+        std::fs::write(p.join("here"), HERE).unwrap();
+        std::fs::write(p.join("elsewhere"), "/tmp/x\n").unwrap();
+        for name in ["empty", "full", "blank.json", "real.json", "here", "elsewhere", "absent"] {
             remove_if_empty(&p.join(name));
         }
-        assert!(!p.join("empty").exists() && !p.join("blank.json").exists());
-        assert!(p.join("full/x").exists() && p.join("real.json").exists());
+        assert!(!p.join("empty").exists() && !p.join("blank.json").exists() && !p.join("here").exists());
+        assert!(p.join("full/x").exists() && p.join("real.json").exists() && p.join("elsewhere").exists());
     }
 
     /// Runs `script` with bash in a Seatbelt sandbox rooted at `cwd`.
@@ -872,6 +943,7 @@ mod tests {
             eprintln!("{e:#}; skipping");
             return;
         }
+        assert!(std::process::Command::new("git").arg("-C").arg(&cwd).args(["init", "-q"]).status().unwrap().success());
         std::fs::create_dir_all(cwd.join(".git/worktrees/wt")).unwrap();
         std::fs::write(cwd.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
         let out = run_bwrap(&s, "echo ok > inside && cat inside && echo x > .git/worktrees/wt/index").await;
@@ -881,6 +953,9 @@ mod tests {
             "echo x > .harness/x",
             "echo x > .git/hooks/pre-commit",
             "echo x > .git/config.worktree",
+            "echo /tmp/x > .git/commondir",
+            "rm .git/commondir",
+            "echo /tmp/x > c && mv c .git/commondir",
             "echo /tmp/x > .git/worktrees/wt/commondir",
             "mv .git/worktrees/wt .git/worktrees/old",
             "mv .git .g",
@@ -890,6 +965,10 @@ mod tests {
         }
         // The stand-ins are gone once nothing runs.
         assert!(!cwd.join(".mcp.json").exists() && !cwd.join(".harness").exists());
+        let out = run_bwrap(&s, "cat .git/commondir && git status --short").await;
+        assert!(out.status.success(), "git runs with the stand-in: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.stdout.starts_with(b".\n"), "{}", String::from_utf8_lossy(&out.stdout));
         assert!(!cwd.join(".git/config.worktree").exists() && !cwd.join(".git/worktrees/wt/config.worktree").exists());
+        assert!(!cwd.join(".git/commondir").exists());
     }
 }
