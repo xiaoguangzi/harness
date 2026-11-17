@@ -166,6 +166,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_a_change_that_kept_the_time_and_size() {
+        // As Linux stamps two writes in one millisecond.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "old").unwrap();
+        let files = FileTracker::default();
+        ReadTool::new(files.clone()).run(json!({"path": path})).await;
+        let then = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "new").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(then).unwrap();
+
+        let out = WriteTool::new(files).run(json!({"path": path, "content": "mine"})).await;
+        assert!(out.is_error && out.content.contains("changed since it was last read"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[tokio::test]
     async fn rejects_unknown_fields() {
         let tool = WriteTool::new(FileTracker::default());
         let out = tool.run(json!({"path": "x", "content": "", "mode": "append"})).await;

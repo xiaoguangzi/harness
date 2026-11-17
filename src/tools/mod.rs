@@ -336,13 +336,13 @@ pub(crate) fn parse_input<T: serde::de::DeserializeOwned>(input: Value) -> Resul
     serde_json::from_value(input).map_err(|e| ToolOutput::error(format!("Invalid input: {e}")))
 }
 
-/// Remembers which files the model has read, and their modification time at
-/// that point, so `edit` and `write` refuse to change a file the model has
+/// Remembers which files the model has read, and how they were at that
+/// point ([`Stamp`]), so `edit` and `write` refuse to change a file the model has
 /// not seen or that changed since it was read.
 #[derive(Clone, Default)]
 pub struct FileTracker {
-    /// Each file's modification time when it was recorded, and a counter
-    /// value saying how recently that was.
+    /// Each file's stamp when it was recorded, and a counter value saying
+    /// how recently that was.
     seen: Arc<Mutex<Seen>>,
 }
 
@@ -353,9 +353,36 @@ pub struct FileTracker {
 /// landed after its check.
 static CHANGING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Files past this size are told apart by time and size only.
+const HASHED_BYTES: u64 = 8 << 20;
+
+/// What tells whether a file changed. Its modification time alone misses a
+/// change within the same tick: Linux stamps files from a coarse clock, so
+/// two writes a millisecond apart often get one time. Its size and a hash
+/// of its contents catch those.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Stamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    hash: Option<u64>,
+}
+
+impl Stamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        let contents = (meta.is_file() && meta.len() <= HASHED_BYTES).then(|| std::fs::read(path).ok()).flatten();
+        let hash = contents.map(|bytes| {
+            let mut hasher = std::hash::DefaultHasher::new();
+            std::hash::Hash::hash(&bytes, &mut hasher);
+            std::hash::Hasher::finish(&hasher)
+        });
+        Some(Self { modified: meta.modified().ok(), len: meta.len(), hash })
+    }
+}
+
 #[derive(Default)]
 struct Seen {
-    files: HashMap<PathBuf, (Option<SystemTime>, u64)>,
+    files: HashMap<PathBuf, (Option<Stamp>, u64)>,
     counter: u64,
     /// The `AGENTS.md` files of subdirectories the model was shown.
     notes: HashSet<PathBuf>,
@@ -366,14 +393,11 @@ impl FileTracker {
         std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
-    fn mtime(path: &Path) -> Option<SystemTime> {
-        std::fs::metadata(path).and_then(|m| m.modified()).ok()
-    }
-
     pub fn record(&self, path: &Path) {
+        let stamp = Stamp::of(path);
         let mut seen = self.seen.lock().unwrap();
         seen.counter += 1;
-        let entry = (Self::mtime(path), seen.counter);
+        let entry = (stamp, seen.counter);
         seen.files.insert(Self::key(path), entry);
     }
 
@@ -424,12 +448,13 @@ impl FileTracker {
         if !path.exists() {
             return Ok(());
         }
+        let now = Stamp::of(path);
         match self.seen.lock().unwrap().files.get(&Self::key(path)) {
             None => Err(format!(
                 "{} already exists; read it with the `read` tool before changing it",
                 path.display()
             )),
-            Some((seen, _)) if *seen != Self::mtime(path) => Err(format!(
+            Some((seen, _)) if *seen != now => Err(format!(
                 "{} changed since it was last read (another agent, a command or the user may have \
                  changed it); read it again before changing it",
                 path.display()

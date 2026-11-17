@@ -188,10 +188,6 @@ other harness's docs or source before acting on an entry. All findings here are 
 
 ### Found on the way (not a comparison)
 
-- [ ] The bwrap side of the `commondir` protection (2026-11-17: read-only `commondir`s, pinned worktree
-  directories, the `.git/commondir` stand-in holding `.`) was never run on Linux; `bwrap_confines_commands`
-  covers it (`cargo test bwrap_confines_commands -- --nocapture` on a Linux machine with bwrap; output saying
-  "skipping" means it did not run). Its Mac unit tests pass. (read)
 - [ ] On a filesystem without hard links the `.git/commondir` stand-in cannot be put in place, so a missing one
   stays open to sandboxed commands on Linux. (read)
 - [ ] Not verified: two harness processes sandboxing one repository on Linux. Stand-ins are tracked per process,
@@ -199,7 +195,7 @@ other harness's docs or source before acting on an entry. All findings here are 
   which Linux is believed to unmount there, leaving the path open to that command. (read)
 - [ ] `lsp` starts its servers at, and shows paths relative to, the directory the harness started in, so a worktree
   subagent's `lsp` looks at the main checkout (lsp.rs:212, 513; the README says so). (read)
-- [ ] `FileTracker` keys are not normalized (`..`, symlinks), staleness is mtime only, and a partial read counts
+- [ ] `FileTracker` keys are not normalized (`..`, symlinks), and a partial read counts
   as a full one for `write`. `edit`/`write` are not atomic (no temp file and rename).
 - [ ] `tool_search` gets no guidance line (the `<deferred-tools>` notice explains it).
 - [ ] The date in the system prompt goes stale in long-lived web tasks (each prompt carries the time, so the
