@@ -7,7 +7,7 @@ mod deferred;
 mod inbox;
 mod usage;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -732,6 +732,7 @@ impl Agent {
         if unanswered {
             self.messages.pop();
         }
+        self.drop_unanswered_server_calls();
         if self.messages.len() == turn_start + 1 {
             self.messages.truncate(turn_start);
         }
@@ -744,6 +745,7 @@ impl Agent {
     /// did get error results saying so.
     fn repair_after_interrupt(&mut self) {
         let mut finished = std::mem::take(&mut *self.finished.lock().unwrap());
+        self.drop_unanswered_server_calls();
         let Some(last) = self.messages.last_mut() else { return };
         let note = json!({"type": "text", "text": INTERRUPTED});
         if last.role == "user" {
@@ -765,14 +767,33 @@ impl Agent {
         }
     }
 
+    /// Takes the server tool calls (`server_tool_use`) that have no result
+    /// out of a last assistant message, as a paused response (`pause_turn`)
+    /// can leave them: the API answers them only when that message is sent
+    /// last, to go on with it, and refuses them before another message.
+    /// The message goes if nothing but thinking is left of it.
+    fn drop_unanswered_server_calls(&mut self) {
+        let Some(last) = self.messages.last_mut().filter(|m| m.role == "assistant") else { return };
+        let answered: HashSet<String> =
+            last.content.iter().filter_map(|b| b["tool_use_id"].as_str()).map(str::to_string).collect();
+        last.content.retain(|b| b["type"] != "server_tool_use" || b["id"].as_str().is_some_and(|id| answered.contains(id)));
+        let thinking = |b: &Value| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking" | "openai_reasoning"));
+        if last.content.iter().all(thinking) {
+            self.messages.pop();
+        }
+    }
+
     async fn run_loop(&mut self, observer: &mut dyn Observer) -> Result<()> {
         let definitions = self.tools.definitions();
         // Whether a Stop hook already kept this turn going.
         let mut stop_hook_active = false;
+        // Whether the last response paused, to be sent back as it is.
+        let mut paused = false;
 
         loop {
-            // What arrived meanwhile goes after the prompt or the tool results.
-            let arrived = self.inbox.take();
+            // What arrived meanwhile goes after the prompt or the tool
+            // results; a paused response goes on first.
+            let arrived = if std::mem::take(&mut paused) { Vec::new() } else { self.inbox.take() };
             if !arrived.is_empty() {
                 match self.messages.last_mut() {
                     Some(last) if last.role == "user" => last.content.extend(arrived),
@@ -804,7 +825,10 @@ impl Agent {
                 // tool calls: the calls stand, and must have results.
                 "" | "end_turn" if !tool_uses.is_empty() => {}
                 // A server tool paused the response: it goes on from here.
-                "pause_turn" => continue,
+                "pause_turn" => {
+                    paused = true;
+                    continue;
+                }
                 "max_tokens" if !tool_uses.is_empty() => {
                     // A tool_use block cut off by max_tokens may carry partial
                     // input; don't execute it.
@@ -970,6 +994,50 @@ pub(crate) mod tests {
                 text(INTERRUPTED),
             ]
         );
+    }
+
+    #[test]
+    fn server_calls_left_without_results_are_dropped() {
+        let search = |id: &str| json!({"type": "server_tool_use", "id": id, "name": "web_search", "input": {}});
+        let found = json!({"type": "web_search_tool_result", "tool_use_id": "s1", "content": []});
+        let paused = Message { role: "assistant", content: vec![search("s1"), found.clone(), text("so"), search("s2")], source: None };
+        let mut a = agent(vec![Message::user(vec![text("look it up")]), paused]);
+        a.repair_after_interrupt();
+        assert_eq!(a.messages[1].content, vec![search("s1"), found, text("so")], "the answered call stays");
+        assert_eq!(a.messages.len(), 2, "no note: nothing was left unanswered for the user to see");
+
+        let thinking = json!({"type": "thinking", "thinking": "t", "signature": "x"});
+        let only = Message { role: "assistant", content: vec![thinking, search("s3")], source: None };
+        let mut a = agent(vec![Message::user(vec![text("q")]), Message { role: "assistant", content: vec![text("a")], source: None },
+            Message::user(vec![text("look it up")]), only]);
+        a.repair_after_error(2);
+        assert_eq!(a.messages.len(), 2, "the message went, then the prompt it answered");
+    }
+
+    #[tokio::test]
+    async fn a_paused_response_goes_on_before_what_arrived() {
+        let search = json!({"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "q"}});
+        let (client, mut requests) = compact::tests::gateway(move |n| match n {
+            0 => (vec![search.clone()], "pause_turn", 100),
+            _ => (vec![text("done")], "end_turn", 100),
+        })
+        .await;
+        let mut agent = Agent::new(client, ToolRegistry::default(), "sys");
+        let inbox = agent.inbox().clone();
+        let mut notices = Notices::default();
+        let turn = agent.run_turn(vec![text("go")], &mut notices);
+        let pushed = async {
+            requests.recv().await.unwrap();
+            inbox.push("a note".into(), true);
+        };
+        let (result, ()) = tokio::join!(turn, pushed);
+        result.unwrap();
+        let second = requests.recv().await.unwrap();
+        let sent = second["messages"].as_array().unwrap();
+        assert_eq!(sent.last().unwrap()["role"], "assistant", "the paused response is sent last: {sent:?}");
+        let third = requests.recv().await.unwrap();
+        let last = third["messages"].as_array().unwrap().last().unwrap().clone();
+        assert!(last["content"].to_string().contains("a note"), "then the note: {last}");
     }
 
     #[tokio::test]
