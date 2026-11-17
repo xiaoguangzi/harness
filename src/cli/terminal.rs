@@ -194,40 +194,6 @@ pub enum TurnEnd {
     Failed(anyhow::Error),
 }
 
-/// Shows a compaction of a conversation waiting at the prompt: a line when
-/// it is done, and the hook notices it brings.
-pub struct IdleCompaction<'a> {
-    out: &'a Output,
-}
-
-impl<'a> IdleCompaction<'a> {
-    pub fn new(out: &'a Output) -> Self {
-        Self { out }
-    }
-}
-
-impl Observer for IdleCompaction<'_> {
-    fn on_text_delta(&mut self, _: &str) {}
-    fn on_text_end(&mut self) {}
-    fn on_tool_call(&mut self, _: &str, _: &Value) {}
-    fn on_tool_result(&mut self, _: &str, _: &ToolOutput) {}
-
-    fn on_compact_start(&mut self) {
-        self.out.set_status(Some("Compacting the idle conversation before its cache expires…"));
-    }
-
-    fn on_compact_end(&mut self, before: u64, after: u64) {
-        self.out.set_status(None);
-        let note = format!("✻ Compacted the idle conversation: context {} → about {}", tokens(before), tokens(after));
-        self.out.compaction_note(&note);
-        self.out.note(&note);
-    }
-
-    fn on_hook(&mut self, message: &str) {
-        self.out.warn(format!("⚑ {message}"));
-    }
-}
-
 impl Observer for Terminal {
     fn on_waiting(&mut self, tasks: &[String]) {
         if tasks.is_empty() {

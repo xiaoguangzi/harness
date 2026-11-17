@@ -9,7 +9,7 @@ mod usage;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -22,7 +22,7 @@ use crate::subagent::Subagents;
 use crate::tools::shells::Shells;
 use crate::tools::{ToolOutput, ToolRegistry};
 
-pub use compact::{is_compacted, set_idle as set_idle_compaction};
+pub use compact::is_compacted;
 pub(crate) use calls::run_nested;
 pub use inbox::Inbox;
 #[cfg(test)]
@@ -215,10 +215,6 @@ pub struct Agent {
     /// A model chosen while a turn ran, switched to when the next one
     /// starts: a turn's requests stay on one model.
     switch_to: Arc<Mutex<Option<Client>>>,
-    /// When the last request with this conversation's prefix started: its
-    /// prompt cache is kept from then on, not from when the answer ended.
-    /// `None` when no cache of it is known to be warm.
-    last_request: Mutex<Option<Instant>>,
     /// Where the conversation is saved after each round of tool calls, if
     /// it is: a crash then loses at most the round under way.
     autosave: Option<crate::session::Autosave>,
@@ -266,15 +262,9 @@ impl Agent {
             told_advisor: None,
             tool_search: None,
             switch_to: Arc::default(),
-            last_request: Mutex::new(None),
             autosave: None,
             finished: Mutex::default(),
         }
-    }
-
-    /// Notes that a request with the conversation's prefix starts now.
-    fn note_request(&self) {
-        *self.last_request.lock().unwrap() = Some(Instant::now());
     }
 
     /// Which tool calls run, ask the user or are refused.
@@ -355,7 +345,6 @@ impl Agent {
             Some(last) if last.role == "user" => last.content.push(asked),
             _ => request.push(Message::user(vec![asked])),
         }
-        self.note_request();
         let (log, model) = (&self.usage, self.client.spec());
         let mut on_event = |event: StreamEvent| match event {
             StreamEvent::TextDelta(text) => on_text(text),
@@ -394,10 +383,6 @@ impl Agent {
 
     /// Switches models; the conversation continues on the new one.
     pub fn set_client(&mut self, client: Client) {
-        // Prompt caches are per model: another one starts cold.
-        if client.spec() != self.client.spec() {
-            *self.last_request.lock().unwrap() = None;
-        }
         self.hooks.set_client(client.clone());
         self.client = client;
     }
@@ -528,7 +513,6 @@ impl Agent {
         self.context = None;
         self.forget_told();
         self.tool_search = None;
-        *self.last_request.lock().unwrap() = None;
         self.session_start = Some("clear");
         if self.checkpoints {
             self.history.clear();
@@ -869,7 +853,6 @@ impl Agent {
     /// counts the tokens it took.
     async fn request(&self, definitions: &[ToolDef], observer: &mut dyn Observer) -> Result<Response> {
         observer.on_request_start();
-        self.note_request();
         let (log, model) = (&self.usage, self.client.spec());
         let mut on_event = |event: StreamEvent| match event {
             StreamEvent::TextDelta(text) => observer.on_text_delta(text),

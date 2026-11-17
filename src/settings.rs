@@ -47,11 +47,6 @@ pub struct Settings {
     pub effort: Option<Effort>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
-    /// Compact a long conversation while it waits for the user, before its
-    /// prompt cache expires. Default: on.
-    pub idle_compaction: Option<bool>,
-    /// The tokens of context from which an idle conversation is compacted.
-    pub idle_compaction_min_tokens: Option<u64>,
     /// Give the model the `code` tool, JavaScript that calls its other
     /// tools. Default: off.
     pub code_mode: Option<bool>,

@@ -7,8 +7,6 @@
 //! recent messages, the summary, and, as Claude Code does, the files read
 //! most recently, as they are now. The assistant turns and tool results go.
 
-use std::time::Duration;
-
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
@@ -56,31 +54,6 @@ above. Build on the work already done and avoid repeating it.";
 const TODO_PREFIX: &str = "Your todo list before the compaction (keep it current with todo_write):";
 /// Starts the count of the tool calls the summary replaces.
 const TOOLS_PREFIX: &str = "Tool calls made before the compaction:";
-
-/// By default, an idle conversation is compacted from this many tokens.
-const IDLE_MIN_TOKENS: u64 = 200_000;
-/// How long before its prompt cache expires an idle conversation is
-/// compacted, so the summary request still reads the cache.
-const IDLE_BEFORE_EXPIRY: Duration = Duration::from_secs(45);
-
-/// When an idle conversation is compacted: the settings' `idle_compaction`
-/// (default on) and `idle_compaction_min_tokens`.
-#[derive(Debug, Clone, Copy)]
-struct IdleConfig {
-    enabled: bool,
-    min_tokens: u64,
-}
-
-static IDLE: std::sync::OnceLock<IdleConfig> = std::sync::OnceLock::new();
-
-/// Sets when idle conversations are compacted, from the settings.
-pub fn set_idle(enabled: Option<bool>, min_tokens: Option<u64>) {
-    let _ = IDLE.set(IdleConfig { enabled: enabled.unwrap_or(true), min_tokens: min_tokens.unwrap_or(IDLE_MIN_TOKENS) });
-}
-
-fn idle_config() -> IdleConfig {
-    *IDLE.get().unwrap_or(&IdleConfig { enabled: true, min_tokens: IDLE_MIN_TOKENS })
-}
 
 /// Whether `message` is the one a compaction left in place of the history.
 pub fn is_compacted(message: &Message) -> bool {
@@ -130,37 +103,6 @@ impl Agent {
         self.compact_history(Trigger::Manual(focus), &definitions, observer).await.map(drop)
     }
 
-    /// How long this conversation may wait for the user before it is
-    /// compacted, or `None` if it is not to be: it must take at least the
-    /// configured tokens of the context, and its prompt cache must still
-    /// be warm. The wait ends a little before the cache would expire, so
-    /// the summary request still reads it, and the user's next message no
-    /// longer resends the long history uncached. The cache is kept from
-    /// the start of the last request, so a long answer leaves less time;
-    /// once it has expired (or after `/resume`, when none is known), a
-    /// summary would cost the whole history uncached for a user who may
-    /// not come back, and the conversation is left as it is.
-    pub fn idle_compaction_after(&self) -> Option<Duration> {
-        self.idle_after(idle_config())
-    }
-
-    fn idle_after(&self, config: IdleConfig) -> Option<Duration> {
-        if !config.enabled || self.messages.is_empty() || self.context_tokens() < config.min_tokens {
-            return None;
-        }
-        let ttl = self.client.cache_ttl().unwrap_or(crate::llm::config::CacheTtl::FiveMinutes).duration();
-        let since = (*self.last_request.lock().unwrap())?.elapsed();
-        idle_wait(ttl, since)
-    }
-
-    /// Compacts the conversation while it waits for the user (see
-    /// [`Agent::idle_compaction_after`]). Cancelling leaves it as it was.
-    pub async fn compact_when_idle(&mut self, observer: &mut dyn Observer) -> Result<()> {
-        self.settle();
-        let definitions = self.tools.definitions();
-        self.compact_history(Trigger::Idle, &definitions, observer).await.map(drop)
-    }
-
     /// Compacts the conversation if the next request would come too close
     /// to the context window, as a turn's loop does before each request.
     pub(super) async fn compact_if_full(&mut self, definitions: &[ToolDef], observer: &mut dyn Observer) -> Result<()> {
@@ -203,7 +145,7 @@ impl Agent {
     ) -> Result<bool> {
         let (trigger, focus) = match trigger {
             Trigger::Manual(focus) => ("manual", focus),
-            Trigger::Auto | Trigger::Idle => ("auto", None),
+            Trigger::Auto => ("auto", None),
         };
         let pending = match self.messages.last() {
             Some(last) if last.role == "user" && !has_tool_results(last) => 1,
@@ -273,7 +215,6 @@ impl Agent {
             Some(last) if last.role == "user" => last.content.push(prompt),
             _ => request.push(Message::user(vec![prompt])),
         }
-        self.note_request();
         let (log, model) = (&self.usage, self.client.spec());
         let mut on_event = |event: StreamEvent| match event {
             StreamEvent::Retry { error, attempt, max, wait } => observer.on_retry(error, attempt, max, wait),
@@ -349,21 +290,12 @@ impl Agent {
     }
 }
 
-/// How long a conversation whose last request started `since` ago may
-/// still wait before it is compacted while its cache, kept for `ttl`, is
-/// warm; `None` once that is too late.
-fn idle_wait(ttl: Duration, since: Duration) -> Option<Duration> {
-    ttl.checked_sub(IDLE_BEFORE_EXPIRY + since)
-}
-
 /// What starts a compaction.
 enum Trigger<'a> {
     /// `/compact`, with what to focus on.
     Manual(Option<&'a str>),
     /// The context filling up.
     Auto,
-    /// The conversation waiting for the user.
-    Idle,
 }
 
 /// How many input tokens a request may carry before the conversation is
@@ -710,25 +642,6 @@ pub(crate) mod tests {
         assert_eq!(usage[0].0, "mock/main");
         assert_eq!(usage[0].1.requests, 2, "the summary and the answer");
         assert_eq!((usage[0].1.usage.input_tokens, usage[0].1.usage.output_tokens), (600, 20));
-    }
-
-    #[tokio::test]
-    async fn compacts_an_idle_conversation_before_its_cache_expires() {
-        let (client, mut requests) = gateway(|_| (vec![text("done")], "end_turn", 3_000)).await;
-        let mut agent = Agent::new(client, crate::tools::ToolRegistry::default(), "sys");
-        let config = |min_tokens| IdleConfig { enabled: true, min_tokens };
-        assert_eq!(agent.idle_after(config(1)), None, "nothing to compact");
-        agent.run_turn(vec![text("go")], &mut Seen::default()).await.unwrap();
-        let _ = requests.recv().await;
-        let after = agent.idle_after(config(1)).unwrap();
-        assert!(after <= Duration::from_secs(255) && after > Duration::from_secs(250), "before the 5-minute cache expires: {after:?}");
-        let (ttl, secs) = (Duration::from_secs(300), Duration::from_secs);
-        assert_eq!(idle_wait(ttl, secs(200)), Some(secs(55)), "counted from the request's start, not the answer's end");
-        assert_eq!(idle_wait(ttl, secs(290)), None, "the cache is as good as gone: not worth a summary");
-        assert_eq!(agent.idle_after(config(100_000)), None, "too short to bother");
-        assert_eq!(agent.idle_after(IdleConfig { enabled: false, min_tokens: 1 }), None);
-        agent.compact_when_idle(&mut Seen::default()).await.unwrap();
-        assert!(is_compacted(&agent.messages[0]) && agent.messages.len() == 1);
     }
 
     #[tokio::test]

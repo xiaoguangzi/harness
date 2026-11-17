@@ -998,7 +998,6 @@ function renderEvent(ev) {
         break;
       }
       case "permission_mode": transcript.append(h("div", { class: "note" }, "权限模式切换为 " + ev.mode)); break;
-      case "idle_compact": assistantEl = null; transcript.append(h("div", { class: "note" }, "✻ 任务空闲，在提示词缓存过期前压缩会话")); break;
       case "compact_start": assistantEl = null; transcript.append(h("div", { class: "note" }, "✻ 正在压缩会话…")); break;
       case "compact": assistantEl = null;
         transcript.append(h("div", { class: "note" }, `✻ 已压缩会话：上下文 ${Math.round(ev.before / 1000)}k → 约 ${Math.round(ev.after / 1000)}k`)); break;

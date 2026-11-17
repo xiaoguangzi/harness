@@ -245,8 +245,7 @@ impl<'a> Repl<'a> {
         }
     }
 
-    /// Reads the input box; if the user is away long enough, the
-    /// conversation is compacted meanwhile.
+    /// Reads the input box.
     async fn read_box(&mut self) -> Result<Read, ReadlineError> {
         let last = mentions::last_pasted_image(self.agent.messages()).max(self.typing.draft.last_image());
         self.typing.draft.note_image(last);
@@ -258,11 +257,7 @@ impl<'a> Repl<'a> {
         let inbox = self.agent.inbox().clone();
         let session = self.recorder.as_ref().map(|rec| (rec.meta().id, rec.file()));
         status_line::refresh(self.agent, session.as_ref().map(|(id, file)| (id.as_str(), file.clone())), &self.out);
-        let read = self.editor.helper().unwrap().read_box(&self.out, &mut self.typing, inbox, past);
-        let read = match self.agent.idle_compaction_after() {
-            Some(after) => compacting_while(read, after, self.agent, &self.out, self.recorder.as_mut()).await,
-            None => read.await,
-        };
+        let read = self.editor.helper().unwrap().read_box(&self.out, &mut self.typing, inbox, past).await;
         self.out.set_status(None);
         let Some((line, images)) = read? else { return Ok(Read::Again) };
         let line = repl::join_continuations(line.trim());
@@ -589,38 +584,6 @@ async fn finish_mcp(agent: &mut Agent, env: &mut Env, out: &Output) {
     let (tools, system) = env.conversation(agent.client());
     agent.set_tools(tools);
     agent.set_system(system);
-}
-
-/// Waits for `read`, the input box; if the user is away for `after`, the
-/// conversation is compacted meanwhile. A message sent before that is done
-/// cancels it, which leaves the conversation as it was.
-async fn compacting_while<T>(
-    read: impl Future<Output = T>,
-    after: Duration,
-    agent: &mut Agent,
-    out: &Output,
-    recorder: Option<&mut Recorder>,
-) -> T {
-    let compact = async {
-        tokio::time::sleep(after).await;
-        let mut observer = terminal::IdleCompaction::new(out);
-        match agent.compact_when_idle(&mut observer).await {
-            Ok(()) => {
-                if let Some(rec) = recorder {
-                    sessions::save(agent, rec, out);
-                }
-            }
-            Err(e) => out.error(format!("could not compact the idle conversation: {e:#}")),
-        }
-    };
-    tokio::pin!(read, compact);
-    let mut compacting = true;
-    loop {
-        tokio::select! {
-            result = &mut read => return result,
-            () = &mut compact, if compacting => compacting = false,
-        }
-    }
 }
 
 /// Runs the Notification hooks if the prompt still waits after

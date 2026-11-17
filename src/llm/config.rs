@@ -217,15 +217,6 @@ pub enum CacheTtl {
     OneHour,
 }
 
-impl CacheTtl {
-    pub fn duration(self) -> std::time::Duration {
-        std::time::Duration::from_secs(match self {
-            CacheTtl::FiveMinutes => 5 * 60,
-            CacheTtl::OneHour => 60 * 60,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {

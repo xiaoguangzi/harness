@@ -114,7 +114,6 @@ async fn main() -> Result<ExitCode> {
     }
     tools::bash::hide_env(settings.credential_vars());
     tools::snapshot::start(settings.shell.snapshot.unwrap_or(true));
-    agent::set_idle_compaction(settings.idle_compaction, settings.idle_compaction_min_tokens);
     tools::code::set_enabled(settings.code_mode.unwrap_or(false));
     prompt::set_git_status(settings.git_status.unwrap_or(true));
     cli::status_line::set(settings.status_line.take());
